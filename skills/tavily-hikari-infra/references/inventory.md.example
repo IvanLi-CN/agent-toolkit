@@ -1,0 +1,10 @@
+# Tavily Hikari inventory template
+
+Record only role and runtime facts here when a deployment chooses to maintain a local inventory. Keep aliases, resolved addresses, public origins, credentials, release records and service paths outside the public repository.
+
+| Role | Runtime | Service identity | Health command |
+| --- | --- | --- | --- |
+| primary | Docker/Compose or configured host service | `tavily-hikari` | deployment-specific read-only health check |
+| standby | configured host service or bundle | `tavily-hikari-standby` | deployment-specific read-only health check |
+
+Primary and standby must run compatible builds before HA synchronization is trusted. The public template intentionally contains no claim about a live deployment.

@@ -1,0 +1,56 @@
+# Agent Toolkit
+
+Agent Toolkit is a public collection of reusable Skills, focused command-line helpers, and narrowly scoped operational contracts for coding and automation agents. The repository is the single source for the standalone Skills listed in `PUBLIC_SKILLS.txt`; consumers load those Skill directories directly from a checkout or symlink and do not need a generated copy or runtime adapter.
+
+## Install
+
+Clone this repository, then point a standalone consumer's Skill root at its `skills/` directory. A direct symlink is sufficient when the consumer has no private Skills:
+
+```bash
+git clone git@github.com:IvanLi-CN/agent-toolkit.git /path/to/agent-toolkit
+ln -sfn /path/to/agent-toolkit/skills /path/to/consumer/skills
+```
+
+The consumer owns the final root path. Agent Toolkit does not require Codex, a Codex runtime home, or a particular host layout. Skills that integrate with an external service document the required CLI, environment variables, and configuration explicitly. A consumer that also has private Skills may link the allowlisted public directories individually beside its private source; that is a direct source link, not a generated adapter.
+
+## Repository layout
+
+```text
+skills/                 reusable Skills, scripts, references, assets, and tests
+docs/specs/agent-vm/    public lifecycle and CLI contracts for Agent VM
+docs/adr/               public architecture decisions supporting Agent VM
+bin/                    repository-local index and safety checks
+.github/workflows/      repository checks
+```
+
+`PUBLIC_SKILLS.txt` is the public boundary and `skills/README.md` is the discoverability index; both must contain the same public Skill set exactly once. `~/.agents/skills` and other installed third-party Skill roots are external dependencies, not content maintained here. Codex-only workflow and runtime integration Skills live in the consumer configuration repository.
+
+## Validation
+
+Run the checks from the repository root:
+
+```bash
+python3 bin/skills_index_check.py
+python3 -m unittest discover -s bin -p 'test_*.py'
+python3 bin/public_boundary_check.py
+python3 -m pip install -r requirements-dev.txt
+while IFS= read -r test_file; do python3 "$test_file"; done < <(find skills -type f -name 'test_*.py' | sort)
+```
+
+During a source migration, compare the public allowlist with the source snapshot and verify that private consumer Skills remain in the private source tree:
+
+```bash
+python3 bin/source_target_inventory_check.py \
+  --source-root /path/to/dot-codex \
+  --source-revision <migration-source-revision>
+```
+
+The Agent VM client has an explicit generic session interface. Use `--session-id` for a one-off override or set `AGENT_VM_SESSION_ID` for a session. The public client never requires a Codex thread identifier.
+
+## Contributions
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before changing a Skill. Keep one source of truth, use repository-relative paths, add focused tests for behavior changes, and keep environment-specific values in ignored local configuration.
+
+## License
+
+Agent Toolkit is released under the [MIT License](LICENSE).

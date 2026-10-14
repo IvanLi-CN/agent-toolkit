@@ -1,0 +1,24 @@
+{
+  "tempo_bpm": 120,
+  "audio": {
+    "waveform": "square",
+    "sample_rate_hz": 44100,
+    "volume": 0.7,
+    "fade_ms": 2
+  },
+  "midi": {
+    "channel": 0,
+    "program": 80,
+    "velocity": 96
+  },
+  "events": [
+    { "note": "C5", "beats": 0.5 },
+    { "note": "D5", "beats": 0.5 },
+    { "note": "E5", "beats": 0.5 },
+    { "note": "G5", "beats": 0.5 },
+    { "rest_beats": 0.25 },
+    { "freq_hz": 1000, "ms": 120 },
+    { "rest_ms": 80 },
+    { "freq_hz": 1400, "ms": 120 }
+  ]
+}

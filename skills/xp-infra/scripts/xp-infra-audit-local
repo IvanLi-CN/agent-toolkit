@@ -1,0 +1,308 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "time"
+require "uri"
+
+class DuplicateJsonMember < StandardError; end
+
+class DuplicateRejectingHash < Hash
+  def []=(key, value)
+    raise DuplicateJsonMember if key?(key)
+
+    super
+  end
+end
+
+def fail_probe(message)
+  warn "audit response invalid: #{message}"
+  exit 1
+end
+
+def read_records
+  records = {}
+  STDIN.each_line do |line|
+    record = line.chomp
+    next if record.empty?
+
+    key, value = record.split("=", 2)
+    fail_probe("malformed record") if key.nil? || key.empty? || value.nil?
+    fail_probe("invalid record key") unless key.match?(/\A[a-z][a-z0-9_]*\z/)
+    fail_probe("duplicate #{key}") if records.key?(key)
+
+    records[key] = value
+  end
+  records
+end
+
+def require_records(records, *keys)
+  keys.each { |key| fail_probe("missing #{key}") unless records.key?(key) }
+end
+
+def parse_json(value, name)
+  JSON.parse(value, object_class: DuplicateRejectingHash)
+rescue JSON::ParserError, DuplicateJsonMember
+  fail_probe("invalid #{name}")
+end
+
+def json_object(value, name, required: false)
+  fail_probe("missing #{name}") if required && value.to_s.empty?
+  return nil if value.to_s.empty?
+
+  parsed = parse_json(value, name)
+  fail_probe("#{name} is not an object") unless parsed.is_a?(Hash)
+
+  parsed
+end
+
+def nested_object(object, key, name)
+  value = object[key]
+  return {} if value.nil?
+
+  fail_probe("#{name} is not an object") unless value.is_a?(Hash)
+  value
+end
+
+def explicit_boolean(value, name, default: nil)
+  normalized = value.to_s.strip.downcase
+  return default if normalized.empty? && !default.nil?
+
+  case normalized
+  when "1", "true", "yes", "on"
+    true
+  when "0", "false", "no", "off"
+    false
+  else
+    fail_probe("#{name} is invalid")
+  end
+end
+
+def bounded_interval(value, default)
+  interval = Integer(value, exception: false)
+  interval = default if interval.nil? || interval.negative?
+  [interval, 3600].min
+end
+
+def parsed_time(value)
+  Time.parse(value.to_s)
+rescue ArgumentError
+  nil
+end
+
+def audit_now
+  test_epoch = ENV["XP_INFRA_TEST_NOW_EPOCH"] || ENV["TEST_NOW_EPOCH"]
+  return Time.at(test_epoch.to_i) if test_epoch&.match?(/\A\d+\z/)
+
+  Time.now
+end
+
+def api_base_host(value)
+  uri = URI.parse(value)
+  valid = uri.is_a?(URI::HTTPS) && uri.host && uri.userinfo.nil? &&
+          uri.query.nil? && uri.fragment.nil? && uri.path.to_s.match?(%r{\A/?\z})
+  fail_probe("api_base must be an HTTPS origin") unless valid
+
+  host = uri.host
+  fail_probe("api_base host must be lowercase") unless host == host.downcase
+
+  host
+rescue URI::InvalidURIError
+  fail_probe("api_base must be an HTTPS origin")
+end
+
+def valid_host?(value)
+  value.match?(/\A[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\z/i) && value.include?(".")
+end
+
+def valid_node_name?(value)
+  # Reserve space for the `-xp` or `-ep` role suffix in the same DNS label.
+  value.match?(/\A[a-z0-9](?:[a-z0-9-]{0,58}[a-z0-9])?\z/)
+end
+
+def tunnel_declaration(records, api_host)
+  cloudflare_enabled = explicit_boolean(records["cloudflare_enabled"], "cloudflare_enabled")
+  settings = json_object(records["cloudflare_settings_json"], "cloudflare_settings_json")
+  if settings
+    enabled = settings["enabled"] == true
+    hostname = settings["hostname"].to_s
+    return "aligned" if enabled && valid_host?(hostname) && hostname == api_host
+    return "missing" if !enabled && hostname.empty?
+
+    return "mismatch"
+  end
+
+  hostname = records["cloudflare_hostname"].to_s
+  return "aligned" if cloudflare_enabled && valid_host?(hostname) && hostname == api_host
+  return "missing" if !cloudflare_enabled && hostname.empty?
+
+  "mismatch"
+end
+
+def managed_defaults(records)
+  state = json_object(records["managed_default_state_json"], "managed_default_state_json")
+  return [false, false] if state.nil?
+
+  fail_probe("managed_default_state_json schema_version is unsupported") unless state["schema_version"] == 1
+  vless = state["vless_endpoint_id"]
+  ss = state["ss_endpoint_id"]
+  fail_probe("managed_default_state_json.vless_endpoint_id is invalid") unless vless.nil? || (vless.is_a?(String) && !vless.empty?)
+  fail_probe("managed_default_state_json.ss_endpoint_id is invalid") unless ss.nil? || (ss.is_a?(String) && !ss.empty?)
+
+  [!vless.nil?, !ss.nil?]
+end
+
+def public_xray_ports(value)
+  return [] if value.to_s.empty?
+
+  ports = value.split(",").map do |entry|
+    port = Integer(entry, exception: false)
+    fail_probe("xray_public_ports is invalid") if port.nil? || port < 1 || port > 65_535
+    port
+  end
+  fail_probe("xray_public_ports contains duplicates") unless ports.uniq.length == ports.length
+
+  ports
+end
+
+def loopback_bind_port(value)
+  match = value.to_s.match(/\A(?:127\.0\.0\.1|\[::1\]):([1-9][0-9]*)\z/)
+  return nil if match.nil?
+
+  port = Integer(match[1], exception: false)
+  return nil if port.nil? || port > 65_535
+
+  port
+end
+
+def emit(key, value)
+  puts "#{key}=#{value}"
+end
+
+def normalize_basic
+  records = read_records
+  require_records(
+    records,
+    "xp_service", "xray_service", "cloudflared_service", "runtime_mode",
+    "container_identity", "container_started_at", "container_xray_token", "host_xray_pid", "host_xray_starttime",
+    "ddns_enabled", "ddns_monitor_mode", "ddns_restart_mode", "ddns_fast_interval",
+    "ddns_monitored_interval", "ddns_unmonitored_interval", "ddns_state_json",
+    "geo_enabled", "geo_origin", "geo_response_json", "health_json", "cluster_json",
+    "node_name", "api_base", "access_host", "cloudflare_enabled", "cloudflare_hostname",
+    "cloudflare_settings_json", "managed_default_state_json", "sync_node_meta", "xray_public_ports"
+  )
+
+  health = json_object(records["health_json"], "health_json", required: true)
+  cluster = json_object(records["cluster_json"], "cluster_json", required: true)
+
+  ddns_enabled = explicit_boolean(records["ddns_enabled"], "ddns_enabled")
+  ddns_state = json_object(records["ddns_state_json"], "ddns_state_json", required: ddns_enabled) || {}
+  snapshot = ddns_state["snapshot"]
+  if ddns_enabled
+    fail_probe("ddns_state_json.snapshot is not an object") unless snapshot.is_a?(Hash)
+  else
+    snapshot = {} unless snapshot.is_a?(Hash)
+  end
+  fast_until = parsed_time(snapshot["fast_mode_until"])
+  monitor_mode = records["ddns_monitor_mode"].to_s
+  monitor_mode = records["ddns_restart_mode"].to_s if monitor_mode.empty?
+  interval = if fast_until && fast_until > audit_now
+               bounded_interval(records["ddns_fast_interval"], 30)
+             elsif !monitor_mode.empty? && monitor_mode != "none"
+               bounded_interval(records["ddns_monitored_interval"], 300)
+             else
+               bounded_interval(records["ddns_unmonitored_interval"], 60)
+             end
+  last_sync = parsed_time(snapshot["last_sync_at"])
+  ddns_ok = ddns_enabled && last_sync && last_sync <= audit_now &&
+            audit_now - last_sync <= interval * 2 + 60 && snapshot["status"] == "up" &&
+            snapshot["last_error"].to_s.empty?
+
+  geo_enabled = explicit_boolean(records["geo_enabled"], "geo_enabled", default: false)
+  geo_origin = records["geo_origin"].to_s
+  geo_origin = "https://api.country.is" if geo_origin.empty?
+  geo_response = json_object(records["geo_response_json"], "geo_response_json", required: geo_enabled) || {}
+  country = geo_response["country"]
+  fail_probe("geo_response_json.country is invalid") if geo_enabled && (!country.is_a?(String) || country.empty?)
+  geo_ok = geo_enabled && geo_origin == "https://api.country.is" && country.is_a?(String) && !country.empty?
+
+  api_base = records["api_base"].to_s
+  api_host = api_base_host(api_base)
+  access_host = records["access_host"].to_s
+  fail_probe("access_host is invalid") unless valid_host?(access_host)
+  fail_probe("access_host must be lowercase") unless access_host == access_host.downcase
+  node_name = records["node_name"].to_s
+  node_name_valid = valid_node_name?(node_name)
+  declaration = tunnel_declaration(records, api_host)
+  vless_managed, ss_managed = managed_defaults(records)
+  public_ports = public_xray_ports(records["xray_public_ports"])
+  runtime_mode = records["runtime_mode"]
+  fail_probe("runtime_mode is invalid") unless %w[host container].include?(runtime_mode)
+  container_identity = records["container_identity"]
+  container_started_at = records["container_started_at"]
+  container_xray_token = records["container_xray_token"]
+  if runtime_mode == "container"
+    fail_probe("container_identity is invalid") unless container_identity.match?(/\A[0-9a-f]{64}\z/)
+    fail_probe("container_started_at is invalid") if parsed_time(container_started_at).nil?
+    fail_probe("container runtime has host Xray identity") unless records["host_xray_pid"].empty? && records["host_xray_starttime"].empty?
+    fail_probe("container_xray_token is invalid") unless container_xray_token.match?(/\A[1-9][0-9]*:[1-9][0-9]*\z/)
+  else
+    fail_probe("host runtime has container identity") unless container_identity.empty? && container_started_at.empty? && container_xray_token.empty?
+    fail_probe("host_xray_pid is invalid") unless records["host_xray_pid"].match?(/\A[1-9][0-9]*\z/)
+    fail_probe("host_xray_starttime is invalid") unless records["host_xray_starttime"].match?(/\A[1-9][0-9]*\z/)
+  end
+
+  xray = nested_object(health, "xray", "health_json.xray")
+  cloudflared = nested_object(health, "cloudflared", "health_json.cloudflared")
+  canary = nested_object(health, "vless_https_canary", "health_json.vless_https_canary")
+  certificate_expiry = parsed_time(canary["cert_not_after"])
+  certificate_ok = canary["enabled"] == true && canary["last_error"].nil? &&
+                   certificate_expiry && certificate_expiry > audit_now
+  canary_port = loopback_bind_port(canary["bind"])
+
+  %w[xp_service xray_service cloudflared_service].each do |key|
+    emit(key, records[key].to_s == "true" ? "true" : "false")
+  end
+  emit("cloudflare_ddns_enabled", ddns_enabled ? "true" : "false")
+  emit("cloudflare_ddns", ddns_ok ? "true" : "false")
+  emit("ip_geo_enrichment", geo_ok ? "true" : "false")
+  emit("local_health", health["status"] == "ok" ? "true" : "false")
+  emit("xray_runtime", xray["status"] == "up" ? "true" : "false")
+  emit("cloudflare_tunnel", cloudflared["status"] == "up" ? "true" : "false")
+  emit("canary_enabled", canary["enabled"] == true ? "true" : "false")
+  emit("canary_certificate", certificate_ok ? "true" : "false")
+  emit("cluster_role", cluster["role"].to_s.empty? ? "missing" : cluster["role"].to_s)
+  emit("runtime_mode", runtime_mode)
+  emit("container_identity", container_identity)
+  emit("container_started_at", container_started_at)
+  emit("container_xray_token", container_xray_token)
+  emit("host_xray_pid", records["host_xray_pid"])
+  emit("host_xray_starttime", records["host_xray_starttime"])
+  emit("node_name", node_name)
+  emit("node_name_valid", node_name_valid ? "true" : "false")
+  emit("api_host", api_host)
+  emit("access_host", access_host)
+  emit("cluster_sync", records["sync_node_meta"] == "true" ? "true" : "false")
+  emit("tunnel_declaration", declaration)
+  emit("managed_default_vless", vless_managed ? "true" : "false")
+  emit("managed_default_ss2022", ss_managed ? "true" : "false")
+  emit("xray_public_listener", public_ports.length == 1 ? "true" : "false")
+  emit("public_health_target", "#{api_base.sub(%r{/$}, "")}/api/health")
+  emit("canary_local_target", "https://#{access_host}:#{canary_port}/generate_204") if canary_port
+  emit("vless_public_target", "https://#{access_host}:#{public_ports.first}/generate_204") if vless_managed && public_ports.length == 1
+end
+
+def normalize_public_health
+  health = parse_json(STDIN.read, "public health json")
+  fail_probe("public health is not an object") unless health.is_a?(Hash)
+  xray = nested_object(health, "xray", "public health.xray")
+
+  emit("public_health", health["status"] == "ok" && xray["status"] == "up" ? "true" : "false")
+  emit("public_health_json_ok", health["status"] == "ok" ? "true" : "false")
+end
+
+case ARGV.fetch(0, "")
+when "basic" then normalize_basic
+when "public-health" then normalize_public_health
+else fail_probe("usage: xp-infra-audit-local basic|public-health")
+end

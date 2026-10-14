@@ -1,0 +1,21 @@
+# Public Skill allowlist
+#
+# Every entry below is expected to work from a standalone agent-toolkit
+# checkout. Codex-specific workflow and runtime integration Skills are kept in
+# the consumer configuration repository instead of this public source.
+agent-requirements
+agent-vm
+agent-vm-ops
+buzzer-audio-preview
+cvm-imagegen
+docs-no-revision-markers
+dst-dedicated-server
+firmware-display-preview
+git-remote-troubleshoot
+git-sync
+linux-server-init
+mcu-agentd-project-integration
+requirements-analysis
+step-stl-print-repair
+tavily-hikari-infra
+xp-infra

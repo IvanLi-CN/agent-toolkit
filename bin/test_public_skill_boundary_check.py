@@ -53,6 +53,13 @@ class PublicSkillBoundaryTests(unittest.TestCase):
             ["skills/alpha/references/hosts.txt: private operator reference must stay outside repository"],
         )
 
+    def test_rejects_skill_directory_missing_from_manifest(self) -> None:
+        root, manifest = self.make_repo("# standalone\n")
+        extra = root / "skills" / "private-looking"
+        extra.mkdir()
+        (extra / "SKILL.md").write_text("Use $CODEX_HOME.\n", encoding="utf-8")
+        self.assertEqual(MODULE.check(root, manifest), ["UNLISTED_PUBLIC_SKILL private-looking"])
+
 
 if __name__ == "__main__":
     unittest.main()

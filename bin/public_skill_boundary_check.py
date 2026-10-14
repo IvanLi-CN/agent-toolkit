@@ -28,6 +28,17 @@ def public_skills(manifest: Path = PUBLIC_MANIFEST) -> list[str]:
     return names
 
 
+def repository_skills(repo_root: Path) -> set[str]:
+    skills_root = repo_root / "skills"
+    if not skills_root.is_dir():
+        return set()
+    return {
+        child.name
+        for child in skills_root.iterdir()
+        if child.is_dir() and not child.name.startswith(".") and (child / "SKILL.md").is_file()
+    }
+
+
 def check(repo_root: Path, manifest: Path = PUBLIC_MANIFEST) -> list[str]:
     findings: list[str] = []
     try:
@@ -37,6 +48,11 @@ def check(repo_root: Path, manifest: Path = PUBLIC_MANIFEST) -> list[str]:
 
     if len(names) != len(set(names)):
         findings.append("DUPLICATE_PUBLIC_SKILL_NAME")
+
+    actual = repository_skills(repo_root)
+    listed = set(names)
+    for name in sorted(actual - listed):
+        findings.append(f"UNLISTED_PUBLIC_SKILL {name}")
 
     for name in names:
         skill_root = repo_root / "skills" / name

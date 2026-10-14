@@ -1,0 +1,4 @@
+interface:
+  display_name: "STEP/STL print repair"
+  short_description: "Regenerate and validate print-ready STL files from STEP/CAD sources"
+  default_prompt: "Use $step-stl-print-repair to regenerate a print-ready STL from the provided STEP/CAD source, sweep tessellation options, validate with Blender 3D Print Toolbox, visually inspect any rounded or user-marked regions, and return the clean final STL with parameters and validation proof."

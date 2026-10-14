@@ -1,0 +1,4 @@
+# Configure deployment-specific SSH aliases outside this repository, or set
+# TAVILY_PRIMARY_ALIAS and TAVILY_STANDBY_ALIAS before using the helper.
+primary
+standby

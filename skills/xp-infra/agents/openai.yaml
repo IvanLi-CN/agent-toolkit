@@ -1,0 +1,4 @@
+interface:
+  display_name: "XP Infra"
+  short_description: "Deploy, audit, and operate XP cluster nodes"
+  default_prompt: "Use $xp-infra to initialize, deploy, join, upgrade, audit, or troubleshoot an XP cluster node with the confirmed policy."

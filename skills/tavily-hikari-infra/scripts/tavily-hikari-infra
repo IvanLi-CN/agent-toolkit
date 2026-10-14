@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+CONFIG_DIR="${TAVILY_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/tavily-hikari-infra}"
+HOSTS_FILE="${TAVILY_HOSTS_FILE:-$CONFIG_DIR/hosts.txt}"
+
+die() { echo "error: $*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+tavily-hikari-infra: read-only helper for a configured primary/standby deployment
+
+Usage:
+  tavily-hikari-infra inventory
+  tavily-hikari-infra status primary|standby
+  tavily-hikari-infra logs primary|standby [--tail N]
+
+Set TAVILY_PRIMARY_ALIAS, TAVILY_STANDBY_ALIAS and the corresponding
+TAVILY_*_STATUS_COMMAND / TAVILY_*_LOG_COMMAND values outside the repository.
+The inventory file defaults to ${HOSTS_FILE}; keep it in protected operator configuration.
+EOF
+}
+
+read_hosts() {
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    line="$(echo "$line" | xargs || true)"
+    [[ -n "$line" ]] || continue
+    printf '%s\n' "$line"
+  done < "$HOSTS_FILE"
+}
+
+role_alias() {
+  case "$1" in
+    primary) printf '%s' "${TAVILY_PRIMARY_ALIAS:-}" ;;
+    standby) printf '%s' "${TAVILY_STANDBY_ALIAS:-}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+role_command() {
+  local role="$1" kind="$2"
+  case "$role:$kind" in
+    primary:status) printf '%s' "${TAVILY_PRIMARY_STATUS_COMMAND:-}" ;;
+    primary:logs) printf '%s' "${TAVILY_PRIMARY_LOG_COMMAND:-}" ;;
+    standby:status) printf '%s' "${TAVILY_STANDBY_STATUS_COMMAND:-}" ;;
+    standby:logs) printf '%s' "${TAVILY_STANDBY_LOG_COMMAND:-}" ;;
+    *) printf '%s' "" ;;
+  esac
+}
+
+cmd_inventory() {
+  while IFS= read -r host; do
+    echo "== $host =="
+    ssh -G "$host" 2>/dev/null | awk '$1=="hostname"||$1=="port"||$1=="user"{print}'
+    echo
+  done < <(read_hosts)
+}
+
+cmd_remote() {
+  local role="$1" kind="$2" tail_lines="${3:-}"
+  [[ "$role" == primary || "$role" == standby ]] || die "unknown role: $role"
+  local host command
+  host="$(role_alias "$role")"
+  command="$(role_command "$role" "$kind")"
+  [[ -n "$host" ]] || die "set the alias for $role outside the repository"
+  [[ -n "$command" ]] || die "set the read-only $kind command for $role outside the repository"
+  if [[ -n "$tail_lines" ]]; then
+    command="$command $tail_lines"
+  fi
+  ssh "$host" bash -lc "$command"
+}
+
+cmd_status() { [[ $# -eq 1 ]] || die "usage: status primary|standby"; cmd_remote "$1" status; }
+
+cmd_logs() {
+  local role="${1:-}"; shift || true
+  [[ -n "$role" ]] || die "missing role"
+  local tail_lines=200
+  if [[ "${1:-}" == "--tail" ]]; then tail_lines="${2:-}"; fi
+  [[ "$tail_lines" =~ ^[0-9]+$ ]] || die "invalid tail count: $tail_lines"
+  cmd_remote "$role" logs "$tail_lines"
+}
+
+case "${1:-}" in
+  inventory) shift; cmd_inventory "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  logs) shift; cmd_logs "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *) die "unknown command: $1" ;;
+esac

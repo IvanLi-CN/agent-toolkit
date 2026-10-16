@@ -73,6 +73,20 @@ test("rejects absolute and file URL imports outside the public repository", () =
   }
 });
 
+test("rejects Windows-style external imports on every host platform", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-windows-"));
+  try {
+    mkdirSync(join(root, "bin"), { recursive: true });
+    writeFileSync(join(root, "bin", "windows.ts"), 'import "C:\\\\Users\\\\ivan\\\\outside.ts";\nimport "\\\\server\\share\\outside.ts";\n');
+    expect(check(root)).toEqual([
+      "bin/windows.ts: local reference outside public repository C:\\\\Users\\\\ivan\\\\outside.ts",
+      "bin/windows.ts: local reference outside public repository \\\\server\\share\\outside.ts",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("rejects unsupported public-tool-boundary CLI options", () => {
   expect(main(["--unknown"])).toBe(2);
 });

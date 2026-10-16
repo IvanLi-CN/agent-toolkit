@@ -89,7 +89,10 @@ test("counts only regular Skill files and rejects malformed options", () => {
     symlinkSync(join(root, "outside", "linked", "SKILL.md"), join(root, "skills", "regular", "references", "linked.md"));
     mkdirSync(join(root, "skills", "regular", "build"), { recursive: true });
     symlinkSync(join(root, "outside", "linked", "SKILL.md"), join(root, "skills", "regular", "build", "ignored.md"));
-    expect(targetSymlinkPaths(root)).toEqual(new Set(["skills/linked", "skills/regular/references/linked.md"]));
+    mkdirSync(join(root, "outside", "build"), { recursive: true });
+    writeFileSync(join(root, "outside", "build", "SKILL.md"), "# build\n");
+    symlinkSync(join(root, "outside", "build"), join(root, "skills", "build"), "dir");
+    expect(targetSymlinkPaths(root)).toEqual(new Set(["skills/build", "skills/linked", "skills/regular/references/linked.md"]));
     expect(parseArgs(["--source-root=/tmp/source", "--source-revision=HEAD", "--target-root=/tmp/target", "--public-manifest=/tmp/public"])).toEqual({
       sourceRoot: "/tmp/source",
       revision: "HEAD",
@@ -99,6 +102,7 @@ test("counts only regular Skill files and rejects malformed options", () => {
     expect(() => parseArgs(["--unknown"])).toThrow();
     expect(() => parseArgs(["--source-root"])).toThrow();
     expect(main(["--help"])).toBe(0);
+    expect(main(["--help", "--unknown"])).toBe(2);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

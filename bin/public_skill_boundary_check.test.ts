@@ -110,6 +110,19 @@ test("reports a nested symlink that escapes the Skill boundary", () => {
   }
 });
 
+test("rejects an in-boundary symlinked private reference", () => {
+  const { root, manifest } = fixture("# standalone\n");
+  try {
+    mkdirSync(join(root, "skills", "alpha", "references"), { recursive: true });
+    symlinkSync(join(root, "skills", "alpha", "SKILL.md"), join(root, "skills", "alpha", "references", "hosts.txt"));
+    expect(check(root, manifest)).toEqual([
+      "skills/alpha/references/hosts.txt: symbolic link escapes public Skill boundary",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("rejects a public manifest that is outside the repository boundary", () => {
   const { root } = fixture("# standalone\n");
   const outside = join(root, "..", "agent-toolkit-manifest-outside.txt");

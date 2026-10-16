@@ -67,6 +67,7 @@ test("uses an explicit repository root and ignores a directory named SKILL.md", 
     expect(main(["--repo-root", root])).toBe(0);
     expect(main([`--repo-root=${root}`])).toBe(0);
     expect(main(["--help"])).toBe(0);
+    expect(main(["--help", "--unknown"])).toBe(2);
     expect(main(["--unknown"])).toBe(2);
   });
 });

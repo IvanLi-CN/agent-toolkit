@@ -18,8 +18,8 @@ export const FORBIDDEN_PATTERNS: Array<[string, RegExp]> = [
   ["private-consumer-root", new RegExp(`(?:~\\/\\.agents\\/skills|${privateRootPattern})`, "i")],
 ];
 
-const RELATIVE_IMPORT = /(?:from\s*|import\s*(?:\(\s*)?|require\s*\()["'](\.{1,2}\/[^"']+)["']/g;
-const ABSOLUTE_IMPORT = /(?:from\s*|import\s*(?:\(\s*)?|require\s*\()["']((?:file:\/\/|\/|[A-Za-z]:[\\/])[^"']+)["']/g;
+const RELATIVE_IMPORT = /(?:from\s*|import\s*(?:\(\s*)?|require\s*\()["'](\.{1,2}[\\/][^"']+)["']/g;
+const ABSOLUTE_IMPORT = /(?:from\s*|import\s*(?:\(\s*)?|require\s*\()["']((?:file:\/\/|\/|\\\\|[A-Za-z]:[\\/])[^"']+)["']/g;
 const EXCLUDED_TEST_FILE = /(?:\.test\.(?:ts|tsx|js|py|sh)$|^test[-_].*\.(?:ts|tsx|js|py|sh)$|_test\.(?:ts|tsx|js|py|sh)$)/;
 const PUBLIC_TOOL_EXTENSIONS = [".ts", ".tsx", ".js", ".py", ".sh"];
 
@@ -41,7 +41,7 @@ export function publicToolFiles(repoRoot: string = REPO_ROOT): string[] {
 }
 
 function importCandidates(file: string, specifier: string): string[] {
-  const absolute = resolve(dirname(file), specifier);
+  const absolute = resolve(dirname(file), specifier.replaceAll("\\", "/"));
   return [
     absolute,
     `${absolute}.ts`,

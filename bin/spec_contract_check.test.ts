@@ -35,6 +35,7 @@ test("fails closed for unsupported or incomplete command-line options", () => {
   expect(main(["--path"])).toBe(2);
   expect(main(["--unknown"])).toBe(2);
   expect(main(["--help"])).toBe(0);
+  expect(main(["--help", "--unknown"])).toBe(2);
 });
 
 test("rejects a canonical-looking Spec reached through a symlinked ancestor", () => {

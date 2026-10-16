@@ -244,6 +244,10 @@ export function check(
 
 export function main(args: string[] = Bun.argv.slice(2)): number {
   if (args.includes("--help")) {
+    if (args.length !== 1) {
+      console.error(USAGE);
+      return 2;
+    }
     console.log(USAGE);
     return 0;
   }

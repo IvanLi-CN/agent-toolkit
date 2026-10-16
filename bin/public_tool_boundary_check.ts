@@ -2,8 +2,9 @@
 /** Check root public tools for private runtime coupling and broken local imports. */
 
 import { lstatSync, realpathSync } from "node:fs";
-import { dirname, join, resolve, sep } from "node:path";
+import { dirname, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import * as ts from "typescript";
 import { isDirectRegularFile, isPathInside, REPO_ROOT, readText, relativePath, resolveExistingFile, walkFiles } from "./repo_util.ts";
 
 const runtimeNamePattern = "CODEX_" + "[A-Z0-9_]+";
@@ -20,10 +21,13 @@ export const FORBIDDEN_PATTERNS: Array<[string, RegExp]> = [
 
 const IMPORT_GAP = String.raw`(?:\s|/\*[\s\S]*?\*/|//[^\r\n]*(?:\r\n|\r|\n))*`;
 const IMPORT_PREFIX = String.raw`(?:\bfrom${IMPORT_GAP}|\bimport${IMPORT_GAP}(?:\(${IMPORT_GAP})?|\brequire${IMPORT_GAP}\(${IMPORT_GAP})`;
-const RELATIVE_IMPORT = new RegExp(`${IMPORT_PREFIX}["'](\.{1,2}[\\/][^"']+)["']`, "g");
-const ABSOLUTE_IMPORT = new RegExp(`${IMPORT_PREFIX}["']((?:file:\/\/|\/|\\\\|[A-Za-z]:[\\\\/])[^"']+)["']`, "g");
+const RELATIVE_IMPORT = new RegExp(String.raw`${IMPORT_PREFIX}["'](\.{1,2}[\\/][^"']+)["']`, "g");
+const ABSOLUTE_IMPORT = new RegExp(String.raw`${IMPORT_PREFIX}["']((?:file://|/|\\|[A-Za-z]:[\\/])[^"']+)["']`, "g");
 const EXCLUDED_TEST_FILE = /(?:\.test\.(?:ts|tsx|js|py|sh)$|^test[-_].*\.(?:ts|tsx|js|py|sh)$|_test\.(?:ts|tsx|js|py|sh)$)/;
 const PUBLIC_TOOL_EXTENSIONS = [".ts", ".tsx", ".js", ".py", ".sh"];
+const JAVASCRIPT_EXTENSIONS = new Set([".js", ".jsx", ".ts", ".tsx"]);
+const RELATIVE_SPECIFIER = /^\.{1,2}[\\/]/;
+const ABSOLUTE_SPECIFIER = /^(?:file:\/\/|\/|\\|[A-Za-z]:[\\/])/;
 
 function collectPublicToolFiles(repoRoot: string): { files: string[]; rejectedSymlinks: string[] } {
   const rejectedSymlinks: string[] = [];
@@ -56,7 +60,7 @@ function importCandidates(file: string, specifier: string): string[] {
 }
 
 function isInside(root: string, candidate: string): boolean {
-  if (/^(?:[A-Za-z]:[\\/]|\\\\)/.test(candidate)) return false;
+  if (/^(?:[A-Za-z]:[\\/]|\\)/.test(candidate)) return false;
   const absoluteRoot = resolve(root);
   const absoluteCandidate = resolve(candidate);
   let realRoot = absoluteRoot;
@@ -74,8 +78,83 @@ function isInside(root: string, candidate: string): boolean {
 }
 
 function absoluteImportPath(specifier: string): string {
-  if (/^(?:[A-Za-z]:[\\/]|\\\\)/.test(specifier)) return specifier;
+  if (/^(?:[A-Za-z]:[\\/]|\\)/.test(specifier)) return specifier;
   return specifier.startsWith("file://") ? fileURLToPath(specifier) : resolve(specifier);
+}
+
+type JavaScriptImports = { specifiers: string[]; hasUnverifiableDynamicImport: boolean };
+
+function javascriptImports(file: string, content: string): JavaScriptImports {
+  const extension = extname(file).toLowerCase();
+  if (!JAVASCRIPT_EXTENSIONS.has(extension)) {
+    return { specifiers: [], hasUnverifiableDynamicImport: false };
+  }
+  const scriptKind = extension === ".tsx" ? ts.ScriptKind.TSX : extension === ".jsx" ? ts.ScriptKind.JSX : extension === ".js" ? ts.ScriptKind.JS : ts.ScriptKind.TS;
+  const source = ts.createSourceFile(file, content, ts.ScriptTarget.Latest, true, scriptKind);
+  const specifiers: string[] = [];
+  let hasUnverifiableDynamicImport = false;
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node) && ts.isStringLiteralLike(node.moduleSpecifier)) {
+      specifiers.push(node.moduleSpecifier.text);
+    } else if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteralLike(node.moduleSpecifier)) {
+      specifiers.push(node.moduleSpecifier.text);
+    } else if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference) && node.moduleReference.expression && ts.isStringLiteralLike(node.moduleReference.expression)) {
+      specifiers.push(node.moduleReference.expression.text);
+    } else if (ts.isCallExpression(node)) {
+      const isDynamicImport = node.expression.kind === ts.SyntaxKind.ImportKeyword;
+      const isRequire = ts.isIdentifier(node.expression) && node.expression.text === "require";
+      if (isDynamicImport || isRequire) {
+        const argument = node.arguments[0];
+        if (argument && ts.isStringLiteralLike(argument)) {
+          specifiers.push(argument.text);
+        } else {
+          hasUnverifiableDynamicImport = true;
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return { specifiers, hasUnverifiableDynamicImport };
+}
+
+function checkImportSpecifier(repoRoot: string, path: string, relative: string, specifier: string, findings: string[]): void {
+  if (RELATIVE_SPECIFIER.test(specifier)) {
+    const candidates = importCandidates(path, specifier);
+    if (candidates.some((candidate) => !isInside(repoRoot, candidate))) {
+      findings.push(`${relative}: local reference outside public repository ${specifier}`);
+      return;
+    }
+    const existing = resolveExistingFile(candidates);
+    if (existing) {
+      try {
+        if (!isInside(repoRoot, realpathSync(existing))) {
+          findings.push(`${relative}: local reference resolves outside public repository ${specifier}`);
+        }
+      } catch {
+        findings.push(`${relative}: unreadable local reference ${specifier}`);
+      }
+      return;
+    }
+    findings.push(`${relative}: missing local reference ${specifier}`);
+    return;
+  }
+  if (!ABSOLUTE_SPECIFIER.test(specifier)) return;
+  try {
+    const absolute = absoluteImportPath(specifier);
+    if (!isInside(repoRoot, absolute)) {
+      findings.push(`${relative}: local reference outside public repository ${specifier}`);
+      return;
+    }
+    const existing = resolveExistingFile(importCandidates(path, absolute));
+    if (!existing) {
+      findings.push(`${relative}: missing local reference ${specifier}`);
+    } else if (!isInside(repoRoot, realpathSync(existing))) {
+      findings.push(`${relative}: local reference resolves outside public repository ${specifier}`);
+    }
+  } catch {
+    findings.push(`${relative}: unreadable local reference ${specifier}`);
+  }
 }
 
 export function check(repoRoot: string = REPO_ROOT): string[] {
@@ -105,46 +184,22 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
         findings.push(`${relative}: forbidden public tool coupling ${label}`);
       }
     }
-    for (const match of content.matchAll(RELATIVE_IMPORT)) {
-      const specifier = match[1];
-      if (!specifier) {
-        continue;
-      }
-      const candidates = importCandidates(path, specifier);
-      if (candidates.some((candidate) => !isInside(repoRoot, candidate))) {
-        findings.push(`${relative}: local reference outside public repository ${specifier}`);
-        continue;
-      }
-      const existing = resolveExistingFile(candidates);
-      if (existing) {
-        try {
-          if (!isInside(repoRoot, realpathSync(existing))) {
-            findings.push(`${relative}: local reference resolves outside public repository ${specifier}`);
-          }
-        } catch {
-          findings.push(`${relative}: unreadable local reference ${specifier}`);
-        }
-        continue;
-      }
-      findings.push(`${relative}: missing local reference ${specifier}`);
+    const parsed = javascriptImports(path, content);
+    if (parsed.hasUnverifiableDynamicImport) {
+      findings.push(`${relative}: dynamic import or require cannot be verified`);
     }
-    for (const match of content.matchAll(ABSOLUTE_IMPORT)) {
-      const specifier = match[1];
-      if (!specifier) continue;
-      try {
-        const absolute = absoluteImportPath(specifier);
-        if (!isInside(repoRoot, absolute)) {
-          findings.push(`${relative}: local reference outside public repository ${specifier}`);
-          continue;
-        }
-        const existing = resolveExistingFile(importCandidates(path, absolute));
-        if (!existing) {
-          findings.push(`${relative}: missing local reference ${specifier}`);
-        } else if (!isInside(repoRoot, realpathSync(existing))) {
-          findings.push(`${relative}: local reference resolves outside public repository ${specifier}`);
-        }
-      } catch {
-        findings.push(`${relative}: unreadable local reference ${specifier}`);
+    if (parsed.specifiers.length > 0) {
+      for (const specifier of parsed.specifiers) {
+        checkImportSpecifier(repoRoot, path, relative, specifier, findings);
+      }
+    } else if (!JAVASCRIPT_EXTENSIONS.has(extname(path).toLowerCase())) {
+      for (const match of content.matchAll(RELATIVE_IMPORT)) {
+        const specifier = match[1];
+        if (specifier) checkImportSpecifier(repoRoot, path, relative, specifier, findings);
+      }
+      for (const match of content.matchAll(ABSOLUTE_IMPORT)) {
+        const specifier = match[1];
+        if (specifier) checkImportSpecifier(repoRoot, path, relative, specifier, findings);
       }
     }
   }

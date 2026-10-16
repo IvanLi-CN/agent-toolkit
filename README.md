@@ -23,24 +23,27 @@ bin/                    repository-local index and safety checks
 .github/workflows/      repository checks
 ```
 
-`PUBLIC_SKILLS.txt` is the public boundary and `skills/README.md` is the discoverability index; both must contain the same public Skill set exactly once. `~/.agents/skills` and other installed third-party Skill roots are external dependencies, not content maintained here. Codex-only workflow and runtime integration Skills live in the consumer configuration repository.
+`PUBLIC_SKILLS.txt` is the public boundary and `skills/README.md` is the discoverability index; both must contain the same public Skill set exactly once. `~/.agents/skills` and other installed third-party Skill roots are external dependencies, not content maintained here. Consumer-specific workflow and runtime integration Skills are outside this public source.
 
 ## Validation
 
-Run the checks from the repository root:
+Run the checks from the repository root with the installed Bun runtime:
 
 ```bash
-python3 bin/skills_index_check.py
-python3 -m unittest discover -s bin -p 'test_*.py'
-python3 bin/public_boundary_check.py
+bun install --frozen-lockfile
+bun run typecheck
+bun run check
+bun run test:repo
 python3 -m pip install -r requirements-dev.txt
-while IFS= read -r test_file; do python3 "$test_file"; done < <(find skills -type f -name 'test_*.py' | sort)
+bun run test:skills
 ```
+
+The test runner discovers maintained TypeScript, Python, and Shell test files automatically, so a new Skill can add a focused test without editing a root test list. It fails when a requested scope has no selected tests instead of reporting a false pass.
 
 During a source migration, compare the public allowlist with the source snapshot and verify that private consumer Skills remain in the private source tree:
 
 ```bash
-python3 bin/source_target_inventory_check.py \
+bun run bin/source_target_inventory_check.ts \
   --source-root /path/to/dot-codex \
   --source-revision <migration-source-revision>
 ```

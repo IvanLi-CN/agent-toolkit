@@ -7,8 +7,8 @@ Codex-specific workflow, native task, owner-facing evidence, and personal servic
 Run the checks after adding, removing, or renaming a public Skill:
 
 ```bash
-python3 bin/skills_index_check.py
-python3 bin/public_skill_boundary_check.py
+bun run bin/skills_index_check.ts
+bun run bin/public_skill_boundary_check.ts
 ```
 
 | Skill | Description | Path |

@@ -2,7 +2,7 @@
 /** Check that skills/README.md indexes every repository-local Skill. */
 
 import { lstatSync, readdirSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { isDirectRegularFile, isPathInside, REPO_ROOT, readText } from "./repo_util.ts";
 
 export const SKILL_NAME_PATTERN = /^`([a-z0-9-]+)`$/;
@@ -13,11 +13,15 @@ export type IndexEntry = {
   lineNumber: number;
   external: boolean;
   path: string;
+  linkTarget?: string;
 };
 
-function pathCell(value: string): string {
+function pathCell(value: string): { path: string; linkTarget?: string } {
   const trimmed = value.trim();
-  return trimmed.startsWith("`") && trimmed.endsWith("`") ? trimmed.slice(1, -1) : trimmed;
+  const markdownLink = trimmed.match(/^\[[^\]]+\]\(([^)]+)\)$/);
+  const linkTarget = markdownLink?.[1]?.trim() ?? trimmed;
+  const path = linkTarget.startsWith("`") && linkTarget.endsWith("`") ? linkTarget.slice(1, -1) : linkTarget;
+  return markdownLink ? { path, linkTarget: path } : { path };
 }
 
 export function repositorySkills(skillsRoot: string): Set<string> {
@@ -59,13 +63,15 @@ export function indexEntries(readmePath: string): IndexEntry[] {
       continue;
     }
     const name = match[1];
-    const path = pathCell(cells[2] ?? "");
+    const pathCellValue = pathCell(cells[2] ?? "");
+    const path = pathCellValue.path;
     const externalMatch = EXTERNAL_PATH_PATTERN.exec(path);
     entries.push({
       name,
       lineNumber,
       external: Boolean(externalMatch && externalMatch[1] === name),
       path,
+      linkTarget: pathCellValue.linkTarget,
     });
   }
   return entries;
@@ -83,9 +89,21 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
   const findings: string[] = [];
 
   for (const entry of localEntries) {
-    const expected = [`skills/${entry.name}/`, `skills/${entry.name}/**`];
+    const expected = [`skills/${entry.name}/`, `skills/${entry.name}/**`, `${entry.name}/`, `${entry.name}/**`, `${entry.name}/SKILL.md`];
     if (!expected.includes(entry.path)) {
       findings.push(`INVALID_INDEX_PATH skill=${entry.name} line=${entry.lineNumber} path=${entry.path || "<missing>"}`);
+    }
+    if (entry.linkTarget) {
+      try {
+        const targetWithoutFragment = entry.linkTarget.split(/[?#]/, 1)[0] ?? "";
+        const target = resolve(dirname(readmePath), decodeURIComponent(targetWithoutFragment));
+        const targetStats = lstatSync(target, { throwIfNoEntry: false });
+        if (!targetWithoutFragment || !isPathInside(repoRoot, target) || (!targetStats?.isFile() && !targetStats?.isDirectory())) {
+          findings.push(`INVALID_INDEX_LINK skill=${entry.name} line=${entry.lineNumber} target=${entry.linkTarget || "<missing>"}`);
+        }
+      } catch {
+        findings.push(`INVALID_INDEX_LINK skill=${entry.name} line=${entry.lineNumber} target=${entry.linkTarget || "<missing>"}`);
+      }
     }
   }
 

@@ -21,6 +21,27 @@ test("accepts a complete local index and explicit external entry", () => {
   });
 });
 
+test("accepts clickable relative Skill source links", () => {
+  withFixture((root) => {
+    mkdirSync(join(root, "skills", "alpha"), { recursive: true });
+    writeFileSync(join(root, "skills", "alpha", "SKILL.md"), "# alpha\n");
+    writeFileSync(join(root, "skills", "README.md"), "| Skill | Description | Path |\n|---|---|---|\n| `alpha` | local | [Skill source](alpha/SKILL.md) |\n");
+    expect(check(root)).toEqual([]);
+  });
+});
+
+test("rejects clickable links whose targets do not exist", () => {
+  withFixture((root) => {
+    mkdirSync(join(root, "skills", "alpha"), { recursive: true });
+    writeFileSync(join(root, "skills", "alpha", "SKILL.md"), "# alpha\n");
+    writeFileSync(join(root, "skills", "README.md"), "| Skill | Description | Path |\n|---|---|---|\n| `alpha` | local | [Skill source](alpha/MISSING.md) |\n");
+    expect(check(root)).toEqual([
+      "INVALID_INDEX_PATH skill=alpha line=3 path=alpha/MISSING.md",
+      "INVALID_INDEX_LINK skill=alpha line=3 target=alpha/MISSING.md",
+    ]);
+  });
+});
+
 test("reports missing and stale entries", () => {
   withFixture((root) => {
     mkdirSync(join(root, "skills", "alpha"), { recursive: true });

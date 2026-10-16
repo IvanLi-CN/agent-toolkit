@@ -16,6 +16,7 @@ test("detects secret assignments and ignores redacted placeholders", () => {
   expect(pattern("quoted-secret-assignment").test(`${name}="${fixtureValue}"`)).toBe(true);
   expect(pattern("quoted-secret-field").test(`database_password: "${fixtureValue}"`)).toBe(true);
   expect(pattern("quoted-secret-field").test(`database_password: '${fixtureValue}'`)).toBe(true);
+  expect(pattern("quoted-secret-field").test('database_password: "provided-out-of-band"')).toBe(false);
   expect(pattern("json-secret-field").test(`{"${name}":"${fixtureValue}"}`)).toBe(true);
   expect(pattern("json-secret-field").test(`{"${name}":"<redacted>"}`)).toBe(false);
   expect(pattern("unquoted-secret-assignment").test(`${name}=0123456789abcdef`)).toBe(true);
@@ -173,6 +174,8 @@ test("detects credential-bearing URLs, bearer tokens, and complete PEM blocks", 
   expect(pattern("yaml-block-secret-field").test(`'${blockName}': >-\n  ${blockValue}`)).toBe(true);
   expect(pattern("yaml-block-secret-field").test(`${blockName}: >\n  correct\n  horse\n  battery\n  staple`)).toBe(true);
   expect(pattern("yaml-scalar-secret-field").test(`"${blockName}": ${blockValue}`)).toBe(true);
+  expect(pattern("yaml-scalar-secret-field").test(`${blockName}: &db ${blockValue}`)).toBe(true);
+  expect(pattern("yaml-scalar-secret-field").test(`${blockName}: !!str ${blockValue}`)).toBe(true);
   expect(pattern("yaml-scalar-secret-field").test(`${blockName}: ${phraseValue}`)).toBe(true);
   expect(pattern("yaml-scalar-secret-field").test(`${blockName}: Qw7n'Pm9rTk2sVx4z`)).toBe(true);
   expect(pattern("yaml-scalar-secret-field").test(`${blockName}: Qw7n"Pm9rTk2sVx4z`)).toBe(true);

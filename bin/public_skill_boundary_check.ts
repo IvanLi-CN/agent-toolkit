@@ -47,7 +47,7 @@ function scanSkillFiles(repoRoot: string, skillRoot: string): { files: string[];
   const rejectedSymlinks: string[] = [];
   const files = new Set(walkFiles(skillRoot, {
     ignoredDirectories: IGNORED_DIRECTORIES,
-    shouldIgnoreDirectory: (_, name) => name.endsWith(".egg-info"),
+    shouldIgnoreDirectory: (_, name) => IGNORED_DIRECTORIES.has(name) || name.endsWith(".egg-info"),
     onRejectedSymlink: (path) => rejectedSymlinks.push(path),
   }));
   try {
@@ -60,6 +60,12 @@ function scanSkillFiles(repoRoot: string, skillRoot: string): { files: string[];
     }
   } catch {
     // Synthetic fixtures need no Git index; ordinary filesystem traversal remains sufficient there.
+  }
+  for (const path of [...files]) {
+    if (!isDirectRegularFile(path)) {
+      files.delete(path);
+      rejectedSymlinks.push(path);
+    }
   }
   return {
     files: [...files].sort((left, right) => left < right ? -1 : left > right ? 1 : 0),

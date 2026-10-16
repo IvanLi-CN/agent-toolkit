@@ -104,6 +104,11 @@ test("matches complete private hostnames while allowing neutral local helper nam
   expect(privateHostname.test("config" + ".local")).toBe(true);
   expect(privateHostname.test("threading" + ".local")).toBe(true);
   expect(privateHostname.test("prod.config" + ".local")).toBe(true);
+  expect(privateHostname.test("db." + "INTERNAL")).toBe(true);
+});
+
+test("detects Windows personal paths", () => {
+  expect(pattern("absolute-home-path").test("C:\\Users\\ivan\\private.txt")).toBe(true);
 });
 
 test("detects credential-bearing URLs, bearer tokens, and complete PEM blocks", () => {

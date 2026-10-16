@@ -136,6 +136,42 @@ test("rejects Windows-style external imports on every host platform", () => {
   }
 });
 
+test("rejects loader aliases, module re-exports, and Bun import.meta.require", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-loaders-"));
+  const outsideName = `${root.split(/[\\/]/).at(-1)}-outside.ts`;
+  const outsidePath = join(root, "..", outsideName);
+  try {
+    mkdirSync(join(root, "bin"), { recursive: true });
+    writeFileSync(outsidePath, "export const outside = 1;\n");
+    writeFileSync(join(root, "bin", "alias.ts"), `const load = require; load("../../${outsideName}");\n`);
+    writeFileSync(join(root, "bin", "export-module.ts"), 'export { createRequire as makeRequire } from "module";\n');
+    writeFileSync(join(root, "bin", "import-meta.ts"), `import.meta.require("../../${outsideName}");\n`);
+    expect(check(root)).toEqual([
+      `bin/alias.ts: local reference outside public repository ../../${outsideName}`,
+      "bin/export-module.ts: dynamic import or require cannot be verified",
+      `bin/import-meta.ts: local reference outside public repository ../../${outsideName}`,
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(outsidePath, { force: true });
+  }
+});
+
+test("rejects production tools that import excluded test files", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-test-import-"));
+  try {
+    mkdirSync(join(root, "bin"), { recursive: true });
+    writeFileSync(join(root, "bin", "entry.ts"), 'import "./runtime.test.ts";\n');
+    writeFileSync(join(root, "bin", "runtime.test.ts"), 'const marker = "fixture-only";\n');
+    expect(publicToolFiles(root).map((path) => path.split(/[\\/]/).at(-1))).toEqual(["entry.ts"]);
+    expect(check(root)).toEqual([
+      "bin/entry.ts: local reference targets excluded test file ./runtime.test.ts",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("rejects unsupported public-tool-boundary CLI options", () => {
   expect(main(["--unknown"])).toBe(2);
 });

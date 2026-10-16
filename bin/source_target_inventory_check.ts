@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /** Compare a split public/private Skill inventory with this checkout. */
 
-import { existsSync, lstatSync, readdirSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { PUBLIC_SKILL_NAME_PATTERN } from "./public_skill_boundary_check.ts";
 import { isDirectRegularFile, isPathInside, REPO_ROOT, readText, runGit } from "./repo_util.ts";
@@ -61,6 +61,28 @@ export function targetSymlinkPaths(root: string): Set<string> {
   };
   visit(skillsRoot, "");
   return result;
+}
+
+export function targetGitlinkPaths(root: string): Set<string> {
+  const target = resolve(root);
+  const topLevel = runGit(["rev-parse", "--show-toplevel"], target);
+  if (topLevel.exitCode !== 0) return new Set();
+  try {
+    if (realpathSync(topLevel.stdout.trim()) !== realpathSync(target)) return new Set();
+  } catch {
+    return new Set();
+  }
+  const result = runGit(["ls-files", "-s", "-z", "--", "skills"], target);
+  if (result.exitCode !== 0) return new Set();
+  const paths = new Set<string>();
+  for (const item of result.stdout.split("\0")) {
+    const separator = item.indexOf("\t");
+    if (separator < 0) continue;
+    const mode = item.slice(0, separator).split(/\s+/)[0] ?? "";
+    const path = item.slice(separator + 1);
+    if (mode === "160000" && path.startsWith("skills/")) paths.add(path);
+  }
+  return paths;
 }
 
 export function manifestEntries(path: string): string[] {
@@ -186,6 +208,7 @@ export function inspect(
   const actual = targetInventory(target);
   const sourceSymlinkPaths = new Set([...snapshot.symlinkPaths, ...targetSymlinkPaths(source)]);
   const targetSymlinkPathsSet = targetSymlinkPaths(target);
+  const targetGitlinkPathsSet = targetGitlinkPaths(target);
   const publicManifestEntries = manifestEntries(publicManifest);
   const publicNames = new Set(publicManifestEntries);
   const privateNames = new Set([...expectedSource].filter((name) => !publicNames.has(name)));
@@ -202,6 +225,9 @@ export function inspect(
   if (sourceSymlinkPaths.has("skills") || isSymlink(join(source, "skills"))) findings.push("SYMLINKED_SOURCE_SKILLS_ROOT");
   for (const path of [...snapshot.gitlinkPaths].sort()) {
     findings.push(`UNSUPPORTED_SOURCE_GITLINK ${path}`);
+  }
+  for (const path of [...targetGitlinkPathsSet].sort()) {
+    findings.push(`UNSUPPORTED_TARGET_GITLINK ${path}`);
   }
   for (const path of [...targetSymlinkPathsSet].filter((path) => path !== "skills").sort()) {
     const parts = path.split("/");

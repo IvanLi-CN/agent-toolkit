@@ -220,6 +220,8 @@ test("rejects propagated, computed, and indirect loader calls", () => {
     writeFileSync(join(root, "bin", "computed.ts"), `const name = "require"; import.meta[name]("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "container.ts"), `const loaders = { load: require }; loaders.load("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "meta-destructure.ts"), `const meta = import.meta; const { require: load } = meta; load("../../${outsideName}");\n`);
+    writeFileSync(join(root, "bin", "module-alias-destructure.ts"), `const m = module; const { require: load } = m; load("../../${outsideName}");\n`);
+    writeFileSync(join(root, "bin", "module-assignment-destructure.ts"), `let load; ({ require: load } = module); load("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "module-destructure.ts"), `const { require: load } = module; load("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "module.ts"), `module.require("../../${outsideName}");\n`);
     expect(check(root)).toEqual([
@@ -230,6 +232,8 @@ test("rejects propagated, computed, and indirect loader calls", () => {
       "bin/computed.ts: dynamic import or require cannot be verified",
       "bin/container.ts: dynamic import or require cannot be verified",
       `bin/meta-destructure.ts: local reference outside public repository ../../${outsideName}`,
+      `bin/module-alias-destructure.ts: local reference outside public repository ../../${outsideName}`,
+      `bin/module-assignment-destructure.ts: local reference outside public repository ../../${outsideName}`,
       `bin/module-destructure.ts: local reference outside public repository ../../${outsideName}`,
       `bin/module.ts: local reference outside public repository ../../${outsideName}`,
     ]);
@@ -356,6 +360,21 @@ test("recursively checks dotted and aliased Python imports", () => {
     expect(check(root)).toEqual([
       "bin/aliased.py: local reference targets excluded test file ./runtime_test",
       "bin/dotted.py: local reference targets excluded test file ./package/runtime_test",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("handles Python relative exports and trailing commas", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-python-trailing-comma-"));
+  try {
+    mkdirSync(join(root, "bin"), { recursive: true });
+    writeFileSync(join(root, "bin", "entry.py"), "from .helper import value\nfrom . import (runtime_test,)\n");
+    writeFileSync(join(root, "bin", "helper.py"), "value = 1\n");
+    writeFileSync(join(root, "bin", "runtime_test.py"), "marker = 'fixture-only'\n");
+    expect(check(root)).toEqual([
+      "bin/entry.py: local reference targets excluded test file ./runtime_test",
     ]);
   } finally {
     rmSync(root, { recursive: true, force: true });

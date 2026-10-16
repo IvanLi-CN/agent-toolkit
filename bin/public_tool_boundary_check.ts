@@ -26,9 +26,9 @@ const ABSOLUTE_IMPORT = new RegExp(String.raw`${IMPORT_PREFIX}["']((?:file://|/|
 const PYTHON_NAME = String.raw`[A-Za-z_][A-Za-z0-9_]*`;
 const PYTHON_IMPORTED_NAME = String.raw`${PYTHON_NAME}(?:\s+as\s+${PYTHON_NAME})?`;
 const PYTHON_IMPORTED_NAMES = String.raw`${PYTHON_IMPORTED_NAME}(?:\s*,\s*${PYTHON_IMPORTED_NAME})*`;
-const PYTHON_RELATIVE_IMPORT = new RegExp(String.raw`\bfrom\s+(\.+${PYTHON_NAME}(?:\.${PYTHON_NAME})*|\.+)\s+import\s+\(?\s*(${PYTHON_IMPORTED_NAMES})\s*\)?`, "g");
-const PYTHON_FROM_IMPORT = new RegExp(String.raw`\bfrom\s+(${PYTHON_NAME}(?:\.${PYTHON_NAME})*)\s+import\s+\(?\s*(${PYTHON_IMPORTED_NAMES})\s*\)?`, "g");
-const PYTHON_LOCAL_IMPORT = new RegExp(String.raw`(?:^[ \t]*|;[ \t]*)import\s+(${PYTHON_NAME}(?:\.${PYTHON_NAME})*(?:\s+as\s+${PYTHON_NAME})?(?:\s*,\s*${PYTHON_NAME}(?:\.${PYTHON_NAME})*(?:\s+as\s+${PYTHON_NAME})?)*)`, "gm");
+const PYTHON_RELATIVE_IMPORT = new RegExp(String.raw`\bfrom\s+(\.+${PYTHON_NAME}(?:\.${PYTHON_NAME})*|\.+)\s+import\s+\(?\s*(${PYTHON_IMPORTED_NAMES})(?:\s*,\s*)?\)?`, "g");
+const PYTHON_FROM_IMPORT = new RegExp(String.raw`\bfrom\s+(${PYTHON_NAME}(?:\.${PYTHON_NAME})*)\s+import\s+\(?\s*(${PYTHON_IMPORTED_NAMES})(?:\s*,\s*)?\)?`, "g");
+const PYTHON_LOCAL_IMPORT = new RegExp(String.raw`(?:^[ \t]*|;[ \t]*)import\s+(${PYTHON_NAME}(?:\.${PYTHON_NAME})*(?:\s+as\s+${PYTHON_NAME})?(?:\s*,\s*${PYTHON_NAME}(?:\.${PYTHON_NAME})*(?:\s+as\s+${PYTHON_NAME})?)*)(?:\s*,\s*)?`, "gm");
 const SHELL_SOURCE_IMPORT = /(?:^[ \t]*|[;&|][ \t]*|then[ \t]+)(?:source\b|\.)\s+(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\s;|]+))/gm;
 const EXCLUDED_TEST_FILE = /(?:\.test\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$|^test[-_].*\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$|_test\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$)/;
 const PUBLIC_TOOL_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".cjs", ".mjs", ".py", ".sh"];
@@ -195,9 +195,14 @@ function isRequireMethodCall(node: ts.Expression, aliases: Set<string>): boolean
   return (access?.name === "apply" || access?.name === "bind" || access?.name === "call") && isRequireExpression(access.receiver, aliases);
 }
 
-function requireBindingNames(name: ts.BindingName, initializer: ts.Expression, importMetaAliases: Set<string>): string[] {
+function isModuleContainerReference(node: ts.Expression, importMetaAliases: Set<string>, moduleAliases: Set<string>): boolean {
+  const expression = unwrapExpression(node);
+  return isImportMetaReference(expression, importMetaAliases) || (ts.isIdentifier(expression) && moduleAliases.has(expression.text));
+}
+
+function requireBindingNames(name: ts.BindingName, initializer: ts.Expression, importMetaAliases: Set<string>, moduleAliases: Set<string>): string[] {
   const expression = unwrapExpression(initializer);
-  const isModuleContainer = isImportMetaReference(expression, importMetaAliases) || (ts.isIdentifier(expression) && expression.text === "module");
+  const isModuleContainer = isModuleContainerReference(expression, importMetaAliases, moduleAliases);
   if (!isModuleContainer || !ts.isObjectBindingPattern(name)) return [];
   const names: string[] = [];
   for (const element of name.elements) {
@@ -209,14 +214,35 @@ function requireBindingNames(name: ts.BindingName, initializer: ts.Expression, i
   return names;
 }
 
+function requireAssignmentNames(left: ts.Expression, initializer: ts.Expression, importMetaAliases: Set<string>, moduleAliases: Set<string>): string[] {
+  if (!isModuleContainerReference(initializer, importMetaAliases, moduleAliases)) return [];
+  const expression = unwrapExpression(left);
+  if (!ts.isObjectLiteralExpression(expression)) return [];
+  const names: string[] = [];
+  for (const property of expression.properties) {
+    if (ts.isPropertyAssignment(property) && ts.isIdentifier(property.initializer)) {
+      const propertyName = ts.isStringLiteralLike(property.name) ? property.name.text : ts.isIdentifier(property.name) ? property.name.text : "";
+      if (propertyName === "require") names.push(property.initializer.text);
+    } else if (ts.isShorthandPropertyAssignment(property) && property.name.text === "require") {
+      names.push(property.name.text);
+    }
+  }
+  return names;
+}
+
 function collectRequireAliases(source: ts.SourceFile, importMetaAliases: Set<string>): Set<string> {
   const aliases = new Set(["require"]);
+  const moduleAliases = new Set(["module"]);
   let changed = true;
   while (changed) {
     changed = false;
     const visit = (node: ts.Node): void => {
       if (ts.isVariableDeclaration(node) && node.initializer) {
-        for (const name of requireBindingNames(node.name, node.initializer, importMetaAliases)) {
+        if (ts.isIdentifier(node.name) && isModuleContainerReference(node.initializer, importMetaAliases, moduleAliases) && !moduleAliases.has(node.name.text)) {
+          moduleAliases.add(node.name.text);
+          changed = true;
+        }
+        for (const name of requireBindingNames(node.name, node.initializer, importMetaAliases, moduleAliases)) {
           if (!aliases.has(name)) {
             aliases.add(name);
             changed = true;
@@ -226,9 +252,21 @@ function collectRequireAliases(source: ts.SourceFile, importMetaAliases: Set<str
           aliases.add(node.name.text);
           changed = true;
         }
-      } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isIdentifier(node.left) && isLoaderExpression(node.right, aliases) && !aliases.has(node.left.text)) {
-        aliases.add(node.left.text);
-        changed = true;
+      } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+        if (ts.isIdentifier(node.left) && isModuleContainerReference(node.right, importMetaAliases, moduleAliases) && !moduleAliases.has(node.left.text)) {
+          moduleAliases.add(node.left.text);
+          changed = true;
+        }
+        for (const name of requireAssignmentNames(node.left, node.right, importMetaAliases, moduleAliases)) {
+          if (!aliases.has(name)) {
+            aliases.add(name);
+            changed = true;
+          }
+        }
+        if (ts.isIdentifier(node.left) && isLoaderExpression(node.right, aliases) && !aliases.has(node.left.text)) {
+          aliases.add(node.left.text);
+          changed = true;
+        }
       }
       ts.forEachChild(node, visit);
     };
@@ -500,7 +538,9 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
           const importedNames = match[2];
           if (moduleSpecifier && importedNames) {
             for (const specifier of pythonRelativeSpecifiers(moduleSpecifier, importedNames)) {
-              checkImportSpecifier(repoRoot, path, relative, specifier, findings, enqueue);
+              if (resolveExistingFile(importCandidates(path, specifier))) {
+                checkImportSpecifier(repoRoot, path, relative, specifier, findings, enqueue);
+              }
             }
           }
         }

@@ -90,14 +90,38 @@ test("rejects imports with comments between the keyword and path", () => {
   }
 });
 
+test("ignores bare modules and rejects Windows-style relative imports", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-relative-"));
+  const outsideName = `${root.split(/[\\/]/).at(-1)}-outside.ts`;
+  const outsidePath = join(root, "..", outsideName);
+  try {
+    mkdirSync(join(root, "bin"), { recursive: true });
+    writeFileSync(outsidePath, "export const outside = 1;\n");
+    writeFileSync(join(root, "bin", "bare.ts"), 'import "fs/promises";\n');
+    writeFileSync(join(root, "bin", "windows-relative.ts"), `import "..\\\\..\\\\${outsideName}";\n`);
+    writeFileSync(join(root, "bin", "escaped.ts"), `import "\\x2e\\x2e/\\x2e\\x2e/${outsideName}";\n`);
+    writeFileSync(join(root, "bin", "template.ts"), "import(`../../" + outsideName + "`);\n");
+    writeFileSync(join(root, "bin", "dynamic.ts"), 'const specifier = "../../' + outsideName + '"; import(specifier);\n');
+    expect(check(root)).toEqual([
+      "bin/dynamic.ts: dynamic import or require cannot be verified",
+      `bin/escaped.ts: local reference outside public repository ../../${outsideName}`,
+      `bin/template.ts: local reference outside public repository ../../${outsideName}`,
+      `bin/windows-relative.ts: local reference outside public repository ..\\..\\${outsideName}`,
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(outsidePath, { force: true });
+  }
+});
+
 test("rejects Windows-style external imports on every host platform", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-windows-"));
   try {
     mkdirSync(join(root, "bin"), { recursive: true });
-    writeFileSync(join(root, "bin", "windows.ts"), 'import "C:\\\\Users\\\\ivan\\\\outside.ts";\nimport "\\\\server\\share\\outside.ts";\n');
+    writeFileSync(join(root, "bin", "windows.ts"), 'import "C:\\\\Users\\\\ivan\\\\outside.ts";\nimport "\\\\server\\\\share\\\\outside.ts";\n');
     expect(check(root)).toEqual([
-      "bin/windows.ts: local reference outside public repository C:\\\\Users\\\\ivan\\\\outside.ts",
-      "bin/windows.ts: local reference outside public repository \\\\server\\share\\outside.ts",
+      "bin/windows.ts: local reference outside public repository C:\\Users\\ivan\\outside.ts",
+      "bin/windows.ts: local reference outside public repository \\server\\share\\outside.ts",
     ]);
   } finally {
     rmSync(root, { recursive: true, force: true });

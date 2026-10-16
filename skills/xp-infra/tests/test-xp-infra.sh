@@ -55,4 +55,3 @@ if XP_INFRA_CONFIG_DIR="$config_dir/missing" "$skill_dir/scripts/xp-infra" inven
 fi
 
 echo "xp-infra public structure ok"
-printf 'TESTS_RUN=%s\n' 5

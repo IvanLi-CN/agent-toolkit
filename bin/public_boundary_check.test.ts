@@ -102,6 +102,15 @@ test("does not let a regex-helper name hide a literal secret", () => {
   if (nonHexMatch) expect(isRegexHelperAssignment(nonHex, nonHexMatch)).toBe(false);
 });
 
+test("does not let a regex helper hide another assignment on the same line", () => {
+  const secretName = ["SERVICE", "_TOKEN"].join("");
+  const content = `re_check="(safe|unsafe|maybe)"; ${secretName}="(` + ["Qw7nPm9r", "Tk2sVx4z"].join("") + `"`;
+  const matches = [...content.matchAll(new RegExp(pattern("prefixed-quoted-secret-assignment").source, "gi"))];
+  expect(matches).toHaveLength(2);
+  const second = matches[1];
+  if (second) expect(isRegexHelperAssignment(content, second)).toBe(false);
+});
+
 test("does not classify long hyphenated input as a secret assignment", () => {
   expect(pattern("prefixed-quoted-secret-assignment").test("a-".repeat(8000) + "!")).toBe(false);
 });
@@ -126,6 +135,9 @@ test("detects credential-bearing URLs, bearer tokens, and complete PEM blocks", 
   expect(pattern("private-key-block").test("-----BEGIN " + "PRIVATE KEY-----\n" + "A".repeat(48) + "\n-----END " + "PRIVATE KEY-----")).toBe(true);
   expect(pattern("private-key-block").test("-----BEGIN " + "PRIVATE KEY-----\n" + "A".repeat(50) + "\n" + "B".repeat(70) + "\n-----END " + "PRIVATE KEY-----")).toBe(true);
   expect(pattern("private-key-block").test("signing_key: |\n  -----BEGIN PRIVATE KEY-----\n  " + "A".repeat(48) + "\n  -----END PRIVATE KEY-----")).toBe(true);
+  const blockName = ["service", "_token"].join("");
+  expect(pattern("yaml-block-secret-field").test(`${blockName}: |\n  ` + ["Qw7nPm9r", "Tk2sVx4z"].join(""))).toBe(true);
+  expect(pattern("yaml-block-secret-field").test(`${blockName}: >-\n  ` + ["Qw7nPm9r", "Tk2sVx4z"].join(""))).toBe(true);
 });
 
 test("checks tracked public files", () => {

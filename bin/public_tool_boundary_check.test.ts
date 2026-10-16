@@ -147,6 +147,7 @@ test("rejects loader aliases, module re-exports, and Bun import.meta.require", (
     writeFileSync(join(root, "bin", "export-module.ts"), 'export { createRequire as makeRequire } from "module";\n');
     writeFileSync(join(root, "bin", "import-meta.ts"), `import.meta.require("../../${outsideName}");\n`);
     expect(check(root)).toEqual([
+      "bin/alias.ts: dynamic import or require cannot be verified",
       `bin/alias.ts: local reference outside public repository ../../${outsideName}`,
       "bin/export-module.ts: dynamic import or require cannot be verified",
       `bin/import-meta.ts: local reference outside public repository ../../${outsideName}`,
@@ -195,8 +196,38 @@ test("rejects wrapped, destructured, late-bound, and bound loaders", () => {
       "bin/bind.ts: dynamic import or require cannot be verified",
       `bin/bind.ts: local reference outside public repository ../../${outsideName}`,
       `bin/destructure.ts: local reference outside public repository ../../${outsideName}`,
+      "bin/late.ts: dynamic import or require cannot be verified",
       `bin/late.ts: local reference outside public repository ../../${outsideName}`,
+      "bin/wrapped.ts: dynamic import or require cannot be verified",
       `bin/wrapped.ts: local reference outside public repository ../../${outsideName}`,
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(outsidePath, { force: true });
+  }
+});
+
+test("rejects propagated, computed, and indirect loader calls", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-loader-propagation-"));
+  const outsideName = `${root.split(/[\\/]/).at(-1)}-outside.ts`;
+  const outsidePath = join(root, "..", outsideName);
+  try {
+    mkdirSync(join(root, "bin"), { recursive: true });
+    writeFileSync(outsidePath, "export const outside = 1;\n");
+    writeFileSync(join(root, "bin", "apply.ts"), `require.apply(null, ["../../${outsideName}"]);\n`);
+    writeFileSync(join(root, "bin", "call.ts"), `require.call(null, "../../${outsideName}");\n`);
+    writeFileSync(join(root, "bin", "comma.ts"), `(0, require)("../../${outsideName}");\n`);
+    writeFileSync(join(root, "bin", "computed.ts"), `const name = "require"; import.meta[name]("../../${outsideName}");\n`);
+    writeFileSync(join(root, "bin", "container.ts"), `const loaders = { load: require }; loaders.load("../../${outsideName}");\n`);
+    writeFileSync(join(root, "bin", "module.ts"), `module.require("../../${outsideName}");\n`);
+    expect(check(root)).toEqual([
+      "bin/apply.ts: dynamic import or require cannot be verified",
+      "bin/call.ts: dynamic import or require cannot be verified",
+      "bin/comma.ts: dynamic import or require cannot be verified",
+      `bin/comma.ts: local reference outside public repository ../../${outsideName}`,
+      "bin/computed.ts: dynamic import or require cannot be verified",
+      "bin/container.ts: dynamic import or require cannot be verified",
+      `bin/module.ts: local reference outside public repository ../../${outsideName}`,
     ]);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -242,6 +273,7 @@ test("recursively checks local JavaScript dependencies for excluded test imports
     writeFileSync(join(root, "bin", "runtime.test.ts"), 'const marker = "fixture-only";\n');
     expect(publicToolFiles(root).map((path) => path.split(/[\\/]/).at(-1))).toEqual(["entry.ts"]);
     expect(check(root)).toEqual([
+      "support/helper.cjs: dynamic import or require cannot be verified",
       "support/helper.cjs: local reference targets excluded test file ../bin/runtime.test.ts",
     ]);
   } finally {
@@ -253,13 +285,16 @@ test("recursively checks Python and Shell local dependencies", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-script-dependency-"));
   try {
     mkdirSync(join(root, "bin"), { recursive: true });
-    writeFileSync(join(root, "bin", "entry.py"), "from . import helper\n");
+    writeFileSync(join(root, "bin", "entry.py"), "from . import helper\nfrom . import (runtime_test)\n");
+    writeFileSync(join(root, "bin", "entry_direct.py"), "import runtime_test\n");
     writeFileSync(join(root, "bin", "helper.py"), "from . import runtime_test\n");
     writeFileSync(join(root, "bin", "runtime_test.py"), "marker = 'fixture-only'\n");
-    writeFileSync(join(root, "bin", "entry.sh"), "source ./helper.sh\n");
-    writeFileSync(join(root, "bin", "helper.sh"), "source ./runtime.test.sh\n");
+    writeFileSync(join(root, "bin", "entry.sh"), "  source ./helper.sh\n");
+    writeFileSync(join(root, "bin", "helper.sh"), "if true; then\n  . ./runtime.test.sh\nfi\n");
     writeFileSync(join(root, "bin", "runtime.test.sh"), "echo fixture-only\n");
     expect(check(root)).toEqual([
+      "bin/entry.py: local reference targets excluded test file ./runtime_test",
+      "bin/entry_direct.py: local reference targets excluded test file ./runtime_test",
       "bin/helper.py: local reference targets excluded test file ./runtime_test",
       "bin/helper.sh: local reference targets excluded test file ./runtime.test.sh",
     ]);

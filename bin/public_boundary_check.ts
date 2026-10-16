@@ -9,6 +9,7 @@ const SECRET_NAME = String.raw`(?:api[_-]?key|apikey|access[_-]?key|accesskey|to
 const COMPOUND_SECRET_NAME = String.raw`[A-Za-z0-9_-]*${SECRET_NAME}[A-Za-z0-9_-]*`;
 const SECRET_VALUE = String.raw`(?![$<\{])[^'"\r\n]{16,}`;
 const UNQUOTED_SECRET_VALUE = String.raw`(?!provided-out-of-band\b|redacted\b|placeholder\b|changeme\b)(?![$<\{])(?=[^\s'"\r\n]{16,}(?:\s|$))[^\s'"\r\n]+`;
+const YAML_PLAIN_SECRET_VALUE = String.raw`(?!provided-out-of-band\b|redacted\b|placeholder\b|changeme\b)(?![$<\{])(?=[^\s\r\n]{16,}(?:[ \t]+|$))[^\s\r\n]+`;
 const UNQUOTED_ASSIGNMENT_VALUE = String.raw`(?!provided-out-of-band\b|redacted\b|placeholder\b|changeme\b)[A-Za-z0-9][A-Za-z0-9._~+/=-]{15,}`;
 const YAML_PHRASE_SECRET_VALUE = String.raw`(?![$<\{])(?!(?:provided-out-of-band|redacted|placeholder|changeme)\b)(?!#)[^\s'"\r\n][^'"\r\n]*[ \t]+[^'"\r\n]*[^\s'"\r\n]`;
 const YAML_MULTILINE_SECRET_VALUE = String.raw`(?![$<\{])(?!(?:provided-out-of-band|redacted|placeholder|changeme)\b)(?!#)[^\s'"\r\n][^'"\r\n]*(?:\r?\n[ \t]+(?!#)[^\s'"\r\n][^'"\r\n]*)+`;
@@ -18,8 +19,8 @@ const REGEX_HELPER_ASSIGNMENT = new RegExp(String.raw`^[ \t]*(?:local[ \t]+)?(?:
 const COMPOUND_ASSIGNMENT = new RegExp(String.raw`(?<![A-Za-z0-9_-])(?<name>[A-Za-z0-9_-]+)\s*=\s*['"]${SECRET_VALUE}['"]`, "i");
 const JSON_SECRET_FIELD = new RegExp(String.raw`["'](?<name>[A-Za-z0-9_-]+)["']\s*:\s*["']${SECRET_VALUE}["']`, "i");
 const QUOTED_SECRET_FIELD = new RegExp(String.raw`(?<![A-Za-z0-9_-])(?<name>${COMPOUND_SECRET_NAME})\s*:\s*["']${SECRET_VALUE}["']`, "i");
-const YAML_BLOCK_SECRET_FIELD = new RegExp(String.raw`(?<![A-Za-z0-9_-])(?<name>"${COMPOUND_SECRET_NAME}"|'${COMPOUND_SECRET_NAME}'|${COMPOUND_SECRET_NAME})\s*:\s*[|>][ \t]*(?:[1-9][-+]?|[-+]?[1-9]|[-+])?[ \t]*(?:#[^\r\n]*)?(?:\r?\n[ \t]*(?:#[^\r\n]*)?)*\r?\n[ \t]+(?:"${SECRET_VALUE}"|'${SECRET_VALUE}'|${UNQUOTED_SECRET_VALUE}|${YAML_PHRASE_SECRET_VALUE}|${YAML_MULTILINE_SECRET_VALUE})`, "i");
-const YAML_SCALAR_SECRET_FIELD = new RegExp(String.raw`^[ \t-]*(?<name>"${COMPOUND_SECRET_NAME}"|'${COMPOUND_SECRET_NAME}'|${COMPOUND_SECRET_NAME})\s*:\s*(?:"${SECRET_VALUE}"|'${SECRET_VALUE}'|${UNQUOTED_SECRET_VALUE}|${YAML_SCALAR_PHRASE_SECRET_VALUE})(?:[ \t]+#[^\r\n]*)?[ \t]*$`, "im");
+const YAML_BLOCK_SECRET_FIELD = new RegExp(String.raw`(?<![A-Za-z0-9_-])(?<name>"${COMPOUND_SECRET_NAME}"|'${COMPOUND_SECRET_NAME}'|${COMPOUND_SECRET_NAME})\s*:\s*[|>][ \t]*(?:[1-9][-+]?|[-+]?[1-9]|[-+])?[ \t]*(?:#[^\r\n]*)?(?:\r?\n[ \t]*(?:#[^\r\n]*)?)*\r?\n[ \t]+(?:"${SECRET_VALUE}"|'${SECRET_VALUE}'|${UNQUOTED_SECRET_VALUE}|${YAML_PLAIN_SECRET_VALUE}|${YAML_PHRASE_SECRET_VALUE}|${YAML_MULTILINE_SECRET_VALUE})`, "i");
+const YAML_SCALAR_SECRET_FIELD = new RegExp(String.raw`^[ \t-]*(?<name>"${COMPOUND_SECRET_NAME}"|'${COMPOUND_SECRET_NAME}'|${COMPOUND_SECRET_NAME})\s*:\s*(?:"${SECRET_VALUE}"|'${SECRET_VALUE}'|${UNQUOTED_SECRET_VALUE}|${YAML_PLAIN_SECRET_VALUE}|${YAML_SCALAR_PHRASE_SECRET_VALUE})(?:[ \t]+#[^\r\n]*)?[ \t]*$`, "im");
 const UNQUOTED_SECRET_ASSIGNMENT = new RegExp(String.raw`(?<![A-Za-z0-9_-])(?<name>${COMPOUND_SECRET_NAME})\s*[:=]\s*${UNQUOTED_ASSIGNMENT_VALUE}(?![A-Za-z0-9._~+/=-])`, "i");
 const PRIVATE_KEY_BLOCK = /-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----\r?\n(?:[ \t]*[A-Za-z0-9+/]{40,}={0,2}\r?\n(?:[ \t]*[A-Za-z0-9+/]{1,128}={0,2}\r?\n)*)[ \t]*-----END [A-Z0-9 _-]*PRIVATE KEY-----/;
 const CREDENTIAL_URL = /\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s:@]+:[^@\s]{16,}@/i;

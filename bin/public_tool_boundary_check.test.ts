@@ -237,6 +237,8 @@ test("rejects propagated, computed, and indirect loader calls", () => {
     writeFileSync(join(root, "bin", "meta-alias-object.ts"), `const meta = import.meta; const loaders = { load: meta.require }; loaders.load("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "module-alias-destructure.ts"), `const m = module; const { require: load } = m; load("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "module-assignment-destructure.ts"), `let load; ({ require: load } = module); load("../../${outsideName}");\n`);
+    writeFileSync(join(root, "bin", "module-computed-destructure.ts"), `const key = "require"; const { [key]: load } = module; load("../../${outsideName}");\n`);
+    writeFileSync(join(root, "bin", "module-computed-call.ts"), `const key = "require"; module[key]("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "module-destructure.ts"), `const { require: load } = module; load("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "module.ts"), `module.require("../../${outsideName}");\n`);
     expect(check(root)).toEqual([
@@ -262,6 +264,8 @@ test("rejects propagated, computed, and indirect loader calls", () => {
       `bin/meta-parenthesized-computed.ts: local reference outside public repository ../../${outsideName}`,
       `bin/module-alias-destructure.ts: local reference outside public repository ../../${outsideName}`,
       `bin/module-assignment-destructure.ts: local reference outside public repository ../../${outsideName}`,
+      "bin/module-computed-call.ts: dynamic import or require cannot be verified",
+      "bin/module-computed-destructure.ts: dynamic import or require cannot be verified",
       `bin/module-destructure.ts: local reference outside public repository ../../${outsideName}`,
       `bin/module.ts: local reference outside public repository ../../${outsideName}`,
     ]);
@@ -297,6 +301,7 @@ test("rejects evaluated JavaScript loaders", () => {
     writeFileSync(join(root, "bin", "function-computed-global.ts"), 'const key = "Function"; const { [key]: F } = globalThis; new F("return require(\\"./hidden.ts\\")")();\n');
     writeFileSync(join(root, "bin", "function-assigned-global.ts"), 'let globalObject; const { Function: F } = (globalObject = globalThis); new F("return require(\\"./hidden.ts\\")")();\n');
     writeFileSync(join(root, "bin", "function-computed-call.ts"), 'const key = "Function"; globalThis[key]("return 7")();\n');
+    writeFileSync(join(root, "bin", "function-global-self.ts"), 'const g = globalThis.globalThis; const key = "Function"; g[key]("return 7")();\n');
     writeFileSync(join(root, "bin", "function-object.ts"), 'const loaders = { load: globalThis.Function }; new loaders.load("return require(\\"./hidden.ts\\")")();\n');
     writeFileSync(join(root, "bin", "function-bracket-object.ts"), 'const loaders = { load: globalThis["Function"] }; new loaders.load("return require(\\"./hidden.ts\\")")();\n');
     expect(check(root)).toEqual([
@@ -309,6 +314,7 @@ test("rejects evaluated JavaScript loaders", () => {
       "bin/function-computed-destructure.ts: dynamic import or require cannot be verified",
       "bin/function-computed-global.ts: dynamic import or require cannot be verified",
       "bin/function-destructure.ts: dynamic import or require cannot be verified",
+      "bin/function-global-self.ts: dynamic import or require cannot be verified",
       "bin/function-object.ts: dynamic import or require cannot be verified",
       "bin/function.ts: dynamic import or require cannot be verified",
     ]);
@@ -388,6 +394,25 @@ test("recursively checks Shell source commands in subshells", () => {
     writeFileSync(join(root, "support", "private.sh"), "echo os.environ[\"CODEX_HOME\"]\n");
     expect(check(root)).toEqual([
       "support/private.sh: forbidden public tool coupling codex-runtime-marker",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("parses Shell source commands without string or extension false positives", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-shell-parser-"));
+  try {
+    mkdirSync(join(root, "bin"), { recursive: true });
+    mkdirSync(join(root, "support"), { recursive: true });
+    writeFileSync(join(root, "bin", "entry.sh"), "printf '%s\\n' '( . ./missing.sh )'\ncat <<'EOF'\n. ./missing.sh\nEOF\nif . ../support/private.sh; then :; fi\nFLAG=1 . ../support/assigned.sh\n. ../support/helper\n");
+    writeFileSync(join(root, "support", "helper.py"), "os.environ[\"CODEX_HOME\"]\n");
+    writeFileSync(join(root, "support", "private.sh"), "echo os.environ[\"CODEX_HOME\"]\n");
+    writeFileSync(join(root, "support", "assigned.sh"), "echo os.environ[\"CODEX_HOME\"]\n");
+    expect(check(root)).toEqual([
+      "bin/entry.sh: missing local reference ../support/helper",
+      "support/private.sh: forbidden public tool coupling codex-runtime-marker",
+      "support/assigned.sh: forbidden public tool coupling codex-runtime-marker",
     ]);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -589,6 +614,23 @@ test("fails closed for dynamic Python package __all__", () => {
   }
 });
 
+test("fails closed for Python __all__ concatenation and mutation", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-python-all-dynamic-forms-"));
+  try {
+    mkdirSync(join(root, "bin", "concat"), { recursive: true });
+    mkdirSync(join(root, "bin", "mutated"), { recursive: true });
+    writeFileSync(join(root, "bin", "entry.py"), "from concat import *\nfrom mutated import *\n");
+    writeFileSync(join(root, "bin", "concat", "__init__.py"), "__all__ = [\"safe\"] + [\"runtime_test\"]\n");
+    writeFileSync(join(root, "bin", "mutated", "__init__.py"), "__all__ = [\"safe\"]\n__all__.append(\"runtime_test\")\n");
+    expect(check(root)).toEqual([
+      "bin/entry.py: wildcard Python import cannot be verified",
+      "bin/entry.py: wildcard Python import cannot be verified",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("scans pure-dot Python package initializers", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-python-pure-dot-"));
   try {
@@ -603,6 +645,20 @@ test("scans pure-dot Python package initializers", () => {
   }
 });
 
+test("bounds Python absolute package initializer scans at the search root", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-python-initializer-boundary-"));
+  try {
+    mkdirSync(join(root, "bin", "package"), { recursive: true });
+    writeFileSync(join(root, "bin", "entry.py"), "from package import helper\n");
+    writeFileSync(join(root, "bin", "package", "__init__.py"), "\n");
+    writeFileSync(join(root, "bin", "package", "helper.py"), "value = 1\n");
+    writeFileSync(join(root, "__init__.py"), "os.environ[\"CODEX_HOME\"]\n");
+    expect(check(root)).toEqual([]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("handles Python explicit line continuations", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-python-continuation-"));
   try {
@@ -611,6 +667,22 @@ test("handles Python explicit line continuations", () => {
     writeFileSync(join(root, "bin", "lib", "runtime_test.py"), "marker = 'fixture-only'\n");
     expect(check(root)).toEqual([
       "bin/entry.py: local reference targets excluded test file ./lib/runtime_test",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("handles Python inline imports and ignores string references", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-python-inline-"));
+  try {
+    mkdirSync(join(root, "bin", "package"), { recursive: true });
+    writeFileSync(join(root, "bin", "entry.py"), "if True: from .package import runtime_test\nimport \\\n    runtime_test\ntext = 'from .package import missing'\n");
+    writeFileSync(join(root, "bin", "package", "runtime_test.py"), "marker = 'fixture-only'\n");
+    writeFileSync(join(root, "bin", "runtime_test.py"), "marker = 'fixture-only'\n");
+    expect(check(root)).toEqual([
+      "bin/entry.py: local reference targets excluded test file ./package/runtime_test",
+      "bin/entry.py: local reference targets excluded test file ./runtime_test",
     ]);
   } finally {
     rmSync(root, { recursive: true, force: true });

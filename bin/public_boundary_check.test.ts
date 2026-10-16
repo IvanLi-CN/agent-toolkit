@@ -102,6 +102,15 @@ test("does not let a regex-helper name hide a literal secret", () => {
   if (nonHexMatch) expect(isRegexHelperAssignment(nonHex, nonHexMatch)).toBe(false);
 });
 
+test("does not let a regex-helper name hide an opaque token-shaped value", () => {
+  const helperName = ["re_service", "_token"].join("");
+  const helperValue = ["Qw7nPm9r", "Tk2sVx4z"].join("");
+  const content = `${helperName}="(${helperValue})"`;
+  const match = pattern("prefixed-quoted-secret-assignment").exec(content);
+  expect(match).not.toBeNull();
+  if (match) expect(isRegexHelperAssignment(content, match)).toBe(false);
+});
+
 test("does not let a regex helper hide another assignment on the same line", () => {
   const secretName = ["SERVICE", "_TOKEN"].join("");
   const content = `re_check="(safe|unsafe|maybe)"; ${secretName}="(` + ["Qw7nPm9r", "Tk2sVx4z"].join("") + `"`;
@@ -136,8 +145,12 @@ test("detects credential-bearing URLs, bearer tokens, and complete PEM blocks", 
   expect(pattern("private-key-block").test("-----BEGIN " + "PRIVATE KEY-----\n" + "A".repeat(50) + "\n" + "B".repeat(70) + "\n-----END " + "PRIVATE KEY-----")).toBe(true);
   expect(pattern("private-key-block").test("signing_key: |\n  -----BEGIN PRIVATE KEY-----\n  " + "A".repeat(48) + "\n  -----END PRIVATE KEY-----")).toBe(true);
   const blockName = ["service", "_token"].join("");
-  expect(pattern("yaml-block-secret-field").test(`${blockName}: |\n  ` + ["Qw7nPm9r", "Tk2sVx4z"].join(""))).toBe(true);
-  expect(pattern("yaml-block-secret-field").test(`${blockName}: >-\n  ` + ["Qw7nPm9r", "Tk2sVx4z"].join(""))).toBe(true);
+  const blockValue = ["Qw7nPm9r", "Tk2sVx4z"].join("");
+  expect(pattern("yaml-block-secret-field").test(`${blockName}: |\n  ${blockValue}`)).toBe(true);
+  expect(pattern("yaml-block-secret-field").test(`${blockName}: >-\n  ${blockValue}`)).toBe(true);
+  expect(pattern("yaml-block-secret-field").test(`${blockName}: |2-\n  ${blockValue}`)).toBe(true);
+  expect(pattern("yaml-block-secret-field").test(`${blockName}: |-2\n  ${blockValue}`)).toBe(true);
+  expect(pattern("yaml-block-secret-field").test(`${blockName}: | # comment\n  ${blockValue}`)).toBe(true);
 });
 
 test("checks tracked public files", () => {

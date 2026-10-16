@@ -5,7 +5,16 @@ import { gitEnvironment } from "./repo_util.ts";
 import { check, main, manifestInventory, parseArgs, targetInventory, targetSymlinkInventory, targetSymlinkPaths } from "./source_target_inventory_check.ts";
 
 function git(cwd: string, ...args: string[]): void {
-  const result = Bun.spawnSync(["git", ...args], { cwd, env: gitEnvironment(Bun.env), stdout: "pipe", stderr: "pipe" });
+  const templateDir = join(cwd, ".git-template");
+  mkdirSync(templateDir, { recursive: true });
+  const env = {
+    ...gitEnvironment(Bun.env),
+    GIT_CONFIG_GLOBAL: join(cwd, ".git-global-config"),
+    GIT_CONFIG_SYSTEM: join(cwd, ".git-system-config"),
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_TEMPLATE_DIR: templateDir,
+  };
+  const result = Bun.spawnSync(["git", "-c", "commit.gpgSign=false", "-c", `core.hooksPath=${templateDir}`, ...args], { cwd, env, stdout: "pipe", stderr: "pipe" });
   if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
 }
 
@@ -17,6 +26,7 @@ test("removes Git repository-selection environment overrides", () => {
     GIT_NAMESPACE: "foreign",
     GIT_CONFIG: "/tmp/foreign/config",
     GIT_CONFIG_COUNT: "1",
+    GIT_TEMPLATE_DIR: "/tmp/foreign/template",
     GIT_SSH_COMMAND: "ssh",
     PATH: "/usr/bin",
   })).toEqual({

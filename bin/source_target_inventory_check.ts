@@ -76,7 +76,8 @@ export function targetGitlinkPaths(root: string): Set<string> {
     throw new Error(`git rev-parse failed for target: ${topLevel.stderr.trim()}`);
   }
   try {
-    if (realpathSync(topLevel.stdout.trim()) !== realpathSync(target)) {
+    const reportedRoot = topLevel.stdout.replace(/\r?\n$/, "");
+    if (realpathSync(reportedRoot) !== realpathSync(target)) {
       throw new Error(`target is not a Git repository root: ${target}`);
     }
   } catch (error) {

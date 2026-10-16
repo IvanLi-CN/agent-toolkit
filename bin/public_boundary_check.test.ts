@@ -175,6 +175,10 @@ test("detects credential-bearing URLs, bearer tokens, and complete PEM blocks", 
   expect(pattern("yaml-scalar-secret-field").test(`"${blockName}": ${blockValue}`)).toBe(true);
   expect(pattern("yaml-scalar-secret-field").test(`${blockName}: ${phraseValue}`)).toBe(true);
   expect(pattern("yaml-scalar-secret-field").test(`${blockName}: <redacted>`)).toBe(false);
+  expect(pattern("yaml-scalar-secret-field").test("private_key: Path) -> Path" )).toBe(false);
+  expect(pattern("yaml-scalar-secret-field").test(`${blockName}: _${blockValue}`)).toBe(true);
+  expect(pattern("yaml-block-secret-field").test(`${blockName}: |\n  @${blockValue}`)).toBe(true);
+  expect(pattern("yaml-block-secret-field").test(`${blockName}: |\n  !${blockValue}`)).toBe(true);
 });
 
 test("checks tracked public files", () => {

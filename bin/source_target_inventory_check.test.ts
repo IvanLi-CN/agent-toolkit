@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { check, main, manifestInventory, parseArgs, targetInventory, targetSymlinkInventory } from "./source_target_inventory_check.ts";
+import { check, main, manifestInventory, parseArgs, targetInventory, targetSymlinkInventory, targetSymlinkPaths } from "./source_target_inventory_check.ts";
 
 function git(cwd: string, ...args: string[]): void {
   const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
@@ -85,6 +85,9 @@ test("counts only regular Skill files and rejects malformed options", () => {
     symlinkSync(join(root, "outside", "linked"), join(root, "skills", "linked"), "dir");
     expect(targetInventory(root)).toEqual(new Set([".hidden", "linked", "regular"]));
     expect(targetSymlinkInventory(root)).toEqual(new Set(["linked"]));
+    mkdirSync(join(root, "skills", "regular", "references"), { recursive: true });
+    symlinkSync(join(root, "outside", "linked", "SKILL.md"), join(root, "skills", "regular", "references", "linked.md"));
+    expect(targetSymlinkPaths(root)).toEqual(new Set(["skills/linked", "skills/regular/references/linked.md"]));
     expect(parseArgs(["--source-root=/tmp/source", "--source-revision=HEAD", "--target-root=/tmp/target", "--public-manifest=/tmp/public"])).toEqual({
       sourceRoot: "/tmp/source",
       revision: "HEAD",
@@ -94,6 +97,62 @@ test("counts only regular Skill files and rejects malformed options", () => {
     expect(() => parseArgs(["--unknown"])).toThrow();
     expect(() => parseArgs(["--source-root"])).toThrow();
     expect(main(["--help"])).toBe(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("reports nested source and target symlinks", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-inventory-nested-link-"));
+  const source = join(root, "source");
+  const target = join(root, "target");
+  try {
+    mkdirSync(join(source, "skills", "public", "references"), { recursive: true });
+    writeFileSync(join(source, "skills", "public", "SKILL.md"), "# public\n");
+    writeFileSync(join(source, "outside.md"), "# outside\n");
+    symlinkSync(join(source, "outside.md"), join(source, "skills", "public", "references", "linked.md"));
+    git(source, "init", "-q");
+    git(source, "config", "user.email", "fixture@example.invalid");
+    git(source, "config", "user.name", "Fixture");
+    git(source, "add", "skills", "outside.md");
+    git(source, "commit", "-qm", "fixture");
+
+    mkdirSync(join(target, "skills", "public", "references"), { recursive: true });
+    writeFileSync(join(target, "skills", "public", "SKILL.md"), "# public\n");
+    writeFileSync(join(target, "PUBLIC_SKILLS.txt"), "public\n");
+    writeFileSync(join(target, "outside.md"), "# outside\n");
+    symlinkSync(join(target, "outside.md"), join(target, "skills", "public", "references", "linked.md"));
+    expect(check(source, "HEAD", target, join(target, "PUBLIC_SKILLS.txt"))).toEqual([
+      "SYMLINKED_TARGET_PATH skills/public/references/linked.md",
+      "SYMLINKED_SOURCE_PATH skills/public/references/linked.md",
+      "PUBLIC_SKILL_SOURCE_DUPLICATE public",
+      "UNEXPECTED_SOURCE_SKILL public",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("reports a source skills-root symlink from the requested Git revision", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-inventory-root-link-"));
+  const source = join(root, "source");
+  const target = join(root, "target");
+  try {
+    mkdirSync(join(root, "outside", "skills"), { recursive: true });
+    mkdirSync(source, { recursive: true });
+    symlinkSync(join(root, "outside", "skills"), join(source, "skills"), "dir");
+    git(source, "init", "-q");
+    git(source, "config", "user.email", "fixture@example.invalid");
+    git(source, "config", "user.name", "Fixture");
+    git(source, "add", "skills");
+    git(source, "commit", "-qm", "fixture");
+    rmSync(join(source, "skills"), { force: true });
+    mkdirSync(join(source, "skills"), { recursive: true });
+    mkdirSync(target, { recursive: true });
+    writeFileSync(join(target, "PUBLIC_SKILLS.txt"), "");
+    expect(check(source, "HEAD", target, join(target, "PUBLIC_SKILLS.txt"))).toEqual([
+      "SYMLINKED_SOURCE_SKILLS_ROOT",
+    ]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

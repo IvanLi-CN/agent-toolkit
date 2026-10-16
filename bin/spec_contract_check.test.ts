@@ -50,3 +50,16 @@ test("rejects a canonical-looking Spec reached through a symlinked ancestor", ()
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("requires Related ADR targets to be regular repository files", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-spec-adr-shape-"));
+  try {
+    const path = join(root, "docs", "specs", "sample-topic", "SPEC.md");
+    mkdirSync(join(root, "docs", "specs", "sample-topic"), { recursive: true });
+    mkdirSync(join(root, "docs", "adr", "0001-example.md"), { recursive: true });
+    writeFileSync(path, "# Sample\n\n## Context and Scope\n\nContext.\n\n## Requirements\n\n### REQ-SAMPLE-01\n\nThe project MUST work.\n\n## Verification\n\n### VER-SAMPLE-01\n\n- covers: `REQ-SAMPLE-01`\n\n## Related ADRs\n\n- [Example](../../adr/0001-example.md)\n");
+    expect(check(path, root).some((finding) => finding.includes("SPEC_RELATED_ADRS_INVALID"))).toBe(true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

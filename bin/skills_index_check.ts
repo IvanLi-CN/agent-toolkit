@@ -12,7 +12,13 @@ export type IndexEntry = {
   name: string;
   lineNumber: number;
   external: boolean;
+  path: string;
 };
+
+function pathCell(value: string): string {
+  const trimmed = value.trim();
+  return trimmed.startsWith("`") && trimmed.endsWith("`") ? trimmed.slice(1, -1) : trimmed;
+}
 
 export function repositorySkills(skillsRoot: string): Set<string> {
   const result = new Set<string>();
@@ -58,6 +64,7 @@ export function indexEntries(readmePath: string): IndexEntry[] {
       name,
       lineNumber,
       external: Boolean(externalMatch && externalMatch[1] === name),
+      path: pathCell(cells[2] ?? ""),
     });
   }
   return entries;
@@ -73,6 +80,13 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
   const localEntries = entries.filter((entry) => !entry.external);
   const indexed = new Set(localEntries.map((entry) => entry.name));
   const findings: string[] = [];
+
+  for (const entry of localEntries) {
+    const expected = [`skills/${entry.name}/`, `skills/${entry.name}/**`];
+    if (!expected.includes(entry.path)) {
+      findings.push(`INVALID_INDEX_PATH skill=${entry.name} line=${entry.lineNumber} path=${entry.path || "<missing>"}`);
+    }
+  }
 
   for (const entry of readdirSync(skillsRoot, { withFileTypes: true }).sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0)) {
     if (entry.isSymbolicLink()) {

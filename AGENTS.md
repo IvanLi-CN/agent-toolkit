@@ -21,10 +21,12 @@ bun install --frozen-lockfile
 bun run typecheck
 bun run check
 bun run test:repo
+python3 -m pip install -r requirements-dev.txt
+ruby -e 'require "yaml"'
 bun run test:skills
 ```
 
-`test:repo` discovers repository-owned Bun, Python, and Shell test files outside `skills/`. `test:skills` discovers the same test families below `skills/`. Python dependencies needed by application-facing or domain tests are declared separately in `requirements-dev.txt`; text-only Skills need no programming runtime.
+`test:repo` discovers repository-owned Bun, Python, and Shell test files outside `skills/`. `test:skills` discovers the same test families below `skills/`. Python dependencies needed by application-facing or domain tests are declared separately in `requirements-dev.txt`; the XP policy test also requires Ruby with its standard YAML library; text-only Skills need no programming runtime.
 
 The source-target inventory check is an opt-in migration check because it compares a synthetic or explicitly supplied Git source snapshot:
 

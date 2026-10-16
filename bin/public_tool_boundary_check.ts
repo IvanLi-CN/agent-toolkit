@@ -54,6 +54,7 @@ function importCandidates(file: string, specifier: string): string[] {
 }
 
 function isInside(root: string, candidate: string): boolean {
+  if (/^(?:[A-Za-z]:[\\/]|\\\\)/.test(candidate)) return false;
   const absoluteRoot = resolve(root);
   const absoluteCandidate = resolve(candidate);
   let realRoot = absoluteRoot;
@@ -71,6 +72,7 @@ function isInside(root: string, candidate: string): boolean {
 }
 
 function absoluteImportPath(specifier: string): string {
+  if (/^(?:[A-Za-z]:[\\/]|\\\\)/.test(specifier)) return specifier;
   return specifier.startsWith("file://") ? fileURLToPath(specifier) : resolve(specifier);
 }
 
@@ -128,18 +130,30 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
       const specifier = match[1];
       if (!specifier) continue;
       try {
-        if (!isInside(repoRoot, absoluteImportPath(specifier))) {
+        const absolute = absoluteImportPath(specifier);
+        if (!isInside(repoRoot, absolute)) {
           findings.push(`${relative}: local reference outside public repository ${specifier}`);
+          continue;
+        }
+        const existing = resolveExistingFile(importCandidates(path, absolute));
+        if (!existing) {
+          findings.push(`${relative}: missing local reference ${specifier}`);
+        } else if (!isInside(repoRoot, realpathSync(existing))) {
+          findings.push(`${relative}: local reference resolves outside public repository ${specifier}`);
         }
       } catch {
-        findings.push(`${relative}: invalid local reference ${specifier}`);
+        findings.push(`${relative}: unreadable local reference ${specifier}`);
       }
     }
   }
   return findings;
 }
 
-export function main(): number {
+export function main(args: string[] = Bun.argv.slice(2)): number {
+  if (args.length > 0) {
+    console.error("usage: public_tool_boundary_check.ts");
+    return 2;
+  }
   const findings = check();
   for (const finding of findings) {
     console.log(`FINDING ${finding}`);

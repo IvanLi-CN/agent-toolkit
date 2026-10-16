@@ -57,7 +57,7 @@ export function isRegexHelperAssignment(content: string, match: RegExpExecArray)
   const nextLine = content.indexOf("\n", match.index + match[0].length);
   const lineEnd = nextLine < 0 ? content.length : nextLine;
   const line = content.slice(lineStart, lineEnd);
-  return REGEX_HELPER_ASSIGNMENT.test(line) && /[([|]/.test(match[0]);
+  return REGEX_HELPER_ASSIGNMENT.test(line) && /[([|]/.test(match[0]) && !/[0-9a-f]{16,}/i.test(match[0]);
 }
 
 function matchesPattern(label: string, pattern: RegExp, content: string): boolean {
@@ -126,7 +126,11 @@ function requireText(path: string): string {
   }
 }
 
-export function main(): number {
+export function main(args: string[] = Bun.argv.slice(2)): number {
+  if (args.length > 0) {
+    console.error("usage: public_boundary_check.ts");
+    return 2;
+  }
   const findings = check();
   for (const finding of findings) {
     console.log(`FINDING ${finding}`);

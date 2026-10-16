@@ -62,13 +62,15 @@ export function targetSymlinkPaths(root: string): Set<string> {
   return result;
 }
 
+export function manifestEntries(path: string): string[] {
+  return readText(path)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"));
+}
+
 export function manifestInventory(path: string): Set<string> {
-  return new Set(
-    readText(path)
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0 && !line.startsWith("#")),
-  );
+  return new Set(manifestEntries(path));
 }
 
 type SnapshotTree = { skillNames: Set<string>; symlinkPaths: Set<string> };
@@ -179,9 +181,14 @@ export function inspect(
   const actual = targetInventory(target);
   const sourceSymlinkPaths = new Set([...snapshot.symlinkPaths, ...targetSymlinkPaths(source)]);
   const targetSymlinkPathsSet = targetSymlinkPaths(target);
-  const publicNames = manifestInventory(publicManifest);
+  const publicManifestEntries = manifestEntries(publicManifest);
+  const publicNames = new Set(publicManifestEntries);
   const privateNames = new Set([...expectedSource].filter((name) => !publicNames.has(name)));
   const findings: string[] = [];
+
+  if (publicManifestEntries.length !== publicNames.size) {
+    findings.push("DUPLICATE_PUBLIC_MANIFEST_ENTRY");
+  }
 
   if (targetSymlinkPathsSet.has("skills")) findings.push("SYMLINKED_TARGET_SKILLS_ROOT");
   if (sourceSymlinkPaths.has("skills") || isSymlink(join(source, "skills"))) findings.push("SYMLINKED_SOURCE_SKILLS_ROOT");

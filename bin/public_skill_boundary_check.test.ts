@@ -110,6 +110,20 @@ test("reports a nested symlink that escapes the Skill boundary", () => {
   }
 });
 
+test("rejects a nested symlink that points inside the Skill boundary", () => {
+  const { root, manifest } = fixture("# standalone\n");
+  try {
+    mkdirSync(join(root, "skills", "alpha", "references"));
+    writeFileSync(join(root, "skills", "alpha", "references", "linked.md"), "# linked\n");
+    symlinkSync(join(root, "skills", "alpha", "references"), join(root, "skills", "alpha", "linked"), "dir");
+    expect(check(root, manifest)).toEqual([
+      "skills/alpha/linked: symbolic link escapes public Skill boundary",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("rejects an in-boundary symlinked private reference", () => {
   const { root, manifest } = fixture("# standalone\n");
   try {

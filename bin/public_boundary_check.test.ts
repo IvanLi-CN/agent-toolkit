@@ -114,6 +114,11 @@ test("does not let a regex-helper name hide an opaque token-shaped value", () =>
   const mixedMatch = pattern("prefixed-quoted-secret-assignment").exec(mixedContent);
   expect(mixedMatch).not.toBeNull();
   if (mixedMatch) expect(isRegexHelperAssignment(mixedContent, mixedMatch)).toBe(false);
+  const phraseValue = ["correct horse", " battery staple"].join("");
+  const phraseContent = `${helperName}="(${phraseValue}|safe)"`;
+  const phraseMatch = pattern("prefixed-quoted-secret-assignment").exec(phraseContent);
+  expect(phraseMatch).not.toBeNull();
+  if (phraseMatch) expect(isRegexHelperAssignment(phraseContent, phraseMatch)).toBe(false);
 });
 
 test("does not let a regex helper hide another assignment on the same line", () => {
@@ -160,6 +165,8 @@ test("detects credential-bearing URLs, bearer tokens, and complete PEM blocks", 
   expect(pattern("yaml-block-secret-field").test(`${blockName}: >-\n  # comment\n  ${blockValue}`)).toBe(true);
   expect(pattern("yaml-block-secret-field").test(`${blockName}: |\n  "${blockValue}"`)).toBe(true);
   expect(pattern("yaml-block-secret-field").test(`${blockName}: >-\n  '${blockValue}'`)).toBe(true);
+  const phraseValue = ["correct horse", " battery staple"].join("");
+  expect(pattern("yaml-block-secret-field").test(`${blockName}: |\n  "${phraseValue}"`)).toBe(true);
 });
 
 test("checks tracked public files", () => {

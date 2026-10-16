@@ -175,6 +175,7 @@ test("preserves special characters in committed symlink paths", () => {
     git(source, "config", "user.name", "Fixture");
     git(source, "add", "skills", "outside.md");
     git(source, "commit", "-qm", "fixture");
+    rmSync(join(source, "skills", "public", "references", linkName), { force: true });
     mkdirSync(join(target, "skills", "public"), { recursive: true });
     writeFileSync(join(target, "skills", "public", "SKILL.md"), "# public\n");
     writeFileSync(join(target, "PUBLIC_SKILLS.txt"), "public\n");

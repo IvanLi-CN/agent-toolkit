@@ -50,7 +50,7 @@ export function targetSymlinkPaths(root: string): Set<string> {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name);
       const relativePath = relativeDirectory ? `${relativeDirectory}/${entry.name}` : entry.name;
-      if (IGNORED_INVENTORY_DIRECTORIES.has(entry.name) || entry.name.endsWith(".egg-info")) continue;
+      if (relativeDirectory && (IGNORED_INVENTORY_DIRECTORIES.has(entry.name) || entry.name.endsWith(".egg-info"))) continue;
       if (entry.isSymbolicLink()) {
         result.add(`skills/${relativePath}`);
       } else if (entry.isDirectory()) {
@@ -81,7 +81,10 @@ function snapshotTree(source: string, revision: string): SnapshotTree {
   const skillNames = new Set<string>();
   const symlinkPaths = new Set<string>();
   for (const item of result.stdout.split("\0")) {
-    const [metadata, path] = item.split("\t", 2);
+    const separator = item.indexOf("\t");
+    if (separator < 0) continue;
+    const metadata = item.slice(0, separator);
+    const path = item.slice(separator + 1);
     const mode = metadata?.split(/\s+/)[0] ?? "";
     if (!path) continue;
     if (["100644", "100755"].includes(mode) && path.startsWith("skills/") && path.endsWith("/SKILL.md") && path.split("/").length === 3) {

@@ -154,7 +154,11 @@ export function check(repoRoot: string = REPO_ROOT, manifest: string = PUBLIC_MA
   return findings;
 }
 
-export function main(): number {
+export function main(args: string[] = Bun.argv.slice(2)): number {
+  if (args.length > 0) {
+    console.error("usage: public_skill_boundary_check.ts");
+    return 2;
+  }
   const findings = check();
   for (const finding of findings) {
     console.log(`FINDING ${finding}`);

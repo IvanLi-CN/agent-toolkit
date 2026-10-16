@@ -59,12 +59,13 @@ export function indexEntries(readmePath: string): IndexEntry[] {
       continue;
     }
     const name = match[1];
-    const externalMatch = EXTERNAL_PATH_PATTERN.exec(stripped);
+    const path = pathCell(cells[2] ?? "");
+    const externalMatch = EXTERNAL_PATH_PATTERN.exec(path);
     entries.push({
       name,
       lineNumber,
       external: Boolean(externalMatch && externalMatch[1] === name),
-      path: pathCell(cells[2] ?? ""),
+      path,
     });
   }
   return entries;

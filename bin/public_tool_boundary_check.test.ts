@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { check, publicToolFiles } from "./public_tool_boundary_check.ts";
+import { check, main, publicToolFiles } from "./public_tool_boundary_check.ts";
 
 test("rejects private runtime coupling and broken local references", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-"));
@@ -71,4 +71,8 @@ test("rejects absolute and file URL imports outside the public repository", () =
     rmSync(root, { recursive: true, force: true });
     rmSync(outsidePath, { force: true });
   }
+});
+
+test("rejects unsupported public-tool-boundary CLI options", () => {
+  expect(main(["--unknown"])).toBe(2);
 });

@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { check } from "./public_skill_boundary_check.ts";
+import { check, main } from "./public_skill_boundary_check.ts";
 
 function fixture(content: string): { root: string; manifest: string } {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-skill-boundary-"));
@@ -122,4 +122,8 @@ test("rejects a public manifest that is outside the repository boundary", () => 
     rmSync(root, { recursive: true, force: true });
     rmSync(outside, { force: true });
   }
+});
+
+test("rejects unsupported public-Skill-boundary CLI options", () => {
+  expect(main(["--unknown"])).toBe(2);
 });

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { check, FORBIDDEN_PATTERNS, isRegexHelperAssignment } from "./public_boundary_check.ts";
+import { check, FORBIDDEN_PATTERNS, isRegexHelperAssignment, main } from "./public_boundary_check.ts";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -88,6 +88,13 @@ test("does not exclude names that merely resemble regex helpers", () => {
   }
 });
 
+test("does not let a regex-helper name hide a literal secret", () => {
+  const content = `${["pattern", "api_key"].join("_")}=\"(${"0123456789abcdef"}\"`;
+  const match = pattern("prefixed-quoted-secret-assignment").exec(content);
+  expect(match).not.toBeNull();
+  if (match) expect(isRegexHelperAssignment(content, match)).toBe(false);
+});
+
 test("does not classify long hyphenated input as a secret assignment", () => {
   expect(pattern("prefixed-quoted-secret-assignment").test("a-".repeat(8000) + "!")).toBe(false);
 });
@@ -117,4 +124,8 @@ test("checks tracked public files", () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("rejects unsupported public-boundary CLI options", () => {
+  expect(main(["--unknown"])).toBe(2);
 });

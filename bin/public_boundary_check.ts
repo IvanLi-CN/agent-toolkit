@@ -13,7 +13,7 @@ const REGEX_HELPER_ASSIGNMENT = new RegExp(String.raw`^[ \t]*(?:local[ \t]+)?(?:
 const COMPOUND_ASSIGNMENT = new RegExp(String.raw`(?<![A-Za-z0-9_-])(?<name>[A-Za-z0-9_-]+)\s*=\s*['"]${SECRET_VALUE}['"]`, "i");
 const JSON_SECRET_FIELD = new RegExp(String.raw`["'](?<name>[A-Za-z0-9_-]+)["']\s*:\s*["']${SECRET_VALUE}["']`, "i");
 const UNQUOTED_SECRET_ASSIGNMENT = new RegExp(String.raw`(?<![A-Za-z0-9_-])(?<name>${COMPOUND_SECRET_NAME})\s*[:=]\s*${UNQUOTED_SECRET_VALUE}(?![A-Za-z0-9._~+/=-])`, "i");
-const PRIVATE_KEY_BLOCK = /-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----\r?\n(?:[A-Za-z0-9+/]{40,}={0,2}\r?\n(?:[A-Za-z0-9+/]{1,64}={0,2}\r?\n)*)-----END [A-Z0-9 _-]*PRIVATE KEY-----/;
+const PRIVATE_KEY_BLOCK = /-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----\r?\n(?:[A-Za-z0-9+/]{40,}={0,2}\r?\n(?:[A-Za-z0-9+/]{1,128}={0,2}\r?\n)*)-----END [A-Z0-9 _-]*PRIVATE KEY-----/;
 const CREDENTIAL_URL = /\b(?:https?|ssh|postgres(?:ql)?):\/\/[^/\s:@]+:[^@\s]{16,}@/i;
 const BEARER_TOKEN = /\bBearer\s+[A-Za-z0-9._~+/=-]{16,}\b/i;
 const SECRET_SUFFIXES = [

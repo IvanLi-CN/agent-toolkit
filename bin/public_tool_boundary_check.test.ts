@@ -180,6 +180,42 @@ test("rejects bracketed and reassigned Bun loaders and import-equals module load
   }
 });
 
+test("rejects wrapped, destructured, late-bound, and bound loaders", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-loader-wrapped-"));
+  const outsideName = `${root.split(/[\\/]/).at(-1)}-outside.ts`;
+  const outsidePath = join(root, "..", outsideName);
+  try {
+    mkdirSync(join(root, "bin"), { recursive: true });
+    writeFileSync(outsidePath, "export const outside = 1;\n");
+    writeFileSync(join(root, "bin", "bind.ts"), `const load = require.bind(null); load("../../${outsideName}");\n`);
+    writeFileSync(join(root, "bin", "destructure.ts"), `const { require: load } = import.meta; load("../../${outsideName}");\n`);
+    writeFileSync(join(root, "bin", "late.ts"), `function run() { load("../../${outsideName}"); } const load = require; run();\n`);
+    writeFileSync(join(root, "bin", "wrapped.ts"), `(require)("../../${outsideName}");\n`);
+    expect(check(root)).toEqual([
+      `bin/bind.ts: local reference outside public repository ../../${outsideName}`,
+      `bin/destructure.ts: local reference outside public repository ../../${outsideName}`,
+      `bin/late.ts: local reference outside public repository ../../${outsideName}`,
+      `bin/wrapped.ts: local reference outside public repository ../../${outsideName}`,
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(outsidePath, { force: true });
+  }
+});
+
+test("rejects executable module URLs", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-data-url-"));
+  try {
+    mkdirSync(join(root, "bin"), { recursive: true });
+    writeFileSync(join(root, "bin", "data.ts"), 'import "data:text/javascript,export%20default%201";\n');
+    expect(check(root)).toEqual([
+      "bin/data.ts: executable module URL cannot be verified",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("rejects production tools that import excluded test files", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-test-import-"));
   try {

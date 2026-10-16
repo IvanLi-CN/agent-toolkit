@@ -1,12 +1,27 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { gitEnvironment } from "./repo_util.ts";
 import { check, main, manifestInventory, parseArgs, targetInventory, targetSymlinkInventory, targetSymlinkPaths } from "./source_target_inventory_check.ts";
 
 function git(cwd: string, ...args: string[]): void {
   const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
   if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
 }
+
+test("removes Git repository-selection environment overrides", () => {
+  expect(gitEnvironment({
+    GIT_DIR: "/tmp/foreign/.git",
+    GIT_WORK_TREE: "/tmp/foreign",
+    GIT_INDEX_FILE: "/tmp/foreign/index",
+    GIT_NAMESPACE: "foreign",
+    GIT_SSH_COMMAND: "ssh",
+    PATH: "/usr/bin",
+  })).toEqual({
+    GIT_SSH_COMMAND: "ssh",
+    PATH: "/usr/bin",
+  });
+});
 
 test("passes a synthetic public/private source snapshot", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-inventory-"));

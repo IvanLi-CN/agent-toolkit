@@ -30,6 +30,7 @@ const SCANNABLE_LOCAL_EXTENSIONS = new Set([...PUBLIC_TOOL_EXTENSIONS, ".json"])
 const NODE_MODULE_BUILTINS = new Set(["module", "node:module"]);
 const RELATIVE_SPECIFIER = /^\.{1,2}[\\/]/;
 const ABSOLUTE_SPECIFIER = /^(?:file:\/\/|\/|\\|[A-Za-z]:[\\/])/;
+const EXECUTABLE_MODULE_URL = /^(?:blob|data|javascript):/i;
 
 function isExcludedTestPath(path: string): boolean {
   const name = path.split(/[\\/]/).at(-1) ?? "";
@@ -94,20 +95,85 @@ function absoluteImportPath(specifier: string): string {
 
 type JavaScriptImports = { specifiers: string[]; hasUnverifiableDynamicImport: boolean };
 
+function unwrapExpression(node: ts.Expression): ts.Expression {
+  let current = node;
+  while (ts.isParenthesizedExpression(current) || ts.isAsExpression(current) || ts.isTypeAssertionExpression(current) || ts.isNonNullExpression(current) || ts.isSatisfiesExpression(current)) {
+    current = current.expression;
+  }
+  return current;
+}
+
 function isImportMeta(node: ts.Expression | undefined): boolean {
-  return !!node && ts.isMetaProperty(node) && node.keywordToken === ts.SyntaxKind.ImportKeyword && node.name.text === "meta";
+  const expression = node ? unwrapExpression(node) : undefined;
+  return !!expression && ts.isMetaProperty(expression) && expression.keywordToken === ts.SyntaxKind.ImportKeyword && expression.name.text === "meta";
 }
 
 function isImportMetaRequire(node: ts.Expression): boolean {
-  if (ts.isPropertyAccessExpression(node)) {
-    return node.name.text === "require" && isImportMeta(node.expression);
+  const expression = unwrapExpression(node);
+  if (ts.isPropertyAccessExpression(expression)) {
+    return expression.name.text === "require" && isImportMeta(expression.expression);
   }
-  return ts.isElementAccessExpression(node) && isImportMeta(node.expression) && !!node.argumentExpression &&
-    ts.isStringLiteralLike(node.argumentExpression) && node.argumentExpression.text === "require";
+  return ts.isElementAccessExpression(expression) && isImportMeta(expression.expression) && !!expression.argumentExpression &&
+    ts.isStringLiteralLike(expression.argumentExpression) && expression.argumentExpression.text === "require";
 }
 
 function isRequireExpression(node: ts.Expression, aliases: Set<string>): boolean {
-  return (ts.isIdentifier(node) && aliases.has(node.text)) || isImportMetaRequire(node);
+  const expression = unwrapExpression(node);
+  return (ts.isIdentifier(expression) && aliases.has(expression.text)) || isImportMetaRequire(expression);
+}
+
+function isRequireBindExpression(node: ts.Expression, aliases: Set<string>): boolean {
+  const expression = unwrapExpression(node);
+  return ts.isPropertyAccessExpression(expression) && expression.name.text === "bind" && isRequireExpression(expression.expression, aliases);
+}
+
+function isRequireBindCall(node: ts.Expression, aliases: Set<string>): boolean {
+  const expression = unwrapExpression(node);
+  return ts.isCallExpression(expression) && isRequireBindExpression(expression.expression, aliases);
+}
+
+function isLoaderExpression(node: ts.Expression, aliases: Set<string>): boolean {
+  return isRequireExpression(node, aliases) || isRequireBindExpression(node, aliases) || isRequireBindCall(node, aliases);
+}
+
+function requireBindingNames(name: ts.BindingName, initializer: ts.Expression): string[] {
+  if (!isImportMeta(initializer) || !ts.isObjectBindingPattern(name)) return [];
+  const names: string[] = [];
+  for (const element of name.elements) {
+    if (!ts.isBindingElement(element) || !ts.isIdentifier(element.name)) continue;
+    const propertyName = element.propertyName;
+    const propertyText = propertyName && ts.isStringLiteralLike(propertyName) ? propertyName.text : propertyName && ts.isIdentifier(propertyName) ? propertyName.text : element.name.text;
+    if (propertyText === "require") names.push(element.name.text);
+  }
+  return names;
+}
+
+function collectRequireAliases(source: ts.SourceFile): Set<string> {
+  const aliases = new Set(["require"]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    const visit = (node: ts.Node): void => {
+      if (ts.isVariableDeclaration(node) && node.initializer) {
+        for (const name of requireBindingNames(node.name, node.initializer)) {
+          if (!aliases.has(name)) {
+            aliases.add(name);
+            changed = true;
+          }
+        }
+        if (ts.isIdentifier(node.name) && isLoaderExpression(node.initializer, aliases) && !aliases.has(node.name.text)) {
+          aliases.add(node.name.text);
+          changed = true;
+        }
+      } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isIdentifier(node.left) && isLoaderExpression(node.right, aliases) && !aliases.has(node.left.text)) {
+        aliases.add(node.left.text);
+        changed = true;
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
+  }
+  return aliases;
 }
 
 function javascriptImports(file: string, content: string): JavaScriptImports {
@@ -119,7 +185,7 @@ function javascriptImports(file: string, content: string): JavaScriptImports {
   const source = ts.createSourceFile(file, content, ts.ScriptTarget.Latest, true, scriptKind);
   const specifiers: string[] = [];
   let hasUnverifiableDynamicImport = false;
-  const requireAliases = new Set(["require"]);
+  const requireAliases = collectRequireAliases(source);
   const visit = (node: ts.Node): void => {
     if (ts.isImportDeclaration(node) && ts.isStringLiteralLike(node.moduleSpecifier)) {
       if (NODE_MODULE_BUILTINS.has(node.moduleSpecifier.text)) {
@@ -136,15 +202,13 @@ function javascriptImports(file: string, content: string): JavaScriptImports {
         hasUnverifiableDynamicImport = true;
       }
       specifiers.push(node.moduleReference.expression.text);
-    } else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer && isRequireExpression(node.initializer, requireAliases)) {
-      requireAliases.add(node.name.text);
-    } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isIdentifier(node.left) && isRequireExpression(node.right, requireAliases)) {
-      requireAliases.add(node.left.text);
     } else if (ts.isCallExpression(node)) {
-      const isDynamicImport = node.expression.kind === ts.SyntaxKind.ImportKeyword;
-      const isRequire = isRequireExpression(node.expression, requireAliases);
-      const isCreateRequire = (ts.isIdentifier(node.expression) && node.expression.text === "createRequire") ||
-        (ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === "createRequire");
+      const expression = unwrapExpression(node.expression);
+      const isDynamicImport = expression.kind === ts.SyntaxKind.ImportKeyword;
+      const isRequire = isRequireExpression(expression, requireAliases) || isRequireBindCall(expression, requireAliases);
+      const isCreateRequire = (ts.isIdentifier(expression) && expression.text === "createRequire") ||
+        (ts.isPropertyAccessExpression(expression) && expression.name.text === "createRequire") ||
+        (ts.isElementAccessExpression(expression) && !!expression.argumentExpression && ts.isStringLiteralLike(expression.argumentExpression) && expression.argumentExpression.text === "createRequire");
       if (isCreateRequire) {
         hasUnverifiableDynamicImport = true;
       }
@@ -167,6 +231,10 @@ function javascriptImports(file: string, content: string): JavaScriptImports {
 }
 
 function checkImportSpecifier(repoRoot: string, path: string, relative: string, specifier: string, findings: string[], onResolved?: (path: string) => void): void {
+  if (EXECUTABLE_MODULE_URL.test(specifier)) {
+    findings.push(`${relative}: executable module URL cannot be verified`);
+    return;
+  }
   if (RELATIVE_SPECIFIER.test(specifier)) {
     const candidates = importCandidates(path, specifier);
     if (candidates.some((candidate) => !isInside(repoRoot, candidate))) {

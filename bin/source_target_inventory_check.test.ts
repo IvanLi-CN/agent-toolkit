@@ -13,6 +13,10 @@ function git(cwd: string, ...args: string[]): void {
     GIT_CONFIG_SYSTEM: join(cwd, ".git-system-config"),
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_TEMPLATE_DIR: templateDir,
+    GIT_AUTHOR_NAME: "Fixture",
+    GIT_AUTHOR_EMAIL: "fixture@example.invalid",
+    GIT_COMMITTER_NAME: "Fixture",
+    GIT_COMMITTER_EMAIL: "fixture@example.invalid",
   };
   const result = Bun.spawnSync(["git", "-c", "commit.gpgSign=false", "-c", `core.hooksPath=${templateDir}`, ...args], { cwd, env, stdout: "pipe", stderr: "pipe" });
   if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
@@ -280,6 +284,46 @@ test("reports Gitlinks in the target Skill tree", () => {
     expect(check(source, "HEAD", target, join(target, "PUBLIC_SKILLS.txt"))).toEqual([
       "UNSUPPORTED_TARGET_GITLINK skills/external",
     ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("reports a Gitlink at the target Skills root", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-inventory-target-root-gitlink-"));
+  const source = join(root, "source");
+  const target = join(root, "target");
+  try {
+    mkdirSync(join(source, "skills"), { recursive: true });
+    git(source, "init", "-q");
+    git(source, "commit", "--allow-empty", "-qm", "fixture");
+    mkdirSync(target, { recursive: true });
+    git(target, "init", "-q");
+    git(target, "update-index", "--add", "--cacheinfo", "160000,3333333333333333333333333333333333333333,skills");
+    git(target, "commit", "-qm", "fixture");
+    writeFileSync(join(target, "PUBLIC_SKILLS.txt"), "");
+    expect(check(source, "HEAD", target, join(target, "PUBLIC_SKILLS.txt"))).toEqual([
+      "UNSUPPORTED_TARGET_GITLINK skills",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fails closed when target Git index enumeration fails", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-inventory-target-git-failure-"));
+  const source = join(root, "source");
+  const target = join(root, "target");
+  try {
+    mkdirSync(join(source, "skills"), { recursive: true });
+    git(source, "init", "-q");
+    git(source, "commit", "--allow-empty", "-qm", "fixture");
+    mkdirSync(target, { recursive: true });
+    git(target, "init", "-q");
+    git(target, "commit", "--allow-empty", "-qm", "fixture");
+    writeFileSync(join(target, ".git", "index"), "corrupt-index\n");
+    writeFileSync(join(target, "PUBLIC_SKILLS.txt"), "");
+    expect(() => check(source, "HEAD", target, join(target, "PUBLIC_SKILLS.txt"))).toThrow("git ls-files failed for target");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -157,6 +157,29 @@ test("rejects loader aliases, module re-exports, and Bun import.meta.require", (
   }
 });
 
+test("rejects bracketed and reassigned Bun loaders and import-equals module loaders", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-loader-forms-"));
+  const outsideName = `${root.split(/[\\/]/).at(-1)}-outside.ts`;
+  const outsidePath = join(root, "..", outsideName);
+  try {
+    mkdirSync(join(root, "bin"), { recursive: true });
+    writeFileSync(outsidePath, "export const outside = 1;\n");
+    writeFileSync(join(root, "bin", "assignment.ts"), `let load; load = import.meta.require; load("../../${outsideName}");\n`);
+    writeFileSync(join(root, "bin", "bun-alias.ts"), `const load = import.meta.require; load("../../${outsideName}");\n`);
+    writeFileSync(join(root, "bin", "bun-bracket.ts"), `import.meta["require"]("../../${outsideName}");\n`);
+    writeFileSync(join(root, "bin", "import-equals.tsx"), 'import moduleLoader = require("module"); moduleLoader["createRequire"](import.meta.url);\n');
+    expect(check(root)).toEqual([
+      `bin/assignment.ts: local reference outside public repository ../../${outsideName}`,
+      `bin/bun-alias.ts: local reference outside public repository ../../${outsideName}`,
+      `bin/bun-bracket.ts: local reference outside public repository ../../${outsideName}`,
+      "bin/import-equals.tsx: dynamic import or require cannot be verified",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(outsidePath, { force: true });
+  }
+});
+
 test("rejects production tools that import excluded test files", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-test-import-"));
   try {
@@ -166,6 +189,23 @@ test("rejects production tools that import excluded test files", () => {
     expect(publicToolFiles(root).map((path) => path.split(/[\\/]/).at(-1))).toEqual(["entry.ts"]);
     expect(check(root)).toEqual([
       "bin/entry.ts: local reference targets excluded test file ./runtime.test.ts",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("recursively checks local JavaScript dependencies for excluded test imports", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-dependency-"));
+  try {
+    mkdirSync(join(root, "bin"), { recursive: true });
+    mkdirSync(join(root, "support"), { recursive: true });
+    writeFileSync(join(root, "bin", "entry.ts"), 'import "../support/helper.cjs";\n');
+    writeFileSync(join(root, "support", "helper.cjs"), 'require("../bin/runtime.test.ts");\n');
+    writeFileSync(join(root, "bin", "runtime.test.ts"), 'const marker = "fixture-only";\n');
+    expect(publicToolFiles(root).map((path) => path.split(/[\\/]/).at(-1))).toEqual(["entry.ts"]);
+    expect(check(root)).toEqual([
+      "support/helper.cjs: local reference targets excluded test file ../bin/runtime.test.ts",
     ]);
   } finally {
     rmSync(root, { recursive: true, force: true });

@@ -3,6 +3,7 @@
 
 import { lstatSync, realpathSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { isDirectRegularFile, isPathInside, REPO_ROOT, readText, relativePath, resolveExistingFile, walkFiles } from "./repo_util.ts";
 
 const runtimeNamePattern = "CODEX_" + "[A-Z0-9_]+";
@@ -18,6 +19,7 @@ export const FORBIDDEN_PATTERNS: Array<[string, RegExp]> = [
 ];
 
 const RELATIVE_IMPORT = /(?:from\s*|import\s*(?:\(\s*)?|require\s*\()["'](\.{1,2}\/[^"']+)["']/g;
+const ABSOLUTE_IMPORT = /(?:from\s*|import\s*(?:\(\s*)?|require\s*\()["']((?:file:\/\/|\/|[A-Za-z]:[\\/])[^"']+)["']/g;
 const EXCLUDED_TEST_FILE = /(?:\.test\.(?:ts|tsx|js|py|sh)$|^test[-_].*\.(?:ts|tsx|js|py|sh)$|_test\.(?:ts|tsx|js|py|sh)$)/;
 const PUBLIC_TOOL_EXTENSIONS = [".ts", ".tsx", ".js", ".py", ".sh"];
 
@@ -66,6 +68,10 @@ function isInside(root: string, candidate: string): boolean {
     absoluteCandidate === realRoot ||
     absoluteCandidate.startsWith(`${realRoot}${sep}`)
   );
+}
+
+function absoluteImportPath(specifier: string): string {
+  return specifier.startsWith("file://") ? fileURLToPath(specifier) : resolve(specifier);
 }
 
 export function check(repoRoot: string = REPO_ROOT): string[] {
@@ -117,6 +123,17 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
         continue;
       }
       findings.push(`${relative}: missing local reference ${specifier}`);
+    }
+    for (const match of content.matchAll(ABSOLUTE_IMPORT)) {
+      const specifier = match[1];
+      if (!specifier) continue;
+      try {
+        if (!isInside(repoRoot, absoluteImportPath(specifier))) {
+          findings.push(`${relative}: local reference outside public repository ${specifier}`);
+        }
+      } catch {
+        findings.push(`${relative}: invalid local reference ${specifier}`);
+      }
     }
   }
   return findings;

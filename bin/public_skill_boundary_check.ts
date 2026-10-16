@@ -69,6 +69,9 @@ function scanSkillFiles(repoRoot: string, skillRoot: string): { files: string[];
 
 export function check(repoRoot: string = REPO_ROOT, manifest: string = PUBLIC_MANIFEST): string[] {
   const findings: string[] = [];
+  if (!isPathInside(repoRoot, manifest) || !isDirectRegularFile(manifest)) {
+    return ["INVALID_PUBLIC_SKILLS_MANIFEST"];
+  }
   let names: string[];
   try {
     names = publicSkills(manifest);

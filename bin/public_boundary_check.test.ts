@@ -18,6 +18,7 @@ test("detects secret assignments and ignores redacted placeholders", () => {
   expect(pattern("unquoted-secret-assignment").test(`${name}=0123456789abcdef`)).toBe(true);
   expect(pattern("unquoted-secret-assignment").test(`${name}: 0123456789abcdef`)).toBe(true);
   expect(pattern("unquoted-secret-assignment").test(`${name}=<redacted>`)).toBe(false);
+  expect(pattern("unquoted-secret-assignment").test(`${name}=provided-out-of-band`)).toBe(false);
 });
 
 test("detects prefixed, lowercase, and compound secret assignments", () => {
@@ -36,6 +37,7 @@ test("detects prefixed, lowercase, and compound secret assignments", () => {
   for (const parts of names) {
     const name = parts.join("");
     expect(pattern("prefixed-quoted-secret-assignment").test(`${name}="${fixtureValue}"`)).toBe(true);
+    expect(pattern("unquoted-secret-assignment").test(`${name}=${fixtureValue}`)).toBe(true);
   }
 });
 
@@ -95,6 +97,13 @@ test("matches complete private hostnames while allowing neutral local helper nam
   expect(privateHostname.test("config" + ".local")).toBe(true);
   expect(privateHostname.test("threading" + ".local")).toBe(true);
   expect(privateHostname.test("prod.config" + ".local")).toBe(true);
+});
+
+test("detects credential-bearing URLs, bearer tokens, and complete PEM blocks", () => {
+  const credential = "a".repeat(24);
+  expect(pattern("credentialed-url").test("https://user:" + credential + "@example.test")).toBe(true);
+  expect(pattern("bearer-token").test("Bearer " + credential)).toBe(true);
+  expect(pattern("private-key-block").test("-----BEGIN " + "PRIVATE KEY-----\n" + "A".repeat(48) + "\n-----END " + "PRIVATE KEY-----")).toBe(true);
 });
 
 test("checks tracked public files", () => {

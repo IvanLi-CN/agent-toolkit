@@ -5,6 +5,8 @@ import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { isDirectRegularFile, isPathInside, REPO_ROOT, readText, runGit } from "./repo_util.ts";
 
+const IGNORED_INVENTORY_DIRECTORIES = new Set([".git", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv", "venv", "dist", "build", "coverage", "reports", "artifacts", "tmp"]);
+
 function isSymlink(path: string): boolean {
   try {
     return lstatSync(path).isSymbolicLink();
@@ -48,6 +50,7 @@ export function targetSymlinkPaths(root: string): Set<string> {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name);
       const relativePath = relativeDirectory ? `${relativeDirectory}/${entry.name}` : entry.name;
+      if (IGNORED_INVENTORY_DIRECTORIES.has(entry.name) || entry.name.endsWith(".egg-info")) continue;
       if (entry.isSymbolicLink()) {
         result.add(`skills/${relativePath}`);
       } else if (entry.isDirectory()) {
@@ -71,13 +74,13 @@ export function manifestInventory(path: string): Set<string> {
 type SnapshotTree = { skillNames: Set<string>; symlinkPaths: Set<string> };
 
 function snapshotTree(source: string, revision: string): SnapshotTree {
-  const result = runGit(["ls-tree", "-r", revision, "--", "skills"], resolve(source));
+  const result = runGit(["ls-tree", "-r", "-z", revision, "--", "skills"], resolve(source));
   if (result.exitCode !== 0) {
     throw new Error(`git ls-tree failed: ${result.stderr.trim()}`);
   }
   const skillNames = new Set<string>();
   const symlinkPaths = new Set<string>();
-  for (const item of result.stdout.split("\n")) {
+  for (const item of result.stdout.split("\0")) {
     const [metadata, path] = item.split("\t", 2);
     const mode = metadata?.split(/\s+/)[0] ?? "";
     if (!path) continue;
@@ -171,7 +174,7 @@ export function inspect(
   const snapshot = snapshotTree(source, revision);
   const expectedSource = snapshot.skillNames;
   const actual = targetInventory(target);
-  const sourceSymlinkPaths = snapshot.symlinkPaths;
+  const sourceSymlinkPaths = new Set([...snapshot.symlinkPaths, ...targetSymlinkPaths(source)]);
   const targetSymlinkPathsSet = targetSymlinkPaths(target);
   const publicNames = manifestInventory(publicManifest);
   const privateNames = new Set([...expectedSource].filter((name) => !publicNames.has(name)));

@@ -109,3 +109,17 @@ test("reports a nested symlink that escapes the Skill boundary", () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("rejects a public manifest that is outside the repository boundary", () => {
+  const { root } = fixture("# standalone\n");
+  const outside = join(root, "..", "agent-toolkit-manifest-outside.txt");
+  const linkedManifest = join(root, "linked-manifest.txt");
+  try {
+    writeFileSync(outside, "alpha\n");
+    symlinkSync(outside, linkedManifest);
+    expect(check(root, linkedManifest)).toEqual(["INVALID_PUBLIC_SKILLS_MANIFEST"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(outside, { force: true });
+  }
+});

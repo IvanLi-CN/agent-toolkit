@@ -78,6 +78,7 @@ function importCandidates(file: string, specifier: string): string[] {
     `${absolute}.py`,
     `${absolute}.sh`,
     `${absolute}.json`,
+    ...(extname(file).toLowerCase() === ".py" ? [join(absolute, "__init__.py")] : []),
     join(absolute, "index.ts"),
     join(absolute, "index.js"),
   ];
@@ -139,11 +140,13 @@ function memberAccess(node: ts.Expression): MemberAccess | undefined {
   return undefined;
 }
 
-function isDynamicCodeReference(node: ts.Expression): boolean {
+const DYNAMIC_CODE_NAMES = new Set(["eval", "Function"]);
+
+function isDynamicCodeReference(node: ts.Expression, aliases: Set<string> = DYNAMIC_CODE_NAMES): boolean {
   const expression = unwrapExpression(node);
-  if (ts.isIdentifier(expression)) return expression.text === "eval" || expression.text === "Function";
+  if (ts.isIdentifier(expression)) return aliases.has(expression.text);
   const access = memberAccess(expression);
-  return access?.name === "eval" || access?.name === "Function";
+  return access !== undefined && DYNAMIC_CODE_NAMES.has(access.name);
 }
 
 function isImportMetaRequire(node: ts.Expression): boolean {
@@ -239,6 +242,30 @@ function collectImportMetaAliases(source: ts.SourceFile): Set<string> {
   return aliases;
 }
 
+function collectDynamicCodeAliases(source: ts.SourceFile): Set<string> {
+  const aliases = new Set(DYNAMIC_CODE_NAMES);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    const visit = (node: ts.Node): void => {
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer &&
+        isDynamicCodeReference(node.initializer, aliases) &&
+        !aliases.has(node.name.text)) {
+        aliases.add(node.name.text);
+        changed = true;
+      } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+        ts.isIdentifier(node.left) && isDynamicCodeReference(node.right, aliases) &&
+        !aliases.has(node.left.text)) {
+        aliases.add(node.left.text);
+        changed = true;
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
+  }
+  return aliases;
+}
+
 function isRequirePropertyName(node: ts.Identifier): boolean {
   const parent = node.parent;
   return (ts.isPropertyAccessExpression(parent) && parent.name === node) ||
@@ -257,6 +284,7 @@ function javascriptImports(file: string, content: string): JavaScriptImports {
   let hasUnverifiableDynamicImport = false;
   const requireAliases = collectRequireAliases(source);
   const importMetaAliases = collectImportMetaAliases(source);
+  const dynamicCodeAliases = collectDynamicCodeAliases(source);
   const visit = (node: ts.Node): void => {
     if (ts.isImportDeclaration(node) && ts.isStringLiteralLike(node.moduleSpecifier)) {
       if (NODE_MODULE_BUILTINS.has(node.moduleSpecifier.text)) {
@@ -277,7 +305,7 @@ function javascriptImports(file: string, content: string): JavaScriptImports {
       const expression = unwrapExpression(node.expression);
       const isDynamicImport = expression.kind === ts.SyntaxKind.ImportKeyword;
       const isRequire = isRequireExpression(expression, requireAliases) || isRequireBindCall(expression, requireAliases);
-      if (isDynamicCodeReference(expression)) {
+      if (isDynamicCodeReference(expression, dynamicCodeAliases)) {
         hasUnverifiableDynamicImport = true;
       }
       if (isRequireMethodCall(expression, requireAliases)) {
@@ -300,13 +328,13 @@ function javascriptImports(file: string, content: string): JavaScriptImports {
           hasUnverifiableDynamicImport = true;
         }
       }
-    } else if (ts.isNewExpression(node) && isDynamicCodeReference(node.expression)) {
+    } else if (ts.isNewExpression(node) && isDynamicCodeReference(node.expression, dynamicCodeAliases)) {
       hasUnverifiableDynamicImport = true;
     } else if (ts.isElementAccessExpression(node) && isImportMetaReference(node.expression, importMetaAliases)) {
       if (!node.argumentExpression || !ts.isStringLiteralLike(node.argumentExpression)) {
         hasUnverifiableDynamicImport = true;
       }
-    } else if (ts.isIdentifier(node) && (node.text === "require" || node.text === "eval" || node.text === "Function") && !isRequirePropertyName(node)) {
+    } else if (ts.isIdentifier(node) && (node.text === "require" || dynamicCodeAliases.has(node.text)) && !isRequirePropertyName(node)) {
       hasUnverifiableDynamicImport = true;
     }
     ts.forEachChild(node, visit);

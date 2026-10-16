@@ -19,6 +19,7 @@ function git(cwd: string, ...args: string[]): void {
 }
 
 test("removes Git repository-selection environment overrides", () => {
+  const nullConfig = process.platform === "win32" ? "NUL" : "/dev/null";
   expect(gitEnvironment({
     GIT_DIR: "/tmp/foreign/.git",
     GIT_WORK_TREE: "/tmp/foreign",
@@ -32,6 +33,8 @@ test("removes Git repository-selection environment overrides", () => {
   })).toEqual({
     GIT_SSH_COMMAND: "ssh",
     PATH: "/usr/bin",
+    GIT_CONFIG_GLOBAL: nullConfig,
+    GIT_CONFIG_NOSYSTEM: "1",
   });
 });
 

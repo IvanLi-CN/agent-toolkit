@@ -254,8 +254,10 @@ test("rejects evaluated JavaScript loaders", () => {
     mkdirSync(join(root, "bin"), { recursive: true });
     writeFileSync(join(root, "bin", "eval.ts"), 'eval("require(\\"./hidden.ts\\")");\n');
     writeFileSync(join(root, "bin", "function.ts"), 'new Function("return require(\\"./hidden.ts\\")")();\n');
+    writeFileSync(join(root, "bin", "function-alias.ts"), 'const F = globalThis.Function; new F("return require(\\"./hidden.ts\\")")();\n');
     expect(check(root)).toEqual([
       "bin/eval.ts: dynamic import or require cannot be verified",
+      "bin/function-alias.ts: dynamic import or require cannot be verified",
       "bin/function.ts: dynamic import or require cannot be verified",
     ]);
   } finally {
@@ -315,6 +317,21 @@ test("recursively checks Python and Shell local dependencies", () => {
       "bin/helper.py: local reference targets excluded test file ./runtime_test",
       "bin/helper.sh: local reference targets excluded test file ./runtime.test.sh",
       "bin/support.py: local reference targets excluded test file ./runtime_test",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("recursively checks Python package initializers", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-python-package-"));
+  try {
+    mkdirSync(join(root, "bin", "package"), { recursive: true });
+    writeFileSync(join(root, "bin", "entry.py"), "from package import helper\n");
+    writeFileSync(join(root, "bin", "package", "__init__.py"), "import runtime_test\n");
+    writeFileSync(join(root, "bin", "package", "runtime_test.py"), "marker = 'fixture-only'\n");
+    expect(check(root)).toEqual([
+      "bin/package/__init__.py: local reference targets excluded test file ./runtime_test",
     ]);
   } finally {
     rmSync(root, { recursive: true, force: true });

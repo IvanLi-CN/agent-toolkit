@@ -43,34 +43,50 @@ export function repositorySkills(repoRoot: string): Set<string> {
   return result;
 }
 
-function scanSkillFiles(repoRoot: string, skillRoot: string): { files: string[]; rejectedSymlinks: string[] } {
+type SkillScan = { files: string[]; rejectedSymlinks: string[]; invalidPaths: string[] };
+
+function scanSkillFiles(repoRoot: string, skillRoot: string, tracked: string[] = []): SkillScan {
   const rejectedSymlinks = new Set<string>();
+  const invalidPaths = new Set<string>();
   const files = new Set(walkFiles(skillRoot, {
     ignoredDirectories: IGNORED_DIRECTORIES,
     shouldIgnoreDirectory: (_, name) => IGNORED_DIRECTORIES.has(name) || name.endsWith(".egg-info"),
     onRejectedSymlink: (path) => rejectedSymlinks.add(path),
   }));
-  try {
-    for (const path of trackedFiles(repoRoot)) {
-      const relative = relativePath(path, skillRoot);
-      if (relative && !relative.startsWith("../")) {
-        if (isPathInside(repoRoot, path) && isDirectRegularFile(path)) files.add(path);
-        else rejectedSymlinks.add(path);
+  for (const path of tracked) {
+    const relative = relativePath(path, skillRoot);
+    if (relative && !relative.startsWith("../")) {
+      if (!isPathInside(repoRoot, path)) {
+        rejectedSymlinks.add(path);
+      } else if (isDirectRegularFile(path)) {
+        files.add(path);
+      } else {
+        invalidPaths.add(path);
       }
     }
-  } catch {
-    // Synthetic fixtures need no Git index; ordinary filesystem traversal remains sufficient there.
   }
   for (const path of [...files]) {
     if (!isDirectRegularFile(path)) {
       files.delete(path);
-      rejectedSymlinks.add(path);
+      invalidPaths.add(path);
     }
   }
   return {
     files: [...files].sort((left, right) => left < right ? -1 : left > right ? 1 : 0),
     rejectedSymlinks: [...rejectedSymlinks].sort(),
+    invalidPaths: [...invalidPaths].sort(),
   };
+}
+
+function loadTrackedFiles(repoRoot: string): { paths: string[]; error?: string } {
+  try {
+    return { paths: trackedFiles(repoRoot) };
+  } catch (error) {
+    if (existsSync(join(repoRoot, ".git"))) {
+      return { paths: [], error: String(error) };
+    }
+    return { paths: [] };
+  }
 }
 
 export function check(repoRoot: string = REPO_ROOT, manifest: string = PUBLIC_MANIFEST): string[] {
@@ -100,6 +116,10 @@ export function check(repoRoot: string = REPO_ROOT, manifest: string = PUBLIC_MA
     return findings;
   }
 
+  const tracked = loadTrackedFiles(repoRoot);
+  if (tracked.error) {
+    findings.push(`TRACKED_FILE_ENUMERATION_ERROR ${tracked.error}`);
+  }
   const actual = repositorySkills(repoRoot);
   const listed = new Set(names);
   for (const name of [...actual].filter((name) => !listed.has(name)).sort()) {
@@ -134,8 +154,15 @@ export function check(repoRoot: string = REPO_ROOT, manifest: string = PUBLIC_MA
       findings.push(`MISSING_PUBLIC_SKILL ${name}`);
       continue;
     }
-    const scanned = scanSkillFiles(repoRoot, skillRoot);
-    for (const path of scanned.files.filter((path) => isDirectRegularFile(path) && isPathInside(repoRoot, path))) {
+    const scanned = scanSkillFiles(repoRoot, skillRoot, tracked.paths);
+    for (const path of scanned.invalidPaths) {
+      findings.push(`PUBLIC_SKILL_FILE_CHANGED_DURING_VALIDATION ${relativePath(path, repoRoot)}`);
+    }
+    for (const path of scanned.files) {
+      if (!isPathInside(repoRoot, path) || !isDirectRegularFile(path)) {
+        findings.push(`PUBLIC_SKILL_FILE_CHANGED_DURING_VALIDATION ${relativePath(path, repoRoot)}`);
+        continue;
+      }
       const relative = relativePath(path, repoRoot);
       if (path.split(/[\\/]/).at(-2) === "references" && PRIVATE_REFERENCE_NAMES.has(path.split(/[\\/]/).at(-1) ?? "")) {
         findings.push(`${relative}: private operator reference must stay outside repository`);

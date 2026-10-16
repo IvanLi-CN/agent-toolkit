@@ -41,9 +41,10 @@ bun run test:skills
 
 The test runner discovers maintained TypeScript, Python, and Shell test files automatically, so a new Skill can add a focused test without editing a root test list. It rejects empty or non-declarative Bun/Python test files before execution; Shell tests must include an assertion command and print a positive `TESTS_RUN=<count>` marker. Skill tests that exercise the XP policy require Ruby with its standard YAML library; Python-facing tests use `requirements-dev.txt`. The runner fails when a requested scope has no selected tests instead of reporting a false pass.
 
-During a source migration, compare the public allowlist with the source snapshot and verify that private consumer Skills remain in the private source tree:
+During a source migration, compare the public allowlist with the source snapshot and verify that private consumer Skills remain in the private source tree. The inventory check rejects duplicate or invalid public manifest names before comparing the source snapshot and target checkout:
 
 ```bash
+
 bun run bin/source_target_inventory_check.ts \
   --source-root /path/to/dot-codex \
   --source-revision <migration-source-revision>

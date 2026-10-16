@@ -18,8 +18,10 @@ export const FORBIDDEN_PATTERNS: Array<[string, RegExp]> = [
   ["private-consumer-root", new RegExp(`(?:~\\/\\.agents\\/skills|${privateRootPattern})`, "i")],
 ];
 
-const RELATIVE_IMPORT = /(?:from\s*|import\s*(?:\(\s*)?|require\s*\()["'](\.{1,2}[\\/][^"']+)["']/g;
-const ABSOLUTE_IMPORT = /(?:from\s*|import\s*(?:\(\s*)?|require\s*\()["']((?:file:\/\/|\/|\\\\|[A-Za-z]:[\\/])[^"']+)["']/g;
+const IMPORT_GAP = String.raw`(?:\s|/\*[\s\S]*?\*/|//[^\r\n]*(?:\r\n|\r|\n))*`;
+const IMPORT_PREFIX = String.raw`(?:\bfrom${IMPORT_GAP}|\bimport${IMPORT_GAP}(?:\(${IMPORT_GAP})?|\brequire${IMPORT_GAP}\(${IMPORT_GAP})`;
+const RELATIVE_IMPORT = new RegExp(`${IMPORT_PREFIX}["'](\.{1,2}[\\/][^"']+)["']`, "g");
+const ABSOLUTE_IMPORT = new RegExp(`${IMPORT_PREFIX}["']((?:file:\/\/|\/|\\\\|[A-Za-z]:[\\\\/])[^"']+)["']`, "g");
 const EXCLUDED_TEST_FILE = /(?:\.test\.(?:ts|tsx|js|py|sh)$|^test[-_].*\.(?:ts|tsx|js|py|sh)$|_test\.(?:ts|tsx|js|py|sh)$)/;
 const PUBLIC_TOOL_EXTENSIONS = [".ts", ".tsx", ".js", ".py", ".sh"];
 

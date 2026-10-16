@@ -82,7 +82,14 @@ function loadTrackedFiles(repoRoot: string): { paths: string[]; error?: string }
   try {
     return { paths: trackedFiles(repoRoot) };
   } catch (error) {
-    if (existsSync(join(repoRoot, ".git"))) {
+    let hasGitMetadata = false;
+    try {
+      lstatSync(join(repoRoot, ".git"));
+      hasGitMetadata = true;
+    } catch (metadataError) {
+      hasGitMetadata = (metadataError as NodeJS.ErrnoException).code !== "ENOENT";
+    }
+    if (hasGitMetadata) {
       return { paths: [], error: String(error) };
     }
     return { paths: [] };

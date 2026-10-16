@@ -151,6 +151,16 @@ test("rejects a public manifest that is outside the repository boundary", () => 
   }
 });
 
+test("fails closed when Git metadata is a dangling symlink", () => {
+  const { root, manifest } = fixture("# standalone\n");
+  try {
+    symlinkSync(join(root, "missing-git"), join(root, ".git"), "file");
+    expect(check(root, manifest).some((finding) => finding.startsWith("TRACKED_FILE_ENUMERATION_ERROR "))).toBe(true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("rejects unsupported public-Skill-boundary CLI options", () => {
   expect(main(["--unknown"])).toBe(2);
 });

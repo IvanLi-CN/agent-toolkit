@@ -65,22 +65,35 @@ export function targetSymlinkPaths(root: string): Set<string> {
 
 export function targetGitlinkPaths(root: string): Set<string> {
   const target = resolve(root);
-  const topLevel = runGit(["rev-parse", "--show-toplevel"], target);
-  if (topLevel.exitCode !== 0) return new Set();
   try {
-    if (realpathSync(topLevel.stdout.trim()) !== realpathSync(target)) return new Set();
-  } catch {
-    return new Set();
+    lstatSync(join(target, ".git"));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return new Set();
+    throw new Error(`cannot inspect target Git metadata: ${String(error)}`);
+  }
+  const topLevel = runGit(["rev-parse", "--show-toplevel"], target);
+  if (topLevel.exitCode !== 0) {
+    throw new Error(`git rev-parse failed for target: ${topLevel.stderr.trim()}`);
+  }
+  try {
+    if (realpathSync(topLevel.stdout.trim()) !== realpathSync(target)) {
+      throw new Error(`target is not a Git repository root: ${target}`);
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("target is not a Git repository root:")) throw error;
+    throw new Error(`cannot resolve target Git root: ${String(error)}`);
   }
   const result = runGit(["ls-files", "-s", "-z", "--", "skills"], target);
-  if (result.exitCode !== 0) return new Set();
+  if (result.exitCode !== 0) {
+    throw new Error(`git ls-files failed for target: ${result.stderr.trim()}`);
+  }
   const paths = new Set<string>();
   for (const item of result.stdout.split("\0")) {
     const separator = item.indexOf("\t");
     if (separator < 0) continue;
     const mode = item.slice(0, separator).split(/\s+/)[0] ?? "";
     const path = item.slice(separator + 1);
-    if (mode === "160000" && path.startsWith("skills/")) paths.add(path);
+    if (mode === "160000" && (path === "skills" || path.startsWith("skills/"))) paths.add(path);
   }
   return paths;
 }

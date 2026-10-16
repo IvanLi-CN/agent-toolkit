@@ -195,6 +195,22 @@ function isRequireMethodCall(node: ts.Expression, aliases: Set<string>): boolean
   return (access?.name === "apply" || access?.name === "bind" || access?.name === "call") && isRequireExpression(access.receiver, aliases);
 }
 
+function staticPropertyName(node: ts.PropertyName | undefined): string | undefined {
+  if (!node) return undefined;
+  if (ts.isIdentifier(node) || ts.isStringLiteralLike(node) || ts.isNumericLiteral(node)) return node.text;
+  if (ts.isComputedPropertyName(node) && ts.isStringLiteralLike(node.expression)) return node.expression.text;
+  return undefined;
+}
+
+function assignmentTargetName(node: ts.Expression): string | undefined {
+  const expression = unwrapExpression(node);
+  if (ts.isIdentifier(expression)) return expression.text;
+  if (ts.isBinaryExpression(expression) && expression.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+    return assignmentTargetName(expression.left);
+  }
+  return undefined;
+}
+
 function isModuleContainerReference(node: ts.Expression, importMetaAliases: Set<string>, moduleAliases: Set<string>): boolean {
   const expression = unwrapExpression(node);
   return isImportMetaReference(expression, importMetaAliases) || (ts.isIdentifier(expression) && moduleAliases.has(expression.text));
@@ -207,8 +223,7 @@ function requireBindingNames(name: ts.BindingName, initializer: ts.Expression, i
   const names: string[] = [];
   for (const element of name.elements) {
     if (!ts.isBindingElement(element) || !ts.isIdentifier(element.name)) continue;
-    const propertyName = element.propertyName;
-    const propertyText = propertyName && ts.isStringLiteralLike(propertyName) ? propertyName.text : propertyName && ts.isIdentifier(propertyName) ? propertyName.text : element.name.text;
+    const propertyText = staticPropertyName(element.propertyName) ?? (element.propertyName ? undefined : element.name.text);
     if (propertyText === "require") names.push(element.name.text);
   }
   return names;
@@ -220,9 +235,10 @@ function requireAssignmentNames(left: ts.Expression, initializer: ts.Expression,
   if (!ts.isObjectLiteralExpression(expression)) return [];
   const names: string[] = [];
   for (const property of expression.properties) {
-    if (ts.isPropertyAssignment(property) && ts.isIdentifier(property.initializer)) {
-      const propertyName = ts.isStringLiteralLike(property.name) ? property.name.text : ts.isIdentifier(property.name) ? property.name.text : "";
-      if (propertyName === "require") names.push(property.initializer.text);
+    if (ts.isPropertyAssignment(property)) {
+      const propertyName = staticPropertyName(property.name);
+      const targetName = assignmentTargetName(property.initializer);
+      if (propertyName === "require" && targetName) names.push(targetName);
     } else if (ts.isShorthandPropertyAssignment(property) && property.name.text === "require") {
       names.push(property.name.text);
     }
@@ -286,12 +302,34 @@ function collectImportMetaAliases(source: ts.SourceFile): Set<string> {
         !aliases.has(node.name.text)) {
         aliases.add(node.name.text);
         changed = true;
+      } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+        ts.isIdentifier(node.left) && isImportMetaReference(node.right, aliases) &&
+        !aliases.has(node.left.text)) {
+        aliases.add(node.left.text);
+        changed = true;
       }
       ts.forEachChild(node, visit);
     };
     visit(source);
   }
   return aliases;
+}
+
+function dynamicCodeAssignmentNames(left: ts.Expression, initializer: ts.Expression, globalAliases: Set<string>): string[] {
+  if (!isGlobalObjectReference(initializer, globalAliases)) return [];
+  const expression = unwrapExpression(left);
+  if (!ts.isObjectLiteralExpression(expression)) return [];
+  const names: string[] = [];
+  for (const property of expression.properties) {
+    if (ts.isPropertyAssignment(property)) {
+      const propertyName = staticPropertyName(property.name);
+      const targetName = assignmentTargetName(property.initializer);
+      if (propertyName && DYNAMIC_CODE_NAMES.has(propertyName) && targetName) names.push(targetName);
+    } else if (ts.isShorthandPropertyAssignment(property) && DYNAMIC_CODE_NAMES.has(property.name.text)) {
+      names.push(property.name.text);
+    }
+  }
+  return names;
 }
 
 function collectDynamicCodeAliases(source: ts.SourceFile): Set<string> {
@@ -313,9 +351,8 @@ function collectDynamicCodeAliases(source: ts.SourceFile): Set<string> {
         if (ts.isObjectBindingPattern(node.name) && isGlobalObjectReference(node.initializer, globalAliases)) {
           for (const element of node.name.elements) {
             if (!ts.isBindingElement(element) || !ts.isIdentifier(element.name)) continue;
-            const propertyName = element.propertyName;
-            const propertyText = propertyName && ts.isStringLiteralLike(propertyName) ? propertyName.text : propertyName && ts.isIdentifier(propertyName) ? propertyName.text : element.name.text;
-            if (DYNAMIC_CODE_NAMES.has(propertyText) && !aliases.has(element.name.text)) {
+            const propertyText = staticPropertyName(element.propertyName) ?? (element.propertyName ? undefined : element.name.text);
+            if (propertyText !== undefined && DYNAMIC_CODE_NAMES.has(propertyText) && !aliases.has(element.name.text)) {
               aliases.add(element.name.text);
               changed = true;
             }
@@ -326,11 +363,18 @@ function collectDynamicCodeAliases(source: ts.SourceFile): Set<string> {
         !aliases.has(node.left.text)) {
         aliases.add(node.left.text);
         changed = true;
-      } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
-        ts.isIdentifier(node.left) && isGlobalObjectReference(node.right, globalAliases) &&
-        !globalAliases.has(node.left.text)) {
-        globalAliases.add(node.left.text);
-        changed = true;
+      } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+        if (ts.isIdentifier(node.left) && isGlobalObjectReference(node.right, globalAliases) &&
+          !globalAliases.has(node.left.text)) {
+          globalAliases.add(node.left.text);
+          changed = true;
+        }
+        for (const name of dynamicCodeAssignmentNames(node.left, node.right, globalAliases)) {
+          if (!aliases.has(name)) {
+            aliases.add(name);
+            changed = true;
+          }
+        }
       }
       ts.forEachChild(node, visit);
     };
@@ -537,8 +581,13 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
           const moduleSpecifier = match[1];
           const importedNames = match[2];
           if (moduleSpecifier && importedNames) {
-            for (const specifier of pythonRelativeSpecifiers(moduleSpecifier, importedNames)) {
+            const specifiers = pythonRelativeSpecifiers(moduleSpecifier, importedNames);
+            const moduleName = moduleSpecifier.replace(/^\.+/, "");
+            const moduleSpecifierPath = moduleName ? specifiers[0] : undefined;
+            for (const specifier of specifiers) {
               if (resolveExistingFile(importCandidates(path, specifier))) {
+                checkImportSpecifier(repoRoot, path, relative, specifier, findings, enqueue);
+              } else if (specifier === moduleSpecifierPath) {
                 checkImportSpecifier(repoRoot, path, relative, specifier, findings, enqueue);
               }
             }

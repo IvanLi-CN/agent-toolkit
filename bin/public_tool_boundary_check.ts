@@ -30,6 +30,11 @@ const NODE_MODULE_BUILTINS = new Set(["module", "node:module"]);
 const RELATIVE_SPECIFIER = /^\.{1,2}[\\/]/;
 const ABSOLUTE_SPECIFIER = /^(?:file:\/\/|\/|\\|[A-Za-z]:[\\/])/;
 
+function isExcludedTestPath(path: string): boolean {
+  const name = path.split(/[\\/]/).at(-1) ?? "";
+  return EXCLUDED_TEST_FILE.test(name);
+}
+
 function collectPublicToolFiles(repoRoot: string): { files: string[]; rejectedSymlinks: string[] } {
   const rejectedSymlinks: string[] = [];
   const files = walkFiles(join(repoRoot, "bin"), {
@@ -94,6 +99,7 @@ function javascriptImports(file: string, content: string): JavaScriptImports {
   const source = ts.createSourceFile(file, content, ts.ScriptTarget.Latest, true, scriptKind);
   const specifiers: string[] = [];
   let hasUnverifiableDynamicImport = false;
+  const requireAliases = new Set(["require"]);
   const visit = (node: ts.Node): void => {
     if (ts.isImportDeclaration(node) && ts.isStringLiteralLike(node.moduleSpecifier)) {
       if (NODE_MODULE_BUILTINS.has(node.moduleSpecifier.text)) {
@@ -101,12 +107,20 @@ function javascriptImports(file: string, content: string): JavaScriptImports {
       }
       specifiers.push(node.moduleSpecifier.text);
     } else if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteralLike(node.moduleSpecifier)) {
+      if (NODE_MODULE_BUILTINS.has(node.moduleSpecifier.text)) {
+        hasUnverifiableDynamicImport = true;
+      }
       specifiers.push(node.moduleSpecifier.text);
     } else if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference) && node.moduleReference.expression && ts.isStringLiteralLike(node.moduleReference.expression)) {
       specifiers.push(node.moduleReference.expression.text);
+    } else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer && ts.isIdentifier(node.initializer) && requireAliases.has(node.initializer.text)) {
+      requireAliases.add(node.name.text);
     } else if (ts.isCallExpression(node)) {
       const isDynamicImport = node.expression.kind === ts.SyntaxKind.ImportKeyword;
-      const isRequire = ts.isIdentifier(node.expression) && node.expression.text === "require";
+      const isImportMetaRequire = ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === "require" &&
+        ts.isMetaProperty(node.expression.expression) && node.expression.expression.keywordToken === ts.SyntaxKind.ImportKeyword &&
+        node.expression.expression.name.text === "meta";
+      const isRequire = (ts.isIdentifier(node.expression) && requireAliases.has(node.expression.text)) || isImportMetaRequire;
       const isCreateRequire = (ts.isIdentifier(node.expression) && node.expression.text === "createRequire") ||
         (ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === "createRequire");
       if (isCreateRequire) {
@@ -140,8 +154,11 @@ function checkImportSpecifier(repoRoot: string, path: string, relative: string, 
     const existing = resolveExistingFile(candidates);
     if (existing) {
       try {
-        if (!isInside(repoRoot, realpathSync(existing))) {
+        const realExisting = realpathSync(existing);
+        if (!isInside(repoRoot, realExisting)) {
           findings.push(`${relative}: local reference resolves outside public repository ${specifier}`);
+        } else if (isExcludedTestPath(existing) || isExcludedTestPath(realExisting)) {
+          findings.push(`${relative}: local reference targets excluded test file ${specifier}`);
         }
       } catch {
         findings.push(`${relative}: unreadable local reference ${specifier}`);
@@ -161,8 +178,13 @@ function checkImportSpecifier(repoRoot: string, path: string, relative: string, 
     const existing = resolveExistingFile(importCandidates(path, absolute));
     if (!existing) {
       findings.push(`${relative}: missing local reference ${specifier}`);
-    } else if (!isInside(repoRoot, realpathSync(existing))) {
-      findings.push(`${relative}: local reference resolves outside public repository ${specifier}`);
+    } else {
+      const realExisting = realpathSync(existing);
+      if (!isInside(repoRoot, realExisting)) {
+        findings.push(`${relative}: local reference resolves outside public repository ${specifier}`);
+      } else if (isExcludedTestPath(existing) || isExcludedTestPath(realExisting)) {
+        findings.push(`${relative}: local reference targets excluded test file ${specifier}`);
+      }
     }
   } catch {
     findings.push(`${relative}: unreadable local reference ${specifier}`);

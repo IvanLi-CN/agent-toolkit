@@ -24,6 +24,7 @@ const IMPORT_PREFIX = String.raw`(?:\bfrom${IMPORT_GAP}|\bimport${IMPORT_GAP}(?:
 const RELATIVE_IMPORT = new RegExp(String.raw`${IMPORT_PREFIX}["'](\.{1,2}[\\/][^"']+)["']`, "g");
 const ABSOLUTE_IMPORT = new RegExp(String.raw`${IMPORT_PREFIX}["']((?:file://|/|\\|[A-Za-z]:[\\/])[^"']+)["']`, "g");
 const PYTHON_RELATIVE_IMPORT = /\bfrom\s+(\.+[A-Za-z_][A-Za-z0-9_.]*|\.+)\s+import\s+\(?\s*([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*\)?/g;
+const PYTHON_FROM_IMPORT = /\bfrom\s+([A-Za-z_][A-Za-z0-9_.]*)\s+import\s+\(?\s*([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*\)?/g;
 const PYTHON_LOCAL_IMPORT = /(?:^[ \t]*|;[ \t]*)import\s+([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)/gm;
 const SHELL_SOURCE_IMPORT = /(?:^[ \t]*|[;&|][ \t]*|then[ \t]+)(?:source\b|\.)\s+(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\s;|]+))/gm;
 const EXCLUDED_TEST_FILE = /(?:\.test\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$|^test[-_].*\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$|_test\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$)/;
@@ -136,6 +137,13 @@ function memberAccess(node: ts.Expression): MemberAccess | undefined {
     return { receiver: expression.expression, name: expression.argumentExpression.text };
   }
   return undefined;
+}
+
+function isDynamicCodeReference(node: ts.Expression): boolean {
+  const expression = unwrapExpression(node);
+  if (ts.isIdentifier(expression)) return expression.text === "eval" || expression.text === "Function";
+  const access = memberAccess(expression);
+  return access?.name === "eval" || access?.name === "Function";
 }
 
 function isImportMetaRequire(node: ts.Expression): boolean {
@@ -269,6 +277,9 @@ function javascriptImports(file: string, content: string): JavaScriptImports {
       const expression = unwrapExpression(node.expression);
       const isDynamicImport = expression.kind === ts.SyntaxKind.ImportKeyword;
       const isRequire = isRequireExpression(expression, requireAliases) || isRequireBindCall(expression, requireAliases);
+      if (isDynamicCodeReference(expression)) {
+        hasUnverifiableDynamicImport = true;
+      }
       if (isRequireMethodCall(expression, requireAliases)) {
         hasUnverifiableDynamicImport = true;
       }
@@ -289,11 +300,13 @@ function javascriptImports(file: string, content: string): JavaScriptImports {
           hasUnverifiableDynamicImport = true;
         }
       }
+    } else if (ts.isNewExpression(node) && isDynamicCodeReference(node.expression)) {
+      hasUnverifiableDynamicImport = true;
     } else if (ts.isElementAccessExpression(node) && isImportMetaReference(node.expression, importMetaAliases)) {
       if (!node.argumentExpression || !ts.isStringLiteralLike(node.argumentExpression)) {
         hasUnverifiableDynamicImport = true;
       }
-    } else if (ts.isIdentifier(node) && node.text === "require" && !isRequirePropertyName(node)) {
+    } else if (ts.isIdentifier(node) && (node.text === "require" || node.text === "eval" || node.text === "Function") && !isRequirePropertyName(node)) {
       hasUnverifiableDynamicImport = true;
     }
     ts.forEachChild(node, visit);
@@ -425,6 +438,22 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
           if (moduleSpecifier && importedNames) {
             for (const specifier of pythonRelativeSpecifiers(moduleSpecifier, importedNames)) {
               checkImportSpecifier(repoRoot, path, relative, specifier, findings, enqueue);
+            }
+          }
+        }
+        for (const match of content.matchAll(PYTHON_FROM_IMPORT)) {
+          const moduleName = match[1];
+          const importedNames = match[2];
+          if (moduleName && importedNames) {
+            const modulePath = moduleName.replaceAll(".", "/");
+            const specifiers = [`./${modulePath}`];
+            for (const name of importedNames.split(",").map((item) => item.trim().split(/\s+as\s+/i)[0]).filter(Boolean)) {
+              specifiers.push(`./${modulePath}/${name}`);
+            }
+            for (const specifier of specifiers) {
+              if (resolveExistingFile(importCandidates(path, specifier))) {
+                checkImportSpecifier(repoRoot, path, relative, specifier, findings, enqueue);
+              }
             }
           }
         }

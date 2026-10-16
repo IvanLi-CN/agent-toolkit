@@ -13,7 +13,7 @@ const REGEX_HELPER_ASSIGNMENT = new RegExp(String.raw`^[ \t]*(?:local[ \t]+)?(?:
 const COMPOUND_ASSIGNMENT = new RegExp(String.raw`(?<![A-Za-z0-9_-])(?<name>[A-Za-z0-9_-]+)\s*=\s*['"]${SECRET_VALUE}['"]`, "i");
 const JSON_SECRET_FIELD = new RegExp(String.raw`["'](?<name>[A-Za-z0-9_-]+)["']\s*:\s*["']${SECRET_VALUE}["']`, "i");
 const QUOTED_SECRET_FIELD = new RegExp(String.raw`(?<![A-Za-z0-9_-])(?<name>${COMPOUND_SECRET_NAME})\s*:\s*["']${SECRET_VALUE}["']`, "i");
-const YAML_BLOCK_SECRET_FIELD = new RegExp(String.raw`(?<![A-Za-z0-9_-])(?<name>${COMPOUND_SECRET_NAME})\s*:\s*[|>]\s*[-+]?\s*\r?\n[ \t]+${UNQUOTED_SECRET_VALUE}`, "i");
+const YAML_BLOCK_SECRET_FIELD = new RegExp(String.raw`(?<![A-Za-z0-9_-])(?<name>${COMPOUND_SECRET_NAME})\s*:\s*[|>][ \t]*(?:[1-9][-+]?|[-+]?[1-9]|[-+])?[ \t]*(?:#[^\r\n]*)?\r?\n[ \t]+${UNQUOTED_SECRET_VALUE}`, "i");
 const UNQUOTED_SECRET_ASSIGNMENT = new RegExp(String.raw`(?<![A-Za-z0-9_-])(?<name>${COMPOUND_SECRET_NAME})\s*[:=]\s*${UNQUOTED_SECRET_VALUE}(?![A-Za-z0-9._~+/=-])`, "i");
 const PRIVATE_KEY_BLOCK = /-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----\r?\n(?:[ \t]*[A-Za-z0-9+/]{40,}={0,2}\r?\n(?:[ \t]*[A-Za-z0-9+/]{1,128}={0,2}\r?\n)*)[ \t]*-----END [A-Z0-9 _-]*PRIVATE KEY-----/;
 const CREDENTIAL_URL = /\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s:@]+:[^@\s]{16,}@/i;
@@ -58,7 +58,8 @@ function isSimpleSecretField(name: string): boolean {
 
 export function isRegexHelperAssignment(content: string, match: RegExpExecArray): boolean {
   const name = match.groups?.name ?? "";
-  return REGEX_HELPER_ASSIGNMENT.test(`${name}=`) && /[([|]/.test(match[0]) && !/[0-9a-f]{16,}/i.test(match[0]);
+  const hasRegexOperator = /(?:\||\[[^\]\r\n]*\]|\\.|[?+*]|\{\d+(?:,\d*)?\})/.test(match[0]);
+  return REGEX_HELPER_ASSIGNMENT.test(`${name}=`) && hasRegexOperator && !/[0-9a-f]{16,}/i.test(match[0]);
 }
 
 function matchesPattern(label: string, pattern: RegExp, content: string): boolean {

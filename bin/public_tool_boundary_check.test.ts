@@ -248,6 +248,21 @@ test("rejects executable module URLs", () => {
   }
 });
 
+test("rejects evaluated JavaScript loaders", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-eval-"));
+  try {
+    mkdirSync(join(root, "bin"), { recursive: true });
+    writeFileSync(join(root, "bin", "eval.ts"), 'eval("require(\\"./hidden.ts\\")");\n');
+    writeFileSync(join(root, "bin", "function.ts"), 'new Function("return require(\\"./hidden.ts\\")")();\n');
+    expect(check(root)).toEqual([
+      "bin/eval.ts: dynamic import or require cannot be verified",
+      "bin/function.ts: dynamic import or require cannot be verified",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("rejects production tools that import excluded test files", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-test-import-"));
   try {
@@ -288,6 +303,8 @@ test("recursively checks Python and Shell local dependencies", () => {
     writeFileSync(join(root, "bin", "entry.py"), "from . import helper\nfrom . import (runtime_test)\n");
     writeFileSync(join(root, "bin", "entry_direct.py"), "import runtime_test\n");
     writeFileSync(join(root, "bin", "helper.py"), "from . import runtime_test\n");
+    writeFileSync(join(root, "bin", "entry_from.py"), "from support import helper\n");
+    writeFileSync(join(root, "bin", "support.py"), "import runtime_test\n");
     writeFileSync(join(root, "bin", "runtime_test.py"), "marker = 'fixture-only'\n");
     writeFileSync(join(root, "bin", "entry.sh"), "  source ./helper.sh\n");
     writeFileSync(join(root, "bin", "helper.sh"), "if true; then\n  . ./runtime.test.sh\nfi\n");
@@ -297,6 +314,7 @@ test("recursively checks Python and Shell local dependencies", () => {
       "bin/entry_direct.py: local reference targets excluded test file ./runtime_test",
       "bin/helper.py: local reference targets excluded test file ./runtime_test",
       "bin/helper.sh: local reference targets excluded test file ./runtime.test.sh",
+      "bin/support.py: local reference targets excluded test file ./runtime_test",
     ]);
   } finally {
     rmSync(root, { recursive: true, force: true });

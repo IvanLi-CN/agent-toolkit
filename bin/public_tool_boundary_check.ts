@@ -24,10 +24,11 @@ const IMPORT_PREFIX = String.raw`(?:\bfrom${IMPORT_GAP}|\bimport${IMPORT_GAP}(?:
 const RELATIVE_IMPORT = new RegExp(String.raw`${IMPORT_PREFIX}["'](\.{1,2}[\\/][^"']+)["']`, "g");
 const ABSOLUTE_IMPORT = new RegExp(String.raw`${IMPORT_PREFIX}["']((?:file://|/|\\|[A-Za-z]:[\\/])[^"']+)["']`, "g");
 const PYTHON_NAME = String.raw`[A-Za-z_][A-Za-z0-9_]*`;
-const PYTHON_IMPORTED_NAME = String.raw`${PYTHON_NAME}(?:\s+as\s+${PYTHON_NAME})?`;
-const PYTHON_IMPORTED_NAMES = String.raw`(?:${PYTHON_IMPORTED_NAME}|\*)(?:\s*,\s*${PYTHON_IMPORTED_NAME})*`;
-const PYTHON_RELATIVE_IMPORT = new RegExp(String.raw`\bfrom\s+(\.+${PYTHON_NAME}(?:\.${PYTHON_NAME})*|\.+)\s+import\s+\(?\s*(${PYTHON_IMPORTED_NAMES})(?:\s*,\s*)?\)?`, "g");
-const PYTHON_FROM_IMPORT = new RegExp(String.raw`\bfrom\s+(${PYTHON_NAME}(?:\.${PYTHON_NAME})*)\s+import\s+\(?\s*(${PYTHON_IMPORTED_NAMES})(?:\s*,\s*)?\)?`, "g");
+const PYTHON_IMPORT_GAP = String.raw`(?:[ \t\r\n]|#[^\r\n]*(?:\r\n|\r|\n))*`;
+const PYTHON_IMPORTED_NAME = String.raw`${PYTHON_NAME}(?:${PYTHON_IMPORT_GAP}as${PYTHON_IMPORT_GAP}${PYTHON_NAME})?`;
+const PYTHON_IMPORTED_NAMES = String.raw`(?:${PYTHON_IMPORTED_NAME}|\*)(?:${PYTHON_IMPORT_GAP},${PYTHON_IMPORT_GAP}(?:${PYTHON_IMPORTED_NAME}|\*))*`;
+const PYTHON_RELATIVE_IMPORT = new RegExp(String.raw`\bfrom${PYTHON_IMPORT_GAP}(\.+${PYTHON_NAME}(?:\.${PYTHON_NAME})*|\.+)${PYTHON_IMPORT_GAP}import${PYTHON_IMPORT_GAP}\(?${PYTHON_IMPORT_GAP}(${PYTHON_IMPORTED_NAMES})${PYTHON_IMPORT_GAP},?${PYTHON_IMPORT_GAP}\)?`, "g");
+const PYTHON_FROM_IMPORT = new RegExp(String.raw`\bfrom${PYTHON_IMPORT_GAP}(${PYTHON_NAME}(?:\.${PYTHON_NAME})*)${PYTHON_IMPORT_GAP}import${PYTHON_IMPORT_GAP}\(?${PYTHON_IMPORT_GAP}(${PYTHON_IMPORTED_NAMES})${PYTHON_IMPORT_GAP},?${PYTHON_IMPORT_GAP}\)?`, "g");
 const PYTHON_LOCAL_IMPORT = new RegExp(String.raw`(?:^[ \t]*|[;:][ \t]*)import\s+(${PYTHON_NAME}(?:\.${PYTHON_NAME})*(?:\s+as\s+${PYTHON_NAME})?(?:\s*,\s*${PYTHON_NAME}(?:\.${PYTHON_NAME})*(?:\s+as\s+${PYTHON_NAME})?)*)(?:\s*,\s*)?`, "gm");
 const SHELL_SOURCE_IMPORT = /(?:^[ \t]*|[;&|][ \t]*|then[ \t]+)(?:source\b|\.)\s+(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\s;|]+))/gm;
 const EXCLUDED_TEST_FILE = /(?:\.test\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$|^test[-_].*\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$|_test\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$)/;
@@ -48,7 +49,7 @@ function pythonRelativeSpecifiers(moduleSpecifier: string, importedNames: string
   const dotCount = moduleSpecifier.match(/^\.+/)?.[0].length ?? 0;
   const moduleName = moduleSpecifier.slice(dotCount).replaceAll(".", "/");
   const prefix = dotCount === 1 ? "./" : "../".repeat(dotCount - 1);
-  const names = importedNames.split(",").map((name) => name.trim().split(/\s+as\s+/i)[0]).filter(Boolean);
+  const names = pythonImportedNames(importedNames);
   return moduleName
     ? [`${prefix}${moduleName}`, ...names.map((name) => `${prefix}${moduleName}/${name}`)]
     : names.map((name) => `${prefix}${name}`);
@@ -100,8 +101,9 @@ function pythonImportCandidates(file: string, specifier: string): string[] {
 
 function pythonImportedNames(importedNames: string): string[] {
   return importedNames
+    .replace(/#[^\r\n]*(?:\r\n|\r|\n|$)/g, "\n")
     .split(",")
-    .map((name) => name.trim().split(/\s+as\s+/i)[0])
+    .map((name) => name.trim().split(/\s+as\s+/i)[0]?.trim() ?? "")
     .filter(Boolean);
 }
 
@@ -144,6 +146,17 @@ function pythonModuleInitializer(file: string, specifier: string): string | unde
   return isDirectRegularFile(initializer) ? initializer : undefined;
 }
 
+function pythonNamespaceDirectory(repoRoot: string, file: string, specifier: string): string | undefined {
+  const directory = resolve(dirname(file), specifier.replaceAll("\\", "/"));
+  if (!isInside(repoRoot, directory)) return undefined;
+  try {
+    if (lstatSync(directory).isDirectory() && !isDirectRegularFile(join(directory, "__init__.py"))) return directory;
+  } catch {
+    // Missing namespace directories are reported by the normal Python resolver.
+  }
+  return undefined;
+}
+
 function isInside(root: string, candidate: string): boolean {
   if (/^(?:[A-Za-z]:[\\/]|\\)/.test(candidate)) return false;
   const absoluteRoot = resolve(root);
@@ -184,6 +197,9 @@ function isImportMeta(node: ts.Expression | undefined): boolean {
 
 function isImportMetaReference(node: ts.Expression, aliases: Set<string>): boolean {
   const expression = unwrapExpression(node);
+  if (ts.isBinaryExpression(expression) && expression.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+    return isImportMetaReference(expression.right, aliases);
+  }
   return isImportMeta(expression) || (ts.isIdentifier(expression) && aliases.has(expression.text));
 }
 
@@ -212,6 +228,9 @@ function isDynamicCodeReference(node: ts.Expression, aliases: Set<string> = DYNA
 
 function isGlobalObjectReference(node: ts.Expression, aliases: Set<string>): boolean {
   const expression = unwrapExpression(node);
+  if (ts.isBinaryExpression(expression) && (expression.operatorToken.kind === ts.SyntaxKind.EqualsToken || expression.operatorToken.kind === ts.SyntaxKind.CommaToken)) {
+    return isGlobalObjectReference(expression.right, aliases);
+  }
   return ts.isIdentifier(expression) && aliases.has(expression.text);
 }
 
@@ -296,6 +315,18 @@ function hasUnverifiableImportMetaAssignment(left: ts.Expression, initializer: t
   return expression.properties.some((property) => ts.isPropertyAssignment(property) && ts.isComputedPropertyName(property.name) && staticPropertyName(property.name) === undefined);
 }
 
+function hasUnverifiableGlobalBinding(name: ts.BindingName, initializer: ts.Expression, aliases: Set<string>): boolean {
+  if (!isGlobalObjectReference(initializer, aliases) || !ts.isObjectBindingPattern(name)) return false;
+  return name.elements.some((element) => ts.isBindingElement(element) && !!element.propertyName && staticPropertyName(element.propertyName) === undefined);
+}
+
+function hasUnverifiableGlobalAssignment(left: ts.Expression, initializer: ts.Expression, aliases: Set<string>): boolean {
+  if (!isGlobalObjectReference(initializer, aliases)) return false;
+  const expression = unwrapExpression(left);
+  if (!ts.isObjectLiteralExpression(expression)) return false;
+  return expression.properties.some((property) => ts.isPropertyAssignment(property) && ts.isComputedPropertyName(property.name) && staticPropertyName(property.name) === undefined);
+}
+
 function requireBindingNames(name: ts.BindingName, initializer: ts.Expression, importMetaAliases: Set<string>, moduleAliases: Set<string>): string[] {
   const expression = unwrapExpression(initializer);
   const isModuleContainer = isModuleContainerReference(expression, importMetaAliases, moduleAliases);
@@ -333,7 +364,7 @@ function collectRequireAliases(source: ts.SourceFile, importMetaAliases: Set<str
   while (changed) {
     changed = false;
     const visit = (node: ts.Node): void => {
-      if (ts.isVariableDeclaration(node) && node.initializer) {
+      if ((ts.isVariableDeclaration(node) || ts.isParameter(node)) && node.initializer) {
         if (ts.isIdentifier(node.name) && isModuleContainerReference(node.initializer, importMetaAliases, moduleAliases) && !moduleAliases.has(node.name.text)) {
           moduleAliases.add(node.name.text);
           changed = true;
@@ -377,7 +408,7 @@ function collectImportMetaAliases(source: ts.SourceFile): Set<string> {
   while (changed) {
     changed = false;
     const visit = (node: ts.Node): void => {
-      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer &&
+      if ((ts.isVariableDeclaration(node) || ts.isParameter(node)) && ts.isIdentifier(node.name) && node.initializer &&
         isImportMetaReference(node.initializer, aliases) &&
         !aliases.has(node.name.text)) {
         aliases.add(node.name.text);
@@ -412,14 +443,16 @@ function dynamicCodeAssignmentNames(left: ts.Expression, initializer: ts.Express
   return names;
 }
 
-function collectDynamicCodeAliases(source: ts.SourceFile): Set<string> {
+type DynamicCodeAnalysis = { aliases: Set<string>; globalAliases: Set<string> };
+
+function collectDynamicCodeAliases(source: ts.SourceFile): DynamicCodeAnalysis {
   const aliases = new Set(DYNAMIC_CODE_NAMES);
   const globalAliases = new Set(GLOBAL_OBJECT_NAMES);
   let changed = true;
   while (changed) {
     changed = false;
     const visit = (node: ts.Node): void => {
-      if (ts.isVariableDeclaration(node) && node.initializer) {
+      if ((ts.isVariableDeclaration(node) || ts.isParameter(node)) && node.initializer) {
         if (ts.isIdentifier(node.name) && isDynamicCodeReference(node.initializer, aliases) && !aliases.has(node.name.text)) {
           aliases.add(node.name.text);
           changed = true;
@@ -460,7 +493,7 @@ function collectDynamicCodeAliases(source: ts.SourceFile): Set<string> {
     };
     visit(source);
   }
-  return aliases;
+  return { aliases, globalAliases };
 }
 
 function isRequirePropertyName(node: ts.Identifier): boolean {
@@ -481,12 +514,19 @@ function javascriptImports(file: string, content: string): JavaScriptImports {
   let hasUnverifiableDynamicImport = false;
   const importMetaAliases = collectImportMetaAliases(source);
   const requireAliases = collectRequireAliases(source, importMetaAliases);
-  const dynamicCodeAliases = collectDynamicCodeAliases(source);
+  const dynamicCodeAnalysis = collectDynamicCodeAliases(source);
+  const dynamicCodeAliases = dynamicCodeAnalysis.aliases;
+  const globalObjectAliases = dynamicCodeAnalysis.globalAliases;
   const visit = (node: ts.Node): void => {
-    if (ts.isVariableDeclaration(node) && node.initializer && hasUnverifiableImportMetaBinding(node.name, node.initializer, importMetaAliases)) {
+    if ((ts.isVariableDeclaration(node) || ts.isParameter(node)) && node.initializer && hasUnverifiableImportMetaBinding(node.name, node.initializer, importMetaAliases)) {
+      hasUnverifiableDynamicImport = true;
+    } else if ((ts.isVariableDeclaration(node) || ts.isParameter(node)) && node.initializer && hasUnverifiableGlobalBinding(node.name, node.initializer, globalObjectAliases)) {
       hasUnverifiableDynamicImport = true;
     } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
       hasUnverifiableImportMetaAssignment(node.left, node.right, importMetaAliases)) {
+      hasUnverifiableDynamicImport = true;
+    } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      hasUnverifiableGlobalAssignment(node.left, node.right, globalObjectAliases)) {
       hasUnverifiableDynamicImport = true;
     } else if (ts.isPropertyAccessExpression(node) &&
       (isImportMetaRequire(node, importMetaAliases) || isDynamicCodeReference(node, dynamicCodeAliases)) &&
@@ -686,6 +726,20 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
             for (const initializer of pythonPackageInitializers(repoRoot, path, specifier)) enqueue(initializer);
           }, pythonImportCandidates);
         };
+        const enqueuePythonInitializers = (specifier: string): void => {
+          for (const initializer of pythonPackageInitializers(repoRoot, path, specifier)) enqueue(initializer);
+        };
+        const checkPythonReference = (specifier: string): boolean => {
+          if (resolveExistingFile(pythonImportCandidates(path, specifier))) {
+            checkPythonSpecifier(specifier);
+            return true;
+          }
+          if (pythonNamespaceDirectory(repoRoot, path, specifier)) {
+            enqueuePythonInitializers(specifier);
+            return true;
+          }
+          return false;
+        };
         for (const match of content.matchAll(PYTHON_RELATIVE_IMPORT)) {
           const moduleSpecifier = match[1];
           const importedNames = match[2];
@@ -696,17 +750,18 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
             const names = pythonImportedNames(importedNames);
             const initializer = join(pythonRelativeBaseDirectory(path, moduleSpecifier), "__init__.py");
             const moduleInitializer = moduleSpecifierPath ? pythonModuleInitializer(path, moduleSpecifierPath) : undefined;
+            const moduleNamespace = moduleSpecifierPath ? pythonNamespaceDirectory(repoRoot, path, moduleSpecifierPath) : undefined;
             if (!moduleName && names.includes("*")) checkPythonSpecifier(pythonPackageInitializerSpecifier(moduleSpecifier));
             for (const [index, specifier] of specifiers.entries()) {
               if (!moduleName && names[index] === "*") continue;
-              if (resolveExistingFile(pythonImportCandidates(path, specifier))) {
-                checkPythonSpecifier(specifier);
-              } else if (specifier === moduleSpecifierPath) {
+              if (checkPythonReference(specifier)) continue;
+              if (specifier === moduleSpecifierPath) {
                 checkPythonSpecifier(specifier);
               } else if (!moduleName && names[index] &&
                 (!isDirectRegularFile(initializer) || !pythonInitializerExportsName(initializer, names[index]))) {
                 checkPythonSpecifier(specifier);
-              } else if (moduleName && names[index - 1] && moduleInitializer && !pythonInitializerExportsName(moduleInitializer, names[index - 1])) {
+              } else if (moduleName && names[index - 1] && names[index - 1] !== "*" &&
+                ((moduleNamespace && !moduleInitializer) || (moduleInitializer && !pythonInitializerExportsName(moduleInitializer, names[index - 1])))) {
                 checkPythonSpecifier(specifier);
               }
             }
@@ -724,9 +779,10 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
               specifiers.push(`./${modulePath}/${name}`);
             }
             for (const [index, specifier] of specifiers.entries()) {
-              if (resolveExistingFile(pythonImportCandidates(path, specifier))) {
+              if (checkPythonReference(specifier)) continue;
+              if (index > 0 && names[index - 1] !== "*" && moduleInitializer && !pythonInitializerExportsName(moduleInitializer, names[index - 1] ?? "")) {
                 checkPythonSpecifier(specifier);
-              } else if (index > 0 && names[index - 1] !== "*" && moduleInitializer && !pythonInitializerExportsName(moduleInitializer, names[index - 1] ?? "")) {
+              } else if (index > 0 && names[index - 1] !== "*" && pythonNamespaceDirectory(repoRoot, path, specifiers[0] ?? "")) {
                 checkPythonSpecifier(specifier);
               }
             }
@@ -737,7 +793,7 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
           if (importedNames) {
             for (const name of pythonImportedNames(importedNames)) {
               const specifier = `./${name.replaceAll(".", "/")}`;
-              if (resolveExistingFile(pythonImportCandidates(path, specifier))) checkPythonSpecifier(specifier);
+              if (resolveExistingFile(pythonImportCandidates(path, specifier)) || pythonNamespaceDirectory(repoRoot, path, specifier)) checkPythonReference(specifier);
             }
           }
         }

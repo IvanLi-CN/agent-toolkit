@@ -348,6 +348,25 @@ test("preserves target repository paths with trailing spaces", () => {
   }
 });
 
+test("preserves target repository paths with trailing carriage returns", () => {
+  if (process.platform === "win32") return;
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-inventory-target-trailing-cr-"));
+  const source = join(root, "source");
+  const target = join(root, "target\r");
+  try {
+    mkdirSync(join(source, "skills"), { recursive: true });
+    git(source, "init", "-q");
+    git(source, "commit", "--allow-empty", "-qm", "fixture");
+    mkdirSync(target, { recursive: true });
+    git(target, "init", "-q");
+    git(target, "commit", "--allow-empty", "-qm", "fixture");
+    writeFileSync(join(target, "PUBLIC_SKILLS.txt"), "");
+    expect(check(source, "HEAD", target, join(target, "PUBLIC_SKILLS.txt"))).toEqual([]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("preserves special characters in committed symlink paths", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-inventory-special-link-"));
   const source = join(root, "source");

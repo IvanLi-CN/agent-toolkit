@@ -229,6 +229,8 @@ test("rejects propagated, computed, and indirect loader calls", () => {
     writeFileSync(join(root, "bin", "meta-as-computed.ts"), `const { ["require" as const]: load } = import.meta; load("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "meta-assignment-expression.ts"), `let meta; const { ["require"]: load } = (meta = import.meta); load("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "meta-dynamic-destructure.ts"), `const key = "require"; const { [key]: load } = import.meta; load("../../${outsideName}");\n`);
+    writeFileSync(join(root, "bin", "meta-default-parameter.ts"), `function run(meta = import.meta) { meta.require("../../${outsideName}"); } run();\n`);
+    writeFileSync(join(root, "bin", "meta-comma-alias.ts"), `const meta = (0, import.meta); meta.require("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "meta-object.ts"), `const loaders = { load: import.meta.require }; loaders.load("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "meta-bracket-object.ts"), `const loaders = { load: import.meta["require"] }; loaders.load("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "meta-alias-object.ts"), `const meta = import.meta; const loaders = { load: meta.require }; loaders.load("../../${outsideName}");\n`);
@@ -248,8 +250,10 @@ test("rejects propagated, computed, and indirect loader calls", () => {
       `bin/meta-assignment-destructure.ts: local reference outside public repository ../../${outsideName}`,
       `bin/meta-assignment-expression.ts: local reference outside public repository ../../${outsideName}`,
       "bin/meta-bracket-object.ts: dynamic import or require cannot be verified",
+      `bin/meta-comma-alias.ts: local reference outside public repository ../../${outsideName}`,
       `bin/meta-computed-destructure.ts: local reference outside public repository ../../${outsideName}`,
       `bin/meta-default-destructure.ts: local reference outside public repository ../../${outsideName}`,
+      `bin/meta-default-parameter.ts: local reference outside public repository ../../${outsideName}`,
       `bin/meta-destructure.ts: local reference outside public repository ../../${outsideName}`,
       "bin/meta-dynamic-destructure.ts: dynamic import or require cannot be verified",
       "bin/meta-object.ts: dynamic import or require cannot be verified",
@@ -288,14 +292,18 @@ test("rejects evaluated JavaScript loaders", () => {
     writeFileSync(join(root, "bin", "function-destructure.ts"), 'const { Function: F } = globalThis; new F("return require(\\"./hidden.ts\\")")();\n');
     writeFileSync(join(root, "bin", "function-assignment-destructure.ts"), 'let F; ({ Function: F } = globalThis); new F("return require(\\"./hidden.ts\\")")();\n');
     writeFileSync(join(root, "bin", "function-computed-destructure.ts"), 'const { ["Function"]: F } = globalThis; new F("return require(\\"./hidden.ts\\")")();\n');
+    writeFileSync(join(root, "bin", "function-computed-global.ts"), 'const key = "Function"; const { [key]: F } = globalThis; new F("return require(\\"./hidden.ts\\")")();\n');
+    writeFileSync(join(root, "bin", "function-assigned-global.ts"), 'let globalObject; const { Function: F } = (globalObject = globalThis); new F("return require(\\"./hidden.ts\\")")();\n');
     writeFileSync(join(root, "bin", "function-object.ts"), 'const loaders = { load: globalThis.Function }; new loaders.load("return require(\\"./hidden.ts\\")")();\n');
     writeFileSync(join(root, "bin", "function-bracket-object.ts"), 'const loaders = { load: globalThis["Function"] }; new loaders.load("return require(\\"./hidden.ts\\")")();\n');
     expect(check(root)).toEqual([
       "bin/eval.ts: dynamic import or require cannot be verified",
       "bin/function-alias.ts: dynamic import or require cannot be verified",
+      "bin/function-assigned-global.ts: dynamic import or require cannot be verified",
       "bin/function-assignment-destructure.ts: dynamic import or require cannot be verified",
       "bin/function-bracket-object.ts: dynamic import or require cannot be verified",
       "bin/function-computed-destructure.ts: dynamic import or require cannot be verified",
+      "bin/function-computed-global.ts: dynamic import or require cannot be verified",
       "bin/function-destructure.ts: dynamic import or require cannot be verified",
       "bin/function-object.ts: dynamic import or require cannot be verified",
       "bin/function.ts: dynamic import or require cannot be verified",
@@ -442,6 +450,47 @@ test("handles Python relative exports and trailing commas", () => {
     writeFileSync(join(root, "bin", "runtime_test.py"), "marker = 'fixture-only'\n");
     expect(check(root)).toEqual([
       "bin/entry.py: local reference targets excluded test file ./runtime_test",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("handles Python multiline import comments", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-python-comments-"));
+  try {
+    mkdirSync(join(root, "bin"), { recursive: true });
+    writeFileSync(join(root, "bin", "entry.py"), "from . import (helper,  # keep this import\n                 runtime_test,\n)\n");
+    writeFileSync(join(root, "bin", "helper.py"), "value = 1\n");
+    writeFileSync(join(root, "bin", "runtime_test.py"), "marker = 'fixture-only'\n");
+    expect(check(root)).toEqual([
+      "bin/entry.py: local reference targets excluded test file ./runtime_test",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("does not treat Python relative wildcards as literal modules", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-python-wildcard-"));
+  try {
+    mkdirSync(join(root, "bin", "child"), { recursive: true });
+    writeFileSync(join(root, "bin", "entry.py"), "from .child import *\n");
+    writeFileSync(join(root, "bin", "child", "__init__.py"), "value = 1\n");
+    expect(check(root)).toEqual([]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resolves Python namespace packages without masking missing members", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-python-namespace-"));
+  try {
+    mkdirSync(join(root, "bin", "namespace"), { recursive: true });
+    writeFileSync(join(root, "bin", "entry.py"), "from .namespace import value\nfrom .namespace import missing\n");
+    writeFileSync(join(root, "bin", "namespace", "value.py"), "value = 1\n");
+    expect(check(root)).toEqual([
+      "bin/entry.py: missing local reference ./namespace/missing",
     ]);
   } finally {
     rmSync(root, { recursive: true, force: true });

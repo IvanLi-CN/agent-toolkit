@@ -1,7 +1,8 @@
 #!/usr/bin/env bun
 /** Check root public tools for private runtime coupling and broken local imports. */
 
-import { dirname, join } from "node:path";
+import { realpathSync } from "node:fs";
+import { dirname, join, resolve, sep } from "node:path";
 import { REPO_ROOT, readText, relativePath, resolveExistingFile, walkFiles } from "./repo_util.ts";
 
 const runtimeNamePattern = "CODEX_" + "[A-Z0-9_]+";
@@ -25,7 +26,7 @@ export function publicToolFiles(repoRoot: string = REPO_ROOT): string[] {
 }
 
 function importCandidates(file: string, specifier: string): string[] {
-  const absolute = join(dirname(file), specifier);
+  const absolute = resolve(dirname(file), specifier);
   return [
     absolute,
     `${absolute}.ts`,
@@ -35,6 +36,23 @@ function importCandidates(file: string, specifier: string): string[] {
     join(absolute, "index.ts"),
     join(absolute, "index.js"),
   ];
+}
+
+function isInside(root: string, candidate: string): boolean {
+  const absoluteRoot = resolve(root);
+  const absoluteCandidate = resolve(candidate);
+  let realRoot = absoluteRoot;
+  try {
+    realRoot = realpathSync(root);
+  } catch {
+    // The lexical check below still handles roots that do not exist yet.
+  }
+  return (
+    absoluteCandidate === absoluteRoot ||
+    absoluteCandidate.startsWith(`${absoluteRoot}${sep}`) ||
+    absoluteCandidate === realRoot ||
+    absoluteCandidate.startsWith(`${realRoot}${sep}`)
+  );
 }
 
 export function check(repoRoot: string = REPO_ROOT): string[] {
@@ -49,7 +67,23 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
     }
     for (const match of content.matchAll(RELATIVE_IMPORT)) {
       const specifier = match[1];
-      if (!specifier || resolveExistingFile(importCandidates(path, specifier))) {
+      if (!specifier) {
+        continue;
+      }
+      const candidates = importCandidates(path, specifier);
+      if (candidates.some((candidate) => !isInside(repoRoot, candidate))) {
+        findings.push(`${relative}: local reference outside public repository ${specifier}`);
+        continue;
+      }
+      const existing = resolveExistingFile(candidates);
+      if (existing) {
+        try {
+          if (!isInside(repoRoot, realpathSync(existing))) {
+            findings.push(`${relative}: local reference resolves outside public repository ${specifier}`);
+          }
+        } catch {
+          findings.push(`${relative}: unreadable local reference ${specifier}`);
+        }
         continue;
       }
       findings.push(`${relative}: missing local reference ${specifier}`);

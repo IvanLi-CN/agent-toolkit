@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 /** Reject consumer-runtime coupling from public Skills. */
 
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { REPO_ROOT, readText, relativePath, walkFiles } from "./repo_util.ts";
+import { isRegularFile, REPO_ROOT, readText, relativePath, walkFiles } from "./repo_util.ts";
 
 export const PUBLIC_MANIFEST = join(REPO_ROOT, "PUBLIC_SKILLS.txt");
 export const PRIVATE_REFERENCE_NAMES = new Set(["hosts.txt", "inventory.md", "deployment-policy.yaml"]);
@@ -12,7 +12,7 @@ const runtimeHomeMarker = "$" + "CODEX_" + "HOME";
 const dotRuntimeMarker = "." + "codex";
 const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const nativeSurfacePattern = ["Task" + "Space", "agent_" + "session"].map(escapeRegExp).join("|");
-const IGNORED_DIRECTORIES = new Set([".git", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv", "venv", "dist", "build", "coverage"]);
+const IGNORED_DIRECTORIES = new Set([".git", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv", "venv"]);
 export const FORBIDDEN_PATTERNS: Array<[string, RegExp]> = [
   ["codex-runtime-marker", new RegExp(`(?:\\b${runtimeNamePattern}\\b|${escapeRegExp(runtimeHomeMarker)}|${escapeRegExp(dotRuntimeMarker)}(?:[\\/\\\\]|\\b))`, "i")],
   ["codex-product-reference", /\bCodex\b/i],
@@ -29,13 +29,14 @@ export function publicSkills(manifest: string = PUBLIC_MANIFEST): string[] {
 export function repositorySkills(repoRoot: string): Set<string> {
   const skillsRoot = join(repoRoot, "skills");
   const result = new Set<string>();
-  for (const path of walkFiles(skillsRoot, { ignoredDirectories: IGNORED_DIRECTORIES })) {
-    if (path.endsWith("/SKILL.md") || path.endsWith("\\SKILL.md")) {
-      const relative = relativePath(path, skillsRoot);
-      const [name] = relative.split("/");
-      if (name) {
-        result.add(name);
-      }
+  if (!existsSync(skillsRoot)) return result;
+  const entries = readdirSync(skillsRoot, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.name.startsWith(".") || (!entry.isDirectory() && !entry.isSymbolicLink())) {
+      continue;
+    }
+    if (isRegularFile(join(skillsRoot, entry.name, "SKILL.md"))) {
+      result.add(entry.name);
     }
   }
   return result;
@@ -63,11 +64,19 @@ export function check(repoRoot: string = REPO_ROOT, manifest: string = PUBLIC_MA
   for (const name of names) {
     const skillRoot = join(repoRoot, "skills", name);
     const skillFile = join(skillRoot, "SKILL.md");
-    if (!existsSync(skillFile)) {
+    if (!isRegularFile(skillFile)) {
       findings.push(`MISSING_PUBLIC_SKILL ${name}`);
       continue;
     }
-    for (const path of walkFiles(skillRoot, { ignoredDirectories: IGNORED_DIRECTORIES })) {
+    if (lstatSync(skillRoot).isSymbolicLink()) {
+      findings.push(`SYMLINKED_PUBLIC_SKILL ${name}`);
+      continue;
+    }
+    const rejectedSymlinks: string[] = [];
+    for (const path of walkFiles(skillRoot, {
+      ignoredDirectories: IGNORED_DIRECTORIES,
+      onRejectedSymlink: (path) => rejectedSymlinks.push(path),
+    })) {
       const relative = relativePath(path, repoRoot);
       if (path.split(/[\\/]/).at(-2) === "references" && PRIVATE_REFERENCE_NAMES.has(path.split(/[\\/]/).at(-1) ?? "")) {
         findings.push(`${relative}: private operator reference must stay outside repository`);
@@ -84,6 +93,9 @@ export function check(repoRoot: string = REPO_ROOT, manifest: string = PUBLIC_MA
           findings.push(`${relative}: forbidden public coupling ${label}`);
         }
       }
+    }
+    for (const path of rejectedSymlinks) {
+      findings.push(`${relativePath(path, repoRoot)}: symbolic link escapes public Skill boundary`);
     }
   }
   return findings;

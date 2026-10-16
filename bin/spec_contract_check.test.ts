@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { check } from "./spec_contract_check.ts";
+import { check, main } from "./spec_contract_check.ts";
 
 test("accepts a minimal canonical Spec", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-spec-"));
@@ -27,4 +27,10 @@ test("rejects progress checkboxes and unresolved decisions", () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("fails closed for unsupported or incomplete command-line options", () => {
+  expect(main(["--all"])).toBe(2);
+  expect(main(["--path"])).toBe(2);
+  expect(main(["--unknown"])).toBe(2);
 });

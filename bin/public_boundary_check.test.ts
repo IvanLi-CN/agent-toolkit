@@ -16,20 +16,74 @@ test("detects secret assignments and ignores redacted placeholders", () => {
   expect(pattern("json-secret-field").test(`{"${name}":"<redacted>"}`)).toBe(false);
 });
 
-test("detects compound and punctuation-leading secret values", () => {
-  const name = "DATABASE_" + "PASSWORD";
+test("detects prefixed, lowercase, and compound secret assignments", () => {
   const fixtureValue = "0123456789abcdef";
-  const punctuationName = "pass" + "word";
-  const punctuationValue = "!" + fixtureValue;
-  expect(pattern("prefixed-quoted-secret-assignment").test(`${name}="${fixtureValue}"`)).toBe(true);
-  expect(pattern("quoted-secret-assignment").test(`${punctuationName}="${punctuationValue}"`)).toBe(true);
+  const names = [
+    ["CVM_", "API_KEY"],
+    ["DATABASE_", "PASSWORD"],
+    ["database_", "password"],
+    ["aws_", "secret_access_key"],
+    ["database", "Password"],
+    ["aws", "SecretAccessKey"],
+    ["secret", "Key"],
+    ["appDatabase", "Password"],
+    ["serviceClient", "Secret"],
+  ];
+  for (const parts of names) {
+    const name = parts.join("");
+    expect(pattern("prefixed-quoted-secret-assignment").test(`${name}="${fixtureValue}"`)).toBe(true);
+  }
+});
+
+test("detects punctuation-leading secret values", () => {
+  const fixtureValue = "0123456789abcdef";
+  const name = "pass" + "word";
+  for (const prefix of ["!", "(", "["]) {
+    expect(pattern("quoted-secret-assignment").test(`${name}="${prefix}${fixtureValue}"`)).toBe(true);
+  }
+});
+
+test("detects compound, camel-case, and Pascal-case JSON secret fields", () => {
+  const fixtureValue = "0123456789abcdef";
+  const names = [
+    ["database_", "password"],
+    ["aws_", "secret_access_key"],
+    ["secret_", "key"],
+    ["database", "Password"],
+    ["client", "Secret"],
+    ["aws", "SecretAccessKey"],
+    ["secret", "Key"],
+    ["Database", "Password"],
+    ["Client", "Secret"],
+    ["Aws", "SecretAccessKey"],
+    ["Secret", "Key"],
+  ];
+  for (const parts of names) {
+    const name = parts.join("");
+    expect(pattern("json-secret-field").test(`{"${name}":"${fixtureValue}"}`)).toBe(true);
+  }
 });
 
 test("recognizes explicit regex helper assignments", () => {
-  const content = 'local re_english_write_token="(write|writes|writing)"';
+  const helperName = "re_english_write_" + "token";
+  const content = `local ${helperName}="(write|writes|writing|modify)"`;
   const match = pattern("prefixed-quoted-secret-assignment").exec(content);
   expect(match).not.toBeNull();
   if (match) expect(isRegexHelperAssignment(content, match)).toBe(true);
+});
+
+test("does not exclude names that merely resemble regex helpers", () => {
+  const fixtureValue = "0123456789abcdef";
+  for (const parts of [["redis_", "password"], ["request_", "api_key"]]) {
+    const content = `${parts.join("")}="(${fixtureValue}"`;
+    const match = pattern("prefixed-quoted-secret-assignment").exec(content);
+    expect(match).not.toBeNull();
+    if (match) expect(isRegexHelperAssignment(content, match)).toBe(false);
+  }
+});
+
+test("does not classify long hyphenated input as a secret assignment", () => {
+  expect(pattern("prefixed-quoted-secret-assignment").test("a-".repeat(8000) + "!")).toBe(false);
 });
 
 test("checks tracked public files", () => {

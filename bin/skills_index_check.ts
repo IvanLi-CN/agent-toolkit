@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 /** Check that skills/README.md indexes every repository-local Skill. */
 
-import { existsSync } from "node:fs";
-import { join } from "node:path";
-import { REPO_ROOT, readText, relativePath, walkFiles } from "./repo_util.ts";
+import { readdirSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { isRegularFile, REPO_ROOT, readText } from "./repo_util.ts";
 
 export const SKILL_NAME_PATTERN = /^`([a-z0-9-]+)`$/;
 export const EXTERNAL_PATH_PATTERN = /~?\/?[^`]*\.agents\/skills\/([a-z0-9-]+)(?:\/|`)/;
@@ -16,14 +16,12 @@ export type IndexEntry = {
 
 export function repositorySkills(skillsRoot: string): Set<string> {
   const result = new Set<string>();
-  for (const path of walkFiles(skillsRoot)) {
-    if (!path.endsWith("/SKILL.md") && !path.endsWith("\\SKILL.md")) {
+  for (const entry of readdirSync(skillsRoot, { withFileTypes: true })) {
+    if (entry.name.startsWith(".") || (!entry.isDirectory() && !entry.isSymbolicLink())) {
       continue;
     }
-    const relative = relativePath(path, skillsRoot);
-    const [name] = relative.split("/");
-    if (name && !name.startsWith(".") && existsSync(join(skillsRoot, name, "SKILL.md"))) {
-      result.add(name);
+    if (isRegularFile(join(skillsRoot, entry.name, "SKILL.md"))) {
+      result.add(entry.name);
     }
   }
   return result;
@@ -95,8 +93,31 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
   return findings;
 }
 
-export function main(): number {
-  const findings = check();
+function parseArgs(args: string[]): string {
+  let repoRoot = resolve(process.cwd());
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg !== "--repo-root") {
+      throw new Error("usage: skills_index_check.ts [--repo-root <path>]");
+    }
+    const value = args[++index];
+    if (!value || value.startsWith("--")) {
+      throw new Error("usage: skills_index_check.ts [--repo-root <path>]");
+    }
+    repoRoot = resolve(value);
+  }
+  return repoRoot;
+}
+
+export function main(args: string[] = Bun.argv.slice(2)): number {
+  let repoRoot: string;
+  try {
+    repoRoot = parseArgs(args);
+  } catch (error) {
+    console.error(`ERROR ${String(error)}`);
+    return 2;
+  }
+  const findings = check(repoRoot);
   for (const finding of findings) {
     console.log(`FINDING ${finding}`);
   }

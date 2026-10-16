@@ -103,6 +103,11 @@ function javascriptImports(file: string, content: string): JavaScriptImports {
     } else if (ts.isCallExpression(node)) {
       const isDynamicImport = node.expression.kind === ts.SyntaxKind.ImportKeyword;
       const isRequire = ts.isIdentifier(node.expression) && node.expression.text === "require";
+      const isCreateRequire = (ts.isIdentifier(node.expression) && node.expression.text === "createRequire") ||
+        (ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === "createRequire");
+      if (isCreateRequire) {
+        hasUnverifiableDynamicImport = true;
+      }
       if (isDynamicImport || isRequire) {
         const argument = node.arguments[0];
         if (argument && ts.isStringLiteralLike(argument)) {

@@ -95,6 +95,9 @@ function javascriptImports(file: string, content: string): JavaScriptImports {
   let hasUnverifiableDynamicImport = false;
   const visit = (node: ts.Node): void => {
     if (ts.isImportDeclaration(node) && ts.isStringLiteralLike(node.moduleSpecifier)) {
+      if (node.moduleSpecifier.text === "node:module") {
+        hasUnverifiableDynamicImport = true;
+      }
       specifiers.push(node.moduleSpecifier.text);
     } else if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteralLike(node.moduleSpecifier)) {
       specifiers.push(node.moduleSpecifier.text);
@@ -111,6 +114,9 @@ function javascriptImports(file: string, content: string): JavaScriptImports {
       if (isDynamicImport || isRequire) {
         const argument = node.arguments[0];
         if (argument && ts.isStringLiteralLike(argument)) {
+          if (isRequire && argument.text === "node:module") {
+            hasUnverifiableDynamicImport = true;
+          }
           specifiers.push(argument.text);
         } else {
           hasUnverifiableDynamicImport = true;

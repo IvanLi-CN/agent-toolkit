@@ -103,7 +103,9 @@ test("ignores bare modules and rejects Windows-style relative imports", () => {
     writeFileSync(join(root, "bin", "template.ts"), "import(`../../" + outsideName + "`);\n");
     writeFileSync(join(root, "bin", "dynamic.ts"), 'const specifier = "../../' + outsideName + '"; import(specifier);\n');
     writeFileSync(join(root, "bin", "create-require.ts"), 'import { createRequire } from "node:module"; const load = createRequire(import.meta.url); load("../../outside.ts");\n');
+    writeFileSync(join(root, "bin", "create-require-alias.ts"), 'import { createRequire as makeRequire } from "node:module"; const load = makeRequire(import.meta.url); load("../../outside.ts");\n');
     expect(check(root)).toEqual([
+      "bin/create-require-alias.ts: dynamic import or require cannot be verified",
       "bin/create-require.ts: dynamic import or require cannot be verified",
       "bin/dynamic.ts: dynamic import or require cannot be verified",
       `bin/escaped.ts: local reference outside public repository ../../${outsideName}`,
@@ -120,9 +122,9 @@ test("rejects Windows-style external imports on every host platform", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-windows-"));
   try {
     mkdirSync(join(root, "bin"), { recursive: true });
-    writeFileSync(join(root, "bin", "windows.ts"), 'import "C:\\\\Users\\\\ivan\\\\outside.ts";\nimport "\\\\server\\\\share\\\\outside.ts";\n');
+    writeFileSync(join(root, "bin", "windows.ts"), 'import "C:\\\\Users\\\\fixture-user\\\\outside.ts";\nimport "\\\\server\\\\share\\\\outside.ts";\n');
     expect(check(root)).toEqual([
-      "bin/windows.ts: local reference outside public repository C:\\Users\\ivan\\outside.ts",
+      "bin/windows.ts: local reference outside public repository C:\\Users\\fixture-user\\outside.ts",
       "bin/windows.ts: local reference outside public repository \\server\\share\\outside.ts",
     ]);
   } finally {

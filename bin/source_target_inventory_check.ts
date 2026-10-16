@@ -3,14 +3,14 @@
 
 import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { isRegularFile, REPO_ROOT, readText, runGit } from "./repo_util.ts";
+import { isDirectRegularFile, isPathInside, REPO_ROOT, readText, runGit } from "./repo_util.ts";
 
 export function targetInventory(root: string): Set<string> {
   const skillsRoot = join(root, "skills");
   const result = new Set<string>();
-  if (!existsSync(skillsRoot)) return result;
+  if (!existsSync(skillsRoot) || !isPathInside(root, skillsRoot)) return result;
   for (const entry of readdirSync(skillsRoot, { withFileTypes: true })) {
-    if (!entry.name.startsWith(".") && entry.isDirectory() && isRegularFile(join(skillsRoot, entry.name, "SKILL.md"))) {
+    if (entry.isDirectory() && isDirectRegularFile(join(skillsRoot, entry.name, "SKILL.md"))) {
       result.add(entry.name);
     }
   }
@@ -43,11 +43,12 @@ export function snapshotInventory(source: string, revision: string): Set<string>
 }
 
 export type ParsedArgs = { sourceRoot?: string; revision: string; targetRoot: string; manifest?: string };
+const USAGE = "usage: source_target_inventory_check.ts --source-root <path> [--source-revision <revision>]";
 
 function requiredValue(args: string[], index: number): string {
   const value = args[index + 1];
   if (!value || value.startsWith("--")) {
-    throw new Error("usage: source_target_inventory_check.ts --source-root <path> [--source-revision <revision>]");
+    throw new Error(USAGE);
   }
   return value;
 }
@@ -62,17 +63,33 @@ export function parseArgs(args: string[]): ParsedArgs {
     if (arg === "--source-root") {
       sourceRoot = resolve(requiredValue(args, index));
       index += 1;
+    } else if (arg.startsWith("--source-root=")) {
+      const value = arg.slice("--source-root=".length);
+      if (!value) throw new Error(USAGE);
+      sourceRoot = resolve(value);
     } else if (arg === "--source-revision") {
       revision = requiredValue(args, index);
       index += 1;
+    } else if (arg.startsWith("--source-revision=")) {
+      const value = arg.slice("--source-revision=".length);
+      if (!value) throw new Error(USAGE);
+      revision = value;
     } else if (arg === "--target-root") {
       targetRoot = resolve(requiredValue(args, index));
       index += 1;
+    } else if (arg.startsWith("--target-root=")) {
+      const value = arg.slice("--target-root=".length);
+      if (!value) throw new Error(USAGE);
+      targetRoot = resolve(value);
     } else if (arg === "--public-manifest") {
       manifest = resolve(requiredValue(args, index));
       index += 1;
+    } else if (arg.startsWith("--public-manifest=")) {
+      const value = arg.slice("--public-manifest=".length);
+      if (!value) throw new Error(USAGE);
+      manifest = resolve(value);
     } else {
-      throw new Error("usage: source_target_inventory_check.ts --source-root <path> [--source-revision <revision>]");
+      throw new Error(USAGE);
     }
   }
   return { sourceRoot, revision, targetRoot, manifest };
@@ -112,7 +129,7 @@ export function inspect(
   if (existsSync(sourceSkills) && !lstatSync(sourceSkills).isSymbolicLink()) {
     const owned = new Set<string>();
     for (const entry of readdirSync(sourceSkills, { withFileTypes: true })) {
-      if (entry.isDirectory() && isRegularFile(join(sourceSkills, entry.name, "SKILL.md"))) owned.add(entry.name);
+      if (entry.isDirectory() && isDirectRegularFile(join(sourceSkills, entry.name, "SKILL.md"))) owned.add(entry.name);
     }
     for (const name of [...new Set([...publicNames].filter((item) => owned.has(item)))].sort()) {
       findings.push(`PUBLIC_SKILL_SOURCE_DUPLICATE ${name}`);
@@ -139,6 +156,10 @@ export function check(
 }
 
 export function main(args: string[] = Bun.argv.slice(2)): number {
+  if (args.includes("--help")) {
+    console.log(USAGE);
+    return 0;
+  }
   let parsed: ParsedArgs;
   try {
     parsed = parseArgs(args);
@@ -147,7 +168,7 @@ export function main(args: string[] = Bun.argv.slice(2)): number {
     return 2;
   }
   if (!parsed.sourceRoot) {
-    console.error("usage: source_target_inventory_check.ts --source-root <path> [--source-revision <revision>]");
+    console.error(USAGE);
     return 2;
   }
   let result: InventoryResult;

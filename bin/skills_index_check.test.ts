@@ -42,11 +42,22 @@ test("reports duplicate entries", () => {
   });
 });
 
+test("ignores tables that are unrelated to the Skill index", () => {
+  withFixture((root) => {
+    mkdirSync(join(root, "skills", "alpha"), { recursive: true });
+    writeFileSync(join(root, "skills", "alpha", "SKILL.md"), "# alpha\n");
+    writeFileSync(join(root, "skills", "README.md"), "| Skill | Description | Path |\n|---|---|---|\n| `alpha` | local | `skills/alpha/**` |\n\n| `flow_type` | Route |\n|---|---|\n| `fast-track` | route |\n");
+    expect(check(root)).toEqual([]);
+  });
+});
+
 test("uses an explicit repository root and ignores a directory named SKILL.md", () => {
   withFixture((root) => {
     mkdirSync(join(root, "skills", "alpha", "SKILL.md"), { recursive: true });
     writeFileSync(join(root, "skills", "README.md"), "| Skill | Description | Path |\n|---|---|---|\n");
     expect(main(["--repo-root", root])).toBe(0);
+    expect(main([`--repo-root=${root}`])).toBe(0);
+    expect(main(["--help"])).toBe(0);
     expect(main(["--unknown"])).toBe(2);
   });
 });

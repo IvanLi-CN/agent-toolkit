@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 /** Reject private environment markers from public repository files. */
 
-import { relativePath, REPO_ROOT, trackedFiles } from "./repo_util.ts";
-import { existsSync, readFileSync } from "node:fs";
+import { isPathInside, relativePath, REPO_ROOT, trackedFiles } from "./repo_util.ts";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
 
 export const FORBIDDEN_MARKERS = ["CODEX_" + "THREAD_ID"];
 const SECRET_NAME = String.raw`(?:api[_-]?key|apikey|access[_-]?key|accesskey|token|secret|secret[_-]?key|secretkey|secret[_-]?access[_-]?key|secretaccesskey|password|passwd|private[_-]?key|privatekey|credential)`;
@@ -76,6 +76,19 @@ function matchesPattern(label: string, pattern: RegExp, content: string): boolea
 export function check(repoRoot: string = REPO_ROOT): string[] {
   const findings: string[] = [];
   for (const path of trackedFiles(repoRoot)) {
+    try {
+      if (lstatSync(path).isSymbolicLink()) {
+        findings.push(`${relativePath(path, repoRoot)}: symbolic links are not allowed in public repository`);
+        continue;
+      }
+    } catch (error) {
+      findings.push(`${relativePath(path, repoRoot)}: cannot inspect tracked path: ${String(error)}`);
+      continue;
+    }
+    if (!isPathInside(repoRoot, path)) {
+      findings.push(`${relativePath(path, repoRoot)}: path escapes public repository`);
+      continue;
+    }
     if (!existsSync(path)) {
       continue;
     }

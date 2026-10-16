@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { check, FORBIDDEN_PATTERNS, isRegexHelperAssignment } from "./public_boundary_check.ts";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 function pattern(label: string): RegExp {
@@ -13,6 +13,7 @@ test("detects secret assignments and ignores redacted placeholders", () => {
   const name = "api_" + "key";
   const fixtureValue = "0123456789abcdef";
   expect(pattern("quoted-secret-assignment").test(`${name}="${fixtureValue}"`)).toBe(true);
+  expect(pattern("json-secret-field").test(`{"${name}":"${fixtureValue}"}`)).toBe(true);
   expect(pattern("json-secret-field").test(`{"${name}":"<redacted>"}`)).toBe(false);
 });
 
@@ -90,9 +91,10 @@ test("checks tracked public files", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-public-boundary-"));
   try {
     writeFileSync(join(root, "safe.md"), "neutral example\n");
+    symlinkSync(join(root, "missing.md"), join(root, "linked.md"));
     const result = Bun.spawnSync(["git", "init", "-q"], { cwd: root, stdout: "pipe", stderr: "pipe" });
     expect(result.exitCode).toBe(0);
-    expect(check(root)).toEqual([]);
+    expect(check(root)).toEqual(["linked.md: symbolic links are not allowed in public repository"]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

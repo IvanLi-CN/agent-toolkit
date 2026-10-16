@@ -48,10 +48,25 @@ test("rejects private operator reference names and unlisted Skills", () => {
     mkdirSync(join(root, "skills", "alpha", "references"));
     writeFileSync(join(root, "skills", "alpha", "references", "hosts.txt"), "neutral alias\n");
     mkdirSync(join(root, "skills", "extra"));
-    writeFileSync(join(root, "skills", "extra", "SKILL.md"), "# extra\n");
+    writeFileSync(join(root, "skills", "extra", "SKILL.md"), "Use $CODEX_HOME.\n");
     expect(check(root, manifest)).toEqual([
       "UNLISTED_PUBLIC_SKILL extra",
       "skills/alpha/references/hosts.txt: private operator reference must stay outside repository",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects invalid manifest names and hidden Skill-shaped directories", () => {
+  const { root, manifest } = fixture("# standalone\n");
+  try {
+    writeFileSync(manifest, "alpha\n../../outside\n");
+    mkdirSync(join(root, "skills", ".private"), { recursive: true });
+    writeFileSync(join(root, "skills", ".private", "SKILL.md"), "# hidden\n");
+    expect(check(root, manifest)).toEqual([
+      "INVALID_PUBLIC_SKILL_NAME ../../outside",
+      "UNLISTED_PUBLIC_SKILL .private",
     ]);
   } finally {
     rmSync(root, { recursive: true, force: true });

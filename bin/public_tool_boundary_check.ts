@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /** Check root public tools for private runtime coupling and broken local imports. */
 
-import { realpathSync } from "node:fs";
+import { lstatSync, realpathSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { REPO_ROOT, readText, relativePath, resolveExistingFile, walkFiles } from "./repo_util.ts";
 
@@ -18,11 +18,24 @@ export const FORBIDDEN_PATTERNS: Array<[string, RegExp]> = [
 ];
 
 const RELATIVE_IMPORT = /(?:from\s*|import\s*(?:\(\s*)?|require\s*\()["'](\.{1,2}\/[^"']+)["']/g;
-const EXCLUDED_TEST_FILE = /(?:\.test|^test[-_]).*\.ts$/;
+const EXCLUDED_TEST_FILE = /(?:\.test|^test[-_]).*\.(?:ts|tsx|js|py|sh)$/;
+const PUBLIC_TOOL_EXTENSIONS = [".ts", ".tsx", ".js", ".py", ".sh"];
+
+function collectPublicToolFiles(repoRoot: string): { files: string[]; rejectedSymlinks: string[] } {
+  const rejectedSymlinks: string[] = [];
+  const files = walkFiles(join(repoRoot, "bin"), {
+    ignoredDirectories: new Set([".git"]),
+    onRejectedSymlink: (path) => rejectedSymlinks.push(path),
+  }).filter((path) => {
+    const name = path.split(/[\\/]/).at(-1) ?? "";
+    return PUBLIC_TOOL_EXTENSIONS.some((extension) => name.endsWith(extension)) &&
+      (name === "test_runner.ts" || !EXCLUDED_TEST_FILE.test(name));
+  });
+  return { files, rejectedSymlinks: rejectedSymlinks.sort() };
+}
 
 export function publicToolFiles(repoRoot: string = REPO_ROOT): string[] {
-  return walkFiles(join(repoRoot, "bin"), { ignoredDirectories: new Set([".git"]) })
-    .filter((path) => path.endsWith(".ts") && !EXCLUDED_TEST_FILE.test(path.split(/[\\/]/).at(-1) ?? ""));
+  return collectPublicToolFiles(repoRoot).files;
 }
 
 function importCandidates(file: string, specifier: string): string[] {
@@ -57,7 +70,20 @@ function isInside(root: string, candidate: string): boolean {
 
 export function check(repoRoot: string = REPO_ROOT): string[] {
   const findings: string[] = [];
-  for (const path of publicToolFiles(repoRoot)) {
+  const binRoot = join(repoRoot, "bin");
+  try {
+    if (lstatSync(binRoot).isSymbolicLink()) {
+      findings.push(`${relativePath(binRoot, repoRoot)}: root tool directory is a symbolic link`);
+      return findings;
+    }
+  } catch {
+    // A missing bin directory produces no public tools and is handled by the caller's repository checks.
+  }
+  const collected = collectPublicToolFiles(repoRoot);
+  for (const path of collected.rejectedSymlinks) {
+    findings.push(`${relativePath(path, repoRoot)}: symbolic link escapes public tool boundary`);
+  }
+  for (const path of collected.files) {
     const relative = relativePath(path, repoRoot);
     const content = readText(path);
     for (const [label, pattern] of FORBIDDEN_PATTERNS) {

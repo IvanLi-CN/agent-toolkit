@@ -23,9 +23,12 @@ const IMPORT_GAP = String.raw`(?:\s|/\*[\s\S]*?\*/|//[^\r\n]*(?:\r\n|\r|\n))*`;
 const IMPORT_PREFIX = String.raw`(?:\bfrom${IMPORT_GAP}|\bimport${IMPORT_GAP}(?:\(${IMPORT_GAP})?|\brequire${IMPORT_GAP}\(${IMPORT_GAP})`;
 const RELATIVE_IMPORT = new RegExp(String.raw`${IMPORT_PREFIX}["'](\.{1,2}[\\/][^"']+)["']`, "g");
 const ABSOLUTE_IMPORT = new RegExp(String.raw`${IMPORT_PREFIX}["']((?:file://|/|\\|[A-Za-z]:[\\/])[^"']+)["']`, "g");
-const PYTHON_RELATIVE_IMPORT = /\bfrom\s+(\.+[A-Za-z_][A-Za-z0-9_.]*|\.+)\s+import\s+\(?\s*([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*\)?/g;
-const PYTHON_FROM_IMPORT = /\bfrom\s+([A-Za-z_][A-Za-z0-9_.]*)\s+import\s+\(?\s*([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*\)?/g;
-const PYTHON_LOCAL_IMPORT = /(?:^[ \t]*|;[ \t]*)import\s+([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)/gm;
+const PYTHON_NAME = String.raw`[A-Za-z_][A-Za-z0-9_]*`;
+const PYTHON_IMPORTED_NAME = String.raw`${PYTHON_NAME}(?:\s+as\s+${PYTHON_NAME})?`;
+const PYTHON_IMPORTED_NAMES = String.raw`${PYTHON_IMPORTED_NAME}(?:\s*,\s*${PYTHON_IMPORTED_NAME})*`;
+const PYTHON_RELATIVE_IMPORT = new RegExp(String.raw`\bfrom\s+(\.+${PYTHON_NAME}(?:\.${PYTHON_NAME})*|\.+)\s+import\s+\(?\s*(${PYTHON_IMPORTED_NAMES})\s*\)?`, "g");
+const PYTHON_FROM_IMPORT = new RegExp(String.raw`\bfrom\s+(${PYTHON_NAME}(?:\.${PYTHON_NAME})*)\s+import\s+\(?\s*(${PYTHON_IMPORTED_NAMES})\s*\)?`, "g");
+const PYTHON_LOCAL_IMPORT = new RegExp(String.raw`(?:^[ \t]*|;[ \t]*)import\s+(${PYTHON_NAME}(?:\.${PYTHON_NAME})*(?:\s+as\s+${PYTHON_NAME})?(?:\s*,\s*${PYTHON_NAME}(?:\.${PYTHON_NAME})*(?:\s+as\s+${PYTHON_NAME})?)*)`, "gm");
 const SHELL_SOURCE_IMPORT = /(?:^[ \t]*|[;&|][ \t]*|then[ \t]+)(?:source\b|\.)\s+(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\s;|]+))/gm;
 const EXCLUDED_TEST_FILE = /(?:\.test\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$|^test[-_].*\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$|_test\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$)/;
 const PUBLIC_TOOL_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".cjs", ".mjs", ".py", ".sh"];
@@ -45,7 +48,10 @@ function pythonRelativeSpecifiers(moduleSpecifier: string, importedNames: string
   const dotCount = moduleSpecifier.match(/^\.+/)?.[0].length ?? 0;
   const moduleName = moduleSpecifier.slice(dotCount).replaceAll(".", "/");
   const prefix = dotCount === 1 ? "./" : "../".repeat(dotCount - 1);
-  return moduleName ? [`${prefix}${moduleName}`] : importedNames.split(",").map((name) => `${prefix}${name.trim()}`);
+  const names = importedNames.split(",").map((name) => name.trim().split(/\s+as\s+/i)[0]).filter(Boolean);
+  return moduleName
+    ? [`${prefix}${moduleName}`, ...names.map((name) => `${prefix}${moduleName}/${name}`)]
+    : names.map((name) => `${prefix}${name}`);
 }
 
 function collectPublicToolFiles(repoRoot: string): { files: string[]; rejectedSymlinks: string[] } {
@@ -141,12 +147,18 @@ function memberAccess(node: ts.Expression): MemberAccess | undefined {
 }
 
 const DYNAMIC_CODE_NAMES = new Set(["eval", "Function"]);
+const GLOBAL_OBJECT_NAMES = new Set(["globalThis", "global", "window", "self"]);
 
 function isDynamicCodeReference(node: ts.Expression, aliases: Set<string> = DYNAMIC_CODE_NAMES): boolean {
   const expression = unwrapExpression(node);
   if (ts.isIdentifier(expression)) return aliases.has(expression.text);
   const access = memberAccess(expression);
   return access !== undefined && DYNAMIC_CODE_NAMES.has(access.name);
+}
+
+function isGlobalObjectReference(node: ts.Expression, aliases: Set<string>): boolean {
+  const expression = unwrapExpression(node);
+  return ts.isIdentifier(expression) && aliases.has(expression.text);
 }
 
 function isImportMetaRequire(node: ts.Expression): boolean {
@@ -183,8 +195,8 @@ function isRequireMethodCall(node: ts.Expression, aliases: Set<string>): boolean
   return (access?.name === "apply" || access?.name === "bind" || access?.name === "call") && isRequireExpression(access.receiver, aliases);
 }
 
-function requireBindingNames(name: ts.BindingName, initializer: ts.Expression): string[] {
-  if (!isImportMeta(initializer) || !ts.isObjectBindingPattern(name)) return [];
+function requireBindingNames(name: ts.BindingName, initializer: ts.Expression, importMetaAliases: Set<string>): string[] {
+  if (!isImportMetaReference(initializer, importMetaAliases) || !ts.isObjectBindingPattern(name)) return [];
   const names: string[] = [];
   for (const element of name.elements) {
     if (!ts.isBindingElement(element) || !ts.isIdentifier(element.name)) continue;
@@ -195,14 +207,14 @@ function requireBindingNames(name: ts.BindingName, initializer: ts.Expression): 
   return names;
 }
 
-function collectRequireAliases(source: ts.SourceFile): Set<string> {
+function collectRequireAliases(source: ts.SourceFile, importMetaAliases: Set<string>): Set<string> {
   const aliases = new Set(["require"]);
   let changed = true;
   while (changed) {
     changed = false;
     const visit = (node: ts.Node): void => {
       if (ts.isVariableDeclaration(node) && node.initializer) {
-        for (const name of requireBindingNames(node.name, node.initializer)) {
+        for (const name of requireBindingNames(node.name, node.initializer, importMetaAliases)) {
           if (!aliases.has(name)) {
             aliases.add(name);
             changed = true;
@@ -244,19 +256,40 @@ function collectImportMetaAliases(source: ts.SourceFile): Set<string> {
 
 function collectDynamicCodeAliases(source: ts.SourceFile): Set<string> {
   const aliases = new Set(DYNAMIC_CODE_NAMES);
+  const globalAliases = new Set(GLOBAL_OBJECT_NAMES);
   let changed = true;
   while (changed) {
     changed = false;
     const visit = (node: ts.Node): void => {
-      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer &&
-        isDynamicCodeReference(node.initializer, aliases) &&
-        !aliases.has(node.name.text)) {
-        aliases.add(node.name.text);
-        changed = true;
+      if (ts.isVariableDeclaration(node) && node.initializer) {
+        if (ts.isIdentifier(node.name) && isDynamicCodeReference(node.initializer, aliases) && !aliases.has(node.name.text)) {
+          aliases.add(node.name.text);
+          changed = true;
+        }
+        if (ts.isIdentifier(node.name) && isGlobalObjectReference(node.initializer, globalAliases) && !globalAliases.has(node.name.text)) {
+          globalAliases.add(node.name.text);
+          changed = true;
+        }
+        if (ts.isObjectBindingPattern(node.name) && isGlobalObjectReference(node.initializer, globalAliases)) {
+          for (const element of node.name.elements) {
+            if (!ts.isBindingElement(element) || !ts.isIdentifier(element.name)) continue;
+            const propertyName = element.propertyName;
+            const propertyText = propertyName && ts.isStringLiteralLike(propertyName) ? propertyName.text : propertyName && ts.isIdentifier(propertyName) ? propertyName.text : element.name.text;
+            if (DYNAMIC_CODE_NAMES.has(propertyText) && !aliases.has(element.name.text)) {
+              aliases.add(element.name.text);
+              changed = true;
+            }
+          }
+        }
       } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
         ts.isIdentifier(node.left) && isDynamicCodeReference(node.right, aliases) &&
         !aliases.has(node.left.text)) {
         aliases.add(node.left.text);
+        changed = true;
+      } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+        ts.isIdentifier(node.left) && isGlobalObjectReference(node.right, globalAliases) &&
+        !globalAliases.has(node.left.text)) {
+        globalAliases.add(node.left.text);
         changed = true;
       }
       ts.forEachChild(node, visit);
@@ -282,8 +315,8 @@ function javascriptImports(file: string, content: string): JavaScriptImports {
   const source = ts.createSourceFile(file, content, ts.ScriptTarget.Latest, true, scriptKind);
   const specifiers: string[] = [];
   let hasUnverifiableDynamicImport = false;
-  const requireAliases = collectRequireAliases(source);
   const importMetaAliases = collectImportMetaAliases(source);
+  const requireAliases = collectRequireAliases(source, importMetaAliases);
   const dynamicCodeAliases = collectDynamicCodeAliases(source);
   const visit = (node: ts.Node): void => {
     if (ts.isImportDeclaration(node) && ts.isStringLiteralLike(node.moduleSpecifier)) {
@@ -489,7 +522,7 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
           const importedNames = match[1];
           if (importedNames) {
             for (const name of importedNames.split(",").map((item) => item.trim().split(/\s+as\s+/i)[0]).filter(Boolean)) {
-              const specifier = `./${name}`;
+              const specifier = `./${name.replaceAll(".", "/")}`;
               if (resolveExistingFile(importCandidates(path, specifier))) {
                 checkImportSpecifier(repoRoot, path, relative, specifier, findings, enqueue);
               }

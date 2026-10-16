@@ -73,6 +73,16 @@ test("rejects invalid manifest names and hidden Skill-shaped directories", () =>
   }
 });
 
+test("rejects unlisted files directly under the public Skills root", () => {
+  const { root, manifest } = fixture("# standalone\n");
+  try {
+    writeFileSync(join(root, "skills", "private-data.md"), "private operator notes\n");
+    expect(check(root, manifest)).toEqual(["UNEXPECTED_PUBLIC_SKILLS_ENTRY private-data.md"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("rejects a symlinked public Skill directory", () => {
   const { root, manifest } = fixture("# standalone\n");
   try {

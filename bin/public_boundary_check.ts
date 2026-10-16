@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 /** Reject private environment markers from public repository files. */
 
-import { isPathInside, relativePath, REPO_ROOT, trackedFiles } from "./repo_util.ts";
-import { existsSync, lstatSync, readFileSync } from "node:fs";
+import { isDirectRegularFile, isPathInside, relativePath, REPO_ROOT, trackedFiles } from "./repo_util.ts";
+import { lstatSync, readFileSync } from "node:fs";
 
 export const FORBIDDEN_MARKERS = ["CODEX_" + "THREAD_ID"];
 const SECRET_NAME = String.raw`(?:api[_-]?key|apikey|access[_-]?key|accesskey|token|secret|secret[_-]?key|secretkey|secret[_-]?access[_-]?key|secretaccesskey|password|passwd|private[_-]?key|privatekey|credential)`;
@@ -89,7 +89,8 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
       findings.push(`${relativePath(path, repoRoot)}: path escapes public repository`);
       continue;
     }
-    if (!existsSync(path)) {
+    if (!isDirectRegularFile(path)) {
+      findings.push(`${relativePath(path, repoRoot)}: tracked path is not a regular file`);
       continue;
     }
     const content = requireText(path);

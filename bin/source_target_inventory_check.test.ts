@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { check, main, manifestInventory, parseArgs, targetInventory } from "./source_target_inventory_check.ts";
+import { check, main, manifestInventory, parseArgs, targetInventory, targetSymlinkInventory } from "./source_target_inventory_check.ts";
 
 function git(cwd: string, ...args: string[]): void {
   const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
@@ -80,6 +80,11 @@ test("counts only regular Skill files and rejects malformed options", () => {
     mkdirSync(join(root, "skills", ".hidden"), { recursive: true });
     writeFileSync(join(root, "skills", ".hidden", "SKILL.md"), "# hidden\n");
     expect(targetInventory(root)).toEqual(new Set([".hidden", "regular"]));
+    mkdirSync(join(root, "outside", "linked"), { recursive: true });
+    writeFileSync(join(root, "outside", "linked", "SKILL.md"), "# linked\n");
+    symlinkSync(join(root, "outside", "linked"), join(root, "skills", "linked"), "dir");
+    expect(targetInventory(root)).toEqual(new Set([".hidden", "linked", "regular"]));
+    expect(targetSymlinkInventory(root)).toEqual(new Set(["linked"]));
     expect(parseArgs(["--source-root=/tmp/source", "--source-revision=HEAD", "--target-root=/tmp/target", "--public-manifest=/tmp/public"])).toEqual({
       sourceRoot: "/tmp/source",
       revision: "HEAD",

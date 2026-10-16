@@ -264,6 +264,27 @@ test("reports Gitlinks in the source Skill snapshot", () => {
   }
 });
 
+test("reports Gitlinks in the target Skill tree", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-inventory-target-gitlink-"));
+  const source = join(root, "source");
+  const target = join(root, "target");
+  try {
+    mkdirSync(join(source, "skills"), { recursive: true });
+    git(source, "init", "-q");
+    git(source, "commit", "--allow-empty", "-qm", "fixture");
+    mkdirSync(join(target, "skills"), { recursive: true });
+    git(target, "init", "-q");
+    git(target, "update-index", "--add", "--cacheinfo", "160000,2222222222222222222222222222222222222222,skills/external");
+    git(target, "commit", "-qm", "fixture");
+    writeFileSync(join(target, "PUBLIC_SKILLS.txt"), "");
+    expect(check(source, "HEAD", target, join(target, "PUBLIC_SKILLS.txt"))).toEqual([
+      "UNSUPPORTED_TARGET_GITLINK skills/external",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("preserves special characters in committed symlink paths", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-inventory-special-link-"));
   const source = join(root, "source");

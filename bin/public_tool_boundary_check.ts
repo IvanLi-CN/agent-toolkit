@@ -3,7 +3,7 @@
 
 import { lstatSync, realpathSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
-import { REPO_ROOT, readText, relativePath, resolveExistingFile, walkFiles } from "./repo_util.ts";
+import { isDirectRegularFile, isPathInside, REPO_ROOT, readText, relativePath, resolveExistingFile, walkFiles } from "./repo_util.ts";
 
 const runtimeNamePattern = "CODEX_" + "[A-Z0-9_]+";
 const runtimeHomeMarker = "$" + "CODEX_" + "HOME";
@@ -85,6 +85,10 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
   }
   for (const path of collected.files) {
     const relative = relativePath(path, repoRoot);
+    if (!isPathInside(repoRoot, path) || !isDirectRegularFile(path)) {
+      findings.push(`${relative}: public tool path is not a regular file inside the repository`);
+      continue;
+    }
     const content = readText(path);
     for (const [label, pattern] of FORBIDDEN_PATTERNS) {
       if (pattern.test(content)) {

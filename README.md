@@ -35,10 +35,11 @@ bun run typecheck
 bun run check
 bun run test:repo
 python3 -m pip install -r requirements-dev.txt
+ruby -e 'require "yaml"'
 bun run test:skills
 ```
 
-The test runner discovers maintained TypeScript, Python, and Shell test files automatically, so a new Skill can add a focused test without editing a root test list. It fails when a requested scope has no selected tests instead of reporting a false pass.
+The test runner discovers maintained TypeScript, Python, and Shell test files automatically, so a new Skill can add a focused test without editing a root test list. Skill tests that exercise the XP policy require Ruby with its standard YAML library; Python-facing tests use `requirements-dev.txt`. The runner fails when a requested scope has no selected tests instead of reporting a false pass.
 
 During a source migration, compare the public allowlist with the source snapshot and verify that private consumer Skills remain in the private source tree:
 

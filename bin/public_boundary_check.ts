@@ -7,9 +7,11 @@ import { lstatSync, readFileSync } from "node:fs";
 export const FORBIDDEN_MARKERS = ["CODEX_" + "THREAD_ID"];
 const SECRET_NAME = String.raw`(?:api[_-]?key|apikey|access[_-]?key|accesskey|token|secret|secret[_-]?key|secretkey|secret[_-]?access[_-]?key|secretaccesskey|password|passwd|private[_-]?key|privatekey|credential)`;
 const SECRET_VALUE = String.raw`(?![$<\{])[^'"\r\n]{16,}`;
+const UNQUOTED_SECRET_VALUE = String.raw`[A-Za-z0-9][A-Za-z0-9._~+/=-]{15,}`;
 const REGEX_HELPER_ASSIGNMENT = new RegExp(String.raw`^[ \t]*(?:local[ \t]+)?(?:re|regex|pattern)[_-][A-Za-z0-9_-]*[ \t]*=`, "i");
 const COMPOUND_ASSIGNMENT = new RegExp(String.raw`(?<![A-Za-z0-9_-])(?<name>[A-Za-z0-9_-]+)\s*=\s*['"]${SECRET_VALUE}['"]`, "i");
 const JSON_SECRET_FIELD = new RegExp(String.raw`["'](?<name>[A-Za-z0-9_-]+)["']\s*:\s*["']${SECRET_VALUE}["']`, "i");
+const UNQUOTED_SECRET_ASSIGNMENT = new RegExp(String.raw`(?<![A-Za-z0-9_-])(?<name>${SECRET_NAME})\s*[:=]\s*${UNQUOTED_SECRET_VALUE}(?![A-Za-z0-9._~+/=-])`, "i");
 const SECRET_SUFFIXES = [
   "api_key", "apikey", "access_key", "accesskey", "token", "secret",
   "secret_key", "secretkey", "secret_access_key", "secretaccesskey", "password", "passwd",
@@ -18,11 +20,12 @@ const SECRET_SUFFIXES = [
 
 export const FORBIDDEN_PATTERNS: Array<[string, RegExp]> = [
   ["absolute-home-path", /\/(?:Users|home)\/[A-Za-z0-9._-]+/],
-  ["private-hostname", /\b[A-Za-z0-9-]+\.(?:internal|lan|local)\b/],
+  ["private-hostname", /(?<![A-Za-z0-9.-])[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.(?:internal|lan|local)\b/],
   ["jwt-like-secret", /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/],
   ["quoted-secret-assignment", new RegExp(String.raw`(?<![A-Za-z0-9_-])${SECRET_NAME}\s*=\s*['"]${SECRET_VALUE}['"]`, "i")],
   ["prefixed-quoted-secret-assignment", COMPOUND_ASSIGNMENT],
   ["json-secret-field", JSON_SECRET_FIELD],
+  ["unquoted-secret-assignment", UNQUOTED_SECRET_ASSIGNMENT],
 ];
 
 const IGNORED_PRIVATE_HOSTNAMES = new Set(["config.local", "threading.local"]);

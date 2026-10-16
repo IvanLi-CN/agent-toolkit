@@ -20,7 +20,7 @@ function hasSkillMarker(path: string): boolean {
 export function targetInventory(root: string): Set<string> {
   const skillsRoot = join(root, "skills");
   const result = new Set<string>();
-  if (!existsSync(skillsRoot) || !isPathInside(root, skillsRoot)) return result;
+  if (!existsSync(skillsRoot) || !isPathInside(root, skillsRoot) || !lstatSync(skillsRoot).isDirectory()) return result;
   for (const entry of readdirSync(skillsRoot, { withFileTypes: true })) {
     if ((entry.isDirectory() || entry.isSymbolicLink()) && hasSkillMarker(join(skillsRoot, entry.name, "SKILL.md"))) {
       result.add(entry.name);
@@ -30,13 +30,32 @@ export function targetInventory(root: string): Set<string> {
 }
 
 export function targetSymlinkInventory(root: string): Set<string> {
+  return new Set([...targetSymlinkPaths(root)]
+    .map((path) => path.split("/")[1])
+    .filter((name): name is string => Boolean(name)));
+}
+
+export function targetSymlinkPaths(root: string): Set<string> {
   const skillsRoot = join(root, "skills");
   const result = new Set<string>();
-  if (!existsSync(skillsRoot) || !isPathInside(root, skillsRoot)) return result;
-  for (const entry of readdirSync(skillsRoot, { withFileTypes: true })) {
-    const skillRoot = join(skillsRoot, entry.name);
-    if (entry.isSymbolicLink() || isSymlink(join(skillRoot, "SKILL.md"))) result.add(entry.name);
+  if (isSymlink(skillsRoot)) {
+    result.add("skills");
+    return result;
   }
+  if (!existsSync(skillsRoot)) return result;
+  if (!isPathInside(root, skillsRoot) || !lstatSync(skillsRoot).isDirectory()) return result;
+  const visit = (directory: string, relativeDirectory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      const relativePath = relativeDirectory ? `${relativeDirectory}/${entry.name}` : entry.name;
+      if (entry.isSymbolicLink()) {
+        result.add(`skills/${relativePath}`);
+      } else if (entry.isDirectory()) {
+        visit(path, relativePath);
+      }
+    }
+  };
+  visit(skillsRoot, "");
   return result;
 }
 
@@ -49,32 +68,37 @@ export function manifestInventory(path: string): Set<string> {
   );
 }
 
-export function snapshotInventory(source: string, revision: string): Set<string> {
+type SnapshotTree = { skillNames: Set<string>; symlinkPaths: Set<string> };
+
+function snapshotTree(source: string, revision: string): SnapshotTree {
   const result = runGit(["ls-tree", "-r", revision, "--", "skills"], resolve(source));
   if (result.exitCode !== 0) {
     throw new Error(`git ls-tree failed: ${result.stderr.trim()}`);
   }
-  return new Set(
-    result.stdout
-      .split("\n")
-      .map((item) => item.split("\t", 2))
-      .filter(([metadata, path]) => ["100644", "100755"].includes(metadata?.split(/\s+/)[0] ?? "") && path?.startsWith("skills/") && path?.endsWith("/SKILL.md") && path.split("/").length === 3)
-      .map(([, path]) => path.slice("skills/".length, -"/SKILL.md".length)),
-  );
+  const skillNames = new Set<string>();
+  const symlinkPaths = new Set<string>();
+  for (const item of result.stdout.split("\n")) {
+    const [metadata, path] = item.split("\t", 2);
+    const mode = metadata?.split(/\s+/)[0] ?? "";
+    if (!path) continue;
+    if (["100644", "100755"].includes(mode) && path.startsWith("skills/") && path.endsWith("/SKILL.md") && path.split("/").length === 3) {
+      skillNames.add(path.slice("skills/".length, -"/SKILL.md".length));
+    }
+    if (mode === "120000" && (path === "skills" || path.startsWith("skills/"))) {
+      symlinkPaths.add(path);
+    }
+  }
+  return { skillNames, symlinkPaths };
+}
+
+export function snapshotInventory(source: string, revision: string): Set<string> {
+  return snapshotTree(source, revision).skillNames;
 }
 
 export function snapshotSymlinkInventory(source: string, revision: string): Set<string> {
-  const result = runGit(["ls-tree", "-r", revision, "--", "skills"], resolve(source));
-  if (result.exitCode !== 0) {
-    throw new Error(`git ls-tree failed: ${result.stderr.trim()}`);
-  }
-  return new Set(
-    result.stdout
-      .split("\n")
-      .map((item) => item.split("\t", 2))
-      .filter(([metadata, path]) => metadata?.split(/\s+/)[0] === "120000" && (path?.split("/").length === 2 || (path?.endsWith("/SKILL.md") && path.split("/").length === 3)))
-      .map(([, path]) => path.split("/")[1]),
-  );
+  return new Set([...snapshotTree(source, revision).symlinkPaths]
+    .map((path) => path.split("/")[1])
+    .filter((name): name is string => Boolean(name)));
 }
 
 export type ParsedArgs = { sourceRoot?: string; revision: string; targetRoot: string; manifest?: string };
@@ -144,18 +168,33 @@ export function inspect(
 ): InventoryResult {
   const source = resolve(sourceRoot);
   const target = resolve(targetRoot);
-  const expectedSource = snapshotInventory(source, revision);
+  const snapshot = snapshotTree(source, revision);
+  const expectedSource = snapshot.skillNames;
   const actual = targetInventory(target);
-  const sourceSymlinks = snapshotSymlinkInventory(source, revision);
-  const targetSymlinks = targetSymlinkInventory(target);
+  const sourceSymlinkPaths = snapshot.symlinkPaths;
+  const targetSymlinkPathsSet = targetSymlinkPaths(target);
   const publicNames = manifestInventory(publicManifest);
   const privateNames = new Set([...expectedSource].filter((name) => !publicNames.has(name)));
   const findings: string[] = [];
 
-  if (isSymlink(join(target, "skills"))) findings.push("SYMLINKED_TARGET_SKILLS_ROOT");
-  if (isSymlink(join(source, "skills"))) findings.push("SYMLINKED_SOURCE_SKILLS_ROOT");
-  for (const name of [...targetSymlinks].sort()) findings.push(`SYMLINKED_TARGET_SKILL ${name}`);
-  for (const name of [...sourceSymlinks].sort()) findings.push(`SYMLINKED_SOURCE_SKILL ${name}`);
+  if (targetSymlinkPathsSet.has("skills")) findings.push("SYMLINKED_TARGET_SKILLS_ROOT");
+  if (sourceSymlinkPaths.has("skills") || isSymlink(join(source, "skills"))) findings.push("SYMLINKED_SOURCE_SKILLS_ROOT");
+  for (const path of [...targetSymlinkPathsSet].filter((path) => path !== "skills").sort()) {
+    const parts = path.split("/");
+    if (parts.length === 2 || (parts.length === 3 && path.endsWith("/SKILL.md"))) {
+      findings.push(`SYMLINKED_TARGET_SKILL ${parts[1]}`);
+    } else {
+      findings.push(`SYMLINKED_TARGET_PATH ${path}`);
+    }
+  }
+  for (const path of [...sourceSymlinkPaths].filter((path) => path !== "skills").sort()) {
+    const parts = path.split("/");
+    if (parts.length === 2 || (parts.length === 3 && path.endsWith("/SKILL.md"))) {
+      findings.push(`SYMLINKED_SOURCE_SKILL ${parts[1]}`);
+    } else {
+      findings.push(`SYMLINKED_SOURCE_PATH ${path}`);
+    }
+  }
 
   for (const name of [...publicNames].filter((name) => !expectedSource.has(name)).sort()) {
     findings.push(`PUBLIC_SKILL_NOT_IN_SOURCE_SNAPSHOT ${name}`);

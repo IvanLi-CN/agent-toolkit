@@ -47,13 +47,14 @@ function scanSkillFiles(repoRoot: string, skillRoot: string): { files: string[];
   const rejectedSymlinks: string[] = [];
   const files = new Set(walkFiles(skillRoot, {
     ignoredDirectories: IGNORED_DIRECTORIES,
+    shouldIgnoreDirectory: (_, name) => name.endsWith(".egg-info"),
     onRejectedSymlink: (path) => rejectedSymlinks.push(path),
   }));
   try {
     for (const path of trackedFiles(repoRoot)) {
       const relative = relativePath(path, skillRoot);
       if (relative && !relative.startsWith("../")) {
-        if (isPathInside(repoRoot, path)) files.add(path);
+        if (isPathInside(repoRoot, path) && isDirectRegularFile(path)) files.add(path);
         else rejectedSymlinks.push(path);
       }
     }
@@ -125,7 +126,7 @@ export function check(repoRoot: string = REPO_ROOT, manifest: string = PUBLIC_MA
       continue;
     }
     const scanned = scanSkillFiles(repoRoot, skillRoot);
-    for (const path of scanned.files) {
+    for (const path of scanned.files.filter((path) => isDirectRegularFile(path) && isPathInside(repoRoot, path))) {
       const relative = relativePath(path, repoRoot);
       if (path.split(/[\\/]/).at(-2) === "references" && PRIVATE_REFERENCE_NAMES.has(path.split(/[\\/]/).at(-1) ?? "")) {
         findings.push(`${relative}: private operator reference must stay outside repository`);

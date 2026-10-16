@@ -42,6 +42,15 @@ test("reports duplicate entries", () => {
   });
 });
 
+test("reports a local index path that names a different Skill", () => {
+  withFixture((root) => {
+    mkdirSync(join(root, "skills", "alpha"), { recursive: true });
+    writeFileSync(join(root, "skills", "alpha", "SKILL.md"), "# alpha\n");
+    writeFileSync(join(root, "skills", "README.md"), "| Skill | Description | Path |\n|---|---|---|\n| `alpha` | local | `skills/wrong/**` |\n");
+    expect(check(root)).toEqual(["INVALID_INDEX_PATH skill=alpha line=3 path=skills/wrong/**"]);
+  });
+});
+
 test("ignores tables that are unrelated to the Skill index", () => {
   withFixture((root) => {
     mkdirSync(join(root, "skills", "alpha"), { recursive: true });

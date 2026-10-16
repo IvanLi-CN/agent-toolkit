@@ -15,6 +15,9 @@ test("detects secret assignments and ignores redacted placeholders", () => {
   expect(pattern("quoted-secret-assignment").test(`${name}="${fixtureValue}"`)).toBe(true);
   expect(pattern("json-secret-field").test(`{"${name}":"${fixtureValue}"}`)).toBe(true);
   expect(pattern("json-secret-field").test(`{"${name}":"<redacted>"}`)).toBe(false);
+  expect(pattern("unquoted-secret-assignment").test(`${name}=0123456789abcdef`)).toBe(true);
+  expect(pattern("unquoted-secret-assignment").test(`${name}: 0123456789abcdef`)).toBe(true);
+  expect(pattern("unquoted-secret-assignment").test(`${name}=<redacted>`)).toBe(false);
 });
 
 test("detects prefixed, lowercase, and compound secret assignments", () => {
@@ -85,6 +88,13 @@ test("does not exclude names that merely resemble regex helpers", () => {
 
 test("does not classify long hyphenated input as a secret assignment", () => {
   expect(pattern("prefixed-quoted-secret-assignment").test("a-".repeat(8000) + "!")).toBe(false);
+});
+
+test("matches complete private hostnames while allowing neutral local helper names", () => {
+  const privateHostname = pattern("private-hostname");
+  expect(privateHostname.test("config" + ".local")).toBe(true);
+  expect(privateHostname.test("threading" + ".local")).toBe(true);
+  expect(privateHostname.test("prod.config" + ".local")).toBe(true);
 });
 
 test("checks tracked public files", () => {

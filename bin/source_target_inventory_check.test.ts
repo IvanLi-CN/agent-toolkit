@@ -13,6 +13,7 @@ function git(cwd: string, ...args: string[]): void {
     GIT_CONFIG_SYSTEM: join(cwd, ".git-system-config"),
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_TEMPLATE_DIR: templateDir,
+    GIT_DEFAULT_HASH: "sha1",
     GIT_AUTHOR_NAME: "Fixture",
     GIT_AUTHOR_EMAIL: "fixture@example.invalid",
     GIT_COMMITTER_NAME: "Fixture",

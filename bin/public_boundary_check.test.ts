@@ -169,6 +169,8 @@ test("detects credential-bearing URLs, bearer tokens, and complete PEM blocks", 
   expect(pattern("yaml-block-secret-field").test(`${blockName}: |\n  "${phraseValue}"`)).toBe(true);
   expect(pattern("yaml-block-secret-field").test(`${blockName}: |\n  ${phraseValue}`)).toBe(true);
   expect(pattern("yaml-block-secret-field").test(`${blockName}: |\n  <redacted>`)).toBe(false);
+  expect(pattern("yaml-block-secret-field").test(`"${blockName}": |\n  ${blockValue}`)).toBe(true);
+  expect(pattern("yaml-block-secret-field").test(`'${blockName}': >-\n  ${blockValue}`)).toBe(true);
 });
 
 test("checks tracked public files", () => {

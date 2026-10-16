@@ -26,6 +26,7 @@ const ABSOLUTE_IMPORT = new RegExp(String.raw`${IMPORT_PREFIX}["']((?:file://|/|
 const EXCLUDED_TEST_FILE = /(?:\.test\.(?:ts|tsx|js|py|sh)$|^test[-_].*\.(?:ts|tsx|js|py|sh)$|_test\.(?:ts|tsx|js|py|sh)$)/;
 const PUBLIC_TOOL_EXTENSIONS = [".ts", ".tsx", ".js", ".py", ".sh"];
 const JAVASCRIPT_EXTENSIONS = new Set([".js", ".jsx", ".ts", ".tsx"]);
+const NODE_MODULE_BUILTINS = new Set(["module", "node:module"]);
 const RELATIVE_SPECIFIER = /^\.{1,2}[\\/]/;
 const ABSOLUTE_SPECIFIER = /^(?:file:\/\/|\/|\\|[A-Za-z]:[\\/])/;
 
@@ -95,7 +96,7 @@ function javascriptImports(file: string, content: string): JavaScriptImports {
   let hasUnverifiableDynamicImport = false;
   const visit = (node: ts.Node): void => {
     if (ts.isImportDeclaration(node) && ts.isStringLiteralLike(node.moduleSpecifier)) {
-      if (node.moduleSpecifier.text === "node:module") {
+      if (NODE_MODULE_BUILTINS.has(node.moduleSpecifier.text)) {
         hasUnverifiableDynamicImport = true;
       }
       specifiers.push(node.moduleSpecifier.text);
@@ -114,7 +115,7 @@ function javascriptImports(file: string, content: string): JavaScriptImports {
       if (isDynamicImport || isRequire) {
         const argument = node.arguments[0];
         if (argument && ts.isStringLiteralLike(argument)) {
-          if (isRequire && argument.text === "node:module") {
+          if ((isDynamicImport || isRequire) && NODE_MODULE_BUILTINS.has(argument.text)) {
             hasUnverifiableDynamicImport = true;
           }
           specifiers.push(argument.text);

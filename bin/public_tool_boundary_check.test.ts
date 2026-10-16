@@ -104,9 +104,13 @@ test("ignores bare modules and rejects Windows-style relative imports", () => {
     writeFileSync(join(root, "bin", "dynamic.ts"), 'const specifier = "../../' + outsideName + '"; import(specifier);\n');
     writeFileSync(join(root, "bin", "create-require.ts"), 'import { createRequire } from "node:module"; const load = createRequire(import.meta.url); load("../../outside.ts");\n');
     writeFileSync(join(root, "bin", "create-require-alias.ts"), 'import { createRequire as makeRequire } from "node:module"; const load = makeRequire(import.meta.url); load("../../outside.ts");\n');
+    writeFileSync(join(root, "bin", "create-require-module.ts"), 'import { createRequire as makeRequire } from "module"; const load = makeRequire(import.meta.url); load("../../outside.ts");\n');
+    writeFileSync(join(root, "bin", "dynamic-module.ts"), 'import("module").then((module) => module["createRequire"](import.meta.url));\n');
     expect(check(root)).toEqual([
       "bin/create-require-alias.ts: dynamic import or require cannot be verified",
+      "bin/create-require-module.ts: dynamic import or require cannot be verified",
       "bin/create-require.ts: dynamic import or require cannot be verified",
+      "bin/dynamic-module.ts: dynamic import or require cannot be verified",
       "bin/dynamic.ts: dynamic import or require cannot be verified",
       `bin/escaped.ts: local reference outside public repository ../../${outsideName}`,
       `bin/template.ts: local reference outside public repository ../../${outsideName}`,

@@ -452,6 +452,36 @@ test("fails closed for Shell source wrappers and dynamic evaluation", () => {
   }
 });
 
+test("checks quoted Shell commands and expandable heredocs", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-shell-quoted-heredoc-"));
+  try {
+    mkdirSync(join(root, "bin"), { recursive: true });
+    mkdirSync(join(root, "support"), { recursive: true });
+    writeFileSync(join(root, "bin", "entry.sh"), [
+      '"source" ../support/quoted.sh',
+      "\\source ../support/escaped.sh",
+      "cat <<EOF",
+      'value="$(. ../support/heredoc.sh)"',
+      "EOF",
+      "cat <<'EOF'",
+      'value="$(. ../support/quoted-heredoc.sh)"',
+      "EOF",
+      "",
+    ].join("\n"));
+    writeFileSync(join(root, "support", "quoted.sh"), "echo os.environ[\"CODEX_HOME\"]\n");
+    writeFileSync(join(root, "support", "escaped.sh"), "echo os.environ[\"CODEX_HOME\"]\n");
+    writeFileSync(join(root, "support", "heredoc.sh"), "echo os.environ[\"CODEX_HOME\"]\n");
+    writeFileSync(join(root, "support", "quoted-heredoc.sh"), "echo os.environ[\"CODEX_HOME\"]\n");
+    expect(check(root)).toEqual([
+      "support/quoted.sh: forbidden public tool coupling codex-runtime-marker",
+      "support/escaped.sh: forbidden public tool coupling codex-runtime-marker",
+      "support/heredoc.sh: forbidden public tool coupling codex-runtime-marker",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("recursively checks Python package initializers", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-python-package-"));
   try {
@@ -742,16 +772,20 @@ test("checks Python static dynamic imports and rejects unknown dynamic imports",
   const unknownRoot = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-python-unknown-dynamic-import-"));
   try {
     mkdirSync(join(staticRoot, "bin"), { recursive: true });
-    writeFileSync(join(staticRoot, "bin", "entry.py"), "from importlib import import_module as load\nimport importlib as imp\nfrom builtins import __import__ as builtin_import\nimport builtins as b\nload(\"runtime_test\")\nimp.import_module(\"other_test\")\nbuiltin_import(\"third_test\")\nb.__import__(\"fourth_test\")\n");
+    writeFileSync(join(staticRoot, "bin", "entry.py"), "from importlib import import_module as load\nimport importlib as imp\nfrom builtins import __import__ as builtin_import\nimport builtins as b\nload(\"runtime_test\")\nimp.import_module(\"other_test\")\nbuiltin_import(\"third_test\")\nb.__import__(\"fourth_test\")\nload = imp.import_module\nload(\"fifth_test\")\ndirect = __import__\ndirect(\"sixth_test\")\n");
     writeFileSync(join(staticRoot, "bin", "runtime_test.py"), "marker = 'fixture-only'\n");
     writeFileSync(join(staticRoot, "bin", "other_test.py"), "marker = 'fixture-only'\n");
     writeFileSync(join(staticRoot, "bin", "third_test.py"), "marker = 'fixture-only'\n");
     writeFileSync(join(staticRoot, "bin", "fourth_test.py"), "marker = 'fixture-only'\n");
+    writeFileSync(join(staticRoot, "bin", "fifth_test.py"), "marker = 'fixture-only'\n");
+    writeFileSync(join(staticRoot, "bin", "sixth_test.py"), "marker = 'fixture-only'\n");
     expect(check(staticRoot)).toEqual([
       "bin/entry.py: local reference targets excluded test file ./runtime_test",
       "bin/entry.py: local reference targets excluded test file ./other_test",
       "bin/entry.py: local reference targets excluded test file ./third_test",
       "bin/entry.py: local reference targets excluded test file ./fourth_test",
+      "bin/entry.py: local reference targets excluded test file ./fifth_test",
+      "bin/entry.py: local reference targets excluded test file ./sixth_test",
     ]);
 
     mkdirSync(join(unknownRoot, "bin"), { recursive: true });
@@ -762,6 +796,36 @@ test("checks Python static dynamic imports and rejects unknown dynamic imports",
   } finally {
     rmSync(staticRoot, { recursive: true, force: true });
     rmSync(unknownRoot, { recursive: true, force: true });
+  }
+});
+
+test("checks Python f-string imports and fails closed for dynamic import expressions", () => {
+  const fStringRoot = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-python-fstring-import-"));
+  const expressionRoot = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-python-expression-import-"));
+  const loaderRoot = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-python-file-loader-"));
+  try {
+    mkdirSync(join(fStringRoot, "bin"), { recursive: true });
+    writeFileSync(join(fStringRoot, "bin", "entry.py"), "value = f\"{__import__('runtime_test')}\"\n");
+    writeFileSync(join(fStringRoot, "bin", "runtime_test.py"), "marker = 'fixture-only'\n");
+    expect(check(fStringRoot)).toEqual([
+      "bin/entry.py: local reference targets excluded test file ./runtime_test",
+    ]);
+
+    mkdirSync(join(expressionRoot, "bin"), { recursive: true });
+    writeFileSync(join(expressionRoot, "bin", "entry.py"), "__import__(\"runtime\" + \"_test\")\n");
+    expect(check(expressionRoot)).toEqual([
+      "bin/entry.py: dynamic Python import cannot be verified",
+    ]);
+
+    mkdirSync(join(loaderRoot, "bin"), { recursive: true });
+    writeFileSync(join(loaderRoot, "bin", "entry.py"), "import importlib.util\nspec = importlib.util.spec_from_file_location(\"runtime\", \"../../private.py\")\nmodule = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(module)\n");
+    expect(check(loaderRoot)).toEqual([
+      "bin/entry.py: dynamic Python import cannot be verified",
+    ]);
+  } finally {
+    rmSync(fStringRoot, { recursive: true, force: true });
+    rmSync(expressionRoot, { recursive: true, force: true });
+    rmSync(loaderRoot, { recursive: true, force: true });
   }
 });
 

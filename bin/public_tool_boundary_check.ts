@@ -72,10 +72,39 @@ function shellCommandSubstitution(content: string, start: number): { body: strin
   return undefined;
 }
 
+function shellCommandSubstitutions(content: string): string[] {
+  const substitutions: string[] = [];
+  for (let index = 0; index < content.length; index += 1) {
+    if (content.startsWith("$(", index)) {
+      const substitution = shellCommandSubstitution(content, index + 2);
+      if (!substitution) {
+        substitutions.push(content.slice(index + 2));
+        break;
+      }
+      substitutions.push(substitution.body);
+      index = substitution.end;
+    } else if (content[index] === "`") {
+      let end = index + 1;
+      while (end < content.length) {
+        if (content[end] === "\\") {
+          end += 2;
+        } else if (content[end] === "`") {
+          break;
+        } else {
+          end += 1;
+        }
+      }
+      substitutions.push(content.slice(index + 1, end));
+      index = end;
+    }
+  }
+  return substitutions;
+}
+
 function shellTokens(content: string): ShellToken[] {
   const tokens: ShellToken[] = [];
-  const pendingHeredocs: Array<{ delimiter: string; stripTabs: boolean }> = [];
-  let activeHeredoc: { delimiter: string; stripTabs: boolean } | undefined;
+  const pendingHeredocs: Array<{ delimiter: string; stripTabs: boolean; expand: boolean }> = [];
+  let activeHeredoc: { delimiter: string; stripTabs: boolean; expand: boolean } | undefined;
   let expectingHeredocDelimiter = false;
   let heredocStripTabs = false;
   let index = 0;
@@ -84,7 +113,12 @@ function shellTokens(content: string): ShellToken[] {
       const end = content.indexOf("\n", index);
       const line = content.slice(index, end < 0 ? content.length : end).replace(/\r$/, "");
       const comparable = activeHeredoc.stripTabs ? line.replace(/^\t+/, "") : line;
-      if (comparable === activeHeredoc.delimiter) activeHeredoc = pendingHeredocs.shift();
+      if (comparable === activeHeredoc.delimiter) {
+        activeHeredoc = pendingHeredocs.shift();
+      } else if (activeHeredoc.expand) {
+        const substitutions = shellCommandSubstitutions(line);
+        if (substitutions.length > 0) tokens.push({ kind: "word", value: "", commandSubstitutions: substitutions });
+      }
       index = end < 0 ? content.length : end + 1;
       continue;
     }
@@ -170,7 +204,7 @@ function shellTokens(content: string): ShellToken[] {
     if (value.length > 0 || quoted) {
       tokens.push({ kind: "word", value, quoted, ...(commandSubstitutions.length > 0 ? { commandSubstitutions } : {}) });
       if (expectingHeredocDelimiter) {
-        pendingHeredocs.push({ delimiter: value, stripTabs: heredocStripTabs });
+        pendingHeredocs.push({ delimiter: value, stripTabs: heredocStripTabs, expand: !quoted });
         expectingHeredocDelimiter = false;
       }
     } else {
@@ -218,8 +252,6 @@ function shellSourceAnalysis(content: string): ShellSourceAnalysis {
     if (!commandStart) continue;
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token.value)) {
       commandStart = true;
-    } else if (token.quoted) {
-      commandStart = false;
     } else if (controlWords.has(token.value) || token.value === "!") {
       commandStart = true;
     } else if (commandWrappers.has(token.value)) {
@@ -291,6 +323,64 @@ function maskPythonNonCode(content: string): string {
     }
   }
   return characters.join("");
+}
+
+function pythonFStringExpressions(content: string): string[] {
+  const expressions: string[] = [];
+  const prefixPattern = /(?:^|[^A-Za-z0-9_])(?:[fF][rR]?|[rR][fF])("""|'''|"|')/g;
+  for (const match of content.matchAll(prefixPattern)) {
+    const quote = match[1];
+    if (!quote) continue;
+    const quoteStart = (match.index ?? 0) + match[0].length - quote.length;
+    const triple = quote.length === 3;
+    let index = quoteStart + quote.length;
+    while (index < content.length) {
+      if (triple && content.startsWith(quote, index)) break;
+      if (!triple && content[index] === quote) break;
+      if (content[index] === "\\") {
+        index += 2;
+        continue;
+      }
+      if (content.startsWith("{{", index) || content.startsWith("}}", index)) {
+        index += 2;
+        continue;
+      }
+      if (content[index] !== "{") {
+        index += 1;
+        continue;
+      }
+      const expressionStart = index + 1;
+      let depth = 1;
+      let expressionQuote: "'" | '"' | undefined;
+      let expressionEnd = -1;
+      for (index = expressionStart; index < content.length; index += 1) {
+        const character = content[index];
+        if (expressionQuote) {
+          if (character === "\\") {
+            index += 1;
+          } else if (character === expressionQuote) {
+            expressionQuote = undefined;
+          }
+          continue;
+        }
+        if (character === "'" || character === '"') {
+          expressionQuote = character;
+        } else if (character === "{") {
+          depth += 1;
+        } else if (character === "}") {
+          depth -= 1;
+          if (depth === 0) {
+            expressionEnd = index;
+            break;
+          }
+        }
+      }
+      if (expressionEnd < 0) break;
+      expressions.push(content.slice(expressionStart, expressionEnd));
+      index = expressionEnd + 1;
+    }
+  }
+  return expressions;
 }
 
 function isExcludedTestPath(path: string): boolean {
@@ -1126,6 +1216,10 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
       if (extname(path).toLowerCase() === ".py") {
         const pythonContent = maskPythonNonCode(content);
         let hasUnverifiableDynamicPythonImport = false;
+        const pythonDynamicSources = [
+          { code: pythonContent, source: content },
+          ...pythonFStringExpressions(content).map((source) => ({ code: source, source })),
+        ];
         const pythonDynamicImportNames = new Set(["__import__", "import_module"]);
         const pythonImportlibAliases = new Set(["importlib"]);
         const pythonBuiltinsAliases = new Set(["builtins"]);
@@ -1147,6 +1241,28 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
               if (binding.name === "__import__") pythonDynamicImportNames.add(binding.alias);
             }
           }
+        }
+        const pythonLoaderAssignments = /\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:(?:([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*(import_module|__import__))|([A-Za-z_][A-Za-z0-9_]*))/g;
+        let loaderAliasesChanged = true;
+        while (loaderAliasesChanged) {
+          loaderAliasesChanged = false;
+          for (const match of pythonContent.matchAll(pythonLoaderAssignments)) {
+            const targetName = match[1];
+            const receiverName = match[2];
+            const memberName = match[3];
+            const directName = match[4];
+            const isImportlibLoader = receiverName !== undefined && memberName === "import_module" && pythonImportlibAliases.has(receiverName);
+            const isBuiltinsLoader = receiverName !== undefined && memberName === "__import__" && pythonBuiltinsAliases.has(receiverName);
+            const isDirectLoader = directName !== undefined && pythonDynamicImportNames.has(directName);
+            if (targetName && (isImportlibLoader || isBuiltinsLoader || isDirectLoader) && !pythonDynamicImportNames.has(targetName)) {
+              pythonDynamicImportNames.add(targetName);
+              loaderAliasesChanged = true;
+            }
+          }
+        }
+        const pythonFileLoaderCall = /(?:\b[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)*(?:spec_from_file_location|module_from_spec|exec_module)\s*\(/;
+        if (pythonDynamicSources.some(({ code }) => pythonFileLoaderCall.test(code))) {
+          hasUnverifiableDynamicPythonImport = true;
         }
         const checkPythonSpecifier = (specifier: string, boundary?: string): void => {
           checkImportSpecifier(repoRoot, path, relative, specifier, reportFinding, (resolved) => {
@@ -1182,34 +1298,36 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
           if (!pythonReferenceExists(topSpecifier)) return;
           if (!checkPythonReference(moduleSpecifier, pythonSearchRoot)) checkPythonSpecifier(moduleSpecifier, pythonSearchRoot);
         };
-        for (const match of pythonContent.matchAll(PYTHON_DYNAMIC_CALL)) {
-          const directName = match[1];
-          const receiverName = match[2];
-          const memberName = match[3];
-          const isDynamicImportCall = directName !== undefined && pythonDynamicImportNames.has(directName);
-          const isImportlibMemberCall = receiverName !== undefined && memberName === "import_module" && pythonImportlibAliases.has(receiverName);
-          const isBuiltinsImportCall = receiverName !== undefined && memberName === "__import__" && pythonBuiltinsAliases.has(receiverName);
-          if (!isDynamicImportCall && !isImportlibMemberCall && !isBuiltinsImportCall) continue;
-          const start = match.index ?? 0;
-          const openIndex = pythonContent.indexOf("(", start);
-          let depth = 0;
-          let closeIndex = -1;
-          for (let index = openIndex; index < pythonContent.length; index += 1) {
-            if (pythonContent[index] === "(") depth += 1;
-            if (pythonContent[index] === ")") {
-              depth -= 1;
-              if (depth === 0) {
-                closeIndex = index;
-                break;
+        for (const { code, source } of pythonDynamicSources) {
+          for (const match of code.matchAll(PYTHON_DYNAMIC_CALL)) {
+            const directName = match[1];
+            const receiverName = match[2];
+            const memberName = match[3];
+            const isDynamicImportCall = directName !== undefined && pythonDynamicImportNames.has(directName);
+            const isImportlibMemberCall = receiverName !== undefined && memberName === "import_module" && pythonImportlibAliases.has(receiverName);
+            const isBuiltinsImportCall = receiverName !== undefined && memberName === "__import__" && pythonBuiltinsAliases.has(receiverName);
+            if (!isDynamicImportCall && !isImportlibMemberCall && !isBuiltinsImportCall) continue;
+            const start = match.index ?? 0;
+            const openIndex = code.indexOf("(", start);
+            let depth = 0;
+            let closeIndex = -1;
+            for (let index = openIndex; index < code.length; index += 1) {
+              if (code[index] === "(") depth += 1;
+              if (code[index] === ")") {
+                depth -= 1;
+                if (depth === 0) {
+                  closeIndex = index;
+                  break;
+                }
               }
             }
+            if (openIndex < 0 || closeIndex < 0) {
+              checkPythonDynamicImport(undefined);
+              continue;
+            }
+            const argument = source.slice(openIndex + 1, closeIndex).match(/^[ \t\r\n]*(?:(["'])([A-Za-z_][A-Za-z0-9_.]*)\1)(?=[ \t\r\n]*(?:,|$))/);
+            checkPythonDynamicImport(argument?.[2]);
           }
-          if (openIndex < 0 || closeIndex < 0) {
-            checkPythonDynamicImport(undefined);
-            continue;
-          }
-          const argument = content.slice(openIndex + 1, closeIndex).match(/^[ \t\r\n]*(?:(["'])([A-Za-z_][A-Za-z0-9_.]*)\1)(?:[ \t\r\n,]|$)/);
-          checkPythonDynamicImport(argument?.[2]);
         }
         if (hasUnverifiableDynamicPythonImport) {
           reportFinding(`${relative}: dynamic Python import cannot be verified`);

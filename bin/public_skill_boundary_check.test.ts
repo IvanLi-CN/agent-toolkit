@@ -139,7 +139,8 @@ test("rejects an in-boundary symlinked private reference", () => {
 
 test("rejects a public manifest that is outside the repository boundary", () => {
   const { root } = fixture("# standalone\n");
-  const outside = join(root, "..", "agent-toolkit-manifest-outside.txt");
+  const outsideRoot = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-manifest-outside-"));
+  const outside = join(outsideRoot, "manifest.txt");
   const linkedManifest = join(root, "linked-manifest.txt");
   try {
     writeFileSync(outside, "alpha\n");
@@ -147,7 +148,7 @@ test("rejects a public manifest that is outside the repository boundary", () => 
     expect(check(root, linkedManifest)).toEqual(["INVALID_PUBLIC_SKILLS_MANIFEST"]);
   } finally {
     rmSync(root, { recursive: true, force: true });
-    rmSync(outside, { force: true });
+    rmSync(outsideRoot, { recursive: true, force: true });
   }
 });
 

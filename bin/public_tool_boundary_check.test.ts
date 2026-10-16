@@ -102,7 +102,9 @@ test("ignores bare modules and rejects Windows-style relative imports", () => {
     writeFileSync(join(root, "bin", "escaped.ts"), `import "\\x2e\\x2e/\\x2e\\x2e/${outsideName}";\n`);
     writeFileSync(join(root, "bin", "template.ts"), "import(`../../" + outsideName + "`);\n");
     writeFileSync(join(root, "bin", "dynamic.ts"), 'const specifier = "../../' + outsideName + '"; import(specifier);\n');
+    writeFileSync(join(root, "bin", "create-require.ts"), 'import { createRequire } from "node:module"; const load = createRequire(import.meta.url); load("../../outside.ts");\n');
     expect(check(root)).toEqual([
+      "bin/create-require.ts: dynamic import or require cannot be verified",
       "bin/dynamic.ts: dynamic import or require cannot be verified",
       `bin/escaped.ts: local reference outside public repository ../../${outsideName}`,
       `bin/template.ts: local reference outside public repository ../../${outsideName}`,

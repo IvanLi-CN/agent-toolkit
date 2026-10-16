@@ -44,18 +44,18 @@ export function repositorySkills(repoRoot: string): Set<string> {
 }
 
 function scanSkillFiles(repoRoot: string, skillRoot: string): { files: string[]; rejectedSymlinks: string[] } {
-  const rejectedSymlinks: string[] = [];
+  const rejectedSymlinks = new Set<string>();
   const files = new Set(walkFiles(skillRoot, {
     ignoredDirectories: IGNORED_DIRECTORIES,
     shouldIgnoreDirectory: (_, name) => IGNORED_DIRECTORIES.has(name) || name.endsWith(".egg-info"),
-    onRejectedSymlink: (path) => rejectedSymlinks.push(path),
+    onRejectedSymlink: (path) => rejectedSymlinks.add(path),
   }));
   try {
     for (const path of trackedFiles(repoRoot)) {
       const relative = relativePath(path, skillRoot);
       if (relative && !relative.startsWith("../")) {
         if (isPathInside(repoRoot, path) && isDirectRegularFile(path)) files.add(path);
-        else rejectedSymlinks.push(path);
+        else rejectedSymlinks.add(path);
       }
     }
   } catch {
@@ -64,12 +64,12 @@ function scanSkillFiles(repoRoot: string, skillRoot: string): { files: string[];
   for (const path of [...files]) {
     if (!isDirectRegularFile(path)) {
       files.delete(path);
-      rejectedSymlinks.push(path);
+      rejectedSymlinks.add(path);
     }
   }
   return {
     files: [...files].sort((left, right) => left < right ? -1 : left > right ? 1 : 0),
-    rejectedSymlinks: rejectedSymlinks.sort(),
+    rejectedSymlinks: [...rejectedSymlinks].sort(),
   };
 }
 

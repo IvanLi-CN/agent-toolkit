@@ -44,6 +44,30 @@ test("ignores comments, blank lines, and surrounding manifest whitespace", () =>
   }
 });
 
+test("reports duplicate public manifest entries in the standalone inventory check", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-inventory-duplicate-"));
+  const source = join(root, "source");
+  const target = join(root, "target");
+  try {
+    mkdirSync(join(source, "skills", "public"), { recursive: true });
+    writeFileSync(join(source, "skills", "public", "SKILL.md"), "# public\n");
+    git(source, "init", "-q");
+    git(source, "config", "user.email", "fixture@example.invalid");
+    git(source, "config", "user.name", "Fixture");
+    git(source, "add", "skills");
+    git(source, "commit", "-qm", "fixture");
+    rmSync(join(source, "skills", "public"), { recursive: true, force: true });
+    mkdirSync(join(target, "skills", "public"), { recursive: true });
+    writeFileSync(join(target, "skills", "public", "SKILL.md"), "# public\n");
+    writeFileSync(join(target, "PUBLIC_SKILLS.txt"), "public\npublic\n");
+    expect(check(source, "HEAD", target, join(target, "PUBLIC_SKILLS.txt"))).toEqual([
+      "DUPLICATE_PUBLIC_MANIFEST_ENTRY",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("reports missing and duplicate source boundaries", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-inventory-invalid-"));
   const source = join(root, "source");

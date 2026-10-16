@@ -26,7 +26,7 @@ ruby -e 'require "yaml"'
 bun run test:skills
 ```
 
-`test:repo` discovers repository-owned Bun, Python, and Shell test files outside `skills/`. `test:skills` discovers the same test families below `skills/`. The runner rejects empty or non-declarative Bun/Python test files before execution. Python dependencies needed by application-facing or domain tests are declared separately in `requirements-dev.txt`; the XP policy test also requires Ruby with its standard YAML library; text-only Skills need no programming runtime.
+`test:repo` discovers repository-owned Bun, Python, and Shell test files outside `skills/`. `test:skills` discovers the same test families below `skills/`. The runner rejects empty or non-declarative Bun/Python test files before execution; Shell tests must include an assertion command and print a positive `TESTS_RUN=<count>` marker. Python dependencies needed by application-facing or domain tests are declared separately in `requirements-dev.txt`; the XP policy test also requires Ruby with its standard YAML library; text-only Skills need no programming runtime.
 
 The source-target inventory check is an opt-in migration check because it compares a synthetic or explicitly supplied Git source snapshot:
 

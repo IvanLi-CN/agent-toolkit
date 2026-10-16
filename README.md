@@ -7,11 +7,22 @@ Agent Toolkit is a public collection of reusable Skills, focused command-line he
 Clone this repository, then point a standalone consumer's Skill root at its `skills/` directory. A direct symlink is sufficient when the consumer has no private Skills:
 
 ```bash
-git clone git@github.com:IvanLi-CN/agent-toolkit.git /path/to/agent-toolkit
+git clone https://github.com/IvanLi-CN/agent-toolkit.git /path/to/agent-toolkit
 ln -sfn /path/to/agent-toolkit/skills /path/to/consumer/skills
 ```
 
 The consumer owns the final root path. Agent Toolkit does not require Codex, a Codex runtime home, or a particular host layout. Skills that integrate with an external service document the required CLI, environment variables, and configuration explicitly. A consumer that also has private Skills may link the allowlisted public directories individually beside its private source; that is a direct source link, not a generated adapter.
+
+### Optional skills-switch management
+
+This repository does not ship a `skills-switch` manager, but an external manager may maintain direct links to the public Skill directories. `PUBLIC_SKILLS.txt` is the allowlist for enablement and reconciliation; the checkout remains the source of truth.
+
+- Enable: create links only for selected allowlisted directories under the consumer root, and record enough ownership metadata to distinguish managed links from private or third-party content.
+- Disable: remove only links owned by the manager after verifying that their resolved targets still point inside this checkout; never remove an unrelated directory or private Skill.
+- Update: update the checkout, re-read the allowlist, and refresh managed links without replacing the consumer root or generating a second copy of the Skills.
+- Upstream deletion reconciliation: remove managed links whose allowlisted source directory was deleted or is no longer public, while leaving unrelated consumer paths untouched.
+- Uninstall: remove managed links and manager metadata only; leave the checkout and private source paths in place unless the consumer explicitly requests their removal.
+- Collision handling: refuse an existing non-managed path or a managed link pointing elsewhere, report the collision, and never overwrite it implicitly.
 
 ## Repository layout
 

@@ -220,6 +220,7 @@ test("rejects propagated, computed, and indirect loader calls", () => {
     writeFileSync(join(root, "bin", "computed.ts"), `const name = "require"; import.meta[name]("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "container.ts"), `const loaders = { load: require }; loaders.load("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "meta-destructure.ts"), `const meta = import.meta; const { require: load } = meta; load("../../${outsideName}");\n`);
+    writeFileSync(join(root, "bin", "module-destructure.ts"), `const { require: load } = module; load("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "module.ts"), `module.require("../../${outsideName}");\n`);
     expect(check(root)).toEqual([
       "bin/apply.ts: dynamic import or require cannot be verified",
@@ -229,6 +230,7 @@ test("rejects propagated, computed, and indirect loader calls", () => {
       "bin/computed.ts: dynamic import or require cannot be verified",
       "bin/container.ts: dynamic import or require cannot be verified",
       `bin/meta-destructure.ts: local reference outside public repository ../../${outsideName}`,
+      `bin/module-destructure.ts: local reference outside public repository ../../${outsideName}`,
       `bin/module.ts: local reference outside public repository ../../${outsideName}`,
     ]);
   } finally {

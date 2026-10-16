@@ -196,7 +196,9 @@ function isRequireMethodCall(node: ts.Expression, aliases: Set<string>): boolean
 }
 
 function requireBindingNames(name: ts.BindingName, initializer: ts.Expression, importMetaAliases: Set<string>): string[] {
-  if (!isImportMetaReference(initializer, importMetaAliases) || !ts.isObjectBindingPattern(name)) return [];
+  const expression = unwrapExpression(initializer);
+  const isModuleContainer = isImportMetaReference(expression, importMetaAliases) || (ts.isIdentifier(expression) && expression.text === "module");
+  if (!isModuleContainer || !ts.isObjectBindingPattern(name)) return [];
   const names: string[] = [];
   for (const element of name.elements) {
     if (!ts.isBindingElement(element) || !ts.isIdentifier(element.name)) continue;

@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { check } from "./skills_index_check.ts";
+import { check, main } from "./skills_index_check.ts";
 
 function withFixture(callback: (root: string) => void): void {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-skills-index-"));
@@ -39,5 +39,14 @@ test("reports duplicate entries", () => {
     writeFileSync(join(root, "skills", "alpha", "SKILL.md"), "# alpha\n");
     writeFileSync(join(root, "skills", "README.md"), "| Skill | Description | Path |\n|---|---|---|\n| `alpha` | first | `skills/alpha/**` |\n| `alpha` | second | `skills/alpha/**` |\n");
     expect(check(root)).toEqual(["DUPLICATE_INDEX_ENTRY skill=alpha count=2"]);
+  });
+});
+
+test("uses an explicit repository root and ignores a directory named SKILL.md", () => {
+  withFixture((root) => {
+    mkdirSync(join(root, "skills", "alpha", "SKILL.md"), { recursive: true });
+    writeFileSync(join(root, "skills", "README.md"), "| Skill | Description | Path |\n|---|---|---|\n");
+    expect(main(["--repo-root", root])).toBe(0);
+    expect(main(["--unknown"])).toBe(2);
   });
 });

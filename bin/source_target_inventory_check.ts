@@ -1,17 +1,17 @@
 #!/usr/bin/env bun
 /** Compare a split public/private Skill inventory with this checkout. */
 
-import { existsSync, lstatSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { REPO_ROOT, readText, runGit } from "./repo_util.ts";
+import { isRegularFile, REPO_ROOT, readText, runGit } from "./repo_util.ts";
 
 export function targetInventory(root: string): Set<string> {
   const skillsRoot = join(root, "skills");
   const result = new Set<string>();
   if (!existsSync(skillsRoot)) return result;
-  for (const entry of new Bun.Glob("*").scanSync({ cwd: skillsRoot, onlyFiles: false })) {
-    if (!entry.startsWith(".") && existsSync(join(skillsRoot, entry, "SKILL.md"))) {
-      result.add(entry);
+  for (const entry of readdirSync(skillsRoot, { withFileTypes: true })) {
+    if (!entry.name.startsWith(".") && entry.isDirectory() && isRegularFile(join(skillsRoot, entry.name, "SKILL.md"))) {
+      result.add(entry.name);
     }
   }
   return result;
@@ -42,27 +42,54 @@ export function snapshotInventory(source: string, revision: string): Set<string>
   );
 }
 
-function parseArgs(args: string[]): { sourceRoot?: string; revision: string; targetRoot: string; manifest?: string } {
+export type ParsedArgs = { sourceRoot?: string; revision: string; targetRoot: string; manifest?: string };
+
+function requiredValue(args: string[], index: number): string {
+  const value = args[index + 1];
+  if (!value || value.startsWith("--")) {
+    throw new Error("usage: source_target_inventory_check.ts --source-root <path> [--source-revision <revision>]");
+  }
+  return value;
+}
+
+export function parseArgs(args: string[]): ParsedArgs {
   let sourceRoot: string | undefined;
   let revision = "HEAD";
   let targetRoot = REPO_ROOT;
   let manifest: string | undefined;
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
-    if (arg === "--source-root") sourceRoot = args[++index];
-    else if (arg === "--source-revision") revision = args[++index] ?? revision;
-    else if (arg === "--target-root") targetRoot = resolve(args[++index] ?? targetRoot);
-    else if (arg === "--public-manifest") manifest = resolve(args[++index] ?? "");
+    if (arg === "--source-root") {
+      sourceRoot = resolve(requiredValue(args, index));
+      index += 1;
+    } else if (arg === "--source-revision") {
+      revision = requiredValue(args, index);
+      index += 1;
+    } else if (arg === "--target-root") {
+      targetRoot = resolve(requiredValue(args, index));
+      index += 1;
+    } else if (arg === "--public-manifest") {
+      manifest = resolve(requiredValue(args, index));
+      index += 1;
+    } else {
+      throw new Error("usage: source_target_inventory_check.ts --source-root <path> [--source-revision <revision>]");
+    }
   }
   return { sourceRoot, revision, targetRoot, manifest };
 }
 
-export function check(
+export type InventoryResult = {
+  findings: string[];
+  publicCount: number;
+  privateCount: number;
+};
+
+export function inspect(
   sourceRoot: string,
   revision = "HEAD",
   targetRoot = REPO_ROOT,
   publicManifest = join(targetRoot, "PUBLIC_SKILLS.txt"),
-): string[] {
+): InventoryResult {
   const source = resolve(sourceRoot);
   const target = resolve(targetRoot);
   const expectedSource = snapshotInventory(source, revision);
@@ -84,8 +111,8 @@ export function check(
   const sourceSkills = join(source, "skills");
   if (existsSync(sourceSkills) && !lstatSync(sourceSkills).isSymbolicLink()) {
     const owned = new Set<string>();
-    for (const entry of new Bun.Glob("*").scanSync({ cwd: sourceSkills, onlyFiles: false })) {
-      if (existsSync(join(sourceSkills, entry, "SKILL.md"))) owned.add(entry);
+    for (const entry of readdirSync(sourceSkills, { withFileTypes: true })) {
+      if (entry.isDirectory() && isRegularFile(join(sourceSkills, entry.name, "SKILL.md"))) owned.add(entry.name);
     }
     for (const name of [...new Set([...publicNames].filter((item) => owned.has(item)))].sort()) {
       findings.push(`PUBLIC_SKILL_SOURCE_DUPLICATE ${name}`);
@@ -99,29 +126,43 @@ export function check(
   } else if (privateNames.size > 0) {
     findings.push(`MISSING_PRIVATE_SOURCE_TREE count=${privateNames.size}`);
   }
-  return findings;
+  return { findings, publicCount: publicNames.size, privateCount: privateNames.size };
+}
+
+export function check(
+  sourceRoot: string,
+  revision = "HEAD",
+  targetRoot = REPO_ROOT,
+  publicManifest = join(targetRoot, "PUBLIC_SKILLS.txt"),
+): string[] {
+  return inspect(sourceRoot, revision, targetRoot, publicManifest).findings;
 }
 
 export function main(args: string[] = Bun.argv.slice(2)): number {
-  const parsed = parseArgs(args);
-  if (!parsed.sourceRoot) {
-    console.error("usage: source_target_inventory_check.ts --source-root <path> [--source-revision <revision>]");
-    return 2;
-  }
-  let findings: string[];
+  let parsed: ParsedArgs;
   try {
-    findings = check(parsed.sourceRoot, parsed.revision, parsed.targetRoot, parsed.manifest ?? join(parsed.targetRoot, "PUBLIC_SKILLS.txt"));
+    parsed = parseArgs(args);
   } catch (error) {
     console.error(`ERROR ${String(error)}`);
     return 2;
   }
-  if (findings.length > 0) {
+  if (!parsed.sourceRoot) {
+    console.error("usage: source_target_inventory_check.ts --source-root <path> [--source-revision <revision>]");
+    return 2;
+  }
+  let result: InventoryResult;
+  try {
+    result = inspect(parsed.sourceRoot, parsed.revision, parsed.targetRoot, parsed.manifest ?? join(parsed.targetRoot, "PUBLIC_SKILLS.txt"));
+  } catch (error) {
+    console.error(`ERROR ${String(error)}`);
+    return 2;
+  }
+  if (result.findings.length > 0) {
+    const findings = result.findings;
     findings.forEach((finding) => console.log(`FINDING ${finding}`));
     return 1;
   }
-  const publicCount = manifestInventory(parsed.manifest ?? join(parsed.targetRoot, "PUBLIC_SKILLS.txt")).size;
-  const sourceCount = snapshotInventory(parsed.sourceRoot, parsed.revision).size - publicCount;
-  console.log(`PASS source-target inventory: public=${publicCount} target skills, private=${sourceCount} source skills, no duplicate source`);
+  console.log(`PASS source-target inventory: public=${result.publicCount} target skills, private=${result.privateCount} source skills, no duplicate source`);
   return 0;
 }
 

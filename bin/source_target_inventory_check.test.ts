@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { check } from "./source_target_inventory_check.ts";
+import { check, parseArgs, targetInventory } from "./source_target_inventory_check.ts";
 
 function git(cwd: string, ...args: string[]): void {
   const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
@@ -54,6 +54,21 @@ test("reports missing and duplicate source boundaries", () => {
       "PUBLIC_SKILL_SOURCE_DUPLICATE public",
       "UNEXPECTED_SOURCE_SKILL public",
     ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("counts only regular Skill files and rejects malformed options", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-inventory-shape-"));
+  try {
+    mkdirSync(join(root, "skills", "valid"), { recursive: true });
+    mkdirSync(join(root, "skills", "valid", "SKILL.md"), { recursive: true });
+    mkdirSync(join(root, "skills", "regular"), { recursive: true });
+    writeFileSync(join(root, "skills", "regular", "SKILL.md"), "# regular\n");
+    expect(targetInventory(root)).toEqual(new Set(["regular"]));
+    expect(() => parseArgs(["--unknown"])).toThrow();
+    expect(() => parseArgs(["--source-root"])).toThrow();
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { check } from "./public_skill_boundary_check.ts";
 
@@ -30,6 +30,18 @@ test("rejects runtime and native task coupling", () => {
   }
 });
 
+test("rejects product references and native task surfaces", () => {
+  for (const content of ["Use " + "Codex" + " Plan Mode.\n", "Use a native task Worktree.\n"]) {
+    const { root, manifest } = fixture(content);
+    try {
+      const label = content.startsWith("Use Codex") ? "codex-product-reference" : "codex-native-surface";
+      expect(check(root, manifest)).toEqual([`skills/alpha/SKILL.md: forbidden public coupling ${label}`]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("rejects private operator reference names and unlisted Skills", () => {
   const { root, manifest } = fixture("# standalone\n");
   try {
@@ -40,6 +52,33 @@ test("rejects private operator reference names and unlisted Skills", () => {
     expect(check(root, manifest)).toEqual([
       "UNLISTED_PUBLIC_SKILL extra",
       "skills/alpha/references/hosts.txt: private operator reference must stay outside repository",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects a symlinked public Skill directory", () => {
+  const { root, manifest } = fixture("# standalone\n");
+  try {
+    rmSync(join(root, "skills", "alpha"), { recursive: true, force: true });
+    mkdirSync(join(root, "outside", "alpha"), { recursive: true });
+    writeFileSync(join(root, "outside", "alpha", "SKILL.md"), "# linked\n");
+    symlinkSync(join(root, "outside", "alpha"), join(root, "skills", "alpha"), "dir");
+    expect(check(root, manifest)).toEqual(["SYMLINKED_PUBLIC_SKILL alpha"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("reports a nested symlink that escapes the Skill boundary", () => {
+  const { root, manifest } = fixture("# standalone\n");
+  try {
+    mkdirSync(join(root, "outside", "references"), { recursive: true });
+    writeFileSync(join(root, "outside", "references", "linked.md"), "# linked\n");
+    symlinkSync(join(root, "outside", "references"), join(root, "skills", "alpha", "linked"), "dir");
+    expect(check(root, manifest)).toEqual([
+      "skills/alpha/linked: symbolic link escapes public Skill boundary",
     ]);
   } finally {
     rmSync(root, { recursive: true, force: true });

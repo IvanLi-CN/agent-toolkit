@@ -68,6 +68,30 @@ test("reports duplicate public manifest entries in the standalone inventory chec
   }
 });
 
+test("reports invalid public names in the standalone inventory check", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-inventory-invalid-name-"));
+  const source = join(root, "source");
+  const target = join(root, "target");
+  try {
+    mkdirSync(join(source, "skills", ".hidden"), { recursive: true });
+    writeFileSync(join(source, "skills", ".hidden", "SKILL.md"), "# hidden\n");
+    git(source, "init", "-q");
+    git(source, "config", "user.email", "fixture@example.invalid");
+    git(source, "config", "user.name", "Fixture");
+    git(source, "add", "skills");
+    git(source, "commit", "-qm", "fixture");
+    rmSync(join(source, "skills", ".hidden"), { recursive: true, force: true });
+    mkdirSync(join(target, "skills", ".hidden"), { recursive: true });
+    writeFileSync(join(target, "skills", ".hidden", "SKILL.md"), "# hidden\n");
+    writeFileSync(join(target, "PUBLIC_SKILLS.txt"), ".hidden\n");
+    expect(check(source, "HEAD", target, join(target, "PUBLIC_SKILLS.txt"))).toEqual([
+      "INVALID_PUBLIC_SKILL_NAME .hidden",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("reports missing and duplicate source boundaries", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-inventory-invalid-"));
   const source = join(root, "source");

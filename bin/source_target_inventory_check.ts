@@ -3,6 +3,7 @@
 
 import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { PUBLIC_SKILL_NAME_PATTERN } from "./public_skill_boundary_check.ts";
 import { isDirectRegularFile, isPathInside, REPO_ROOT, readText, runGit } from "./repo_util.ts";
 
 const IGNORED_INVENTORY_DIRECTORIES = new Set([".git", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv", "venv", "dist", "build", "coverage", "reports", "artifacts", "tmp"]);
@@ -188,6 +189,9 @@ export function inspect(
 
   if (publicManifestEntries.length !== publicNames.size) {
     findings.push("DUPLICATE_PUBLIC_MANIFEST_ENTRY");
+  }
+  for (const name of [...publicNames].filter((name) => !PUBLIC_SKILL_NAME_PATTERN.test(name)).sort()) {
+    findings.push(`INVALID_PUBLIC_SKILL_NAME ${name}`);
   }
 
   if (targetSymlinkPathsSet.has("skills")) findings.push("SYMLINKED_TARGET_SKILLS_ROOT");

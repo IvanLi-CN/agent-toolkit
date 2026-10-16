@@ -73,6 +73,23 @@ test("rejects absolute and file URL imports outside the public repository", () =
   }
 });
 
+test("rejects imports with comments between the keyword and path", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-comments-"));
+  const outsideName = `${root.split(/[\\/]/).at(-1)}-outside.ts`;
+  const outsidePath = join(root, "..", outsideName);
+  try {
+    mkdirSync(join(root, "bin"), { recursive: true });
+    writeFileSync(outsidePath, "export const outside = 1;\n");
+    writeFileSync(join(root, "bin", "commented.ts"), `import /* comment */ "../../${outsideName}";\n`);
+    expect(check(root)).toEqual([
+      `bin/commented.ts: local reference outside public repository ../../${outsideName}`,
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(outsidePath, { force: true });
+  }
+});
+
 test("rejects Windows-style external imports on every host platform", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-windows-"));
   try {

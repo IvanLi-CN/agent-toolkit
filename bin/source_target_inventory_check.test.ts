@@ -27,6 +27,7 @@ test("removes Git repository-selection environment overrides", () => {
     GIT_NAMESPACE: "foreign",
     GIT_CONFIG: "/tmp/foreign/config",
     GIT_CONFIG_COUNT: "1",
+    GIT_SHALLOW_FILE: "/tmp/foreign/shallow",
     GIT_TEMPLATE_DIR: "/tmp/foreign/template",
     GIT_SSH_COMMAND: "ssh",
     PATH: "/usr/bin",

@@ -9,12 +9,13 @@ const SECRET_NAME = String.raw`(?:api[_-]?key|apikey|access[_-]?key|accesskey|to
 const COMPOUND_SECRET_NAME = String.raw`[A-Za-z0-9_-]*${SECRET_NAME}[A-Za-z0-9_-]*`;
 const SECRET_VALUE = String.raw`(?![$<\{])[^'"\r\n]{16,}`;
 const UNQUOTED_SECRET_VALUE = String.raw`(?!provided-out-of-band\b|redacted\b|placeholder\b|changeme\b)[A-Za-z0-9][A-Za-z0-9._~+/=-]{15,}`;
-const REGEX_HELPER_ASSIGNMENT = new RegExp(String.raw`^[ \t]*(?:local[ \t]+)?(?:re|regex|pattern)[_-][A-Za-z0-9_-]*[ \t]*=`, "i");
+const REGEX_HELPER_ASSIGNMENT = new RegExp(String.raw`^[ \t]*(?:local[ \t]+)?(?:re|regex)[_-][A-Za-z0-9_-]*[ \t]*=`, "i");
 const COMPOUND_ASSIGNMENT = new RegExp(String.raw`(?<![A-Za-z0-9_-])(?<name>[A-Za-z0-9_-]+)\s*=\s*['"]${SECRET_VALUE}['"]`, "i");
 const JSON_SECRET_FIELD = new RegExp(String.raw`["'](?<name>[A-Za-z0-9_-]+)["']\s*:\s*["']${SECRET_VALUE}["']`, "i");
+const QUOTED_SECRET_FIELD = new RegExp(String.raw`(?<![A-Za-z0-9_-])(?<name>${COMPOUND_SECRET_NAME})\s*:\s*["']${SECRET_VALUE}["']`, "i");
 const UNQUOTED_SECRET_ASSIGNMENT = new RegExp(String.raw`(?<![A-Za-z0-9_-])(?<name>${COMPOUND_SECRET_NAME})\s*[:=]\s*${UNQUOTED_SECRET_VALUE}(?![A-Za-z0-9._~+/=-])`, "i");
-const PRIVATE_KEY_BLOCK = /-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----\r?\n(?:[A-Za-z0-9+/]{40,}={0,2}\r?\n(?:[A-Za-z0-9+/]{1,128}={0,2}\r?\n)*)-----END [A-Z0-9 _-]*PRIVATE KEY-----/;
-const CREDENTIAL_URL = /\b(?:https?|ssh|postgres(?:ql)?):\/\/[^/\s:@]+:[^@\s]{16,}@/i;
+const PRIVATE_KEY_BLOCK = /-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----\r?\n(?:[ \t]*[A-Za-z0-9+/]{40,}={0,2}\r?\n(?:[ \t]*[A-Za-z0-9+/]{1,128}={0,2}\r?\n)*)[ \t]*-----END [A-Z0-9 _-]*PRIVATE KEY-----/;
+const CREDENTIAL_URL = /\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s:@]+:[^@\s]{16,}@/i;
 const BEARER_TOKEN = /\bBearer\s+[A-Za-z0-9._~+/=-]{16,}\b/i;
 const SECRET_SUFFIXES = [
   "api_key", "apikey", "access_key", "accesskey", "token", "secret",
@@ -29,6 +30,7 @@ export const FORBIDDEN_PATTERNS: Array<[string, RegExp]> = [
   ["quoted-secret-assignment", new RegExp(String.raw`(?<![A-Za-z0-9_-])${SECRET_NAME}\s*=\s*['"]${SECRET_VALUE}['"]`, "i")],
   ["prefixed-quoted-secret-assignment", COMPOUND_ASSIGNMENT],
   ["json-secret-field", JSON_SECRET_FIELD],
+  ["quoted-secret-field", QUOTED_SECRET_FIELD],
   ["unquoted-secret-assignment", UNQUOTED_SECRET_ASSIGNMENT],
   ["private-key-block", PRIVATE_KEY_BLOCK],
   ["credentialed-url", CREDENTIAL_URL],
@@ -66,7 +68,7 @@ function matchesPattern(label: string, pattern: RegExp, content: string): boolea
     if (IGNORED_PRIVATE_HOSTNAMES.has(value)) {
       continue;
     }
-    if (label === "prefixed-quoted-secret-assignment" || label === "unquoted-secret-assignment") {
+    if (label === "prefixed-quoted-secret-assignment" || label === "quoted-secret-field" || label === "unquoted-secret-assignment") {
       const name = match.groups?.name ?? "";
       if (!isSecretField(name) || (label === "prefixed-quoted-secret-assignment" && isSimpleSecretField(name))) {
         continue;

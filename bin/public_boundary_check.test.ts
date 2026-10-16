@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { check, FORBIDDEN_PATTERNS, isRegexHelperAssignment, main } from "./public_boundary_check.ts";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { gitEnvironment } from "./repo_util.ts";
 
 function pattern(label: string): RegExp {
   const pattern = FORBIDDEN_PATTERNS.find(([name]) => name === label)?.[1];
@@ -13,6 +14,8 @@ test("detects secret assignments and ignores redacted placeholders", () => {
   const name = "api_" + "key";
   const fixtureValue = "0123456789abcdef";
   expect(pattern("quoted-secret-assignment").test(`${name}="${fixtureValue}"`)).toBe(true);
+  expect(pattern("quoted-secret-field").test(`database_password: "${fixtureValue}"`)).toBe(true);
+  expect(pattern("quoted-secret-field").test(`database_password: '${fixtureValue}'`)).toBe(true);
   expect(pattern("json-secret-field").test(`{"${name}":"${fixtureValue}"}`)).toBe(true);
   expect(pattern("json-secret-field").test(`{"${name}":"<redacted>"}`)).toBe(false);
   expect(pattern("unquoted-secret-assignment").test(`${name}=0123456789abcdef`)).toBe(true);
@@ -93,6 +96,10 @@ test("does not let a regex-helper name hide a literal secret", () => {
   const match = pattern("prefixed-quoted-secret-assignment").exec(content);
   expect(match).not.toBeNull();
   if (match) expect(isRegexHelperAssignment(content, match)).toBe(false);
+  const nonHex = `${["pattern", "api_key"].join("_")}=\"(` + ["Qw7nPm9r", "Tk2sVx4z"].join("") + `\"`;
+  const nonHexMatch = pattern("prefixed-quoted-secret-assignment").exec(nonHex);
+  expect(nonHexMatch).not.toBeNull();
+  if (nonHexMatch) expect(isRegexHelperAssignment(nonHex, nonHexMatch)).toBe(false);
 });
 
 test("does not classify long hyphenated input as a secret assignment", () => {
@@ -114,9 +121,11 @@ test("detects Windows personal paths", () => {
 test("detects credential-bearing URLs, bearer tokens, and complete PEM blocks", () => {
   const credential = "a".repeat(24);
   expect(pattern("credentialed-url").test("https://user:" + credential + "@example.test")).toBe(true);
+  expect(pattern("credentialed-url").test("mysql://user:" + credential + "@db.example.test/database")).toBe(true);
   expect(pattern("bearer-token").test("Bearer " + credential)).toBe(true);
   expect(pattern("private-key-block").test("-----BEGIN " + "PRIVATE KEY-----\n" + "A".repeat(48) + "\n-----END " + "PRIVATE KEY-----")).toBe(true);
   expect(pattern("private-key-block").test("-----BEGIN " + "PRIVATE KEY-----\n" + "A".repeat(50) + "\n" + "B".repeat(70) + "\n-----END " + "PRIVATE KEY-----")).toBe(true);
+  expect(pattern("private-key-block").test("signing_key: |\n  -----BEGIN PRIVATE KEY-----\n  " + "A".repeat(48) + "\n  -----END PRIVATE KEY-----")).toBe(true);
 });
 
 test("checks tracked public files", () => {
@@ -124,7 +133,7 @@ test("checks tracked public files", () => {
   try {
     writeFileSync(join(root, "safe.md"), "neutral example\n");
     symlinkSync(join(root, "missing.md"), join(root, "linked.md"));
-    const result = Bun.spawnSync(["git", "init", "-q"], { cwd: root, stdout: "pipe", stderr: "pipe" });
+    const result = Bun.spawnSync(["git", "init", "-q"], { cwd: root, env: gitEnvironment(Bun.env), stdout: "pipe", stderr: "pipe" });
     expect(result.exitCode).toBe(0);
     expect(check(root)).toEqual(["linked.md: symbolic links are not allowed in public repository"]);
   } finally {

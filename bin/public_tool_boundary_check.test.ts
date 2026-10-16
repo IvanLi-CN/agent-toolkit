@@ -240,6 +240,7 @@ test("rejects propagated, computed, and indirect loader calls", () => {
     writeFileSync(join(root, "bin", "module-computed-destructure.ts"), `const key = "require"; const { [key]: load } = module; load("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "module-computed-call.ts"), `const key = "require"; module[key]("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "module-constructor-alias.ts"), `const load = module.constructor._load; load("../../${outsideName}");\n`);
+    writeFileSync(join(root, "bin", "module-constructor-class-alias.ts"), `const loaderClass = module.constructor; loaderClass._load("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "module-constructor-load.ts"), `module.constructor._load("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "module-destructure.ts"), `const { require: load } = module; load("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "module.ts"), `module.require("../../${outsideName}");\n`);
@@ -269,6 +270,7 @@ test("rejects propagated, computed, and indirect loader calls", () => {
       "bin/module-computed-call.ts: dynamic import or require cannot be verified",
       "bin/module-computed-destructure.ts: dynamic import or require cannot be verified",
       `bin/module-constructor-alias.ts: local reference outside public repository ../../${outsideName}`,
+      `bin/module-constructor-class-alias.ts: local reference outside public repository ../../${outsideName}`,
       `bin/module-constructor-load.ts: local reference outside public repository ../../${outsideName}`,
       `bin/module-destructure.ts: local reference outside public repository ../../${outsideName}`,
       `bin/module.ts: local reference outside public repository ../../${outsideName}`,
@@ -411,14 +413,20 @@ test("parses Shell source commands without string or extension false positives",
   try {
     mkdirSync(join(root, "bin"), { recursive: true });
     mkdirSync(join(root, "support"), { recursive: true });
-    writeFileSync(join(root, "bin", "entry.sh"), "printf '%s\\n' '( . ./missing.sh )'\ncat <<'EOF'\n. ./missing.sh\nEOF\nif . ../support/private.sh; then :; fi\nFLAG=1 . ../support/assigned.sh\n. ../support/helper\n");
+    writeFileSync(join(root, "bin", "entry.sh"), "printf '%s\\n' '( . ./missing.sh )'\ncat <<'EOF'\n. ./missing.sh\nEOF\nif . ../support/private.sh; then :; fi\nFLAG=1 . ../support/assigned.sh\ntime source ../support/timed.sh\nvalue=\"$(. ../support/nested.sh)\"\ncat <<< \"fixture\"\n. ../support/herestring.sh\n. ../support/helper\n");
     writeFileSync(join(root, "support", "helper.py"), "os.environ[\"CODEX_HOME\"]\n");
     writeFileSync(join(root, "support", "private.sh"), "echo os.environ[\"CODEX_HOME\"]\n");
     writeFileSync(join(root, "support", "assigned.sh"), "echo os.environ[\"CODEX_HOME\"]\n");
+    writeFileSync(join(root, "support", "timed.sh"), "echo os.environ[\"CODEX_HOME\"]\n");
+    writeFileSync(join(root, "support", "nested.sh"), "echo os.environ[\"CODEX_HOME\"]\n");
+    writeFileSync(join(root, "support", "herestring.sh"), "echo os.environ[\"CODEX_HOME\"]\n");
     expect(check(root)).toEqual([
       "bin/entry.sh: missing local reference ../support/helper",
       "support/private.sh: forbidden public tool coupling codex-runtime-marker",
       "support/assigned.sh: forbidden public tool coupling codex-runtime-marker",
+      "support/timed.sh: forbidden public tool coupling codex-runtime-marker",
+      "support/nested.sh: forbidden public tool coupling codex-runtime-marker",
+      "support/herestring.sh: forbidden public tool coupling codex-runtime-marker",
     ]);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -610,6 +618,21 @@ test("scans Python absolute imports from the entry search root", () => {
   }
 });
 
+test("does not duplicate Python findings when a dependency is scanned under multiple search roots", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-python-duplicate-scan-"));
+  try {
+    mkdirSync(join(root, "bin", "package"), { recursive: true });
+    mkdirSync(join(root, "support"), { recursive: true });
+    writeFileSync(join(root, "bin", "package", "entry.py"), "from ...support import helper\n");
+    writeFileSync(join(root, "support", "helper.py"), "import os\nos.environ[\"CODEX_HOME\"]\n");
+    expect(check(root)).toEqual([
+      "support/helper.py: forbidden public tool coupling codex-runtime-marker",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("scans local modules listed by Python package __all__", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-python-all-"));
   try {
@@ -719,12 +742,16 @@ test("checks Python static dynamic imports and rejects unknown dynamic imports",
   const unknownRoot = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-python-unknown-dynamic-import-"));
   try {
     mkdirSync(join(staticRoot, "bin"), { recursive: true });
-    writeFileSync(join(staticRoot, "bin", "entry.py"), "from importlib import import_module\nimport_module(\"runtime_test\")\n__import__(\"other_test\")\n");
+    writeFileSync(join(staticRoot, "bin", "entry.py"), "from importlib import import_module as load\nimport importlib as imp\nfrom builtins import __import__ as builtin_import\nimport builtins as b\nload(\"runtime_test\")\nimp.import_module(\"other_test\")\nbuiltin_import(\"third_test\")\nb.__import__(\"fourth_test\")\n");
     writeFileSync(join(staticRoot, "bin", "runtime_test.py"), "marker = 'fixture-only'\n");
     writeFileSync(join(staticRoot, "bin", "other_test.py"), "marker = 'fixture-only'\n");
+    writeFileSync(join(staticRoot, "bin", "third_test.py"), "marker = 'fixture-only'\n");
+    writeFileSync(join(staticRoot, "bin", "fourth_test.py"), "marker = 'fixture-only'\n");
     expect(check(staticRoot)).toEqual([
       "bin/entry.py: local reference targets excluded test file ./runtime_test",
       "bin/entry.py: local reference targets excluded test file ./other_test",
+      "bin/entry.py: local reference targets excluded test file ./third_test",
+      "bin/entry.py: local reference targets excluded test file ./fourth_test",
     ]);
 
     mkdirSync(join(unknownRoot, "bin"), { recursive: true });

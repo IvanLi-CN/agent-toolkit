@@ -25,13 +25,14 @@ const RELATIVE_IMPORT = new RegExp(String.raw`${IMPORT_PREFIX}["'](\.{1,2}[\\/][
 const ABSOLUTE_IMPORT = new RegExp(String.raw`${IMPORT_PREFIX}["']((?:file://|/|\\|[A-Za-z]:[\\/])[^"']+)["']`, "g");
 const PYTHON_NAME = String.raw`[A-Za-z_][A-Za-z0-9_]*`;
 const PYTHON_IMPORT_GAP = String.raw`(?:[ \t\r\n]|\\[ \t]*(?:\r\n|\r|\n)|#[^\r\n]*(?:\r\n|\r|\n))*`;
-const PYTHON_IMPORT_START = String.raw`(?:^[ \t]*|;[ \t]*)`;
+const PYTHON_IMPORT_START = String.raw`(?:^[ \t]*|[;:][ \t]*)`;
 const PYTHON_IMPORTED_NAME = String.raw`${PYTHON_NAME}(?:${PYTHON_IMPORT_GAP}as${PYTHON_IMPORT_GAP}${PYTHON_NAME})?`;
 const PYTHON_IMPORTED_NAMES = String.raw`(?:${PYTHON_IMPORTED_NAME}|\*)(?:${PYTHON_IMPORT_GAP},${PYTHON_IMPORT_GAP}(?:${PYTHON_IMPORTED_NAME}|\*))*`;
+const PYTHON_LOCAL_IMPORTED_NAME = String.raw`${PYTHON_NAME}(?:\.${PYTHON_NAME})*(?:${PYTHON_IMPORT_GAP}as${PYTHON_IMPORT_GAP}${PYTHON_NAME})?`;
+const PYTHON_LOCAL_IMPORT_NAMES = String.raw`${PYTHON_LOCAL_IMPORTED_NAME}(?:${PYTHON_IMPORT_GAP},${PYTHON_IMPORT_GAP}${PYTHON_LOCAL_IMPORTED_NAME})*`;
 const PYTHON_RELATIVE_IMPORT = new RegExp(String.raw`${PYTHON_IMPORT_START}from${PYTHON_IMPORT_GAP}(\.+${PYTHON_NAME}(?:\.${PYTHON_NAME})*|\.+)${PYTHON_IMPORT_GAP}import${PYTHON_IMPORT_GAP}\(?${PYTHON_IMPORT_GAP}(${PYTHON_IMPORTED_NAMES})${PYTHON_IMPORT_GAP},?${PYTHON_IMPORT_GAP}\)?`, "gm");
 const PYTHON_FROM_IMPORT = new RegExp(String.raw`${PYTHON_IMPORT_START}from${PYTHON_IMPORT_GAP}(${PYTHON_NAME}(?:\.${PYTHON_NAME})*)${PYTHON_IMPORT_GAP}import${PYTHON_IMPORT_GAP}\(?${PYTHON_IMPORT_GAP}(${PYTHON_IMPORTED_NAMES})${PYTHON_IMPORT_GAP},?${PYTHON_IMPORT_GAP}\)?`, "gm");
-const PYTHON_LOCAL_IMPORT = new RegExp(String.raw`(?:^[ \t]*|[;:][ \t]*)import\s+(${PYTHON_NAME}(?:\.${PYTHON_NAME})*(?:\s+as\s+${PYTHON_NAME})?(?:\s*,\s*${PYTHON_NAME}(?:\.${PYTHON_NAME})*(?:\s+as\s+${PYTHON_NAME})?)*)(?:\s*,\s*)?`, "gm");
-const SHELL_SOURCE_IMPORT = /(?:^[ \t]*|[;&|(){}][ \t]*|(?:then|do)[ \t]+)(?:source\b|\.)\s+(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\s;|]+))/gm;
+const PYTHON_LOCAL_IMPORT = new RegExp(String.raw`${PYTHON_IMPORT_START}import${PYTHON_IMPORT_GAP}\(?${PYTHON_IMPORT_GAP}(${PYTHON_LOCAL_IMPORT_NAMES})${PYTHON_IMPORT_GAP},?${PYTHON_IMPORT_GAP}\)?`, "gm");
 const EXCLUDED_TEST_FILE = /(?:\.test\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$|^test[-_].*\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$|_test\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$)/;
 const PUBLIC_TOOL_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".cjs", ".mjs", ".py", ".sh"];
 const JAVASCRIPT_EXTENSIONS = new Set([".cjs", ".js", ".jsx", ".mjs", ".ts", ".tsx"]);
@@ -40,6 +41,142 @@ const NODE_MODULE_BUILTINS = new Set(["module", "node:module"]);
 const RELATIVE_SPECIFIER = /^\.{1,2}[\\/]/;
 const ABSOLUTE_SPECIFIER = /^(?:file:\/\/|\/|\\|[A-Za-z]:[\\/])/;
 const EXECUTABLE_MODULE_URL = /^(?:blob|data|javascript):/i;
+
+type ShellToken = { kind: "word" | "operator" | "newline"; value: string; quoted?: boolean };
+
+function shellTokens(content: string): ShellToken[] {
+  const tokens: ShellToken[] = [];
+  const pendingHeredocs: Array<{ delimiter: string; stripTabs: boolean }> = [];
+  let activeHeredoc: { delimiter: string; stripTabs: boolean } | undefined;
+  let expectingHeredocDelimiter = false;
+  let heredocStripTabs = false;
+  let index = 0;
+  while (index < content.length) {
+    if (activeHeredoc) {
+      const end = content.indexOf("\n", index);
+      const line = content.slice(index, end < 0 ? content.length : end).replace(/\r$/, "");
+      const comparable = activeHeredoc.stripTabs ? line.replace(/^\t+/, "") : line;
+      if (comparable === activeHeredoc.delimiter) activeHeredoc = pendingHeredocs.shift();
+      index = end < 0 ? content.length : end + 1;
+      continue;
+    }
+    const character = content[index];
+    if (character === "\n" || character === "\r") {
+      tokens.push({ kind: "newline", value: character });
+      if (character === "\n" && pendingHeredocs.length > 0) activeHeredoc = pendingHeredocs.shift();
+      index += 1;
+      continue;
+    }
+    if (/\s/.test(character ?? "")) {
+      index += 1;
+      continue;
+    }
+    if (character === "#") {
+      const end = content.indexOf("\n", index);
+      index = end < 0 ? content.length : end;
+      continue;
+    }
+    if (content.startsWith("<<-", index) || content.startsWith("<<", index)) {
+      const value = content.startsWith("<<-", index) ? "<<-" : "<<";
+      tokens.push({ kind: "operator", value });
+      expectingHeredocDelimiter = true;
+      heredocStripTabs = value === "<<-";
+      index += value.length;
+      continue;
+    }
+    if ([";", "&", "|", "(", ")", "{", "}", "!"].includes(character ?? "")) {
+      tokens.push({ kind: "operator", value: character ?? "" });
+      index += 1;
+      continue;
+    }
+    let value = "";
+    let quoted = false;
+    while (index < content.length) {
+      const current = content[index];
+      if (!current || /\s/.test(current) || [";", "&", "|", "(", ")", "{", "}"].includes(current)) break;
+      if (current === "\\") {
+        quoted = true;
+        value += content[index + 1] ?? "";
+        index += 2;
+        continue;
+      }
+      if (current === "'" || current === '"') {
+        quoted = true;
+        const quote = current;
+        index += 1;
+        while (index < content.length) {
+          const quotedCharacter = content[index];
+          if (quotedCharacter === quote) {
+            index += 1;
+            break;
+          }
+          if (quote === '"' && quotedCharacter === "\\") {
+            value += content[index + 1] ?? "";
+            index += 2;
+          } else {
+            value += quotedCharacter ?? "";
+            index += 1;
+          }
+        }
+        continue;
+      }
+      value += current;
+      index += 1;
+    }
+    if (value.length > 0 || quoted) {
+      tokens.push({ kind: "word", value, quoted });
+      if (expectingHeredocDelimiter) {
+        pendingHeredocs.push({ delimiter: value, stripTabs: heredocStripTabs });
+        expectingHeredocDelimiter = false;
+      }
+    } else {
+      index += 1;
+    }
+  }
+  return tokens;
+}
+
+function shellSourceSpecifiers(content: string): string[] {
+  const result: string[] = [];
+  const tokens = shellTokens(content);
+  const controlWords = new Set(["case", "do", "elif", "else", "for", "if", "then", "until", "while"]);
+  let commandStart = true;
+  let sourceArgument = false;
+  for (const token of tokens) {
+    if (token.kind === "newline") {
+      commandStart = true;
+      sourceArgument = false;
+      continue;
+    }
+    if (token.kind === "operator") {
+      if ([";", "&", "|", "(", ")", "{", "}"].includes(token.value)) {
+        commandStart = true;
+        sourceArgument = false;
+      }
+      continue;
+    }
+    if (sourceArgument) {
+      result.push(token.value);
+      sourceArgument = false;
+      commandStart = false;
+      continue;
+    }
+    if (!commandStart) continue;
+    if (token.quoted) {
+      commandStart = false;
+    } else if (controlWords.has(token.value) || token.value === "!") {
+      commandStart = true;
+    } else if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token.value)) {
+      commandStart = true;
+    } else if (token.value === "source" || token.value === ".") {
+      sourceArgument = true;
+      commandStart = false;
+    } else {
+      commandStart = false;
+    }
+  }
+  return result;
+}
 
 // Keep line structure intact while removing Python comments and string literals from import matching.
 function maskPythonNonCode(content: string): string {
@@ -156,6 +293,10 @@ function pythonImportCandidates(file: string, specifier: string): string[] {
   ];
 }
 
+function shellImportCandidates(file: string, specifier: string): string[] {
+  return [resolve(dirname(file), specifier.replaceAll("\\", "/"))];
+}
+
 function pythonImportedNames(importedNames: string): string[] {
   return importedNames
     .replace(/#[^\r\n]*(?:\r\n|\r|\n|$)/g, "\n")
@@ -189,8 +330,9 @@ function pythonInitializerExportsName(path: string, name: string): boolean {
     const escapedName = escapeRegExp(name);
     const content = readText(path);
     const code = maskPythonNonCode(content);
+    const allNames = pythonInitializerAllNames(path);
     return new RegExp(String.raw`(?:^|\r?\n)[ \t]*(?:(?:(?:async[ \t]+)?def|class)[ \t]+${escapedName}\b|${escapedName}[ \t]*(?:=|:=)|(?:from|import)\b[^\r\n]*\b${escapedName}\b)`, "m").test(code) ||
-      new RegExp(String.raw`__all__[ \t]*=[^\r\n]*\b${escapedName}\b`, "m").test(content);
+      allNames?.includes(name) === true;
   } catch {
     return false;
   }
@@ -200,20 +342,49 @@ function pythonInitializerAllNames(path: string): string[] | null | undefined {
   try {
     const content = readText(path);
     const code = maskPythonNonCode(content);
-    if (!/__all__[ \t]*=/.test(code)) return undefined;
-    const match = content.match(/__all__[ \t]*=[ \t]*(?:\[|\()([\s\S]*?)(?:\]|\))/m);
-    if (!match) return null;
-    return [...(match[1] ?? "").matchAll(/["']([A-Za-z_][A-Za-z0-9_]*)["']/g)].map((item) => item[1]).filter((name): name is string => Boolean(name));
+    const assignments = [...code.matchAll(/(?:^|[;\r\n])[ \t]*__all__[ \t]*(\+?=)/gm)];
+    if (assignments.length === 0) return undefined;
+    if (assignments.length !== 1 || assignments[0]?.[1] !== "=") return null;
+    if (/__all__[ \t]*(?:\.|\[)/.test(code)) return null;
+    const assignment = assignments[0];
+    const bracketIndex = code.indexOf("[", assignment.index);
+    const parenIndex = code.indexOf("(", assignment.index);
+    const openIndex = bracketIndex >= 0 && (parenIndex < 0 || bracketIndex < parenIndex) ? bracketIndex : parenIndex;
+    if (openIndex < 0) return null;
+    const opening = code[openIndex];
+    const closing = opening === "[" ? "]" : ")";
+    let depth = 0;
+    let closeIndex = -1;
+    for (let index = openIndex; index < code.length; index += 1) {
+      if (code[index] === opening) depth += 1;
+      if (code[index] === closing) {
+        depth -= 1;
+        if (depth === 0) {
+          closeIndex = index;
+          break;
+        }
+      }
+    }
+    if (closeIndex < 0) return null;
+    const expressionPrefix = code.slice(assignment.index + assignment[0].length, openIndex);
+    if (expressionPrefix.trim().length > 0) return null;
+    const trailing = code.slice(closeIndex + 1).match(/^[ \t]*(?:\r?\n|;|$)/);
+    if (!trailing) return null;
+    const body = content.slice(openIndex + 1, closeIndex).replace(/#[^\r\n]*/g, "");
+    const names = [...body.matchAll(/["']([A-Za-z_][A-Za-z0-9_]*)["']/g)].map((item) => item[1]).filter((name): name is string => Boolean(name));
+    const remainder = body.replace(/["'][A-Za-z_][A-Za-z0-9_]*["']/g, "").replace(/[\s,]/g, "");
+    if (remainder.length > 0) return null;
+    return names;
   } catch {
     return null;
   }
 }
 
-function pythonPackageInitializers(repoRoot: string, file: string, specifier: string): string[] {
+function pythonPackageInitializers(repoRoot: string, file: string, specifier: string, boundary?: string): string[] {
   const moduleBase = resolve(dirname(file), specifier.replaceAll("\\", "/"));
   let directory = isDirectRegularFile(join(moduleBase, "__init__.py")) ? moduleBase : dirname(moduleBase);
   const result: string[] = [];
-  while (isPathInside(repoRoot, directory)) {
+  while (isPathInside(repoRoot, directory) && (!boundary || isPathInside(boundary, directory))) {
     const initializer = join(directory, "__init__.py");
     if (isDirectRegularFile(initializer)) result.push(initializer);
     const parent = dirname(directory);
@@ -313,6 +484,8 @@ function isGlobalObjectReference(node: ts.Expression, aliases: Set<string>): boo
   if (ts.isBinaryExpression(expression) && (expression.operatorToken.kind === ts.SyntaxKind.EqualsToken || expression.operatorToken.kind === ts.SyntaxKind.CommaToken)) {
     return isGlobalObjectReference(expression.right, aliases);
   }
+  const access = memberAccess(expression);
+  if (access?.name === "globalThis") return isGlobalObjectReference(access.receiver, aliases);
   return ts.isIdentifier(expression) && aliases.has(expression.text);
 }
 
@@ -415,6 +588,24 @@ function hasUnverifiableGlobalAssignment(left: ts.Expression, initializer: ts.Ex
   return expression.properties.some((property) => ts.isPropertyAssignment(property) && ts.isComputedPropertyName(property.name) && staticPropertyName(property.name) === undefined);
 }
 
+function hasUnverifiableModuleBinding(name: ts.BindingName, initializer: ts.Expression, importMetaAliases: Set<string>, moduleAliases: Set<string>): boolean {
+  if (!isModuleContainerReference(initializer, importMetaAliases, moduleAliases) || !ts.isObjectBindingPattern(name)) return false;
+  return name.elements.some((element) => ts.isBindingElement(element) && !!element.propertyName && staticPropertyName(element.propertyName) === undefined);
+}
+
+function hasUnverifiableModuleAssignment(left: ts.Expression, initializer: ts.Expression, importMetaAliases: Set<string>, moduleAliases: Set<string>): boolean {
+  if (!isModuleContainerReference(initializer, importMetaAliases, moduleAliases)) return false;
+  const expression = unwrapExpression(left);
+  if (!ts.isObjectLiteralExpression(expression)) return false;
+  return expression.properties.some((property) => ts.isPropertyAssignment(property) && ts.isComputedPropertyName(property.name) && staticPropertyName(property.name) === undefined);
+}
+
+function isUnknownModulePropertyAccess(node: ts.ElementAccessExpression, importMetaAliases: Set<string>, moduleAliases: Set<string>): boolean {
+  if (!isModuleContainerReference(node.expression, importMetaAliases, moduleAliases) || !node.argumentExpression) return false;
+  const argument = unwrapExpression(node.argumentExpression);
+  return !ts.isStringLiteralLike(argument) && !ts.isNumericLiteral(argument);
+}
+
 function requireBindingNames(name: ts.BindingName, initializer: ts.Expression, importMetaAliases: Set<string>, moduleAliases: Set<string>): string[] {
   const expression = unwrapExpression(initializer);
   const isModuleContainer = isModuleContainerReference(expression, importMetaAliases, moduleAliases);
@@ -445,7 +636,9 @@ function requireAssignmentNames(left: ts.Expression, initializer: ts.Expression,
   return names;
 }
 
-function collectRequireAliases(source: ts.SourceFile, importMetaAliases: Set<string>): Set<string> {
+type RequireAnalysis = { aliases: Set<string>; moduleAliases: Set<string> };
+
+function collectRequireAliases(source: ts.SourceFile, importMetaAliases: Set<string>): RequireAnalysis {
   const aliases = new Set(["require"]);
   const moduleAliases = new Set(["module"]);
   let changed = true;
@@ -487,7 +680,7 @@ function collectRequireAliases(source: ts.SourceFile, importMetaAliases: Set<str
     };
     visit(source);
   }
-  return aliases;
+  return { aliases, moduleAliases };
 }
 
 function collectImportMetaAliases(source: ts.SourceFile): Set<string> {
@@ -601,7 +794,9 @@ function javascriptImports(file: string, content: string): JavaScriptImports {
   const specifiers: string[] = [];
   let hasUnverifiableDynamicImport = false;
   const importMetaAliases = collectImportMetaAliases(source);
-  const requireAliases = collectRequireAliases(source, importMetaAliases);
+  const requireAnalysis = collectRequireAliases(source, importMetaAliases);
+  const requireAliases = requireAnalysis.aliases;
+  const moduleObjectAliases = requireAnalysis.moduleAliases;
   const dynamicCodeAnalysis = collectDynamicCodeAliases(source);
   const dynamicCodeAliases = dynamicCodeAnalysis.aliases;
   const globalObjectAliases = dynamicCodeAnalysis.globalAliases;
@@ -610,11 +805,16 @@ function javascriptImports(file: string, content: string): JavaScriptImports {
       hasUnverifiableDynamicImport = true;
     } else if ((ts.isVariableDeclaration(node) || ts.isParameter(node)) && node.initializer && hasUnverifiableGlobalBinding(node.name, node.initializer, globalObjectAliases)) {
       hasUnverifiableDynamicImport = true;
+    } else if ((ts.isVariableDeclaration(node) || ts.isParameter(node)) && node.initializer && hasUnverifiableModuleBinding(node.name, node.initializer, importMetaAliases, moduleObjectAliases)) {
+      hasUnverifiableDynamicImport = true;
     } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
       hasUnverifiableImportMetaAssignment(node.left, node.right, importMetaAliases)) {
       hasUnverifiableDynamicImport = true;
     } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
       hasUnverifiableGlobalAssignment(node.left, node.right, globalObjectAliases)) {
+      hasUnverifiableDynamicImport = true;
+    } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      hasUnverifiableModuleAssignment(node.left, node.right, importMetaAliases, moduleObjectAliases)) {
       hasUnverifiableDynamicImport = true;
     } else if (ts.isPropertyAccessExpression(node) &&
       (isImportMetaRequire(node, importMetaAliases) || isDynamicCodeReference(node, dynamicCodeAliases)) &&
@@ -671,6 +871,8 @@ function javascriptImports(file: string, content: string): JavaScriptImports {
         hasUnverifiableDynamicImport = true;
       }
     } else if (ts.isElementAccessExpression(node) && isUnknownGlobalPropertyAccess(node, globalObjectAliases)) {
+      hasUnverifiableDynamicImport = true;
+    } else if (ts.isElementAccessExpression(node) && isUnknownModulePropertyAccess(node, importMetaAliases, moduleObjectAliases)) {
       hasUnverifiableDynamicImport = true;
     } else if (ts.isElementAccessExpression(node) && isDynamicCodeReference(node, dynamicCodeAliases)) {
       hasUnverifiableDynamicImport = true;
@@ -803,40 +1005,42 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
         checkImportSpecifier(repoRoot, path, relative, specifier, findings, enqueue);
       }
     } else if (!JAVASCRIPT_EXTENSIONS.has(extname(path).toLowerCase())) {
-      for (const match of content.matchAll(RELATIVE_IMPORT)) {
-        const specifier = match[1];
-        if (specifier) checkImportSpecifier(repoRoot, path, relative, specifier, findings, enqueue);
-      }
-      for (const match of content.matchAll(ABSOLUTE_IMPORT)) {
-        const specifier = match[1];
-        if (specifier) checkImportSpecifier(repoRoot, path, relative, specifier, findings, enqueue);
+      if (extname(path).toLowerCase() !== ".py") {
+        for (const match of content.matchAll(RELATIVE_IMPORT)) {
+          const specifier = match[1];
+          if (specifier) checkImportSpecifier(repoRoot, path, relative, specifier, findings, enqueue);
+        }
+        for (const match of content.matchAll(ABSOLUTE_IMPORT)) {
+          const specifier = match[1];
+          if (specifier) checkImportSpecifier(repoRoot, path, relative, specifier, findings, enqueue);
+        }
       }
       if (extname(path).toLowerCase() === ".py") {
         const pythonContent = maskPythonNonCode(content);
-        const checkPythonSpecifier = (specifier: string): void => {
+        const checkPythonSpecifier = (specifier: string, boundary?: string): void => {
           checkImportSpecifier(repoRoot, path, relative, specifier, findings, (resolved) => {
             enqueue(resolved, pythonSearchRoot);
-            for (const initializer of pythonPackageInitializers(repoRoot, path, specifier)) enqueue(initializer, pythonSearchRoot);
+            for (const initializer of pythonPackageInitializers(repoRoot, path, specifier, boundary)) enqueue(initializer, pythonSearchRoot);
           }, pythonImportCandidates);
         };
-        const enqueuePythonInitializers = (specifier: string): void => {
-          for (const initializer of pythonPackageInitializers(repoRoot, path, specifier)) enqueue(initializer, pythonSearchRoot);
+        const enqueuePythonInitializers = (specifier: string, boundary?: string): void => {
+          for (const initializer of pythonPackageInitializers(repoRoot, path, specifier, boundary)) enqueue(initializer, pythonSearchRoot);
         };
         const pythonReferenceExists = (specifier: string): boolean => {
           return Boolean(resolveExistingFile(pythonImportCandidates(path, specifier)) || pythonNamespaceDirectory(repoRoot, path, specifier));
         };
-        const checkPythonReference = (specifier: string): boolean => {
+        const checkPythonReference = (specifier: string, boundary?: string): boolean => {
           if (resolveExistingFile(pythonImportCandidates(path, specifier))) {
-            checkPythonSpecifier(specifier);
+            checkPythonSpecifier(specifier, boundary);
             return true;
           }
           if (pythonNamespaceDirectory(repoRoot, path, specifier)) {
-            enqueuePythonInitializers(specifier);
+            enqueuePythonInitializers(specifier, boundary);
             return true;
           }
           return false;
         };
-        const scanPythonWildcard = (packageSpecifier: string, initializer: string | undefined): void => {
+        const scanPythonWildcard = (packageSpecifier: string, initializer: string | undefined, boundary?: string): void => {
           if (!initializer) return;
           const names = pythonInitializerAllNames(initializer);
           if (names === null) {
@@ -845,7 +1049,7 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
           }
           for (const name of names ?? []) {
             const specifier = `${packageSpecifier}/${name}`;
-            if (pythonReferenceExists(specifier)) checkPythonReference(specifier);
+            if (pythonReferenceExists(specifier)) checkPythonReference(specifier, boundary);
           }
         };
         for (const match of pythonContent.matchAll(PYTHON_RELATIVE_IMPORT)) {
@@ -891,20 +1095,20 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
             const names = pythonImportedNames(importedNames);
             const moduleInitializer = pythonModuleInitializer(path, moduleSpecifier);
             const moduleNamespace = pythonNamespaceDirectory(repoRoot, path, moduleSpecifier);
-            if (!checkPythonReference(moduleSpecifier)) {
-              checkPythonSpecifier(moduleSpecifier);
+            if (!checkPythonReference(moduleSpecifier, pythonSearchRoot)) {
+              checkPythonSpecifier(moduleSpecifier, pythonSearchRoot);
               continue;
             }
             for (const name of names) {
               if (name === "*") continue;
               const specifier = `${moduleSpecifier}/${name}`;
-              if (checkPythonReference(specifier)) continue;
+              if (checkPythonReference(specifier, pythonSearchRoot)) continue;
               if ((moduleInitializer && !pythonInitializerExportsName(moduleInitializer, name)) || (moduleNamespace && !moduleInitializer)) {
-                checkPythonSpecifier(specifier);
+                checkPythonSpecifier(specifier, pythonSearchRoot);
               }
             }
             if (names.includes("*")) {
-              scanPythonWildcard(moduleSpecifier, moduleInitializer);
+              scanPythonWildcard(moduleSpecifier, moduleInitializer, pythonSearchRoot);
             }
           }
         }
@@ -916,18 +1120,15 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
               const topSpecifier = pythonSearchSpecifier(path, pythonSearchRoot, moduleName.split("/")[0] ?? moduleName);
               if (!pythonReferenceExists(topSpecifier)) continue;
               const specifier = pythonSearchSpecifier(path, pythonSearchRoot, moduleName);
-              if (!checkPythonReference(specifier)) checkPythonSpecifier(specifier);
+              if (!checkPythonReference(specifier, pythonSearchRoot)) checkPythonSpecifier(specifier, pythonSearchRoot);
             }
           }
         }
       }
       if (extname(path).toLowerCase() === ".sh") {
-        for (const match of content.matchAll(SHELL_SOURCE_IMPORT)) {
-          const source = match[1] ?? match[2] ?? match[3];
-          if (source) {
-            const specifier = RELATIVE_SPECIFIER.test(source) || ABSOLUTE_SPECIFIER.test(source) ? source : `./${source}`;
-            checkImportSpecifier(repoRoot, path, relative, specifier, findings, enqueue);
-          }
+        for (const source of shellSourceSpecifiers(content)) {
+          const specifier = RELATIVE_SPECIFIER.test(source) || ABSOLUTE_SPECIFIER.test(source) ? source : `./${source}`;
+          checkImportSpecifier(repoRoot, path, relative, specifier, findings, enqueue, shellImportCandidates);
         }
       }
     }

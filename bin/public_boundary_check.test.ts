@@ -116,6 +116,7 @@ test("detects credential-bearing URLs, bearer tokens, and complete PEM blocks", 
   expect(pattern("credentialed-url").test("https://user:" + credential + "@example.test")).toBe(true);
   expect(pattern("bearer-token").test("Bearer " + credential)).toBe(true);
   expect(pattern("private-key-block").test("-----BEGIN " + "PRIVATE KEY-----\n" + "A".repeat(48) + "\n-----END " + "PRIVATE KEY-----")).toBe(true);
+  expect(pattern("private-key-block").test("-----BEGIN " + "PRIVATE KEY-----\n" + "A".repeat(50) + "\n" + "B".repeat(70) + "\n-----END " + "PRIVATE KEY-----")).toBe(true);
 });
 
 test("checks tracked public files", () => {

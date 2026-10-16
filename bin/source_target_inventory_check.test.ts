@@ -87,6 +87,8 @@ test("counts only regular Skill files and rejects malformed options", () => {
     expect(targetSymlinkInventory(root)).toEqual(new Set(["linked"]));
     mkdirSync(join(root, "skills", "regular", "references"), { recursive: true });
     symlinkSync(join(root, "outside", "linked", "SKILL.md"), join(root, "skills", "regular", "references", "linked.md"));
+    mkdirSync(join(root, "skills", "regular", "build"), { recursive: true });
+    symlinkSync(join(root, "outside", "linked", "SKILL.md"), join(root, "skills", "regular", "build", "ignored.md"));
     expect(targetSymlinkPaths(root)).toEqual(new Set(["skills/linked", "skills/regular/references/linked.md"]));
     expect(parseArgs(["--source-root=/tmp/source", "--source-revision=HEAD", "--target-root=/tmp/target", "--public-manifest=/tmp/public"])).toEqual({
       sourceRoot: "/tmp/source",
@@ -153,6 +155,32 @@ test("reports a source skills-root symlink from the requested Git revision", () 
     expect(check(source, "HEAD", target, join(target, "PUBLIC_SKILLS.txt"))).toEqual([
       "SYMLINKED_SOURCE_SKILLS_ROOT",
     ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("preserves special characters in committed symlink paths", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-inventory-special-link-"));
+  const source = join(root, "source");
+  const target = join(root, "target");
+  const linkName = "link\tname";
+  try {
+    mkdirSync(join(source, "skills", "public", "references"), { recursive: true });
+    writeFileSync(join(source, "skills", "public", "SKILL.md"), "# public\n");
+    writeFileSync(join(source, "outside.md"), "# outside\n");
+    symlinkSync(join(source, "outside.md"), join(source, "skills", "public", "references", linkName));
+    git(source, "init", "-q");
+    git(source, "config", "user.email", "fixture@example.invalid");
+    git(source, "config", "user.name", "Fixture");
+    git(source, "add", "skills", "outside.md");
+    git(source, "commit", "-qm", "fixture");
+    mkdirSync(join(target, "skills", "public"), { recursive: true });
+    writeFileSync(join(target, "skills", "public", "SKILL.md"), "# public\n");
+    writeFileSync(join(target, "PUBLIC_SKILLS.txt"), "public\n");
+    expect(check(source, "HEAD", target, join(target, "PUBLIC_SKILLS.txt"))).toContain(
+      `SYMLINKED_SOURCE_PATH skills/public/references/${linkName}`,
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

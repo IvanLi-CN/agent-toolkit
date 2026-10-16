@@ -6,12 +6,16 @@ import { lstatSync, readFileSync } from "node:fs";
 
 export const FORBIDDEN_MARKERS = ["CODEX_" + "THREAD_ID"];
 const SECRET_NAME = String.raw`(?:api[_-]?key|apikey|access[_-]?key|accesskey|token|secret|secret[_-]?key|secretkey|secret[_-]?access[_-]?key|secretaccesskey|password|passwd|private[_-]?key|privatekey|credential)`;
+const COMPOUND_SECRET_NAME = String.raw`[A-Za-z0-9_-]*${SECRET_NAME}[A-Za-z0-9_-]*`;
 const SECRET_VALUE = String.raw`(?![$<\{])[^'"\r\n]{16,}`;
-const UNQUOTED_SECRET_VALUE = String.raw`[A-Za-z0-9][A-Za-z0-9._~+/=-]{15,}`;
+const UNQUOTED_SECRET_VALUE = String.raw`(?!provided-out-of-band\b|redacted\b|placeholder\b|changeme\b)[A-Za-z0-9][A-Za-z0-9._~+/=-]{15,}`;
 const REGEX_HELPER_ASSIGNMENT = new RegExp(String.raw`^[ \t]*(?:local[ \t]+)?(?:re|regex|pattern)[_-][A-Za-z0-9_-]*[ \t]*=`, "i");
 const COMPOUND_ASSIGNMENT = new RegExp(String.raw`(?<![A-Za-z0-9_-])(?<name>[A-Za-z0-9_-]+)\s*=\s*['"]${SECRET_VALUE}['"]`, "i");
 const JSON_SECRET_FIELD = new RegExp(String.raw`["'](?<name>[A-Za-z0-9_-]+)["']\s*:\s*["']${SECRET_VALUE}["']`, "i");
-const UNQUOTED_SECRET_ASSIGNMENT = new RegExp(String.raw`(?<![A-Za-z0-9_-])(?<name>${SECRET_NAME})\s*[:=]\s*${UNQUOTED_SECRET_VALUE}(?![A-Za-z0-9._~+/=-])`, "i");
+const UNQUOTED_SECRET_ASSIGNMENT = new RegExp(String.raw`(?<![A-Za-z0-9_-])(?<name>${COMPOUND_SECRET_NAME})\s*[:=]\s*${UNQUOTED_SECRET_VALUE}(?![A-Za-z0-9._~+/=-])`, "i");
+const PRIVATE_KEY_BLOCK = /-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----\r?\n(?:[A-Za-z0-9+/]{40,}={0,2}\r?\n)+-----END [A-Z0-9 _-]*PRIVATE KEY-----/;
+const CREDENTIAL_URL = /\b(?:https?|ssh|postgres(?:ql)?):\/\/[^/\s:@]+:[^@\s]{16,}@/i;
+const BEARER_TOKEN = /\bBearer\s+[A-Za-z0-9._~+/=-]{16,}\b/i;
 const SECRET_SUFFIXES = [
   "api_key", "apikey", "access_key", "accesskey", "token", "secret",
   "secret_key", "secretkey", "secret_access_key", "secretaccesskey", "password", "passwd",
@@ -26,6 +30,9 @@ export const FORBIDDEN_PATTERNS: Array<[string, RegExp]> = [
   ["prefixed-quoted-secret-assignment", COMPOUND_ASSIGNMENT],
   ["json-secret-field", JSON_SECRET_FIELD],
   ["unquoted-secret-assignment", UNQUOTED_SECRET_ASSIGNMENT],
+  ["private-key-block", PRIVATE_KEY_BLOCK],
+  ["credentialed-url", CREDENTIAL_URL],
+  ["bearer-token", BEARER_TOKEN],
 ];
 
 const IGNORED_PRIVATE_HOSTNAMES = new Set(["config.local", "threading.local"]);
@@ -59,12 +66,12 @@ function matchesPattern(label: string, pattern: RegExp, content: string): boolea
     if (IGNORED_PRIVATE_HOSTNAMES.has(value)) {
       continue;
     }
-    if (label === "prefixed-quoted-secret-assignment") {
+    if (label === "prefixed-quoted-secret-assignment" || label === "unquoted-secret-assignment") {
       const name = match.groups?.name ?? "";
-      if (!isSecretField(name) || isSimpleSecretField(name)) {
+      if (!isSecretField(name) || (label === "prefixed-quoted-secret-assignment" && isSimpleSecretField(name))) {
         continue;
       }
-      if (isRegexHelperAssignment(content, match)) {
+      if (label === "prefixed-quoted-secret-assignment" && isRegexHelperAssignment(content, match)) {
         continue;
       }
     }

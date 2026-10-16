@@ -55,3 +55,20 @@ test("inspects the production test runner and rejects escaping tool links", () =
     rmSync(outsidePath, { force: true });
   }
 });
+
+test("rejects absolute and file URL imports outside the public repository", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-absolute-"));
+  const outsidePath = join(root, "..", `${root.split(/[\\/]/).at(-1)}-outside.ts`);
+  try {
+    mkdirSync(join(root, "bin"), { recursive: true });
+    writeFileSync(outsidePath, "export const outside = 1;\n");
+    writeFileSync(join(root, "bin", "absolute.ts"), `import "${outsidePath}";\nimport "file://${outsidePath}";\n`);
+    expect(check(root)).toEqual([
+      `bin/absolute.ts: local reference outside public repository ${outsidePath}`,
+      `bin/absolute.ts: local reference outside public repository file://${outsidePath}`,
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(outsidePath, { force: true });
+  }
+});

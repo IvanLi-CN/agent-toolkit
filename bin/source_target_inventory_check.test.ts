@@ -5,7 +5,7 @@ import { gitEnvironment } from "./repo_util.ts";
 import { check, main, manifestInventory, parseArgs, targetInventory, targetSymlinkInventory, targetSymlinkPaths } from "./source_target_inventory_check.ts";
 
 function git(cwd: string, ...args: string[]): void {
-  const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+  const result = Bun.spawnSync(["git", ...args], { cwd, env: gitEnvironment(Bun.env), stdout: "pipe", stderr: "pipe" });
   if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
 }
 

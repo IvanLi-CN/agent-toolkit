@@ -192,6 +192,7 @@ test("rejects wrapped, destructured, late-bound, and bound loaders", () => {
     writeFileSync(join(root, "bin", "late.ts"), `function run() { load("../../${outsideName}"); } const load = require; run();\n`);
     writeFileSync(join(root, "bin", "wrapped.ts"), `(require)("../../${outsideName}");\n`);
     expect(check(root)).toEqual([
+      "bin/bind.ts: dynamic import or require cannot be verified",
       `bin/bind.ts: local reference outside public repository ../../${outsideName}`,
       `bin/destructure.ts: local reference outside public repository ../../${outsideName}`,
       `bin/late.ts: local reference outside public repository ../../${outsideName}`,
@@ -242,6 +243,25 @@ test("recursively checks local JavaScript dependencies for excluded test imports
     expect(publicToolFiles(root).map((path) => path.split(/[\\/]/).at(-1))).toEqual(["entry.ts"]);
     expect(check(root)).toEqual([
       "support/helper.cjs: local reference targets excluded test file ../bin/runtime.test.ts",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("recursively checks Python and Shell local dependencies", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-script-dependency-"));
+  try {
+    mkdirSync(join(root, "bin"), { recursive: true });
+    writeFileSync(join(root, "bin", "entry.py"), "from . import helper\n");
+    writeFileSync(join(root, "bin", "helper.py"), "from . import runtime_test\n");
+    writeFileSync(join(root, "bin", "runtime_test.py"), "marker = 'fixture-only'\n");
+    writeFileSync(join(root, "bin", "entry.sh"), "source ./helper.sh\n");
+    writeFileSync(join(root, "bin", "helper.sh"), "source ./runtime.test.sh\n");
+    writeFileSync(join(root, "bin", "runtime.test.sh"), "echo fixture-only\n");
+    expect(check(root)).toEqual([
+      "bin/helper.py: local reference targets excluded test file ./runtime_test",
+      "bin/helper.sh: local reference targets excluded test file ./runtime.test.sh",
     ]);
   } finally {
     rmSync(root, { recursive: true, force: true });

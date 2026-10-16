@@ -23,6 +23,8 @@ const IMPORT_GAP = String.raw`(?:\s|/\*[\s\S]*?\*/|//[^\r\n]*(?:\r\n|\r|\n))*`;
 const IMPORT_PREFIX = String.raw`(?:\bfrom${IMPORT_GAP}|\bimport${IMPORT_GAP}(?:\(${IMPORT_GAP})?|\brequire${IMPORT_GAP}\(${IMPORT_GAP})`;
 const RELATIVE_IMPORT = new RegExp(String.raw`${IMPORT_PREFIX}["'](\.{1,2}[\\/][^"']+)["']`, "g");
 const ABSOLUTE_IMPORT = new RegExp(String.raw`${IMPORT_PREFIX}["']((?:file://|/|\\|[A-Za-z]:[\\/])[^"']+)["']`, "g");
+const PYTHON_RELATIVE_IMPORT = /\bfrom\s+(\.+[A-Za-z_][A-Za-z0-9_.]*|\.+)\s+import\s+([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)/g;
+const SHELL_SOURCE_IMPORT = /(?:^|[;&|]\s*)(?:source\b|\.)\s+(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\s;|]+))/gm;
 const EXCLUDED_TEST_FILE = /(?:\.test\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$|^test[-_].*\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$|_test\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$)/;
 const PUBLIC_TOOL_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".cjs", ".mjs", ".py", ".sh"];
 const JAVASCRIPT_EXTENSIONS = new Set([".cjs", ".js", ".jsx", ".mjs", ".ts", ".tsx"]);
@@ -35,6 +37,13 @@ const EXECUTABLE_MODULE_URL = /^(?:blob|data|javascript):/i;
 function isExcludedTestPath(path: string): boolean {
   const name = path.split(/[\\/]/).at(-1) ?? "";
   return EXCLUDED_TEST_FILE.test(name);
+}
+
+function pythonRelativeSpecifiers(moduleSpecifier: string, importedNames: string): string[] {
+  const dotCount = moduleSpecifier.match(/^\.+/)?.[0].length ?? 0;
+  const moduleName = moduleSpecifier.slice(dotCount).replaceAll(".", "/");
+  const prefix = dotCount === 1 ? "./" : "../".repeat(dotCount - 1);
+  return moduleName ? [`${prefix}${moduleName}`] : importedNames.split(",").map((name) => `${prefix}${name.trim()}`);
 }
 
 function collectPublicToolFiles(repoRoot: string): { files: string[]; rejectedSymlinks: string[] } {
@@ -64,6 +73,8 @@ function importCandidates(file: string, specifier: string): string[] {
     `${absolute}.jsx`,
     `${absolute}.cjs`,
     `${absolute}.mjs`,
+    `${absolute}.py`,
+    `${absolute}.sh`,
     `${absolute}.json`,
     join(absolute, "index.ts"),
     join(absolute, "index.js"),
@@ -108,23 +119,37 @@ function isImportMeta(node: ts.Expression | undefined): boolean {
   return !!expression && ts.isMetaProperty(expression) && expression.keywordToken === ts.SyntaxKind.ImportKeyword && expression.name.text === "meta";
 }
 
-function isImportMetaRequire(node: ts.Expression): boolean {
+type MemberAccess = { receiver: ts.Expression; name: string };
+
+function memberAccess(node: ts.Expression): MemberAccess | undefined {
   const expression = unwrapExpression(node);
   if (ts.isPropertyAccessExpression(expression)) {
-    return expression.name.text === "require" && isImportMeta(expression.expression);
+    return { receiver: expression.expression, name: expression.name.text };
   }
-  return ts.isElementAccessExpression(expression) && isImportMeta(expression.expression) && !!expression.argumentExpression &&
-    ts.isStringLiteralLike(expression.argumentExpression) && expression.argumentExpression.text === "require";
+  if (ts.isElementAccessExpression(expression) && !!expression.argumentExpression && ts.isStringLiteralLike(expression.argumentExpression)) {
+    return { receiver: expression.expression, name: expression.argumentExpression.text };
+  }
+  return undefined;
+}
+
+function isImportMetaRequire(node: ts.Expression): boolean {
+  const access = memberAccess(node);
+  return access?.name === "require" && isImportMeta(access.receiver);
 }
 
 function isRequireExpression(node: ts.Expression, aliases: Set<string>): boolean {
   const expression = unwrapExpression(node);
-  return (ts.isIdentifier(expression) && aliases.has(expression.text)) || isImportMetaRequire(expression);
+  if (ts.isIdentifier(expression) && aliases.has(expression.text)) return true;
+  if (ts.isBinaryExpression(expression) && expression.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+    return isRequireExpression(expression.right, aliases);
+  }
+  const access = memberAccess(expression);
+  return access?.name === "require" || isImportMetaRequire(expression);
 }
 
 function isRequireBindExpression(node: ts.Expression, aliases: Set<string>): boolean {
-  const expression = unwrapExpression(node);
-  return ts.isPropertyAccessExpression(expression) && expression.name.text === "bind" && isRequireExpression(expression.expression, aliases);
+  const access = memberAccess(node);
+  return access?.name === "bind" && isRequireExpression(access.receiver, aliases);
 }
 
 function isRequireBindCall(node: ts.Expression, aliases: Set<string>): boolean {
@@ -134,6 +159,11 @@ function isRequireBindCall(node: ts.Expression, aliases: Set<string>): boolean {
 
 function isLoaderExpression(node: ts.Expression, aliases: Set<string>): boolean {
   return isRequireExpression(node, aliases) || isRequireBindExpression(node, aliases) || isRequireBindCall(node, aliases);
+}
+
+function isRequireMethodCall(node: ts.Expression, aliases: Set<string>): boolean {
+  const access = memberAccess(node);
+  return (access?.name === "apply" || access?.name === "bind" || access?.name === "call") && isRequireExpression(access.receiver, aliases);
 }
 
 function requireBindingNames(name: ts.BindingName, initializer: ts.Expression): string[] {
@@ -206,6 +236,9 @@ function javascriptImports(file: string, content: string): JavaScriptImports {
       const expression = unwrapExpression(node.expression);
       const isDynamicImport = expression.kind === ts.SyntaxKind.ImportKeyword;
       const isRequire = isRequireExpression(expression, requireAliases) || isRequireBindCall(expression, requireAliases);
+      if (isRequireMethodCall(expression, requireAliases)) {
+        hasUnverifiableDynamicImport = true;
+      }
       const isCreateRequire = (ts.isIdentifier(expression) && expression.text === "createRequire") ||
         (ts.isPropertyAccessExpression(expression) && expression.name.text === "createRequire") ||
         (ts.isElementAccessExpression(expression) && !!expression.argumentExpression && ts.isStringLiteralLike(expression.argumentExpression) && expression.argumentExpression.text === "createRequire");
@@ -306,6 +339,12 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
   }
   const pending = [...collected.files];
   const scanned = new Set<string>();
+  const enqueue = (dependency: string): void => {
+    const dependencyKey = resolve(dependency);
+    if (!scanned.has(dependencyKey) && !pending.some((candidate) => resolve(candidate) === dependencyKey)) {
+      pending.push(dependency);
+    }
+  };
   while (pending.length > 0) {
     const path = pending.shift();
     if (!path) continue;
@@ -329,21 +368,36 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
     }
     if (parsed.specifiers.length > 0) {
       for (const specifier of parsed.specifiers) {
-        checkImportSpecifier(repoRoot, path, relative, specifier, findings, (dependency) => {
-          const dependencyKey = resolve(dependency);
-          if (!scanned.has(dependencyKey) && !pending.some((candidate) => resolve(candidate) === dependencyKey)) {
-            pending.push(dependency);
-          }
-        });
+        checkImportSpecifier(repoRoot, path, relative, specifier, findings, enqueue);
       }
     } else if (!JAVASCRIPT_EXTENSIONS.has(extname(path).toLowerCase())) {
       for (const match of content.matchAll(RELATIVE_IMPORT)) {
         const specifier = match[1];
-        if (specifier) checkImportSpecifier(repoRoot, path, relative, specifier, findings, (dependency) => pending.push(dependency));
+        if (specifier) checkImportSpecifier(repoRoot, path, relative, specifier, findings, enqueue);
       }
       for (const match of content.matchAll(ABSOLUTE_IMPORT)) {
         const specifier = match[1];
-        if (specifier) checkImportSpecifier(repoRoot, path, relative, specifier, findings, (dependency) => pending.push(dependency));
+        if (specifier) checkImportSpecifier(repoRoot, path, relative, specifier, findings, enqueue);
+      }
+      if (extname(path).toLowerCase() === ".py") {
+        for (const match of content.matchAll(PYTHON_RELATIVE_IMPORT)) {
+          const moduleSpecifier = match[1];
+          const importedNames = match[2];
+          if (moduleSpecifier && importedNames) {
+            for (const specifier of pythonRelativeSpecifiers(moduleSpecifier, importedNames)) {
+              checkImportSpecifier(repoRoot, path, relative, specifier, findings, enqueue);
+            }
+          }
+        }
+      }
+      if (extname(path).toLowerCase() === ".sh") {
+        for (const match of content.matchAll(SHELL_SOURCE_IMPORT)) {
+          const source = match[1] ?? match[2] ?? match[3];
+          if (source) {
+            const specifier = RELATIVE_SPECIFIER.test(source) || ABSOLUTE_SPECIFIER.test(source) ? source : `./${source}`;
+            checkImportSpecifier(repoRoot, path, relative, specifier, findings, enqueue);
+          }
+        }
       }
     }
   }

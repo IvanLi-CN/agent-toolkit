@@ -3,7 +3,7 @@
 
 import { readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { isRegularFile, REPO_ROOT, readText } from "./repo_util.ts";
+import { isDirectRegularFile, REPO_ROOT, readText } from "./repo_util.ts";
 
 export const SKILL_NAME_PATTERN = /^`([a-z0-9-]+)`$/;
 export const EXTERNAL_PATH_PATTERN = /~?\/?[^`]*\.agents\/skills\/([a-z0-9-]+)(?:\/|`)/;
@@ -17,10 +17,10 @@ export type IndexEntry = {
 export function repositorySkills(skillsRoot: string): Set<string> {
   const result = new Set<string>();
   for (const entry of readdirSync(skillsRoot, { withFileTypes: true })) {
-    if (entry.name.startsWith(".") || (!entry.isDirectory() && !entry.isSymbolicLink())) {
+    if (!entry.isDirectory() && !entry.isSymbolicLink()) {
       continue;
     }
-    if (isRegularFile(join(skillsRoot, entry.name, "SKILL.md"))) {
+    if (isDirectRegularFile(join(skillsRoot, entry.name, "SKILL.md"))) {
       result.add(entry.name);
     }
   }
@@ -93,23 +93,32 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
   return findings;
 }
 
+const USAGE = "usage: skills_index_check.ts [--repo-root <path>]";
+
 function parseArgs(args: string[]): string {
   let repoRoot = resolve(process.cwd());
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
-    if (arg !== "--repo-root") {
-      throw new Error("usage: skills_index_check.ts [--repo-root <path>]");
+    if (arg === "--repo-root") {
+      const value = args[++index];
+      if (!value || value.startsWith("--")) throw new Error(USAGE);
+      repoRoot = resolve(value);
+    } else if (arg.startsWith("--repo-root=")) {
+      const value = arg.slice("--repo-root=".length);
+      if (!value) throw new Error(USAGE);
+      repoRoot = resolve(value);
+    } else {
+      throw new Error(USAGE);
     }
-    const value = args[++index];
-    if (!value || value.startsWith("--")) {
-      throw new Error("usage: skills_index_check.ts [--repo-root <path>]");
-    }
-    repoRoot = resolve(value);
   }
   return repoRoot;
 }
 
 export function main(args: string[] = Bun.argv.slice(2)): number {
+  if (args.includes("--help")) {
+    console.log(USAGE);
+    return 0;
+  }
   let repoRoot: string;
   try {
     repoRoot = parseArgs(args);

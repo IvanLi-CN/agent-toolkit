@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { check, parseArgs, targetInventory } from "./source_target_inventory_check.ts";
+import { check, main, manifestInventory, parseArgs, targetInventory } from "./source_target_inventory_check.ts";
 
 function git(cwd: string, ...args: string[]): void {
   const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
@@ -28,6 +28,17 @@ test("passes a synthetic public/private source snapshot", () => {
     writeFileSync(join(target, "skills", "public", "SKILL.md"), "# public\n");
     writeFileSync(join(target, "PUBLIC_SKILLS.txt"), "public\n");
     expect(check(source, "HEAD", target, join(target, "PUBLIC_SKILLS.txt"))).toEqual([]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("ignores comments, blank lines, and surrounding manifest whitespace", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-inventory-manifest-"));
+  try {
+    const manifest = join(root, "PUBLIC_SKILLS.txt");
+    writeFileSync(manifest, "# comment\n\nalpha\n beta \n");
+    expect(manifestInventory(manifest)).toEqual(new Set(["alpha", "beta"]));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -66,9 +77,18 @@ test("counts only regular Skill files and rejects malformed options", () => {
     mkdirSync(join(root, "skills", "valid", "SKILL.md"), { recursive: true });
     mkdirSync(join(root, "skills", "regular"), { recursive: true });
     writeFileSync(join(root, "skills", "regular", "SKILL.md"), "# regular\n");
-    expect(targetInventory(root)).toEqual(new Set(["regular"]));
+    mkdirSync(join(root, "skills", ".hidden"), { recursive: true });
+    writeFileSync(join(root, "skills", ".hidden", "SKILL.md"), "# hidden\n");
+    expect(targetInventory(root)).toEqual(new Set([".hidden", "regular"]));
+    expect(parseArgs(["--source-root=/tmp/source", "--source-revision=HEAD", "--target-root=/tmp/target", "--public-manifest=/tmp/public"])).toEqual({
+      sourceRoot: "/tmp/source",
+      revision: "HEAD",
+      targetRoot: "/tmp/target",
+      manifest: "/tmp/public",
+    });
     expect(() => parseArgs(["--unknown"])).toThrow();
     expect(() => parseArgs(["--source-root"])).toThrow();
+    expect(main(["--help"])).toBe(0);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

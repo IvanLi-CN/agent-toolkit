@@ -23,9 +23,10 @@ const IMPORT_GAP = String.raw`(?:\s|/\*[\s\S]*?\*/|//[^\r\n]*(?:\r\n|\r|\n))*`;
 const IMPORT_PREFIX = String.raw`(?:\bfrom${IMPORT_GAP}|\bimport${IMPORT_GAP}(?:\(${IMPORT_GAP})?|\brequire${IMPORT_GAP}\(${IMPORT_GAP})`;
 const RELATIVE_IMPORT = new RegExp(String.raw`${IMPORT_PREFIX}["'](\.{1,2}[\\/][^"']+)["']`, "g");
 const ABSOLUTE_IMPORT = new RegExp(String.raw`${IMPORT_PREFIX}["']((?:file://|/|\\|[A-Za-z]:[\\/])[^"']+)["']`, "g");
-const EXCLUDED_TEST_FILE = /(?:\.test\.(?:ts|tsx|js|py|sh)$|^test[-_].*\.(?:ts|tsx|js|py|sh)$|_test\.(?:ts|tsx|js|py|sh)$)/;
-const PUBLIC_TOOL_EXTENSIONS = [".ts", ".tsx", ".js", ".py", ".sh"];
-const JAVASCRIPT_EXTENSIONS = new Set([".js", ".jsx", ".ts", ".tsx"]);
+const EXCLUDED_TEST_FILE = /(?:\.test\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$|^test[-_].*\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$|_test\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$)/;
+const PUBLIC_TOOL_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".cjs", ".mjs", ".py", ".sh"];
+const JAVASCRIPT_EXTENSIONS = new Set([".cjs", ".js", ".jsx", ".mjs", ".ts", ".tsx"]);
+const SCANNABLE_LOCAL_EXTENSIONS = new Set([...PUBLIC_TOOL_EXTENSIONS, ".json"]);
 const NODE_MODULE_BUILTINS = new Set(["module", "node:module"]);
 const RELATIVE_SPECIFIER = /^\.{1,2}[\\/]/;
 const ABSOLUTE_SPECIFIER = /^(?:file:\/\/|\/|\\|[A-Za-z]:[\\/])/;
@@ -59,6 +60,9 @@ function importCandidates(file: string, specifier: string): string[] {
     `${absolute}.ts`,
     `${absolute}.tsx`,
     `${absolute}.js`,
+    `${absolute}.jsx`,
+    `${absolute}.cjs`,
+    `${absolute}.mjs`,
     `${absolute}.json`,
     join(absolute, "index.ts"),
     join(absolute, "index.js"),
@@ -90,12 +94,28 @@ function absoluteImportPath(specifier: string): string {
 
 type JavaScriptImports = { specifiers: string[]; hasUnverifiableDynamicImport: boolean };
 
+function isImportMeta(node: ts.Expression | undefined): boolean {
+  return !!node && ts.isMetaProperty(node) && node.keywordToken === ts.SyntaxKind.ImportKeyword && node.name.text === "meta";
+}
+
+function isImportMetaRequire(node: ts.Expression): boolean {
+  if (ts.isPropertyAccessExpression(node)) {
+    return node.name.text === "require" && isImportMeta(node.expression);
+  }
+  return ts.isElementAccessExpression(node) && isImportMeta(node.expression) && !!node.argumentExpression &&
+    ts.isStringLiteralLike(node.argumentExpression) && node.argumentExpression.text === "require";
+}
+
+function isRequireExpression(node: ts.Expression, aliases: Set<string>): boolean {
+  return (ts.isIdentifier(node) && aliases.has(node.text)) || isImportMetaRequire(node);
+}
+
 function javascriptImports(file: string, content: string): JavaScriptImports {
   const extension = extname(file).toLowerCase();
   if (!JAVASCRIPT_EXTENSIONS.has(extension)) {
     return { specifiers: [], hasUnverifiableDynamicImport: false };
   }
-  const scriptKind = extension === ".tsx" ? ts.ScriptKind.TSX : extension === ".jsx" ? ts.ScriptKind.JSX : extension === ".js" ? ts.ScriptKind.JS : ts.ScriptKind.TS;
+  const scriptKind = extension === ".tsx" ? ts.ScriptKind.TSX : extension === ".jsx" ? ts.ScriptKind.JSX : JAVASCRIPT_EXTENSIONS.has(extension) ? ts.ScriptKind.JS : ts.ScriptKind.TS;
   const source = ts.createSourceFile(file, content, ts.ScriptTarget.Latest, true, scriptKind);
   const specifiers: string[] = [];
   let hasUnverifiableDynamicImport = false;
@@ -112,15 +132,17 @@ function javascriptImports(file: string, content: string): JavaScriptImports {
       }
       specifiers.push(node.moduleSpecifier.text);
     } else if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference) && node.moduleReference.expression && ts.isStringLiteralLike(node.moduleReference.expression)) {
+      if (NODE_MODULE_BUILTINS.has(node.moduleReference.expression.text)) {
+        hasUnverifiableDynamicImport = true;
+      }
       specifiers.push(node.moduleReference.expression.text);
-    } else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer && ts.isIdentifier(node.initializer) && requireAliases.has(node.initializer.text)) {
+    } else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer && isRequireExpression(node.initializer, requireAliases)) {
       requireAliases.add(node.name.text);
+    } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isIdentifier(node.left) && isRequireExpression(node.right, requireAliases)) {
+      requireAliases.add(node.left.text);
     } else if (ts.isCallExpression(node)) {
       const isDynamicImport = node.expression.kind === ts.SyntaxKind.ImportKeyword;
-      const isImportMetaRequire = ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === "require" &&
-        ts.isMetaProperty(node.expression.expression) && node.expression.expression.keywordToken === ts.SyntaxKind.ImportKeyword &&
-        node.expression.expression.name.text === "meta";
-      const isRequire = (ts.isIdentifier(node.expression) && requireAliases.has(node.expression.text)) || isImportMetaRequire;
+      const isRequire = isRequireExpression(node.expression, requireAliases);
       const isCreateRequire = (ts.isIdentifier(node.expression) && node.expression.text === "createRequire") ||
         (ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === "createRequire");
       if (isCreateRequire) {
@@ -144,7 +166,7 @@ function javascriptImports(file: string, content: string): JavaScriptImports {
   return { specifiers, hasUnverifiableDynamicImport };
 }
 
-function checkImportSpecifier(repoRoot: string, path: string, relative: string, specifier: string, findings: string[]): void {
+function checkImportSpecifier(repoRoot: string, path: string, relative: string, specifier: string, findings: string[], onResolved?: (path: string) => void): void {
   if (RELATIVE_SPECIFIER.test(specifier)) {
     const candidates = importCandidates(path, specifier);
     if (candidates.some((candidate) => !isInside(repoRoot, candidate))) {
@@ -159,6 +181,10 @@ function checkImportSpecifier(repoRoot: string, path: string, relative: string, 
           findings.push(`${relative}: local reference resolves outside public repository ${specifier}`);
         } else if (isExcludedTestPath(existing) || isExcludedTestPath(realExisting)) {
           findings.push(`${relative}: local reference targets excluded test file ${specifier}`);
+        } else if (!SCANNABLE_LOCAL_EXTENSIONS.has(extname(realExisting).toLowerCase())) {
+          findings.push(`${relative}: local reference cannot be inspected ${specifier}`);
+        } else {
+          onResolved?.(existing);
         }
       } catch {
         findings.push(`${relative}: unreadable local reference ${specifier}`);
@@ -184,6 +210,10 @@ function checkImportSpecifier(repoRoot: string, path: string, relative: string, 
         findings.push(`${relative}: local reference resolves outside public repository ${specifier}`);
       } else if (isExcludedTestPath(existing) || isExcludedTestPath(realExisting)) {
         findings.push(`${relative}: local reference targets excluded test file ${specifier}`);
+      } else if (!SCANNABLE_LOCAL_EXTENSIONS.has(extname(realExisting).toLowerCase())) {
+        findings.push(`${relative}: local reference cannot be inspected ${specifier}`);
+      } else {
+        onResolved?.(existing);
       }
     }
   } catch {
@@ -206,7 +236,14 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
   for (const path of collected.rejectedSymlinks) {
     findings.push(`${relativePath(path, repoRoot)}: symbolic link escapes public tool boundary`);
   }
-  for (const path of collected.files) {
+  const pending = [...collected.files];
+  const scanned = new Set<string>();
+  while (pending.length > 0) {
+    const path = pending.shift();
+    if (!path) continue;
+    const key = resolve(path);
+    if (scanned.has(key)) continue;
+    scanned.add(key);
     const relative = relativePath(path, repoRoot);
     if (!isPathInside(repoRoot, path) || !isDirectRegularFile(path)) {
       findings.push(`${relative}: public tool path is not a regular file inside the repository`);
@@ -224,16 +261,21 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
     }
     if (parsed.specifiers.length > 0) {
       for (const specifier of parsed.specifiers) {
-        checkImportSpecifier(repoRoot, path, relative, specifier, findings);
+        checkImportSpecifier(repoRoot, path, relative, specifier, findings, (dependency) => {
+          const dependencyKey = resolve(dependency);
+          if (!scanned.has(dependencyKey) && !pending.some((candidate) => resolve(candidate) === dependencyKey)) {
+            pending.push(dependency);
+          }
+        });
       }
     } else if (!JAVASCRIPT_EXTENSIONS.has(extname(path).toLowerCase())) {
       for (const match of content.matchAll(RELATIVE_IMPORT)) {
         const specifier = match[1];
-        if (specifier) checkImportSpecifier(repoRoot, path, relative, specifier, findings);
+        if (specifier) checkImportSpecifier(repoRoot, path, relative, specifier, findings, (dependency) => pending.push(dependency));
       }
       for (const match of content.matchAll(ABSOLUTE_IMPORT)) {
         const specifier = match[1];
-        if (specifier) checkImportSpecifier(repoRoot, path, relative, specifier, findings);
+        if (specifier) checkImportSpecifier(repoRoot, path, relative, specifier, findings, (dependency) => pending.push(dependency));
       }
     }
   }

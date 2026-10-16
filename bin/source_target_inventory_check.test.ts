@@ -15,6 +15,8 @@ test("removes Git repository-selection environment overrides", () => {
     GIT_WORK_TREE: "/tmp/foreign",
     GIT_INDEX_FILE: "/tmp/foreign/index",
     GIT_NAMESPACE: "foreign",
+    GIT_CONFIG: "/tmp/foreign/config",
+    GIT_CONFIG_COUNT: "1",
     GIT_SSH_COMMAND: "ssh",
     PATH: "/usr/bin",
   })).toEqual({
@@ -221,6 +223,27 @@ test("reports a source skills-root symlink from the requested Git revision", () 
     writeFileSync(join(target, "PUBLIC_SKILLS.txt"), "");
     expect(check(source, "HEAD", target, join(target, "PUBLIC_SKILLS.txt"))).toEqual([
       "SYMLINKED_SOURCE_SKILLS_ROOT",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("reports Gitlinks in the source Skill snapshot", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-inventory-gitlink-"));
+  const source = join(root, "source");
+  const target = join(root, "target");
+  try {
+    mkdirSync(join(source, "skills"), { recursive: true });
+    git(source, "init", "-q");
+    git(source, "config", "user.email", "fixture@example.invalid");
+    git(source, "config", "user.name", "Fixture");
+    git(source, "update-index", "--add", "--cacheinfo", "160000,1111111111111111111111111111111111111111,skills/external");
+    git(source, "commit", "-qm", "fixture");
+    mkdirSync(join(target, "skills"), { recursive: true });
+    writeFileSync(join(target, "PUBLIC_SKILLS.txt"), "");
+    expect(check(source, "HEAD", target, join(target, "PUBLIC_SKILLS.txt"))).toEqual([
+      "UNSUPPORTED_SOURCE_GITLINK skills/external",
     ]);
   } finally {
     rmSync(root, { recursive: true, force: true });

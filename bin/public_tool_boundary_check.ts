@@ -23,8 +23,9 @@ const IMPORT_GAP = String.raw`(?:\s|/\*[\s\S]*?\*/|//[^\r\n]*(?:\r\n|\r|\n))*`;
 const IMPORT_PREFIX = String.raw`(?:\bfrom${IMPORT_GAP}|\bimport${IMPORT_GAP}(?:\(${IMPORT_GAP})?|\brequire${IMPORT_GAP}\(${IMPORT_GAP})`;
 const RELATIVE_IMPORT = new RegExp(String.raw`${IMPORT_PREFIX}["'](\.{1,2}[\\/][^"']+)["']`, "g");
 const ABSOLUTE_IMPORT = new RegExp(String.raw`${IMPORT_PREFIX}["']((?:file://|/|\\|[A-Za-z]:[\\/])[^"']+)["']`, "g");
-const PYTHON_RELATIVE_IMPORT = /\bfrom\s+(\.+[A-Za-z_][A-Za-z0-9_.]*|\.+)\s+import\s+([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)/g;
-const SHELL_SOURCE_IMPORT = /(?:^|[;&|]\s*)(?:source\b|\.)\s+(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\s;|]+))/gm;
+const PYTHON_RELATIVE_IMPORT = /\bfrom\s+(\.+[A-Za-z_][A-Za-z0-9_.]*|\.+)\s+import\s+\(?\s*([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*\)?/g;
+const PYTHON_LOCAL_IMPORT = /(?:^[ \t]*|;[ \t]*)import\s+([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)/gm;
+const SHELL_SOURCE_IMPORT = /(?:^[ \t]*|[;&|][ \t]*|then[ \t]+)(?:source\b|\.)\s+(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\s;|]+))/gm;
 const EXCLUDED_TEST_FILE = /(?:\.test\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$|^test[-_].*\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$|_test\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$)/;
 const PUBLIC_TOOL_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".cjs", ".mjs", ".py", ".sh"];
 const JAVASCRIPT_EXTENSIONS = new Set([".cjs", ".js", ".jsx", ".mjs", ".ts", ".tsx"]);
@@ -119,6 +120,11 @@ function isImportMeta(node: ts.Expression | undefined): boolean {
   return !!expression && ts.isMetaProperty(expression) && expression.keywordToken === ts.SyntaxKind.ImportKeyword && expression.name.text === "meta";
 }
 
+function isImportMetaReference(node: ts.Expression, aliases: Set<string>): boolean {
+  const expression = unwrapExpression(node);
+  return isImportMeta(expression) || (ts.isIdentifier(expression) && aliases.has(expression.text));
+}
+
 type MemberAccess = { receiver: ts.Expression; name: string };
 
 function memberAccess(node: ts.Expression): MemberAccess | undefined {
@@ -206,6 +212,32 @@ function collectRequireAliases(source: ts.SourceFile): Set<string> {
   return aliases;
 }
 
+function collectImportMetaAliases(source: ts.SourceFile): Set<string> {
+  const aliases = new Set<string>();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    const visit = (node: ts.Node): void => {
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer &&
+        isImportMetaReference(node.initializer, aliases) &&
+        !aliases.has(node.name.text)) {
+        aliases.add(node.name.text);
+        changed = true;
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
+  }
+  return aliases;
+}
+
+function isRequirePropertyName(node: ts.Identifier): boolean {
+  const parent = node.parent;
+  return (ts.isPropertyAccessExpression(parent) && parent.name === node) ||
+    (ts.isBindingElement(parent) && parent.propertyName === node) ||
+    (ts.isPropertyAssignment(parent) && parent.name === node);
+}
+
 function javascriptImports(file: string, content: string): JavaScriptImports {
   const extension = extname(file).toLowerCase();
   if (!JAVASCRIPT_EXTENSIONS.has(extension)) {
@@ -216,6 +248,7 @@ function javascriptImports(file: string, content: string): JavaScriptImports {
   const specifiers: string[] = [];
   let hasUnverifiableDynamicImport = false;
   const requireAliases = collectRequireAliases(source);
+  const importMetaAliases = collectImportMetaAliases(source);
   const visit = (node: ts.Node): void => {
     if (ts.isImportDeclaration(node) && ts.isStringLiteralLike(node.moduleSpecifier)) {
       if (NODE_MODULE_BUILTINS.has(node.moduleSpecifier.text)) {
@@ -256,6 +289,12 @@ function javascriptImports(file: string, content: string): JavaScriptImports {
           hasUnverifiableDynamicImport = true;
         }
       }
+    } else if (ts.isElementAccessExpression(node) && isImportMetaReference(node.expression, importMetaAliases)) {
+      if (!node.argumentExpression || !ts.isStringLiteralLike(node.argumentExpression)) {
+        hasUnverifiableDynamicImport = true;
+      }
+    } else if (ts.isIdentifier(node) && node.text === "require" && !isRequirePropertyName(node)) {
+      hasUnverifiableDynamicImport = true;
     }
     ts.forEachChild(node, visit);
   };
@@ -386,6 +425,17 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
           if (moduleSpecifier && importedNames) {
             for (const specifier of pythonRelativeSpecifiers(moduleSpecifier, importedNames)) {
               checkImportSpecifier(repoRoot, path, relative, specifier, findings, enqueue);
+            }
+          }
+        }
+        for (const match of content.matchAll(PYTHON_LOCAL_IMPORT)) {
+          const importedNames = match[1];
+          if (importedNames) {
+            for (const name of importedNames.split(",").map((item) => item.trim().split(/\s+as\s+/i)[0]).filter(Boolean)) {
+              const specifier = `./${name}`;
+              if (resolveExistingFile(importCandidates(path, specifier))) {
+                checkImportSpecifier(repoRoot, path, relative, specifier, findings, enqueue);
+              }
             }
           }
         }

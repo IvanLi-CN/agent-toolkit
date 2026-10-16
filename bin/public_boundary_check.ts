@@ -13,6 +13,7 @@ const REGEX_HELPER_ASSIGNMENT = new RegExp(String.raw`^[ \t]*(?:local[ \t]+)?(?:
 const COMPOUND_ASSIGNMENT = new RegExp(String.raw`(?<![A-Za-z0-9_-])(?<name>[A-Za-z0-9_-]+)\s*=\s*['"]${SECRET_VALUE}['"]`, "i");
 const JSON_SECRET_FIELD = new RegExp(String.raw`["'](?<name>[A-Za-z0-9_-]+)["']\s*:\s*["']${SECRET_VALUE}["']`, "i");
 const QUOTED_SECRET_FIELD = new RegExp(String.raw`(?<![A-Za-z0-9_-])(?<name>${COMPOUND_SECRET_NAME})\s*:\s*["']${SECRET_VALUE}["']`, "i");
+const YAML_BLOCK_SECRET_FIELD = new RegExp(String.raw`(?<![A-Za-z0-9_-])(?<name>${COMPOUND_SECRET_NAME})\s*:\s*[|>]\s*[-+]?\s*\r?\n[ \t]+${UNQUOTED_SECRET_VALUE}`, "i");
 const UNQUOTED_SECRET_ASSIGNMENT = new RegExp(String.raw`(?<![A-Za-z0-9_-])(?<name>${COMPOUND_SECRET_NAME})\s*[:=]\s*${UNQUOTED_SECRET_VALUE}(?![A-Za-z0-9._~+/=-])`, "i");
 const PRIVATE_KEY_BLOCK = /-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----\r?\n(?:[ \t]*[A-Za-z0-9+/]{40,}={0,2}\r?\n(?:[ \t]*[A-Za-z0-9+/]{1,128}={0,2}\r?\n)*)[ \t]*-----END [A-Z0-9 _-]*PRIVATE KEY-----/;
 const CREDENTIAL_URL = /\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s:@]+:[^@\s]{16,}@/i;
@@ -31,6 +32,7 @@ export const FORBIDDEN_PATTERNS: Array<[string, RegExp]> = [
   ["prefixed-quoted-secret-assignment", COMPOUND_ASSIGNMENT],
   ["json-secret-field", JSON_SECRET_FIELD],
   ["quoted-secret-field", QUOTED_SECRET_FIELD],
+  ["yaml-block-secret-field", YAML_BLOCK_SECRET_FIELD],
   ["unquoted-secret-assignment", UNQUOTED_SECRET_ASSIGNMENT],
   ["private-key-block", PRIVATE_KEY_BLOCK],
   ["credentialed-url", CREDENTIAL_URL],
@@ -55,11 +57,8 @@ function isSimpleSecretField(name: string): boolean {
 }
 
 export function isRegexHelperAssignment(content: string, match: RegExpExecArray): boolean {
-  const lineStart = content.lastIndexOf("\n", match.index - 1) + 1;
-  const nextLine = content.indexOf("\n", match.index + match[0].length);
-  const lineEnd = nextLine < 0 ? content.length : nextLine;
-  const line = content.slice(lineStart, lineEnd);
-  return REGEX_HELPER_ASSIGNMENT.test(line) && /[([|]/.test(match[0]) && !/[0-9a-f]{16,}/i.test(match[0]);
+  const name = match.groups?.name ?? "";
+  return REGEX_HELPER_ASSIGNMENT.test(`${name}=`) && /[([|]/.test(match[0]) && !/[0-9a-f]{16,}/i.test(match[0]);
 }
 
 function matchesPattern(label: string, pattern: RegExp, content: string): boolean {
@@ -68,7 +67,7 @@ function matchesPattern(label: string, pattern: RegExp, content: string): boolea
     if (IGNORED_PRIVATE_HOSTNAMES.has(value)) {
       continue;
     }
-    if (label === "prefixed-quoted-secret-assignment" || label === "quoted-secret-field" || label === "unquoted-secret-assignment") {
+    if (label === "prefixed-quoted-secret-assignment" || label === "quoted-secret-field" || label === "yaml-block-secret-field" || label === "unquoted-secret-assignment") {
       const name = match.groups?.name ?? "";
       if (!isSecretField(name) || (label === "prefixed-quoted-secret-assignment" && isSimpleSecretField(name))) {
         continue;

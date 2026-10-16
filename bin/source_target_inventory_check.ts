@@ -74,7 +74,7 @@ export function manifestInventory(path: string): Set<string> {
   return new Set(manifestEntries(path));
 }
 
-type SnapshotTree = { skillNames: Set<string>; symlinkPaths: Set<string> };
+type SnapshotTree = { skillNames: Set<string>; symlinkPaths: Set<string>; gitlinkPaths: Set<string> };
 
 function snapshotTree(source: string, revision: string): SnapshotTree {
   const result = runGit(["ls-tree", "-r", "-z", revision, "--", "skills"], resolve(source));
@@ -83,6 +83,7 @@ function snapshotTree(source: string, revision: string): SnapshotTree {
   }
   const skillNames = new Set<string>();
   const symlinkPaths = new Set<string>();
+  const gitlinkPaths = new Set<string>();
   for (const item of result.stdout.split("\0")) {
     const separator = item.indexOf("\t");
     if (separator < 0) continue;
@@ -96,8 +97,11 @@ function snapshotTree(source: string, revision: string): SnapshotTree {
     if (mode === "120000" && (path === "skills" || path.startsWith("skills/"))) {
       symlinkPaths.add(path);
     }
+    if (mode === "160000" && (path === "skills" || path.startsWith("skills/"))) {
+      gitlinkPaths.add(path);
+    }
   }
-  return { skillNames, symlinkPaths };
+  return { skillNames, symlinkPaths, gitlinkPaths };
 }
 
 export function snapshotInventory(source: string, revision: string): Set<string> {
@@ -196,6 +200,9 @@ export function inspect(
 
   if (targetSymlinkPathsSet.has("skills")) findings.push("SYMLINKED_TARGET_SKILLS_ROOT");
   if (sourceSymlinkPaths.has("skills") || isSymlink(join(source, "skills"))) findings.push("SYMLINKED_SOURCE_SKILLS_ROOT");
+  for (const path of [...snapshot.gitlinkPaths].sort()) {
+    findings.push(`UNSUPPORTED_SOURCE_GITLINK ${path}`);
+  }
   for (const path of [...targetSymlinkPathsSet].filter((path) => path !== "skills").sort()) {
     const parts = path.split("/");
     if (parts.length === 2 || (parts.length === 3 && path.endsWith("/SKILL.md"))) {

@@ -33,6 +33,7 @@ const PYTHON_LOCAL_IMPORT_NAMES = String.raw`${PYTHON_LOCAL_IMPORTED_NAME}(?:${P
 const PYTHON_RELATIVE_IMPORT = new RegExp(String.raw`${PYTHON_IMPORT_START}from${PYTHON_IMPORT_GAP}(\.+${PYTHON_NAME}(?:\.${PYTHON_NAME})*|\.+)${PYTHON_IMPORT_GAP}import${PYTHON_IMPORT_GAP}\(?${PYTHON_IMPORT_GAP}(${PYTHON_IMPORTED_NAMES})${PYTHON_IMPORT_GAP},?${PYTHON_IMPORT_GAP}\)?`, "gm");
 const PYTHON_FROM_IMPORT = new RegExp(String.raw`${PYTHON_IMPORT_START}from${PYTHON_IMPORT_GAP}(${PYTHON_NAME}(?:\.${PYTHON_NAME})*)${PYTHON_IMPORT_GAP}import${PYTHON_IMPORT_GAP}\(?${PYTHON_IMPORT_GAP}(${PYTHON_IMPORTED_NAMES})${PYTHON_IMPORT_GAP},?${PYTHON_IMPORT_GAP}\)?`, "gm");
 const PYTHON_LOCAL_IMPORT = new RegExp(String.raw`${PYTHON_IMPORT_START}import${PYTHON_IMPORT_GAP}\(?${PYTHON_IMPORT_GAP}(${PYTHON_LOCAL_IMPORT_NAMES})${PYTHON_IMPORT_GAP},?${PYTHON_IMPORT_GAP}\)?`, "gm");
+const PYTHON_DYNAMIC_IMPORT = /(?<![A-Za-z0-9_.])(?:__import__|import_module)\s*\(|\bimportlib\s*\.\s*import_module\s*\(/g;
 const EXCLUDED_TEST_FILE = /(?:\.test\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$|^test[-_].*\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$|_test\.(?:ts|tsx|js|jsx|cjs|mjs|py|sh)$)/;
 const PUBLIC_TOOL_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".cjs", ".mjs", ".py", ".sh"];
 const JAVASCRIPT_EXTENSIONS = new Set([".cjs", ".js", ".jsx", ".mjs", ".ts", ".tsx"]);
@@ -136,10 +137,14 @@ function shellTokens(content: string): ShellToken[] {
   return tokens;
 }
 
-function shellSourceSpecifiers(content: string): string[] {
+type ShellSourceAnalysis = { specifiers: string[]; hasUnverifiableDynamicSource: boolean };
+
+function shellSourceAnalysis(content: string): ShellSourceAnalysis {
   const result: string[] = [];
+  let hasUnverifiableDynamicSource = false;
   const tokens = shellTokens(content);
   const controlWords = new Set(["case", "do", "elif", "else", "for", "if", "then", "until", "while"]);
+  const commandWrappers = new Set(["builtin", "command"]);
   let commandStart = true;
   let sourceArgument = false;
   for (const token of tokens) {
@@ -162,20 +167,25 @@ function shellSourceSpecifiers(content: string): string[] {
       continue;
     }
     if (!commandStart) continue;
-    if (token.quoted) {
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token.value)) {
+      commandStart = true;
+    } else if (token.quoted) {
       commandStart = false;
     } else if (controlWords.has(token.value) || token.value === "!") {
       commandStart = true;
-    } else if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token.value)) {
+    } else if (commandWrappers.has(token.value)) {
       commandStart = true;
     } else if (token.value === "source" || token.value === ".") {
       sourceArgument = true;
+      commandStart = false;
+    } else if (token.value === "eval") {
+      hasUnverifiableDynamicSource = true;
       commandStart = false;
     } else {
       commandStart = false;
     }
   }
-  return result;
+  return { specifiers: result, hasUnverifiableDynamicSource };
 }
 
 // Keep line structure intact while removing Python comments and string literals from import matching.
@@ -510,6 +520,14 @@ function isRequireExpression(node: ts.Expression, aliases: Set<string>, importMe
   return access?.name === "require" || isImportMetaRequire(expression, importMetaAliases);
 }
 
+function isCommonJsLoaderExpression(node: ts.Expression, moduleAliases: Set<string>): boolean {
+  const loadAccess = memberAccess(node);
+  if (loadAccess?.name !== "_load") return false;
+  const constructorAccess = memberAccess(loadAccess.receiver);
+  const receiver = constructorAccess ? unwrapExpression(constructorAccess.receiver) : undefined;
+  return constructorAccess?.name === "constructor" && !!receiver && ts.isIdentifier(receiver) && moduleAliases.has(receiver.text);
+}
+
 function isRequireBindExpression(node: ts.Expression, aliases: Set<string>, importMetaAliases: Set<string> = new Set()): boolean {
   const access = memberAccess(node);
   return access?.name === "bind" && isRequireExpression(access.receiver, aliases, importMetaAliases);
@@ -520,8 +538,8 @@ function isRequireBindCall(node: ts.Expression, aliases: Set<string>, importMeta
   return ts.isCallExpression(expression) && isRequireBindExpression(expression.expression, aliases, importMetaAliases);
 }
 
-function isLoaderExpression(node: ts.Expression, aliases: Set<string>, importMetaAliases: Set<string> = new Set()): boolean {
-  return isRequireExpression(node, aliases, importMetaAliases) || isRequireBindExpression(node, aliases, importMetaAliases) || isRequireBindCall(node, aliases, importMetaAliases);
+function isLoaderExpression(node: ts.Expression, aliases: Set<string>, importMetaAliases: Set<string> = new Set(), moduleAliases: Set<string> = new Set()): boolean {
+  return isRequireExpression(node, aliases, importMetaAliases) || isRequireBindExpression(node, aliases, importMetaAliases) || isRequireBindCall(node, aliases, importMetaAliases) || isCommonJsLoaderExpression(node, moduleAliases);
 }
 
 function isRequireMethodCall(node: ts.Expression, aliases: Set<string>, importMetaAliases: Set<string> = new Set()): boolean {
@@ -656,7 +674,7 @@ function collectRequireAliases(source: ts.SourceFile, importMetaAliases: Set<str
             changed = true;
           }
         }
-        if (ts.isIdentifier(node.name) && isLoaderExpression(node.initializer, aliases, importMetaAliases) && !aliases.has(node.name.text)) {
+        if (ts.isIdentifier(node.name) && isLoaderExpression(node.initializer, aliases, importMetaAliases, moduleAliases) && !aliases.has(node.name.text)) {
           aliases.add(node.name.text);
           changed = true;
         }
@@ -671,7 +689,7 @@ function collectRequireAliases(source: ts.SourceFile, importMetaAliases: Set<str
             changed = true;
           }
         }
-        if (ts.isIdentifier(node.left) && isLoaderExpression(node.right, aliases, importMetaAliases) && !aliases.has(node.left.text)) {
+        if (ts.isIdentifier(node.left) && isLoaderExpression(node.right, aliases, importMetaAliases, moduleAliases) && !aliases.has(node.left.text)) {
           aliases.add(node.left.text);
           changed = true;
         }
@@ -746,7 +764,10 @@ function collectDynamicCodeAliases(source: ts.SourceFile): DynamicCodeAnalysis {
           for (const element of node.name.elements) {
             if (!ts.isBindingElement(element) || !ts.isIdentifier(element.name)) continue;
             const propertyText = staticPropertyName(element.propertyName) ?? (element.propertyName ? undefined : element.name.text);
-            if (propertyText !== undefined && DYNAMIC_CODE_NAMES.has(propertyText) && !aliases.has(element.name.text)) {
+            if (propertyText === "globalThis" && !globalAliases.has(element.name.text)) {
+              globalAliases.add(element.name.text);
+              changed = true;
+            } else if (propertyText !== undefined && DYNAMIC_CODE_NAMES.has(propertyText) && !aliases.has(element.name.text)) {
               aliases.add(element.name.text);
               changed = true;
             }
@@ -838,7 +859,7 @@ function javascriptImports(file: string, content: string): JavaScriptImports {
     } else if (ts.isCallExpression(node)) {
       const expression = unwrapExpression(node.expression);
       const isDynamicImport = expression.kind === ts.SyntaxKind.ImportKeyword;
-      const isRequire = isRequireExpression(expression, requireAliases, importMetaAliases) || isRequireBindCall(expression, requireAliases, importMetaAliases);
+      const isRequire = isRequireExpression(expression, requireAliases, importMetaAliases) || isRequireBindCall(expression, requireAliases, importMetaAliases) || isCommonJsLoaderExpression(expression, moduleObjectAliases);
       if (isDynamicCodeReference(expression, dynamicCodeAliases)) {
         hasUnverifiableDynamicImport = true;
       }
@@ -1017,6 +1038,7 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
       }
       if (extname(path).toLowerCase() === ".py") {
         const pythonContent = maskPythonNonCode(content);
+        let hasUnverifiableDynamicPythonImport = false;
         const checkPythonSpecifier = (specifier: string, boundary?: string): void => {
           checkImportSpecifier(repoRoot, path, relative, specifier, findings, (resolved) => {
             enqueue(resolved, pythonSearchRoot);
@@ -1040,6 +1062,42 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
           }
           return false;
         };
+        const checkPythonDynamicImport = (moduleName: string | undefined): void => {
+          if (!moduleName || !new RegExp(`^${PYTHON_NAME}(?:\\.${PYTHON_NAME})*$`).test(moduleName)) {
+            hasUnverifiableDynamicPythonImport = true;
+            return;
+          }
+          const modulePath = moduleName.replaceAll(".", "/");
+          const moduleSpecifier = pythonSearchSpecifier(path, pythonSearchRoot, modulePath);
+          const topSpecifier = pythonSearchSpecifier(path, pythonSearchRoot, modulePath.split("/")[0] ?? modulePath);
+          if (!pythonReferenceExists(topSpecifier)) return;
+          if (!checkPythonReference(moduleSpecifier, pythonSearchRoot)) checkPythonSpecifier(moduleSpecifier, pythonSearchRoot);
+        };
+        for (const match of pythonContent.matchAll(PYTHON_DYNAMIC_IMPORT)) {
+          const start = match.index ?? 0;
+          const openIndex = pythonContent.indexOf("(", start);
+          let depth = 0;
+          let closeIndex = -1;
+          for (let index = openIndex; index < pythonContent.length; index += 1) {
+            if (pythonContent[index] === "(") depth += 1;
+            if (pythonContent[index] === ")") {
+              depth -= 1;
+              if (depth === 0) {
+                closeIndex = index;
+                break;
+              }
+            }
+          }
+          if (openIndex < 0 || closeIndex < 0) {
+            checkPythonDynamicImport(undefined);
+            continue;
+          }
+          const argument = content.slice(openIndex + 1, closeIndex).match(/^[ \t\r\n]*(?:(["'])([A-Za-z_][A-Za-z0-9_.]*)\1)(?:[ \t\r\n,]|$)/);
+          checkPythonDynamicImport(argument?.[2]);
+        }
+        if (hasUnverifiableDynamicPythonImport) {
+          findings.push(`${relative}: dynamic Python import cannot be verified`);
+        }
         const scanPythonWildcard = (packageSpecifier: string, initializer: string | undefined, boundary?: string): void => {
           if (!initializer) return;
           const names = pythonInitializerAllNames(initializer);
@@ -1126,7 +1184,11 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
         }
       }
       if (extname(path).toLowerCase() === ".sh") {
-        for (const source of shellSourceSpecifiers(content)) {
+        const shellSources = shellSourceAnalysis(content);
+        if (shellSources.hasUnverifiableDynamicSource) {
+          findings.push(`${relative}: dynamic Shell source cannot be verified`);
+        }
+        for (const source of shellSources.specifiers) {
           const specifier = RELATIVE_SPECIFIER.test(source) || ABSOLUTE_SPECIFIER.test(source) ? source : `./${source}`;
           checkImportSpecifier(repoRoot, path, relative, specifier, findings, enqueue, shellImportCandidates);
         }

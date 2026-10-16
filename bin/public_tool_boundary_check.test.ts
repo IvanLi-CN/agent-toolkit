@@ -239,6 +239,8 @@ test("rejects propagated, computed, and indirect loader calls", () => {
     writeFileSync(join(root, "bin", "module-assignment-destructure.ts"), `let load; ({ require: load } = module); load("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "module-computed-destructure.ts"), `const key = "require"; const { [key]: load } = module; load("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "module-computed-call.ts"), `const key = "require"; module[key]("../../${outsideName}");\n`);
+    writeFileSync(join(root, "bin", "module-constructor-alias.ts"), `const load = module.constructor._load; load("../../${outsideName}");\n`);
+    writeFileSync(join(root, "bin", "module-constructor-load.ts"), `module.constructor._load("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "module-destructure.ts"), `const { require: load } = module; load("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "module.ts"), `module.require("../../${outsideName}");\n`);
     expect(check(root)).toEqual([
@@ -266,6 +268,8 @@ test("rejects propagated, computed, and indirect loader calls", () => {
       `bin/module-assignment-destructure.ts: local reference outside public repository ../../${outsideName}`,
       "bin/module-computed-call.ts: dynamic import or require cannot be verified",
       "bin/module-computed-destructure.ts: dynamic import or require cannot be verified",
+      `bin/module-constructor-alias.ts: local reference outside public repository ../../${outsideName}`,
+      `bin/module-constructor-load.ts: local reference outside public repository ../../${outsideName}`,
       `bin/module-destructure.ts: local reference outside public repository ../../${outsideName}`,
       `bin/module.ts: local reference outside public repository ../../${outsideName}`,
     ]);
@@ -301,6 +305,7 @@ test("rejects evaluated JavaScript loaders", () => {
     writeFileSync(join(root, "bin", "function-computed-global.ts"), 'const key = "Function"; const { [key]: F } = globalThis; new F("return require(\\"./hidden.ts\\")")();\n');
     writeFileSync(join(root, "bin", "function-assigned-global.ts"), 'let globalObject; const { Function: F } = (globalObject = globalThis); new F("return require(\\"./hidden.ts\\")")();\n');
     writeFileSync(join(root, "bin", "function-computed-call.ts"), 'const key = "Function"; globalThis[key]("return 7")();\n');
+    writeFileSync(join(root, "bin", "function-global-destructure.ts"), 'const { globalThis: g } = globalThis; const key = "Function"; g[key]("return 7")();\n');
     writeFileSync(join(root, "bin", "function-global-self.ts"), 'const g = globalThis.globalThis; const key = "Function"; g[key]("return 7")();\n');
     writeFileSync(join(root, "bin", "function-object.ts"), 'const loaders = { load: globalThis.Function }; new loaders.load("return require(\\"./hidden.ts\\")")();\n');
     writeFileSync(join(root, "bin", "function-bracket-object.ts"), 'const loaders = { load: globalThis["Function"] }; new loaders.load("return require(\\"./hidden.ts\\")")();\n');
@@ -314,6 +319,7 @@ test("rejects evaluated JavaScript loaders", () => {
       "bin/function-computed-destructure.ts: dynamic import or require cannot be verified",
       "bin/function-computed-global.ts: dynamic import or require cannot be verified",
       "bin/function-destructure.ts: dynamic import or require cannot be verified",
+      "bin/function-global-destructure.ts: dynamic import or require cannot be verified",
       "bin/function-global-self.ts: dynamic import or require cannot be verified",
       "bin/function-object.ts: dynamic import or require cannot be verified",
       "bin/function.ts: dynamic import or require cannot be verified",
@@ -413,6 +419,25 @@ test("parses Shell source commands without string or extension false positives",
       "bin/entry.sh: missing local reference ../support/helper",
       "support/private.sh: forbidden public tool coupling codex-runtime-marker",
       "support/assigned.sh: forbidden public tool coupling codex-runtime-marker",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fails closed for Shell source wrappers and dynamic evaluation", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-shell-wrappers-"));
+  try {
+    mkdirSync(join(root, "bin"), { recursive: true });
+    mkdirSync(join(root, "support"), { recursive: true });
+    writeFileSync(join(root, "bin", "entry.sh"), "FLAG=\"1\" . ../support/quoted.sh\nbuiltin source ../support/builtin.sh\neval '. ../support/eval.sh'\n");
+    writeFileSync(join(root, "support", "quoted.sh"), "echo os.environ[\"CODEX_HOME\"]\n");
+    writeFileSync(join(root, "support", "builtin.sh"), "echo os.environ[\"CODEX_HOME\"]\n");
+    writeFileSync(join(root, "support", "eval.sh"), "echo os.environ[\"CODEX_HOME\"]\n");
+    expect(check(root)).toEqual([
+      "bin/entry.sh: dynamic Shell source cannot be verified",
+      "support/quoted.sh: forbidden public tool coupling codex-runtime-marker",
+      "support/builtin.sh: forbidden public tool coupling codex-runtime-marker",
     ]);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -686,6 +711,30 @@ test("handles Python inline imports and ignores string references", () => {
     ]);
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("checks Python static dynamic imports and rejects unknown dynamic imports", () => {
+  const staticRoot = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-python-static-dynamic-import-"));
+  const unknownRoot = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-python-unknown-dynamic-import-"));
+  try {
+    mkdirSync(join(staticRoot, "bin"), { recursive: true });
+    writeFileSync(join(staticRoot, "bin", "entry.py"), "from importlib import import_module\nimport_module(\"runtime_test\")\n__import__(\"other_test\")\n");
+    writeFileSync(join(staticRoot, "bin", "runtime_test.py"), "marker = 'fixture-only'\n");
+    writeFileSync(join(staticRoot, "bin", "other_test.py"), "marker = 'fixture-only'\n");
+    expect(check(staticRoot)).toEqual([
+      "bin/entry.py: local reference targets excluded test file ./runtime_test",
+      "bin/entry.py: local reference targets excluded test file ./other_test",
+    ]);
+
+    mkdirSync(join(unknownRoot, "bin"), { recursive: true });
+    writeFileSync(join(unknownRoot, "bin", "entry.py"), "import importlib\nimportlib.import_module(module_name)\n");
+    expect(check(unknownRoot)).toEqual([
+      "bin/entry.py: dynamic Python import cannot be verified",
+    ]);
+  } finally {
+    rmSync(staticRoot, { recursive: true, force: true });
+    rmSync(unknownRoot, { recursive: true, force: true });
   }
 });
 

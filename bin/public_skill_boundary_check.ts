@@ -3,10 +3,11 @@
 
 import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { isDirectRegularFile, isPathInside, REPO_ROOT, readText, relativePath, walkFiles } from "./repo_util.ts";
+import { isDirectRegularFile, isPathInside, REPO_ROOT, readText, relativePath, trackedFiles, walkFiles } from "./repo_util.ts";
 
 export const PUBLIC_MANIFEST = join(REPO_ROOT, "PUBLIC_SKILLS.txt");
 export const PRIVATE_REFERENCE_NAMES = new Set(["hosts.txt", "inventory.md", "deployment-policy.yaml"]);
+const IGNORED_DIRECTORIES = new Set([".git", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv", "venv", "dist", "build", "coverage", "reports", "artifacts", "tmp"]);
 const runtimeNamePattern = "CODEX_" + "[A-Z0-9_]+";
 const runtimeHomeMarker = "$" + "CODEX_" + "HOME";
 const dotRuntimeMarker = "." + "codex";
@@ -42,6 +43,29 @@ export function repositorySkills(repoRoot: string): Set<string> {
   return result;
 }
 
+function scanSkillFiles(repoRoot: string, skillRoot: string): { files: string[]; rejectedSymlinks: string[] } {
+  const rejectedSymlinks: string[] = [];
+  const files = new Set(walkFiles(skillRoot, {
+    ignoredDirectories: IGNORED_DIRECTORIES,
+    onRejectedSymlink: (path) => rejectedSymlinks.push(path),
+  }));
+  try {
+    for (const path of trackedFiles(repoRoot)) {
+      const relative = relativePath(path, skillRoot);
+      if (relative && !relative.startsWith("../")) {
+        if (isPathInside(repoRoot, path)) files.add(path);
+        else rejectedSymlinks.push(path);
+      }
+    }
+  } catch {
+    // Synthetic fixtures need no Git index; ordinary filesystem traversal remains sufficient there.
+  }
+  return {
+    files: [...files].sort((left, right) => left < right ? -1 : left > right ? 1 : 0),
+    rejectedSymlinks: rejectedSymlinks.sort(),
+  };
+}
+
 export function check(repoRoot: string = REPO_ROOT, manifest: string = PUBLIC_MANIFEST): string[] {
   const findings: string[] = [];
   let names: string[];
@@ -71,6 +95,18 @@ export function check(repoRoot: string = REPO_ROOT, manifest: string = PUBLIC_MA
   for (const name of [...actual].filter((name) => !listed.has(name)).sort()) {
     findings.push(`UNLISTED_PUBLIC_SKILL ${name}`);
   }
+  for (const entry of readdirSync(skillsRoot, { withFileTypes: true }).sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0)) {
+    if (entry.name === "README.md") {
+      const readme = join(skillsRoot, entry.name);
+      if (!isDirectRegularFile(readme) || !isPathInside(repoRoot, readme)) {
+        findings.push("INVALID_PUBLIC_SKILLS_README");
+      }
+      continue;
+    }
+    if (!actual.has(entry.name)) {
+      findings.push(`UNEXPECTED_PUBLIC_SKILLS_ENTRY ${entry.name}`);
+    }
+  }
 
   for (const name of names) {
     if (!PUBLIC_SKILL_NAME_PATTERN.test(name)) continue;
@@ -88,8 +124,8 @@ export function check(repoRoot: string = REPO_ROOT, manifest: string = PUBLIC_MA
       findings.push(`MISSING_PUBLIC_SKILL ${name}`);
       continue;
     }
-    const rejectedSymlinks: string[] = [];
-    for (const path of walkFiles(skillRoot, { onRejectedSymlink: (path) => rejectedSymlinks.push(path) })) {
+    const scanned = scanSkillFiles(repoRoot, skillRoot);
+    for (const path of scanned.files) {
       const relative = relativePath(path, repoRoot);
       if (path.split(/[\\/]/).at(-2) === "references" && PRIVATE_REFERENCE_NAMES.has(path.split(/[\\/]/).at(-1) ?? "")) {
         findings.push(`${relative}: private operator reference must stay outside repository`);
@@ -107,7 +143,7 @@ export function check(repoRoot: string = REPO_ROOT, manifest: string = PUBLIC_MA
         }
       }
     }
-    for (const path of rejectedSymlinks.sort()) {
+    for (const path of scanned.rejectedSymlinks) {
       findings.push(`${relativePath(path, repoRoot)}: symbolic link escapes public Skill boundary`);
     }
   }

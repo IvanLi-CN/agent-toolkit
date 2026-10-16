@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 /** Check that skills/README.md indexes every repository-local Skill. */
 
-import { readdirSync } from "node:fs";
+import { lstatSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { isDirectRegularFile, REPO_ROOT, readText } from "./repo_util.ts";
+import { isDirectRegularFile, isPathInside, REPO_ROOT, readText } from "./repo_util.ts";
 
 export const SKILL_NAME_PATTERN = /^`([a-z0-9-]+)`$/;
 export const EXTERNAL_PATH_PATTERN = /~?\/?[^`]*\.agents\/skills\/([a-z0-9-]+)(?:\/|`)/;
@@ -17,7 +17,7 @@ export type IndexEntry = {
 export function repositorySkills(skillsRoot: string): Set<string> {
   const result = new Set<string>();
   for (const entry of readdirSync(skillsRoot, { withFileTypes: true })) {
-    if (!entry.isDirectory() && !entry.isSymbolicLink()) {
+    if (!entry.isDirectory()) {
       continue;
     }
     if (isDirectRegularFile(join(skillsRoot, entry.name, "SKILL.md"))) {
@@ -66,11 +66,28 @@ export function indexEntries(readmePath: string): IndexEntry[] {
 export function check(repoRoot: string = REPO_ROOT): string[] {
   const skillsRoot = join(repoRoot, "skills");
   const readmePath = join(skillsRoot, "README.md");
+  if (!isPathInside(repoRoot, skillsRoot)) return ["SYMLINKED_SKILLS_ROOT"];
+  if (!isPathInside(repoRoot, readmePath)) return ["SYMLINKED_SKILLS_README"];
   const actual = repositorySkills(skillsRoot);
   const entries = indexEntries(readmePath);
   const localEntries = entries.filter((entry) => !entry.external);
   const indexed = new Set(localEntries.map((entry) => entry.name));
   const findings: string[] = [];
+
+  for (const entry of readdirSync(skillsRoot, { withFileTypes: true }).sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0)) {
+    if (entry.isSymbolicLink()) {
+      findings.push(`SYMLINKED_SKILLS_ENTRY skill=${entry.name}`);
+      continue;
+    }
+    if (entry.isDirectory()) {
+      const marker = join(skillsRoot, entry.name, "SKILL.md");
+      try {
+        if (lstatSync(marker).isSymbolicLink()) findings.push(`SYMLINKED_SKILL_MARKER skill=${entry.name}`);
+      } catch {
+        // Missing markers are reported through the normal index comparison.
+      }
+    }
+  }
 
   for (const name of [...actual].filter((name) => !indexed.has(name)).sort()) {
     findings.push(`MISSING_INDEX_ENTRY skill=${name}`);
@@ -85,7 +102,7 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
   for (const entry of entries) {
     counts.set(entry.name, (counts.get(entry.name) ?? 0) + 1);
   }
-  for (const [name, count] of [...counts.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+  for (const [name, count] of [...counts.entries()].sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)) {
     if (count > 1) {
       findings.push(`DUPLICATE_INDEX_ENTRY skill=${name} count=${count}`);
     }

@@ -5,14 +5,37 @@ import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { isDirectRegularFile, isPathInside, REPO_ROOT, readText, runGit } from "./repo_util.ts";
 
+function isSymlink(path: string): boolean {
+  try {
+    return lstatSync(path).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+function hasSkillMarker(path: string): boolean {
+  return isDirectRegularFile(path) || isSymlink(path);
+}
+
 export function targetInventory(root: string): Set<string> {
   const skillsRoot = join(root, "skills");
   const result = new Set<string>();
   if (!existsSync(skillsRoot) || !isPathInside(root, skillsRoot)) return result;
   for (const entry of readdirSync(skillsRoot, { withFileTypes: true })) {
-    if (entry.isDirectory() && isDirectRegularFile(join(skillsRoot, entry.name, "SKILL.md"))) {
+    if ((entry.isDirectory() || entry.isSymbolicLink()) && hasSkillMarker(join(skillsRoot, entry.name, "SKILL.md"))) {
       result.add(entry.name);
     }
+  }
+  return result;
+}
+
+export function targetSymlinkInventory(root: string): Set<string> {
+  const skillsRoot = join(root, "skills");
+  const result = new Set<string>();
+  if (!existsSync(skillsRoot) || !isPathInside(root, skillsRoot)) return result;
+  for (const entry of readdirSync(skillsRoot, { withFileTypes: true })) {
+    const skillRoot = join(skillsRoot, entry.name);
+    if (entry.isSymbolicLink() || isSymlink(join(skillRoot, "SKILL.md"))) result.add(entry.name);
   }
   return result;
 }
@@ -27,23 +50,35 @@ export function manifestInventory(path: string): Set<string> {
 }
 
 export function snapshotInventory(source: string, revision: string): Set<string> {
-  const result = runGit(["ls-tree", "-r", "--name-only", revision, "--", "skills"], resolve(source));
+  const result = runGit(["ls-tree", "-r", revision, "--", "skills"], resolve(source));
   if (result.exitCode !== 0) {
     throw new Error(`git ls-tree failed: ${result.stderr.trim()}`);
   }
-  const prefix = "skills/";
-  const suffix = "/SKILL.md";
   return new Set(
     result.stdout
       .split("\n")
-      .map((item) => item.trim())
-      .filter((item) => item.startsWith(prefix) && item.endsWith(suffix) && item.split("/").length === 3)
-      .map((item) => item.slice(prefix.length, -suffix.length)),
+      .map((item) => item.split("\t", 2))
+      .filter(([metadata, path]) => ["100644", "100755"].includes(metadata?.split(/\s+/)[0] ?? "") && path?.startsWith("skills/") && path?.endsWith("/SKILL.md") && path.split("/").length === 3)
+      .map(([, path]) => path.slice("skills/".length, -"/SKILL.md".length)),
+  );
+}
+
+export function snapshotSymlinkInventory(source: string, revision: string): Set<string> {
+  const result = runGit(["ls-tree", "-r", revision, "--", "skills"], resolve(source));
+  if (result.exitCode !== 0) {
+    throw new Error(`git ls-tree failed: ${result.stderr.trim()}`);
+  }
+  return new Set(
+    result.stdout
+      .split("\n")
+      .map((item) => item.split("\t", 2))
+      .filter(([metadata, path]) => metadata?.split(/\s+/)[0] === "120000" && (path?.split("/").length === 2 || (path?.endsWith("/SKILL.md") && path.split("/").length === 3)))
+      .map(([, path]) => path.split("/")[1]),
   );
 }
 
 export type ParsedArgs = { sourceRoot?: string; revision: string; targetRoot: string; manifest?: string };
-const USAGE = "usage: source_target_inventory_check.ts --source-root <path> [--source-revision <revision>]";
+const USAGE = "usage: source_target_inventory_check.ts --source-root <path> [--source-revision <revision>] [--target-root <path>] [--public-manifest <path>]";
 
 function requiredValue(args: string[], index: number): string {
   const value = args[index + 1];
@@ -111,9 +146,16 @@ export function inspect(
   const target = resolve(targetRoot);
   const expectedSource = snapshotInventory(source, revision);
   const actual = targetInventory(target);
+  const sourceSymlinks = snapshotSymlinkInventory(source, revision);
+  const targetSymlinks = targetSymlinkInventory(target);
   const publicNames = manifestInventory(publicManifest);
   const privateNames = new Set([...expectedSource].filter((name) => !publicNames.has(name)));
   const findings: string[] = [];
+
+  if (isSymlink(join(target, "skills"))) findings.push("SYMLINKED_TARGET_SKILLS_ROOT");
+  if (isSymlink(join(source, "skills"))) findings.push("SYMLINKED_SOURCE_SKILLS_ROOT");
+  for (const name of [...targetSymlinks].sort()) findings.push(`SYMLINKED_TARGET_SKILL ${name}`);
+  for (const name of [...sourceSymlinks].sort()) findings.push(`SYMLINKED_SOURCE_SKILL ${name}`);
 
   for (const name of [...publicNames].filter((name) => !expectedSource.has(name)).sort()) {
     findings.push(`PUBLIC_SKILL_NOT_IN_SOURCE_SNAPSHOT ${name}`);

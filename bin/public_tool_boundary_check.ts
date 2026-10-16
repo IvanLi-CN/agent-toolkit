@@ -18,7 +18,7 @@ export const FORBIDDEN_PATTERNS: Array<[string, RegExp]> = [
 ];
 
 const RELATIVE_IMPORT = /(?:from\s*|import\s*(?:\(\s*)?|require\s*\()["'](\.{1,2}\/[^"']+)["']/g;
-const EXCLUDED_TEST_FILE = /(?:\.test|^test[-_]).*\.(?:ts|tsx|js|py|sh)$/;
+const EXCLUDED_TEST_FILE = /(?:\.test\.(?:ts|tsx|js|py|sh)$|^test[-_].*\.(?:ts|tsx|js|py|sh)$|_test\.(?:ts|tsx|js|py|sh)$)/;
 const PUBLIC_TOOL_EXTENSIONS = [".ts", ".tsx", ".js", ".py", ".sh"];
 
 function collectPublicToolFiles(repoRoot: string): { files: string[]; rejectedSymlinks: string[] } {

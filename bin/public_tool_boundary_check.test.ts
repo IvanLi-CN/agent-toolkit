@@ -219,6 +219,7 @@ test("rejects propagated, computed, and indirect loader calls", () => {
     writeFileSync(join(root, "bin", "comma.ts"), `(0, require)("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "computed.ts"), `const name = "require"; import.meta[name]("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "container.ts"), `const loaders = { load: require }; loaders.load("../../${outsideName}");\n`);
+    writeFileSync(join(root, "bin", "meta-destructure.ts"), `const meta = import.meta; const { require: load } = meta; load("../../${outsideName}");\n`);
     writeFileSync(join(root, "bin", "module.ts"), `module.require("../../${outsideName}");\n`);
     expect(check(root)).toEqual([
       "bin/apply.ts: dynamic import or require cannot be verified",
@@ -227,6 +228,7 @@ test("rejects propagated, computed, and indirect loader calls", () => {
       `bin/comma.ts: local reference outside public repository ../../${outsideName}`,
       "bin/computed.ts: dynamic import or require cannot be verified",
       "bin/container.ts: dynamic import or require cannot be verified",
+      `bin/meta-destructure.ts: local reference outside public repository ../../${outsideName}`,
       `bin/module.ts: local reference outside public repository ../../${outsideName}`,
     ]);
   } finally {
@@ -255,9 +257,11 @@ test("rejects evaluated JavaScript loaders", () => {
     writeFileSync(join(root, "bin", "eval.ts"), 'eval("require(\\"./hidden.ts\\")");\n');
     writeFileSync(join(root, "bin", "function.ts"), 'new Function("return require(\\"./hidden.ts\\")")();\n');
     writeFileSync(join(root, "bin", "function-alias.ts"), 'const F = globalThis.Function; new F("return require(\\"./hidden.ts\\")")();\n');
+    writeFileSync(join(root, "bin", "function-destructure.ts"), 'const { Function: F } = globalThis; new F("return require(\\"./hidden.ts\\")")();\n');
     expect(check(root)).toEqual([
       "bin/eval.ts: dynamic import or require cannot be verified",
       "bin/function-alias.ts: dynamic import or require cannot be verified",
+      "bin/function-destructure.ts: dynamic import or require cannot be verified",
       "bin/function.ts: dynamic import or require cannot be verified",
     ]);
   } finally {
@@ -332,6 +336,24 @@ test("recursively checks Python package initializers", () => {
     writeFileSync(join(root, "bin", "package", "runtime_test.py"), "marker = 'fixture-only'\n");
     expect(check(root)).toEqual([
       "bin/package/__init__.py: local reference targets excluded test file ./runtime_test",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("recursively checks dotted and aliased Python imports", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-tool-boundary-python-import-forms-"));
+  try {
+    mkdirSync(join(root, "bin", "package"), { recursive: true });
+    writeFileSync(join(root, "bin", "dotted.py"), "import package.runtime_test\n");
+    writeFileSync(join(root, "bin", "aliased.py"), "from . import runtime_test as rt\n");
+    writeFileSync(join(root, "bin", "package", "__init__.py"), "\n");
+    writeFileSync(join(root, "bin", "package", "runtime_test.py"), "marker = 'fixture-only'\n");
+    writeFileSync(join(root, "bin", "runtime_test.py"), "marker = 'fixture-only'\n");
+    expect(check(root)).toEqual([
+      "bin/aliased.py: local reference targets excluded test file ./runtime_test",
+      "bin/dotted.py: local reference targets excluded test file ./package/runtime_test",
     ]);
   } finally {
     rmSync(root, { recursive: true, force: true });

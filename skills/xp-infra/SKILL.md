@@ -17,6 +17,8 @@ The helper and audit scripts are read-only. They must fail closed on missing or 
 
 Set `XP_INFRA_CONFIG_DIR` to a protected directory containing `hosts.txt` and `deployment-policy.yaml`, or set `XP_HOSTS_FILE` and `XP_POLICY_FILE` individually. By default the helper reads `${XDG_CONFIG_HOME:-$HOME/.config}/xp-infra/`. Keep resolved connection details in the operator's SSH configuration. Copy the public `references/hosts.txt.example` and `references/deployment-policy.yaml.example` templates into the private directory, and use `references/xp.env.template` for key names and placeholders; never commit live values.
 
+Local entrypoints require the installed Bun runtime plus native `ssh` and `curl`. Remote observation remains in POSIX Shell and does not require Bun on an inspected node; this Skill has no Ruby or Python runtime prerequisite.
+
 ## Workflow
 
 1. Validate policy and SSH operator access.

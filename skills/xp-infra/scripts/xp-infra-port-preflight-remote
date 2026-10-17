@@ -1,0 +1,839 @@
+#!/bin/sh
+set -eu
+XP_CONTAINER_IMAGE_PREFIX="${1:-${XP_CONTAINER_IMAGE_PREFIX:-ghcr.io/example/xp}}"
+echo XP_INFRA_PORT_PREFLIGHT=1 >/dev/null
+env_file=/etc/xp/xp.env
+container=""
+MAX_PREFLIGHT_STATE_BYTES=32768
+MAX_PREFLIGHT_DISCOVERY_BYTES=32768
+PREFLIGHT_COMMAND_TIMEOUT_SECONDS=15
+bounded_preflight_input() (
+  output_file="$(mktemp)" || exit 1
+  trap "rm -f \"$output_file\"" 0 HUP INT TERM
+  dd iflag=fullblock bs="$((MAX_PREFLIGHT_DISCOVERY_BYTES + 1))" count=1 of="$output_file" 2>/dev/null || exit 1
+  byte_count="$(wc -c < "$output_file" | tr -d "[:space:]")"
+  case "$byte_count" in ""|*[!0-9]*) exit 1 ;; esac
+  [ "$byte_count" -le "$MAX_PREFLIGHT_DISCOVERY_BYTES" ] || exit 1
+  cat "$output_file"
+)
+bounded_preflight_command() (
+  status_file="$(mktemp)" || exit 1
+  trap "rm -f \"$status_file\"" 0 HUP INT TERM
+  if (
+    set +e
+    timeout "$PREFLIGHT_COMMAND_TIMEOUT_SECONDS" "$@"
+    command_status=$?
+    printf "%s\n" "$command_status" > "$status_file"
+  ) | bounded_preflight_input; then
+    bounded_status=0
+  else
+    bounded_status=$?
+  fi
+  command_status="$(cat "$status_file" 2>/dev/null || true)"
+  [ "$bounded_status" -eq 0 ] && [ "$command_status" = 0 ]
+)
+command -v timeout >/dev/null 2>&1 || exit 1
+bounded_preflight_command sudo -n true >/dev/null || exit 1
+host_env=false
+host_env_status="$(bounded_preflight_command sudo -n sh -c '
+  path="$1"
+  case "$path" in /*) ;; *) exit 1 ;; esac
+  while [ "$path" != "/" ]; do
+    [ ! -L "$path" ] || exit 1
+    parent=${path%/*}
+    [ -n "$parent" ] || parent=/
+    [ "$parent" != "$path" ] || exit 1
+    path="$parent"
+  done
+  if [ -e "$1" ] || [ -L "$1" ]; then
+    [ -r "$1" ] || exit 1
+    printf %s readable
+  else
+    printf %s absent
+  fi
+' sh "$env_file" 2>/dev/null)" || exit 1
+case "$host_env_status" in
+  readable) host_env=true ;;
+  absent) ;;
+  *) exit 1 ;;
+esac
+host_env_value() {
+  key="$1"
+  bounded_preflight_command sudo -n sh -c '
+    env_file="$1"
+    key="$2"
+    path="$env_file"
+    case "$path" in /*) ;; *) exit 1 ;; esac
+    while [ "$path" != "/" ]; do
+      [ ! -L "$path" ] || exit 1
+      parent=${path%/*}
+      [ -n "$parent" ] || parent=/
+      [ "$parent" != "$path" ] || exit 1
+      path="$parent"
+    done
+    [ -r "$env_file" ] || exit 1
+    awk -v key="$key" "
+      {
+        line = \$0
+        sub(/^[[:space:]]+/, \"\", line)
+        sub(/^export[[:space:]]+/, \"\", line)
+        split(line, pair, \"=\")
+        if (pair[1] == key) value = substr(line, index(line, \"=\") + 1)
+      }
+      END { if (value != \"\") print value }
+    " "$env_file"
+  ' sh "$env_file" "$key" 2>/dev/null
+}
+host_env_fingerprint() {
+  if [ "$host_env" = false ]; then
+    printf %s absent
+    return 0
+  fi
+  bounded_preflight_command sudo -n sh -c '
+    path="$1"
+    case "$path" in /*) ;; *) exit 1 ;; esac
+    while [ "$path" != "/" ]; do
+      [ ! -L "$path" ] || exit 1
+      parent=${path%/*}
+      [ -n "$parent" ] || parent=/
+      [ "$parent" != "$path" ] || exit 1
+      path="$parent"
+    done
+    [ -r "$1" ] || exit 1
+    cksum "$1"
+  ' sh "$env_file" 2>/dev/null
+}
+host_env_snapshot_fingerprint="$(host_env_fingerprint)" || exit 1
+normalize_env_value() {
+  value="$(printf "%s" "$1" | sed "s/^[[:space:]]*//;s/[[:space:]]*$//")"
+  single_quote="$(printf "\\047")"
+  case "$value" in
+    \"*\") value="${value#\"}"; value="${value%\"}" ;;
+    "$single_quote"*"$single_quote") value="${value#"$single_quote"}"; value="${value%"$single_quote"}" ;;
+  esac
+  printf %s "$value"
+}
+docker_path="$(bounded_preflight_command sudo -n sh -c 'docker_path="$(command -v docker 2>/dev/null || true)"; for candidate in "$docker_path" /usr/bin/docker /usr/local/bin/docker; do if [ -n "$candidate" ] && [ -x "$candidate" ]; then printf %s "$candidate"; exit 0; fi; done; printf %s absent' 2>/dev/null)" || exit 1
+case "$docker_path" in
+  absent|/*) ;;
+  *) exit 1 ;;
+esac
+if [ "$docker_path" = absent ]; then
+  docker_socket="$(bounded_preflight_command sudo -n sh -c 'if [ -S /run/docker.sock ] || [ -S /var/run/docker.sock ]; then printf %s present; else printf %s absent; fi' 2>/dev/null)" || exit 1
+  [ "$docker_socket" = absent ] || exit 1
+fi
+containers=""
+container_count=0
+docker_inventory=""
+if [ "$docker_path" != absent ]; then
+  docker_inventory="$(bounded_preflight_command sudo -n "$docker_path" ps --format '{{.Names}} {{.Image}}' 2>/dev/null)" || exit 1
+  containers="$(printf '%s\n' "$docker_inventory" | awk -v image_prefix="$XP_CONTAINER_IMAGE_PREFIX" '
+    NF == 0 { next }
+    NF != 2 || $1 !~ /^[A-Za-z0-9][A-Za-z0-9_.-]*$/ { exit 1 }
+    index($2, image_prefix ":") == 1 || index($2, image_prefix "@") == 1 { print $1 }
+  ')" || exit 1
+  container_count="$(printf '%s\n' "$containers" | awk 'NF { count++ } END { print count + 0 }')"
+  [ "$container_count" -le 1 ] || exit 1
+fi
+if [ "$host_env" = true ] && [ "$container_count" -ne 0 ]; then
+  exit 1
+fi
+xray_systemd_unit=xray
+xray_openrc_service=xray
+xray_api_addr=127.0.0.1:10085
+state_path=""
+legacy_state_path=""
+state_selector=absent
+if [ "$container_count" -eq 1 ]; then
+  container_name="$containers"
+  container="$container_name"
+  container_identity="$(bounded_preflight_command sudo -n "$docker_path" inspect --format '{{.Id}}' "$container_name" 2>/dev/null)" || exit 1
+  container_started_at="$(bounded_preflight_command sudo -n "$docker_path" inspect --format '{{.State.StartedAt}}' "$container_name" 2>/dev/null)" || exit 1
+  [ -n "$container_identity" ] && [ -n "$container_started_at" ] || exit 1
+  container="$container_identity"
+  data_dir="$(bounded_preflight_command sudo -n "$docker_path" exec "$container" sh -c 'if [ -n "${XP_DATA_DIR:-}" ]; then printf %s "$XP_DATA_DIR"; else printf %s /var/lib/xp/data; fi' 2>/dev/null)" || exit 1
+  xray_api_addr="$(bounded_preflight_command sudo -n "$docker_path" exec "$container" sh -c 'printf %s "${XP_XRAY_API_ADDR:-127.0.0.1:10085}"' 2>/dev/null)" || exit 1
+  case "$data_dir" in /*) ;; *) exit 1 ;; esac
+  state_path="$data_dir/managed-default-endpoints.json"
+  legacy_state_path="$data_dir/container/managed_default_endpoints.json"
+  state_selector=absent
+elif [ "$host_env" = true ]; then
+  xray_systemd_unit="$(host_env_value XP_XRAY_SYSTEMD_UNIT)" || exit 1
+  xray_openrc_service="$(host_env_value XP_XRAY_OPENRC_SERVICE)" || exit 1
+  xray_api_addr="$(host_env_value XP_XRAY_API_ADDR)" || exit 1
+  xray_systemd_unit="$(normalize_env_value "$xray_systemd_unit")"
+  xray_openrc_service="$(normalize_env_value "$xray_openrc_service")"
+  xray_api_addr="$(normalize_env_value "$xray_api_addr")"
+  [ -n "$xray_systemd_unit" ] || xray_systemd_unit=xray
+  [ -n "$xray_openrc_service" ] || xray_openrc_service=xray
+  [ -n "$xray_api_addr" ] || xray_api_addr=127.0.0.1:10085
+  case "$xray_systemd_unit" in *[!A-Za-z0-9_.@-]*) exit 1 ;; esac
+  case "$xray_openrc_service" in *[!A-Za-z0-9_.-]*) exit 1 ;; esac
+  data_dir="$(host_env_value XP_DATA_DIR)" || exit 1
+  data_dir="$(normalize_env_value "$data_dir")"
+  [ -n "$data_dir" ] || data_dir=/var/lib/xp/data
+  case "$data_dir" in /*) ;; *) exit 1 ;; esac
+  bounded_preflight_command sudo -n sh -c 'data_dir=$1; [ -d "$data_dir" ] && [ -r "$data_dir" ] && [ -x "$data_dir" ]' sh "$data_dir" 2>/dev/null || exit 1
+  state_path="$data_dir/managed-default-endpoints.json"
+  legacy_state_path="$data_dir/container/managed_default_endpoints.json"
+  state_selector=absent
+fi
+state_file_status() {
+  path="$1"
+  if [ -z "$path" ]; then
+    printf %s absent
+  elif [ "$container_count" -eq 1 ]; then
+    bounded_preflight_command sudo -n "$docker_path" exec "$container" sh -c '
+      path=$1
+      case "$path" in /*) ;; *) exit 1 ;; esac
+      target_path="$path"
+      while [ "$path" != "/" ]; do
+        [ ! -L "$path" ] || exit 1
+        parent=${path%/*}
+        [ -n "$parent" ] || parent=/
+        [ "$parent" != "$path" ] || exit 1
+        path="$parent"
+      done
+      if [ -e "$target_path" ]; then
+        [ -f "$target_path" ] && [ -r "$target_path" ] || exit 1
+        printf %s present
+      else
+        parent_dir=${target_path%/*}
+        [ -n "$parent_dir" ] || parent_dir=/
+        if [ -e "$parent_dir" ]; then
+          [ -d "$parent_dir" ] && [ -r "$parent_dir" ] && [ -x "$parent_dir" ] || exit 1
+        fi
+        printf %s absent
+      fi
+    ' sh "$path" 2>/dev/null
+  else
+    bounded_preflight_command sudo -n sh -c '
+      path=$1
+      case "$path" in /*) ;; *) exit 1 ;; esac
+      target_path="$path"
+      while [ "$path" != "/" ]; do
+        [ ! -L "$path" ] || exit 1
+        parent=${path%/*}
+        [ -n "$parent" ] || parent=/
+        [ "$parent" != "$path" ] || exit 1
+        path="$parent"
+      done
+      if [ -e "$target_path" ]; then
+        [ -f "$target_path" ] && [ -r "$target_path" ] || exit 1
+        printf %s present
+      else
+        parent_dir=${target_path%/*}
+        [ -n "$parent_dir" ] || parent_dir=/
+        if [ -e "$parent_dir" ]; then
+          [ -d "$parent_dir" ] && [ -r "$parent_dir" ] && [ -x "$parent_dir" ] || exit 1
+        fi
+        printf %s absent
+      fi
+    ' sh "$path" 2>/dev/null
+  fi
+}
+read_state_file() {
+  path="$1"
+  if [ "$container_count" -eq 1 ]; then
+    bounded_preflight_command sudo -n "$docker_path" exec "$container" sh -c '
+      path=$1
+      limit=$2
+      case "$path" in /*) ;; *) exit 1 ;; esac
+      target_path="$path"
+      while [ "$path" != "/" ]; do
+        [ ! -L "$path" ] || exit 1
+        parent=${path%/*}
+        [ -n "$parent" ] || parent=/
+        [ "$parent" != "$path" ] || exit 1
+        path="$parent"
+      done
+      [ -f "$target_path" ] && [ -r "$target_path" ] || exit 1
+      dd if="$target_path" bs="$((limit + 1))" count=1 2>/dev/null
+    ' sh "$path" "$MAX_PREFLIGHT_STATE_BYTES" 2>/dev/null
+  else
+    bounded_preflight_command sudo -n sh -c '
+      path=$1
+      limit=$2
+      case "$path" in /*) ;; *) exit 1 ;; esac
+      target_path="$path"
+      while [ "$path" != "/" ]; do
+        [ ! -L "$path" ] || exit 1
+        parent=${path%/*}
+        [ -n "$parent" ] || parent=/
+        [ "$parent" != "$path" ] || exit 1
+        path="$parent"
+      done
+      [ -f "$target_path" ] && [ -r "$target_path" ] || exit 1
+      dd if="$target_path" bs="$((limit + 1))" count=1 2>/dev/null
+    ' sh "$path" "$MAX_PREFLIGHT_STATE_BYTES" 2>/dev/null
+  fi
+}
+state_current='{}'
+state_legacy='{}'
+if [ -n "$state_path" ]; then
+  state_current_status="$(state_file_status "$state_path")" || exit 1
+  state_legacy_status="$(state_file_status "$legacy_state_path")" || exit 1
+  case "$state_current_status:$state_legacy_status" in
+    present:present)
+      state_current="$(read_state_file "$state_path")" || exit 1
+      state_legacy="$(read_state_file "$legacy_state_path")" || exit 1
+      [ "$state_current" = "$state_legacy" ] || exit 1
+      state_selector=current
+      ;;
+    present:absent) state_current="$(read_state_file "$state_path")" || exit 1; state_selector=current ;;
+    absent:present) state_legacy="$(read_state_file "$legacy_state_path")" || exit 1; state_selector=legacy ;;
+    absent:absent) state_selector=absent ;;
+    *) exit 1 ;;
+  esac
+fi
+case "$state_selector" in
+  current) state="$state_current" ;;
+  legacy) state="$state_legacy" ;;
+  absent) state='{}' ;;
+  *) exit 1 ;;
+esac
+state_compact="$(printf '%s' "$state" | tr -d '[:space:]')"
+xray_api_required=false
+case "$state_compact" in
+  *'"vless_endpoint_id":'*)
+    case "$state_compact" in
+      *'"vless_endpoint_id":null'*) ;;
+      *) xray_api_required=true ;;
+    esac
+    ;;
+esac
+case "$xray_api_addr" in
+  127.*:*)
+    xray_api_host="${xray_api_addr%:*}"
+    old_ifs="$IFS"
+    IFS=.
+    set -- $xray_api_host
+    IFS="$old_ifs"
+    [ "$#" -eq 4 ] || exit 1
+    for octet in "$@"; do
+      case "$octet" in
+        [0-9]|[0-9][0-9]|[0-9][0-9][0-9]) ;;
+        *) exit 1 ;;
+      esac
+      [ "$octet" -le 255 ] || exit 1
+    done
+    ;;
+  \[::1\]:*) ;;
+  *) exit 1 ;;
+esac
+xray_api_port="${xray_api_addr##*:}"
+[ "$xray_api_port" -ge 1 ] && [ "$xray_api_port" -le 65535 ] || exit 1
+[ "$(printf '%s' "$state" | wc -c | tr -d '[:space:]')" -le "$MAX_PREFLIGHT_STATE_BYTES" ] || exit 1
+printf 'state_b64=%s\n' "$(printf '%s' "$state" | base64 | tr -d '\r\n')"
+
+collect_host_listeners() {
+  if command -v ss >/dev/null 2>&1; then
+    bounded_preflight_command sudo -n ss -H -ltnp 2>/dev/null
+  elif command -v netstat >/dev/null 2>&1; then
+    bounded_preflight_command sudo -n netstat -ltnp 2>/dev/null
+  else
+    return 1
+  fi
+}
+host_listeners="$(collect_host_listeners)" || exit 1
+runtime_listeners="$host_listeners"
+collect_published_ports() {
+  published_ports=""
+  if [ "$docker_path" != absent ]; then
+    docker_ids="$(bounded_preflight_command sudo -n "$docker_path" ps -q 2>/dev/null)" || return 1
+    for docker_id in $docker_ids; do
+      container_ports="$(bounded_preflight_command sudo -n "$docker_path" port "$docker_id" 2>/dev/null)" || return 1
+      container_published_ports="$(printf '%s\n' "$container_ports" | awk -v max="$MAX_PREFLIGHT_DISCOVERY_BYTES" '
+        function emit(port) {
+          value = port "\n"
+          if (bytes + length(value) > max) { invalid = 1; return }
+          print port
+          bytes += length(value)
+        }
+        NF == 0 { next }
+        {
+          value = $NF
+          sub(/^.*:/, "", value)
+          count = split(value, bounds, "-")
+          if (count < 1 || count > 2 || bounds[1] !~ /^[1-9][0-9]*$/ || (count == 2 && bounds[2] !~ /^[1-9][0-9]*$/)) { invalid = 1; next }
+          first = bounds[1] + 0
+          last = count == 2 ? bounds[2] + 0 : first
+          if (first > 65535 || last > 65535 || last < first) { invalid = 1; next }
+          for (port = first; port <= last; port++) { emit(port); if (invalid) exit 1 }
+        }
+        END { if (invalid) exit 1 }
+      ')" || return 1
+      published_ports="${published_ports}
+${container_published_ports}"
+      [ "$(printf '%s' "$published_ports" | wc -c | tr -d "[:space:]")" -le "$MAX_PREFLIGHT_DISCOVERY_BYTES" ] || return 1
+    done
+  fi
+  printf '%s' "$published_ports"
+}
+published_ports="$(collect_published_ports)" || exit 1
+collect_runtime_listeners() {
+  if [ -n "$container" ]; then
+    if bounded_preflight_command sudo -n "$docker_path" exec "$container" sh -c 'command -v ss >/dev/null 2>&1'; then bounded_preflight_command sudo -n "$docker_path" exec "$container" ss -H -ltnp
+    elif bounded_preflight_command sudo -n "$docker_path" exec "$container" sh -c 'command -v netstat >/dev/null 2>&1'; then bounded_preflight_command sudo -n "$docker_path" exec "$container" netstat -ltnp
+    else return 1
+    fi
+  else
+    printf '%s' "$host_listeners"
+  fi
+}
+runtime_listeners="$(collect_runtime_listeners)" || exit 1
+listener_ports="$(printf '%s\n%s\n%s\n' "$host_listeners" "$runtime_listeners" "$published_ports" | awk '
+  function add_port(port) { seen[port] = 1 }
+  /^[1-9][0-9]*$/ { if ($1 <= 65535) add_port($1); next }
+  NF == 0 || /^(Proto|Active)[[:space:]]/ { next }
+  NF < 4 { invalid = 1; next }
+  { value=$4; sub(/^.*:/, "", value); if (value !~ /^[1-9][0-9]*$/ || value > 65535) { invalid = 1; next }; add_port(value) }
+  END {
+    if (invalid) exit 1
+    output = ""
+    for (port in seen) output = output (output ? "," : "") port
+    print output
+  }
+')" || exit 1
+printf 'occupied_ports=%s\n' "$listener_ports"
+printf 'xray_ports=%s\n' "$(printf '%s\n' "$runtime_listeners" | awk '/users:\(\("xray",pid=[0-9]+/ || /(^|[[:space:]])[0-9]+\/xray([[:space:]]|$)/ { value=$4; if (value ~ /^127\./ || value ~ /^\[?::1\]?:/ || value ~ /^\[?::ffff:127\./) next; sub(/^.*:/, "", value); if (value ~ /^[1-9][0-9]*$/ && value <= 65535 && !seen[value]++) print value }' | sort -n | paste -sd, -)"
+printf 'xray_listener_pids=%s\n' "$(printf '%s\n' "$runtime_listeners" | awk '
+  /users:\(\("xray",pid=[0-9]+/ {
+    value = $0
+    sub(/^.*users:\(\("xray",pid=/, "", value)
+    sub(/[^0-9].*$/, "", value)
+    if (value ~ /^[1-9][0-9]*$/ && !seen[value]++) print value
+    next
+  }
+  /(^|[[:space:]])[1-9][0-9]*\/xray([[:space:]]|$)/ {
+    for (field = 1; field <= NF; field++) {
+      if ($field ~ /^[1-9][0-9]*\/xray$/) {
+        split($field, parts, "/")
+        if (!seen[parts[1]]++) print parts[1]
+        break
+      }
+    }
+  }
+' | sort -n | paste -sd, -)"
+read_xray_pid() {
+  if [ -n "$container" ]; then
+    bounded_preflight_command sudo -n "$docker_path" exec "$container" sh -c 'if pid_output=$(pidof xray 2>/dev/null); then set -- $pid_output; [ "$#" -eq 1 ] || exit 1; printf %s "$1"; else status=$?; [ "$status" -eq 1 ] || exit "$status"; fi' 2>/dev/null
+  else
+    bounded_preflight_command sudo -n sh -c 'if pid_output=$(pidof xray 2>/dev/null); then set -- $pid_output; [ "$#" -eq 1 ] || exit 1; printf %s "$1"; else status=$?; [ "$status" -eq 1 ] || exit "$status"; fi' 2>/dev/null
+  fi
+}
+read_xray_starttime() {
+  runtime_pid="$1"
+  if [ -n "$container" ]; then
+    bounded_preflight_command sudo -n "$docker_path" exec "$container" sh -c 'stat_file="/proc/$1/stat"; [ -r "$stat_file" ] || exit 1; line=$(cat "$stat_file") || exit 1; line=${line#*) }; set -- $line; starttime="${20:-}"; case "$starttime" in ""|*[!0-9]*) exit 1 ;; esac; printf %s "$starttime"' sh "$runtime_pid" 2>/dev/null
+  else
+    bounded_preflight_command sudo -n sh -c 'stat_file="/proc/$1/stat"; [ -r "$stat_file" ] || exit 1; line=$(cat "$stat_file") || exit 1; line=${line#*) }; set -- $line; starttime="${20:-}"; case "$starttime" in ""|*[!0-9]*) exit 1 ;; esac; printf %s "$starttime"' sh "$runtime_pid" 2>/dev/null
+  fi
+}
+read_ephemeral_range() {
+  if [ -n "$container" ]; then
+    bounded_preflight_command sudo -n "$docker_path" exec "$container" sh -c 'sysctl -n net.ipv4.ip_local_port_range 2>/dev/null || cat /proc/sys/net/ipv4/ip_local_port_range' 2>/dev/null
+  else
+    bounded_preflight_command sudo -n sh -c 'sysctl -n net.ipv4.ip_local_port_range 2>/dev/null || cat /proc/sys/net/ipv4/ip_local_port_range' 2>/dev/null
+  fi
+}
+read_reserved_ports() {
+  if [ -n "$container" ]; then
+    bounded_preflight_command sudo -n "$docker_path" exec "$container" sh -c 'sysctl -n net.ipv4.ip_local_reserved_ports 2>/dev/null || cat /proc/sys/net/ipv4/ip_local_reserved_ports' 2>/dev/null
+  else
+    bounded_preflight_command sudo -n sh -c 'sysctl -n net.ipv4.ip_local_reserved_ports 2>/dev/null || cat /proc/sys/net/ipv4/ip_local_reserved_ports' 2>/dev/null
+  fi
+}
+read_unprivileged_port_start() {
+  if [ -n "$container" ]; then
+    bounded_preflight_command sudo -n "$docker_path" exec "$container" sh -c 'sysctl -n net.ipv4.ip_unprivileged_port_start 2>/dev/null || cat /proc/sys/net/ipv4/ip_unprivileged_port_start' 2>/dev/null
+  else
+    bounded_preflight_command sudo -n sh -c 'sysctl -n net.ipv4.ip_unprivileged_port_start 2>/dev/null || cat /proc/sys/net/ipv4/ip_unprivileged_port_start' 2>/dev/null
+  fi
+}
+project_xray_api() {
+  awk '
+    function json_field(object, wanted, body, n, i, ch, key, value_start, value_end, depth, in_string, escaped, candidate) {
+      body = substr(object, 2, length(object) - 2)
+      n = length(body)
+      i = 1
+      while (i <= n) {
+        while (i <= n && substr(body, i, 1) ~ /[[:space:],]/) i++
+        if (i > n || substr(body, i, 1) != "\"") return ""
+        i++
+        key = ""
+        escaped = 0
+        while (i <= n) {
+          ch = substr(body, i, 1)
+          if (escaped) {
+            key = key ch
+            escaped = 0
+          } else if (ch == "\\") {
+            escaped = 1
+          } else if (ch == "\"") {
+            i++
+            break
+          } else {
+            key = key ch
+          }
+          i++
+        }
+        while (i <= n && substr(body, i, 1) ~ /[[:space:]]/) i++
+        if (i > n || substr(body, i, 1) != ":") return ""
+        i++
+        while (i <= n && substr(body, i, 1) ~ /[[:space:]]/) i++
+        value_start = i
+        depth = 0
+        in_string = 0
+        escaped = 0
+        while (i <= n) {
+          ch = substr(body, i, 1)
+          if (in_string) {
+            if (escaped) escaped = 0
+            else if (ch == "\\") escaped = 1
+            else if (ch == "\"") in_string = 0
+          } else if (ch == "\"") {
+            in_string = 1
+          } else if (ch == "{" || ch == "[") {
+            depth++
+          } else if (ch == "}" || ch == "]") {
+            if (depth > 0) depth--
+          } else if (ch == "," && depth == 0) {
+            break
+          }
+          i++
+        }
+        value_end = i - 1
+        candidate = substr(body, value_start, value_end - value_start + 1)
+        if (key == wanted) return candidate
+        if (i <= n && substr(body, i, 1) == ",") i++
+      }
+      return ""
+    }
+    function string_field(object, field, value) {
+      value = json_field(object, field)
+      sub(/^[[:space:]]*/, "", value)
+      sub(/[[:space:]]*$/, "", value)
+      if (value !~ /^"[^"]*"$/) return ""
+      sub(/^"/, "", value)
+      sub(/"$/, "", value)
+      return value
+    }
+    function emit_inbound(object, tag, receiver, receiver_type, port, value) {
+      tag = string_field(object, "tag")
+      if (tag == "" || tag !~ /^[A-Za-z0-9_.:@\/-]+$/) return
+      receiver = json_field(object, "receiverSettings")
+      if (receiver == "") receiver = json_field(object, "receiver_settings")
+      printf "%s{\"tag\":\"%s\"", comma, tag
+      if (receiver != "") {
+        receiver_type = string_field(receiver, "type")
+        if (receiver_type == "") receiver_type = string_field(receiver, "_TypedMessage_")
+        if (receiver_type ~ /^[A-Za-z0-9._-]+$/) {
+          port = json_field(receiver, "portList")
+          sub(/^[[:space:]]*/, "", port)
+          sub(/[[:space:]]*$/, "", port)
+          if (port ~ /^[0-9]+$/) {
+            printf ",\"receiverSettings\":{\"type\":\"%s\",\"portList\":%s}", receiver_type, port
+          } else {
+            value = string_field(receiver, "value")
+            if (value ~ /^[A-Za-z0-9+\/=_-]+$/) {
+              printf ",\"receiverSettings\":{\"type\":\"%s\",\"value\":\"%s\"}", receiver_type, value
+            }
+          }
+        }
+      }
+      printf "}"
+      comma = ","
+    }
+    BEGIN { raw = "" }
+    { raw = raw $0 }
+    END {
+      if (raw == "") exit 1
+      printf "{\"inbounds\":["
+      comma = ""
+      if (!match(raw, /"inbounds"[[:space:]]*:[[:space:]]*\[/)) {
+        print "]}"
+        exit
+      }
+      remaining = substr(raw, RSTART + RLENGTH)
+      array_depth = 1
+      array_end = 0
+      in_string = 0
+      escaped = 0
+      for (pos = 1; pos <= length(remaining); pos++) {
+        ch = substr(remaining, pos, 1)
+        if (in_string) {
+          if (escaped) escaped = 0
+          else if (ch == "\\") escaped = 1
+          else if (ch == "\"") in_string = 0
+        } else if (ch == "\"") {
+          in_string = 1
+        } else if (ch == "[") {
+          array_depth++
+        } else if (ch == "]") {
+          array_depth--
+          if (array_depth == 0) {
+            array_end = pos - 1
+            break
+          }
+        }
+      }
+      array_text = substr(remaining, 1, array_end)
+      object_depth = 0
+      object_start = 0
+      in_string = 0
+      escaped = 0
+      for (pos = 1; pos <= length(array_text); pos++) {
+        ch = substr(array_text, pos, 1)
+        if (in_string) {
+          if (escaped) escaped = 0
+          else if (ch == "\\") escaped = 1
+          else if (ch == "\"") in_string = 0
+        } else if (ch == "\"") {
+          in_string = 1
+        } else if (ch == "{") {
+          if (object_depth == 0) object_start = pos
+          object_depth++
+        } else if (ch == "}") {
+          object_depth--
+          if (object_depth == 0 && object_start > 0) {
+            emit_inbound(substr(array_text, object_start, pos - object_start + 1))
+            object_start = 0
+          }
+        }
+      }
+      print "]}"
+    }
+  '
+}
+
+bounded_projected_command() (
+  status_file="$(mktemp)" || exit 1
+  trap 'rm -f "$status_file"' 0 HUP INT TERM
+  if (
+    set +e
+    "$@" | project_xray_api
+    command_status=$?
+    printf '%s\n' "$command_status" > "$status_file"
+  ) | bounded_preflight_input; then
+    bounded_status=0
+  else
+    bounded_status=$?
+  fi
+  command_status="$(cat "$status_file" 2>/dev/null || true)"
+  [ "$bounded_status" -eq 0 ] && [ "$command_status" = 0 ]
+)
+
+read_xray_api() {
+  [ "$xray_api_required" = true ] || return 0
+  [ -n "$xray_runtime_pid" ] || return 0
+  if [ -n "$container" ]; then
+    bounded_projected_command sudo -n "$docker_path" exec "$container" xray api lsi --server="$xray_api_addr" --isOnlyTags=false 2>/dev/null
+  else
+    bounded_projected_command sudo -n xray api lsi --server="$xray_api_addr" --isOnlyTags=false 2>/dev/null
+  fi
+}
+read_xray_process_security() {
+  [ -n "$xray_runtime_pid" ] || { printf '%s' unavailable; return 0; }
+  if [ -n "$container" ]; then
+    bounded_preflight_command sudo -n "$docker_path" exec "$container" awk '/^Uid:/{uid=$3}/^CapEff:/{cap=$2}END{if(uid=="" || cap=="")exit 1; print uid,cap}' "/proc/$xray_runtime_pid/status" 2>/dev/null
+  else
+    bounded_preflight_command sudo -n awk '/^Uid:/{uid=$3}/^CapEff:/{cap=$2}END{if(uid=="" || cap=="")exit 1; print uid,cap}' "/proc/$xray_runtime_pid/status" 2>/dev/null
+  fi
+}
+revalidate_host_service() {
+  [ -n "$container" ] && return 0
+  [ -n "$xray_runtime_pid" ] || return 0
+  if command -v systemctl >/dev/null 2>&1 && bounded_preflight_command sudo -n systemctl is-active --quiet "$xray_systemd_unit" >/dev/null; then
+    [ "$xray_service" = active ] || return 1
+    xray_service_pid_after="$(bounded_preflight_command sudo -n systemctl show --property MainPID --value "$xray_systemd_unit" 2>/dev/null)" || return 1
+    [ "$xray_service_pid_after" = "$xray_service_pid" ] || return 1
+    return 0
+  fi
+  if command -v rc-service >/dev/null 2>&1 && bounded_preflight_command sudo -n rc-service "$xray_openrc_service" status >/dev/null; then
+    [ "$xray_service" = active ] || return 1
+    xray_pidfile_after="$(bounded_preflight_command sudo -n sh -c 'service=$1; for candidate in "/run/supervise-$service.pid" "/var/run/supervise-$service.pid" "/run/$service.pid" "/var/run/$service.pid"; do if [ -r "$candidate" ]; then printf %s "$candidate"; exit 0; fi; done; exit 1' sh "$xray_openrc_service" 2>/dev/null)" || return 1
+    [ "$xray_pidfile_after" = "$xray_pidfile" ] || return 1
+    xray_service_pid_after="$(bounded_preflight_command sudo -n cat "$xray_pidfile_after" 2>/dev/null)" || return 1
+    [ "$xray_service_pid_after" = "$xray_service_pid" ] || return 1
+    return 0
+  fi
+  return 1
+}
+if [ -n "$container" ]; then
+  ephemeral_range="$(read_ephemeral_range)" || exit 1
+  reserved_ports="$(read_reserved_ports)" || exit 1
+  unprivileged_port_start="$(read_unprivileged_port_start)" || exit 1
+  xray_runtime_pid="$(read_xray_pid)" || exit 1
+  if [ -n "$xray_runtime_pid" ]; then xray_runtime_starttime="$(read_xray_starttime "$xray_runtime_pid")" || exit 1; else xray_runtime_starttime=""; fi
+  xray_api_json="$(read_xray_api)" || exit 1
+  if [ -n "$xray_runtime_pid" ]; then
+    xray_security="$(read_xray_process_security)" || exit 1
+  else
+    xray_security=unavailable
+  fi
+  if [ "$xray_security" = unavailable ]; then
+    container_user_raw="$(bounded_preflight_command sudo -n "$docker_path" inspect --format '{{.Config.User}}' "$container" 2>/dev/null)" || exit 1
+    container_cap_drop="$(bounded_preflight_command sudo -n "$docker_path" inspect --format '{{json .HostConfig.CapDrop}}' "$container" 2>/dev/null)" || exit 1
+    container_cap_add="$(bounded_preflight_command sudo -n "$docker_path" inspect --format '{{json .HostConfig.CapAdd}}' "$container" 2>/dev/null)" || exit 1
+    container_capability=0
+    case "$container_cap_add" in *NET_BIND_SERVICE*) container_capability=0000000000000400 ;; esac
+    container_user="$container_user_raw"
+    container_user="${container_user%%:*}"
+    if [ -z "$container_user" ] || [ "$container_user" = root ] || [ "$container_user" = 0 ]; then
+      case "$container_cap_drop" in
+        *ALL*|*NET_BIND_SERVICE*) [ "$container_capability" != 0 ] || container_capability=0 ;;
+        *) [ "$container_capability" != 0 ] || container_capability=0000000000000400 ;;
+      esac
+      xray_security="0 $container_capability"
+    else
+      case "$container_user" in
+        *[!0-9]*) container_user="$(bounded_preflight_command sudo -n "$docker_path" exec "$container" id -u "$container_user" 2>/dev/null)" || exit 1 ;;
+      esac
+      case "$container_user" in [1-9][0-9]*) xray_security="$container_user $container_capability" ;; *) exit 1 ;; esac
+    fi
+  fi
+  if [ -n "$xray_runtime_pid" ]; then xray_service=active; else xray_service=inactive; fi
+else
+  ephemeral_range="$(read_ephemeral_range)" || exit 1
+  reserved_ports="$(read_reserved_ports)" || exit 1
+  unprivileged_port_start="$(read_unprivileged_port_start)" || exit 1
+  xray_runtime_pid="$(read_xray_pid)" || exit 1
+  if [ -n "$xray_runtime_pid" ]; then xray_runtime_starttime="$(read_xray_starttime "$xray_runtime_pid")" || exit 1; else xray_runtime_starttime=""; fi
+  xray_api_json="$(read_xray_api)" || exit 1
+  if [ -n "$xray_runtime_pid" ]; then
+    xray_security="$(read_xray_process_security)" || exit 1
+  else
+    xray_security='unavailable'
+  fi
+  if [ -n "$xray_runtime_pid" ]; then
+    xray_service=inactive
+    xray_service_pid=""
+    if command -v systemctl >/dev/null 2>&1 && bounded_preflight_command sudo -n systemctl is-active --quiet "$xray_systemd_unit" >/dev/null; then
+      xray_service_pid="$(bounded_preflight_command sudo -n systemctl show --property MainPID --value "$xray_systemd_unit" 2>/dev/null)" || exit 1
+      xray_service=active
+      [ "$xray_service_pid" = "$xray_runtime_pid" ] || exit 1
+    elif command -v rc-service >/dev/null 2>&1 && bounded_preflight_command sudo -n rc-service "$xray_openrc_service" status >/dev/null; then
+      xray_pidfile="$(bounded_preflight_command sudo -n sh -c 'service=$1; for candidate in "/run/supervise-$service.pid" "/var/run/supervise-$service.pid" "/run/$service.pid" "/var/run/$service.pid"; do if [ -r "$candidate" ]; then printf %s "$candidate"; exit 0; fi; done; exit 1' sh "$xray_openrc_service" 2>/dev/null)" || exit 1
+      xray_service_pid="$(bounded_preflight_command sudo -n cat "$xray_pidfile" 2>/dev/null)" || exit 1
+      [ -n "$xray_service_pid" ] || exit 1
+      case "$xray_service_pid" in *[!0-9]*) exit 1 ;; esac
+      if [ "$xray_service_pid" != "$xray_runtime_pid" ]; then
+        xray_supervisor_cmd="$(bounded_preflight_command sudo -n sh -c 'tr "\\000" " " < "/proc/$1/cmdline"' sh "$xray_service_pid" 2>/dev/null)" || exit 1
+        case " $xray_supervisor_cmd " in
+          *" supervise-daemon $xray_openrc_service "*|*" /supervise-daemon $xray_openrc_service "*) ;;
+          *) exit 1 ;;
+        esac
+        xray_parent_pid="$(bounded_preflight_command sudo -n sh -c 'stat_file="/proc/$1/stat"; [ -r "$stat_file" ] || exit 1; line=$(cat "$stat_file") || exit 1; line=${line#*) }; set -- $line; printf %s "${2:-}"' sh "$xray_runtime_pid" 2>/dev/null)" || exit 1
+        [ -n "$xray_parent_pid" ] || exit 1
+        case "$xray_parent_pid" in *[!0-9]*) exit 1 ;; esac
+        [ "$xray_parent_pid" = "$xray_service_pid" ] || exit 1
+      fi
+      xray_service=active
+    fi
+    [ "$xray_service" = active ] || exit 1
+  else
+    xray_service=inactive
+  fi
+fi
+host_env_status_after="$(bounded_preflight_command sudo -n sh -c '
+  path="$1"
+  case "$path" in /*) ;; *) exit 1 ;; esac
+  while [ "$path" != "/" ]; do
+    [ ! -L "$path" ] || exit 1
+    parent=${path%/*}
+    [ -n "$parent" ] || parent=/
+    [ "$parent" != "$path" ] || exit 1
+    path="$parent"
+  done
+  if [ -e "$1" ] || [ -L "$1" ]; then
+    [ -r "$1" ] || exit 1
+    printf %s readable
+  else
+    printf %s absent
+  fi
+' sh "$env_file" 2>/dev/null)" || exit 1
+[ "$host_env_status_after" = "$host_env_status" ] || exit 1
+host_env_snapshot_fingerprint_after="$(host_env_fingerprint)" || exit 1
+[ "$host_env_snapshot_fingerprint_after" = "$host_env_snapshot_fingerprint" ] || exit 1
+docker_path_after="$(bounded_preflight_command sudo -n sh -c 'docker_path="$(command -v docker 2>/dev/null || true)"; for candidate in "$docker_path" /usr/bin/docker /usr/local/bin/docker; do if [ -n "$candidate" ] && [ -x "$candidate" ]; then printf %s "$candidate"; exit 0; fi; done; printf %s absent' 2>/dev/null)" || exit 1
+[ "$docker_path_after" = "$docker_path" ] || exit 1
+if [ "$docker_path" = absent ]; then
+  docker_socket_after="$(bounded_preflight_command sudo -n sh -c 'if [ -S /run/docker.sock ] || [ -S /var/run/docker.sock ]; then printf %s present; else printf %s absent; fi' 2>/dev/null)" || exit 1
+  [ "$docker_socket_after" = "$docker_socket" ] || exit 1
+else
+  docker_inventory_after="$(bounded_preflight_command sudo -n "$docker_path" ps --format '{{.Names}} {{.Image}}' 2>/dev/null)" || exit 1
+  [ "$docker_inventory_after" = "$docker_inventory" ] || exit 1
+  containers_after="$(printf '%s\n' "$docker_inventory_after" | awk -v image_prefix="$XP_CONTAINER_IMAGE_PREFIX" '
+    NF == 0 { next }
+    NF != 2 || $1 !~ /^[A-Za-z0-9][A-Za-z0-9_.-]*$/ { exit 1 }
+    index($2, image_prefix ":") == 1 || index($2, image_prefix "@") == 1 { print $1 }
+  ')" || exit 1
+  container_count_after="$(printf '%s\n' "$containers_after" | awk 'NF { count++ } END { print count + 0 }')"
+  [ "$container_count_after" -le 1 ] || exit 1
+  [ "$containers_after" = "$containers" ] || exit 1
+  [ "$container_count_after" = "$container_count" ] || exit 1
+  container_identity_after="$(bounded_preflight_command sudo -n "$docker_path" inspect --format '{{.Id}}' "$container" 2>/dev/null)" || exit 1
+  [ "$container_identity_after" = "$container_identity" ] || exit 1
+  container_started_at_after="$(bounded_preflight_command sudo -n "$docker_path" inspect --format '{{.State.StartedAt}}' "$container" 2>/dev/null)" || exit 1
+  [ "$container_started_at_after" = "$container_started_at" ] || exit 1
+fi
+state_current_after='{}'
+state_legacy_after='{}'
+if [ -n "$state_path" ]; then
+  state_current_status_after="$(state_file_status "$state_path")" || exit 1
+  state_legacy_status_after="$(state_file_status "$legacy_state_path")" || exit 1
+  [ "$state_current_status_after:$state_legacy_status_after" = "$state_current_status:$state_legacy_status" ] || exit 1
+  case "$state_current_status_after:$state_legacy_status_after" in
+    present:present)
+      state_current_after="$(read_state_file "$state_path")" || exit 1
+      state_legacy_after="$(read_state_file "$legacy_state_path")" || exit 1
+      [ "$state_current_after" = "$state_legacy_after" ] || exit 1
+      ;;
+    present:absent) state_current_after="$(read_state_file "$state_path")" || exit 1 ;;
+    absent:present) state_legacy_after="$(read_state_file "$legacy_state_path")" || exit 1 ;;
+    absent:absent) ;;
+    *) exit 1 ;;
+  esac
+fi
+[ "$state_current_after" = "$state_current" ] || exit 1
+[ "$state_legacy_after" = "$state_legacy" ] || exit 1
+published_ports_after="$(collect_published_ports)" || exit 1
+[ "$published_ports_after" = "$published_ports" ] || exit 1
+ephemeral_range_after="$(read_ephemeral_range)" || exit 1
+reserved_ports_after="$(read_reserved_ports)" || exit 1
+unprivileged_port_start_after="$(read_unprivileged_port_start)" || exit 1
+[ "$ephemeral_range_after" = "$ephemeral_range" ] || exit 1
+[ "$reserved_ports_after" = "$reserved_ports" ] || exit 1
+[ "$unprivileged_port_start_after" = "$unprivileged_port_start" ] || exit 1
+host_listeners_after="$(collect_host_listeners)" || exit 1
+[ "$host_listeners_after" = "$host_listeners" ] || exit 1
+runtime_listeners_after="$(collect_runtime_listeners)" || exit 1
+[ "$runtime_listeners_after" = "$runtime_listeners" ] || exit 1
+xray_runtime_pid_after="$(read_xray_pid)" || exit 1
+[ "$xray_runtime_pid_after" = "$xray_runtime_pid" ] || exit 1
+if [ -n "$xray_runtime_pid" ]; then
+  xray_runtime_starttime_after="$(read_xray_starttime "$xray_runtime_pid_after")" || exit 1
+  [ "$xray_runtime_starttime_after" = "$xray_runtime_starttime" ] || exit 1
+fi
+xray_api_json_after="$(read_xray_api)" || exit 1
+[ "$xray_api_json_after" = "$xray_api_json" ] || exit 1
+if [ -n "$xray_runtime_pid" ]; then
+  xray_security_after="$(read_xray_process_security)" || exit 1
+  [ "$xray_security_after" = "$xray_security" ] || exit 1
+elif [ -n "$container" ]; then
+  container_user_after="$(bounded_preflight_command sudo -n "$docker_path" inspect --format '{{.Config.User}}' "$container" 2>/dev/null)" || exit 1
+  container_cap_drop_after="$(bounded_preflight_command sudo -n "$docker_path" inspect --format '{{json .HostConfig.CapDrop}}' "$container" 2>/dev/null)" || exit 1
+  container_cap_add_after="$(bounded_preflight_command sudo -n "$docker_path" inspect --format '{{json .HostConfig.CapAdd}}' "$container" 2>/dev/null)" || exit 1
+  [ "$container_user_after" = "$container_user_raw" ] || exit 1
+  [ "$container_cap_drop_after" = "$container_cap_drop" ] || exit 1
+  [ "$container_cap_add_after" = "$container_cap_add" ] || exit 1
+fi
+revalidate_host_service || exit 1
+printf 'ephemeral_range=%s\n' "$ephemeral_range"
+printf 'reserved_ports=%s\n' "$reserved_ports"
+printf 'unprivileged_port_start=%s\n' "$unprivileged_port_start"
+printf 'xray_runtime_pid=%s\n' "$xray_runtime_pid"
+printf 'xray_service=%s\n' "$xray_service"
+printf 'xray_security=%s\n' "$xray_security"
+printf 'xray_api_b64=%s\n' "$(printf '%s' "$xray_api_json" | base64 | tr -d '\r\n')"

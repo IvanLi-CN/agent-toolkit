@@ -1,13 +1,5 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env bun
+import { main } from "./xp-infra-compose-image-check.ts";
 
-if [ "$#" -ne 1 ]; then
-  echo "usage: xp-infra-compose-image-check EXPECTED_IMAGE" >&2
-  exit 2
-fi
-
-expected_image="$1"
-images="$(cat)"
-nonempty_images="$(printf '%s\n' "${images}" | grep -v '^[[:space:]]*$' || true)"
-[ "$(printf '%s\n' "${nonempty_images}" | grep -c .)" -eq 1 ]
-printf '%s\n' "${nonempty_images}" | grep -Fxq "${expected_image}"
+const args = Bun.argv.slice(2);
+process.exitCode = main(args, args.length === 1 && Boolean(args[0]) ? await Bun.stdin.text() : "");

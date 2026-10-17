@@ -4,6 +4,8 @@
 
 Resolve the selected alias through the operator's SSH configuration, then run `xp-infra policy check`, `inventory`, `status` and `audit`. Redact resolved hostnames, addresses, ports and response bodies before sharing.
 
+The local commands require the installed Bun runtime plus native `ssh` and `curl`. Remote observation stays in POSIX Shell and does not require Bun on the inspected node. The checks are read-only and fail closed on missing, malformed or changing evidence.
+
 ## Deployment sequence
 
 1. Establish a dedicated key-authenticated operator account and verify non-interactive privilege escalation.

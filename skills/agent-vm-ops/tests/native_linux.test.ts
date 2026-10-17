@@ -170,6 +170,28 @@ linuxTest("enforces one deadline across descendant pipes and stdin backpressure"
   }
 });
 
+linuxTest("reaps a descendant when the command closes stdin before a large write", async () => {
+  const runner = new CommandRunner();
+  const probeRoot = root("agent-vm-early-stdin");
+  const pidPath = join(probeRoot, "child.pid");
+  let failure: any;
+  try {
+    await runner.runBounded(["/bin/sh", "-c", `echo $$ > ${pidPath}; exec 0<&-; sleep 30`], { timeout: 1, inputData: new Uint8Array(1024 * 1024) });
+  } catch (error) { failure = error; }
+  expect(failure?.code).toBe("command_timeout");
+  expect(failure?.detail?.reaped).toBe(true);
+  expect(failure?.detail?.process_group_killed).toBe(true);
+  expect(await waitFor(pidPath)).toBe(true);
+  const pid = Number(readFileSync(pidPath, "utf8"));
+  let state: string | undefined;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    state = procState(pid);
+    if (state === undefined || state === "Z") break;
+    await Bun.sleep(10);
+  }
+  expect(state === undefined || state === "Z").toBe(true);
+});
+
 linuxTest("waits for an independent SQLite writer and preserves durable failure metadata", async () => {
   const probeRoot = root("agent-vm-sqlite-writer");
   const dbPath = join(probeRoot, "state.sqlite3");

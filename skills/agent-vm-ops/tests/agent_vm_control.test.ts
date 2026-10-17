@@ -92,6 +92,7 @@ class NativeCommands extends CommandRunner {
   onConfigSet: ((name: string, key: string, value: string) => void) | undefined;
   guestFixture: GuestFixture | undefined;
   malformedInventory = false;
+  malformedListRecord = false;
   invalidDeviceMaps = false;
 
   configureGuest(root: string): void { this.guestFixture = createGuestFixture(root, { virtualBytes: 20 * GIB }); }
@@ -146,7 +147,7 @@ class NativeCommands extends CommandRunner {
 
   private incus(command: string[]): ProcessResult {
     const verb = command[0];
-    if (verb === "list") return result(["incus", ...command], [...this.instances.values()]);
+    if (verb === "list") return result(["incus", ...command], this.malformedListRecord ? [...this.instances.values(), {}] : [...this.instances.values()]);
     if (verb === "init") {
       const image = command[1]!;
       const name = command[2]!;
@@ -442,6 +443,49 @@ test("rejects invalid identity, protocol, action and generation before native wr
   expect(f.runner.calls).toHaveLength(0);
 });
 
+test("treats prototype-sensitive JSON keys as data and requires own envelope fields", async () => {
+  const f = fixture();
+  const inheritedOnly = parseRequestBytes(new TextEncoder().encode('{"__proto__":{"protocol":4,"action":"drain-enter","operation_id":"proto-op","generation":0}}'));
+  await expectCode(f.control.dispatch(inheritedOnly), "invalid_request");
+  expect(f.store.getMeta("draining")).toBeUndefined();
+
+  const raw = `{"protocol":4,"action":"acquire","session_id":"thread-a","generation":0,"operation_id":"op-proto-data","public_key":"${KEY}","__proto__":{"action":"drain-exit"},"metadata":{"__proto__":{"nested":1},"constructor":{"prototype":"legitimate"}}}`;
+  const request = parseRequestBytes(new TextEncoder().encode(raw));
+  expect(Object.keys(request)).toContain("__proto__");
+  await f.control.dispatch(request);
+  const conflict = parseRequestBytes(new TextEncoder().encode(raw.replace('"nested":1', '"nested":2')));
+  await expectCode(f.control.dispatch(conflict), "operation_conflict");
+
+  await expectCode(f.control.dispatch(parseRequestBytes(new TextEncoder().encode('{"protocol":4,"action":"status","__proto__":{"session_id":"thread-a"}}'))), "invalid_request");
+  await expectCode(f.control.dispatch(parseRequestBytes(new TextEncoder().encode('{"protocol":4,"action":"drain-enter","operation_id":"missing-generation","__proto__":{"generation":0}}'))), "invalid_request");
+});
+
+test("preserves JSON float semantics and Python canonical numeric digests", async () => {
+  const root = mkdtempSync("/tmp/agent-vm-numeric-boundary-test-");
+  try {
+    const base: Dict = { project: "agents", profile: "agent-vm", image_alias: "image", image_fingerprint: "a".repeat(64), network: "agentsbr0", network_acl: "agent-vm-isolation", pool: "agents", host_address: "198.51.100.19", port_start: 20000, port_end: 20030, vm_ip_start: "198.51.100.20", vm_ip_end: "198.51.100.250", gateway_ip: "198.51.100.1", storage_path: root, state_db: join(root, "state.sqlite3"), timer_dir: join(root, "systemd"), cpu_overcommit_ratio: 2e4 };
+    const configPath = join(root, "config.json");
+    writeFileSync(configPath, JSON.stringify(base).replace('"port_start":20000', '"port_start":20000.0'));
+    expectSyncCode(() => loadConfig(configPath), "config_invalid");
+    writeFileSync(configPath, JSON.stringify(base).replace('"cpu_overcommit_ratio":20000', '"cpu_overcommit_ratio":2e4'));
+    expect(loadConfig(configPath).cpu_overcommit_ratio).toEqual({ numerator: 200000n, denominator: 10n, text: "20000.0" });
+
+    const f = fixture();
+    const raw = `{"protocol":4,"action":"acquire","session_id":"thread-a","generation":0,"operation_id":"op-float-digest","public_key":"${KEY}","metadata":{"small":1e-7,"whole":2e4,"one":1.0}}`;
+    await f.control.dispatch(parseRequestBytes(new TextEncoder().encode(raw)));
+    const journal = f.store.db.query("SELECT response_json FROM operations WHERE operation_id = ?").get("op-float-digest") as { response_json: string };
+    const python = Bun.spawnSync(["python3", "-c", "import hashlib,json,sys; print(hashlib.sha256(json.dumps(json.loads(sys.argv[1]), ensure_ascii=True, sort_keys=True, separators=(\", \", \": \" )).encode(\"utf-8\")).hexdigest())", raw], { stdout: "pipe", stderr: "pipe" });
+    if (python.exitCode !== 0) throw new Error(new TextDecoder().decode(python.stderr));
+    expect(JSON.parse(journal.response_json)._request_digest).toBe(new TextDecoder().decode(python.stdout).trim());
+
+    const equivalent = parseRequestBytes(new TextEncoder().encode(raw.replace("2e4", "20000.0")));
+    expect((await f.control.dispatch(equivalent)).outcome).toBe("replayed");
+    const integerConflict = parseRequestBytes(new TextEncoder().encode(raw.replace('"one":1.0', '"one":1')));
+    await expectCode(f.control.dispatch(integerConflict), "operation_conflict");
+    await expectCode(f.control.dispatch(parseRequestBytes(new TextEncoder().encode('{"protocol":4,"action":"drain-enter","operation_id":"float-generation","generation":0.0}'))), "invalid_request");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("keeps SQLite integer reservations exact beyond the JS safe range", () => {
   const root = mkdtempSync("/tmp/agent-vm-sqlite-test-");
   const store = new StateStore(join(root, "state.sqlite3"));
@@ -610,6 +654,12 @@ test("bounds descendant-held pipes and stdin backpressure by one communication d
   }
 });
 
+test("keeps a successful command outcome when the child closes stdin early", async () => {
+  const runner = new CommandRunner();
+  const completed = await runner.runBounded(["/bin/sh", "-c", "exec 0<&-; exit 0"], { timeout: 1, inputData: new Uint8Array(1024 * 1024) });
+  expect(completed.returncode).toBe(0);
+});
+
 test("flushes a large response before a child exits", async () => {
   const child = Bun.spawn([process.execPath, "-e", `const { writeProcessOutput } = await import(process.env.CONTROL_PATH); await writeProcessOutput(JSON.stringify({ ok: true, data: "x".repeat(16 * 1024 * 1024) })); process.exit(0);`], {
     env: { ...process.env, CONTROL_PATH: fileURLToPath(new URL("../scripts/agent_vm_control.ts", import.meta.url)) },
@@ -735,6 +785,67 @@ test("retains conservative accounting after cleanup failure and reconciles on re
   expect(f.runner.instances.get(active.instance_name)?.status).toBe("Stopped");
 });
 
+test("keeps an orphan native proxy retryable and refuses cached resume", async () => {
+  const f = fixture();
+  const active = await f.call("acquire", { public_key: KEY }, "op-orphan-cleanup");
+  const instance = f.runner.instances.get(active.instance_name)!;
+  const orphan = { type: "proxy", listen: "tcp:198.51.100.19:20029", connect: "tcp:198.51.100.20:9029", nat: "true" };
+  instance.devices["orphan-proxy"] = orphan;
+  instance.expanded_devices["orphan-proxy"] = orphan;
+  await expectCode(f.call("release", {}, "op-orphan-release"), "cleanup_incomplete");
+  expect(f.store.getTask({ taskId: String(active.task_id) })?.state).toBe("closing");
+  expect(f.runner.instances.get(active.instance_name)?.status).toBe("Stopped");
+  expect(f.runner.instances.get(active.instance_name)?.expanded_devices["orphan-proxy"]).toBeDefined();
+
+  const second = fixture();
+  const cached = await second.call("acquire", { public_key: KEY }, "op-orphan-resume-create");
+  await second.call("release", {}, "op-orphan-resume-release");
+  const cachedInstance = second.runner.instances.get(cached.instance_name)!;
+  cachedInstance.devices["orphan-proxy"] = orphan;
+  cachedInstance.expanded_devices["orphan-proxy"] = orphan;
+  await expectCode(second.call("acquire", { public_key: KEY }, "op-orphan-resume"), "cache_ineligible");
+  expect(second.store.getTask({ taskId: String(cached.task_id) })?.state).toBe("cached");
+});
+
+test("fails before resize or GC writes when native device maps are malformed", async () => {
+  const f = fixture();
+  const active = await f.call("acquire", { public_key: KEY }, "op-malformed-resize-create");
+  const before = f.runner.calls.length;
+  f.runner.invalidDeviceMaps = true;
+  await expectCode(f.call("resize", { disk_gib: 40, allow_restart: true }, "op-malformed-resize"), "mapping_unverified");
+  expect(f.runner.calls.slice(before).some(({ args }) => args[0] === "incus" && args[3] === "config" && ["set", "device"].includes(args[4] ?? ""))).toBe(false);
+
+  f.runner.invalidDeviceMaps = false;
+  await f.call("release", {}, "op-malformed-gc-release");
+  f.runner.invalidDeviceMaps = true;
+  const gc = await f.control.dispatch(f.request("admin-gc", { apply: true }, "op-malformed-gc"));
+  expect(gc.result.candidates).toHaveLength(1);
+  expect(gc.result.candidates[0].error.code).toBe("mapping_unverified");
+  expect(f.store.getTask({ taskId: String(active.task_id) })?.state).toBe("cached");
+});
+
+test("normalizes CIDR native addresses and rejects ambiguous address inventory", async () => {
+  const f = fixture();
+  f.runner.instances.set("native-cidr", {
+    name: "native-cidr",
+    status: "Stopped",
+    devices: { eth0: { type: "nic", network: "agentsbr0", "ipv4.address": "198.51.100.20/24", "ipv6.address": "2001:db8::20/64" } },
+    expanded_devices: { eth0: { type: "nic", network: "agentsbr0", "ipv4.address": "198.51.100.20/24", "ipv6.address": "2001:db8::20/64" } },
+  });
+  const allocated = await f.call("acquire", { public_key: KEY }, "op-cidr-address");
+  expect(allocated.vm_ip).toBe("198.51.100.21");
+
+  const malformed = fixture();
+  malformed.runner.instances.set("native-malformed-address", {
+    name: "native-malformed-address",
+    status: "Stopped",
+    devices: { eth0: { type: "nic", network: "agentsbr0", "ipv4.address": "198.51.100.20/33" } },
+    expanded_devices: { eth0: { type: "nic", network: "agentsbr0", "ipv4.address": "198.51.100.20/33" } },
+  });
+  await expectCode(malformed.call("acquire", { public_key: KEY }, "op-malformed-address"), "vm_ip_unverified");
+  expect(malformed.runner.calls.some(({ args }) => args[0] === "incus" && args[3] === "init")).toBe(false);
+});
+
 test("GC previews and deletes only eligible stopped caches", async () => {
   const f = fixture();
   const old = await f.callFor("old-session", "acquire", { public_key: KEY }, "op-gc-old");
@@ -749,6 +860,28 @@ test("GC previews and deletes only eligible stopped caches", async () => {
   expect(f.store.getTask({ taskId: String(active.task_id) })?.state).toBe("active");
   expect(f.runner.instances.has(old.instance_name)).toBe(false);
   expect(f.runner.instances.has(active.instance_name)).toBe(true);
+});
+
+test("requires named native instances before release and deletion absence claims", async () => {
+  const f = fixture();
+  const active = await f.call("acquire", { public_key: KEY }, "op-malformed-list-release-create");
+  f.runner.malformedListRecord = true;
+  await expectCode(f.call("release", {}, "op-malformed-list-release"), "cleanup_incomplete");
+  expect(f.store.getTask({ taskId: String(active.task_id) })?.state).toBe("closing");
+
+  const deleting = fixture();
+  const cached = await deleting.call("acquire", { public_key: KEY }, "op-malformed-list-delete-create");
+  await deleting.call("release", {}, "op-malformed-list-delete-release");
+  deleting.runner.malformedListRecord = true;
+  await expectCode(deleting.call("destroy", {}, "op-malformed-list-delete"), "native_inventory_unverified");
+  expect(deleting.store.getTask({ taskId: String(cached.task_id) })?.state).toBe("deleting");
+  const reconciled = await deleting.control.dispatch(deleting.request("admin-reconcile", { apply: true }, "op-malformed-list-reconcile"));
+  expect(reconciled.result.actions.some((item: Dict) => item.error?.code === "native_inventory_unverified")).toBe(true);
+
+  const absent = fixture();
+  const owned = await absent.call("acquire", { public_key: KEY }, "op-valid-absence-create");
+  absent.runner.instances.delete(owned.instance_name);
+  expect((await absent.call("release", {}, "op-valid-absence-release")).state).toBe("absent");
 });
 
 test("partial live-memory failure keeps conservative allocation and no restart fallback", async () => {

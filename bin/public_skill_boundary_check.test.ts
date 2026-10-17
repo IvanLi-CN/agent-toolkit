@@ -42,6 +42,17 @@ test("rejects product references and native task surfaces", () => {
   }
 });
 
+test("rejects personal consumer Skill paths", () => {
+  const { root, manifest } = fixture("Load Skills from ~/.agents/skills.\n");
+  try {
+    expect(check(root, manifest)).toEqual([
+      "skills/alpha/SKILL.md: forbidden public coupling personal-consumer-skills-path",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("rejects private operator reference names and unlisted Skills", () => {
   const { root, manifest } = fixture("# standalone\n");
   try {

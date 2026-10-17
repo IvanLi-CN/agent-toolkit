@@ -18,6 +18,7 @@ export const FORBIDDEN_PATTERNS: Array<[string, RegExp]> = [
   ["codex-runtime-marker", new RegExp(`(?:\\b${runtimeNamePattern}\\b|${escapeRegExp(runtimeHomeMarker)}|${escapeRegExp(dotRuntimeMarker)}(?:[\\/\\\\]|\\b))`, "i")],
   ["codex-product-reference", /\bCodex\b/i],
   ["codex-native-surface", new RegExp(`\\b(?:${nativeSurfacePattern})\\b|native\\s+(?:task|worktree|background)`, "i")],
+  ["personal-consumer-skills-path", /(?:~[\/\\]\.agents[\/\\]+skills|[\/\\](?:Users|home)[\/\\][^\/\\\s]+[\/\\]\.agents[\/\\]+skills)(?:[\/\\\s.,;:)]|$)/i],
 ];
 
 export function publicSkills(manifest: string = PUBLIC_MANIFEST): string[] {

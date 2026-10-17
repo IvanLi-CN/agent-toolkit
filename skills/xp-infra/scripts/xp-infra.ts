@@ -26,6 +26,7 @@ const SSH_CONNECT_TIMEOUT_SECS = 10;
 const PORT_PREFLIGHT_EXEC_TIMEOUT_MS = 60_000;
 const REMOTE_COMMAND_TIMEOUT_MS = 60_000;
 const MAX_AUDIT_RESPONSE_BYTES = 65_536;
+const PUBLIC_NETWORK_TIMEOUT_MS = 20_000;
 
 type Paths = { configDir: string; hostsFile: string; policyFile: string };
 type ProcessOptions = { input?: Blob; timeoutMs?: number; maxBuffer?: number };
@@ -36,17 +37,22 @@ function die(message: string): never {
   throw new ValidationError(message);
 }
 
+function envOrDefault(name: string, fallback: string): string {
+  const value = process.env[name];
+  return value ? value : fallback;
+}
+
 function configurationPaths(): Paths {
   let configDir = process.env.XP_INFRA_CONFIG_DIR ?? "";
   if (!configDir) {
-    const configHome = process.env.XDG_CONFIG_HOME ?? (process.env.HOME ? join(process.env.HOME, ".config") : "");
+    const configHome = envOrDefault("XDG_CONFIG_HOME", process.env.HOME ? join(process.env.HOME, ".config") : "");
     if (!configHome) die("set XP_INFRA_CONFIG_DIR or HOME before using xp-infra");
     configDir = join(configHome, "xp-infra");
   }
   return {
     configDir,
-    hostsFile: process.env.XP_HOSTS_FILE ?? join(configDir, "hosts.txt"),
-    policyFile: process.env.XP_POLICY_FILE ?? join(configDir, "deployment-policy.yaml"),
+    hostsFile: envOrDefault("XP_HOSTS_FILE", join(configDir, "hosts.txt")),
+    policyFile: envOrDefault("XP_POLICY_FILE", join(configDir, "deployment-policy.yaml")),
   };
 }
 
@@ -143,7 +149,8 @@ async function requireOperatorAccount(paths: Paths, host: string): Promise<void>
 
 async function sshCommand(paths: Paths, host: string, args: string[], input?: string, timeoutMs = REMOTE_COMMAND_TIMEOUT_MS): Promise<ProcessResult> {
   await requireOperatorAccount(paths, host);
-  const command = ["ssh", ...(input === undefined ? ["-n"] : []), "-o", "BatchMode=yes", "-o", "ConnectTimeout=" + SSH_CONNECT_TIMEOUT_SECS, host, ...args];
+  const remoteCommand = args.map((value) => `'${value.replaceAll("'", "'\\''")}'`).join(" ");
+  const command = ["ssh", ...(input === undefined ? ["-n"] : []), "-o", "BatchMode=yes", "-o", "ConnectTimeout=" + SSH_CONNECT_TIMEOUT_SECS, host, remoteCommand];
   return runProcess(command, { input: input === undefined ? undefined : new Blob([input]), timeoutMs });
 }
 
@@ -286,7 +293,7 @@ async function cmdPort(paths: Paths, args: string[]): Promise<number> {
   await requireRegisteredHost(paths, host);
   effectivePolicy(context.policy, host, context.inventory);
   const script = await readText(join(SCRIPT_DIR, "xp-infra-port-preflight-remote"), "missing port preflight probe");
-  const prefix = process.env.XP_CONTAINER_IMAGE_PREFIX ?? "ghcr.io/example/xp";
+  const prefix = envOrDefault("XP_CONTAINER_IMAGE_PREFIX", "ghcr.io/example/xp");
   if (!/^[A-Za-z0-9._/-]+$/.test(prefix)) die("XP_CONTAINER_IMAGE_PREFIX is invalid");
   const raw = await runRemoteProbe(paths, host, script, [prefix], PORT_PREFLIGHT_EXEC_TIMEOUT_MS);
   console.log(String(interpretPortPreflight(raw, host)));
@@ -321,12 +328,25 @@ function checkTrue(key: string, actual: string): boolean {
 
 async function resolvePublicTarget(target: string, path: string): Promise<ValidatedPublicTarget> {
   return validatePublicTarget(target, path, async (hostname) => {
-    const addresses = await lookup(hostname, { all: true, verbatim: true });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new ValidationError("public target DNS lookup timed out")), PUBLIC_NETWORK_TIMEOUT_MS);
+    });
+    let addresses: Array<{ address: string; family: number }>;
+    try {
+      addresses = await Promise.race([lookup(hostname, { all: true, verbatim: true }), timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
     return addresses.map((address) => ({ address: address.address, family: address.family }));
   });
 }
 
 type CurlResult = { body: string; headers: string; status: number };
+
+function isSuccessfulHttpStatus(status: number): boolean {
+  return status >= 200 && status < 300;
+}
 
 function parseCurlHeaders(output: string): { headers: string; body: string; status: number } {
   const separators = [...output.matchAll(/\r?\n\r?\n/g)];
@@ -351,7 +371,9 @@ async function curlJson(target: ValidatedPublicTarget): Promise<CurlResult> {
     "-D", "-", "--resolve", target.resolve, "--", target.target,
   ], { timeoutMs: 20_000, maxBuffer: MAX_AUDIT_RESPONSE_BYTES });
   if (result.exitCode !== 0 || result.timedOut) die("public health probe failed");
-  return parseCurlHeaders(result.stdout);
+  const response = parseCurlHeaders(result.stdout);
+  if (!isSuccessfulHttpStatus(response.status)) die("public health probe returned an unsuccessful HTTP status");
+  return response;
 }
 
 async function curlStatus(target: ValidatedPublicTarget): Promise<string> {
@@ -366,9 +388,11 @@ async function curlStatus(target: ValidatedPublicTarget): Promise<string> {
 async function curlText(url: string): Promise<string> {
   requireCommand("curl");
   const result = await runProcess([
-    "curl", "-fsS", "--noproxy", "*", "--max-time", "15", "--max-filesize", String(MAX_AUDIT_RESPONSE_BYTES), "--", url,
+    "curl", "-fsS", "--noproxy", "*", "--max-time", "15", "--max-filesize", String(MAX_AUDIT_RESPONSE_BYTES), "-D", "-", "--", url,
   ], { timeoutMs: 20_000, maxBuffer: MAX_AUDIT_RESPONSE_BYTES });
-  return result.exitCode === 0 && !result.timedOut ? result.stdout : "";
+  if (result.exitCode !== 0 || result.timedOut) return "";
+  const response = parseCurlHeaders(result.stdout);
+  return isSuccessfulHttpStatus(response.status) ? response.body : "";
 }
 
 function hasHeader(headers: string, name: string, expected?: string): boolean {
@@ -415,16 +439,16 @@ async function cmdAudit(paths: Paths, args: string[]): Promise<number> {
     }
   }
 
-  let publicHealthJsonOk = "";
+  let publicHealth = "";
   let gotCloudflareTunnel = recordValue(basic, "cloudflare_tunnel");
   if (recordValue(basic, "public_health_target") && !privateDockerException) {
     const publicTarget = await resolvePublicTarget(recordValue(basic, "public_health_target"), "/api/health");
     const publicResponse = await curlJson(publicTarget);
     const publicResult = normalizePublicHealth(publicResponse.body);
-    publicHealthJsonOk = publicResult.public_health_json_ok;
+    publicHealth = publicResult.public_health;
     if (flags.cloudflare_tunnel) gotCloudflareTunnel = "false";
     const cloudflareRanges = flags.cloudflare_tunnel ? (await curlText("https://www.cloudflare.com/ips-v4")) + "\n" + (await curlText("https://www.cloudflare.com/ips-v6")) : "";
-    if (flags.cloudflare_tunnel && recordValue(basic, "tunnel_declaration") === "aligned" && isCloudflareAddress(publicTarget.address, cloudflareRanges) && hasHeader(publicResponse.headers, "server", "cloudflare") && hasHeader(publicResponse.headers, "cf-ray") && publicHealthJsonOk === "true") gotCloudflareTunnel = "true";
+    if (flags.cloudflare_tunnel && recordValue(basic, "tunnel_declaration") === "aligned" && isCloudflareAddress(publicTarget.address, cloudflareRanges) && hasHeader(publicResponse.headers, "server", "cloudflare") && hasHeader(publicResponse.headers, "cf-ray") && publicHealth === "true") gotCloudflareTunnel = "true";
   }
 
   let gotLocalCanary = "";
@@ -495,7 +519,7 @@ async function cmdAudit(paths: Paths, args: string[]): Promise<number> {
   }
   if (!checkTrue("local_health", recordValue(basic, "local_health"))) failed = 1;
   if (!checkTrue("xray_runtime", recordValue(basic, "xray_runtime"))) failed = 1;
-  if (!privateDockerException && !checkTrue("public_health", publicHealthJsonOk === "true" ? "true" : recordValue(basic, "public_health"))) failed = 1;
+  if (!privateDockerException && !checkTrue("public_health", publicHealth || recordValue(basic, "public_health"))) failed = 1;
   else if (privateDockerException) console.log("SKIP public_health (approved private-node exception)");
   const role = recordValue(basic, "cluster_role");
   if (role === "leader" || role === "follower") console.log("PASS cluster_role=" + role);

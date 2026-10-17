@@ -571,8 +571,14 @@ data_dir="$(env_value XP_DATA_DIR)"
 [ -n "$data_dir" ] || data_dir=/var/lib/xp/data
 bind="$(env_value XP_BIND)"
 [ "$bind" != "$READ_ERROR_SENTINEL" ] || exit 1
-xp_port="${bind##*:}"
-case "$xp_port" in ''|*[!0-9]*) xp_port=62416 ;; esac
+if [ -z "$bind" ]; then
+  xp_port=62416
+else
+  case "$bind" in *:*) ;; *) exit 1 ;; esac
+  xp_port="${bind##*:}"
+  case "$xp_port" in ''|*[!0-9]*) exit 1 ;; esac
+  [ "$xp_port" -ge 1 ] && [ "$xp_port" -le 65535 ] || exit 1
+fi
 if [ "$mode" = container ]; then
   container_port_target="$xp_port"
   docker_published_ports="$(bounded_command docker_cmd port "$container" "${container_port_target}/tcp" 2>/dev/null)" || exit 1
@@ -588,7 +594,8 @@ emit_value ddns_restart_mode "$(env_value XP_CLOUDFLARED_RESTART_MODE)"
 emit_value ddns_fast_interval "$(env_value XP_CLOUDFLARE_DDNS_FAST_INTERVAL_SECS)"
 emit_value ddns_monitored_interval "$(env_value XP_CLOUDFLARE_DDNS_INTERVAL_SECS_WITH_MONITOR)"
 emit_value ddns_unmonitored_interval "$(env_value XP_CLOUDFLARE_DDNS_INTERVAL_SECS_NO_MONITOR)"
-emit_value ddns_state_json "$(runtime_file_read "$data_dir/ddns_state.json" || true)"
+ddns_state_json="$(runtime_file_read "$data_dir/ddns_state.json" || true)"
+emit_value ddns_state_json "$ddns_state_json"
 # Geo opt-in writes `true`; a missing opt-in remains the supported false default.
 geo_enabled="$(strict_bool_value XP_IP_GEO_ENABLED false)"
 emit_value geo_enabled "$geo_enabled"
@@ -616,7 +623,8 @@ if [ "$mode" = host ]; then
 else
   emit_value cloudflare_settings_json ""
 fi
-emit_value managed_default_state_json "$(runtime_file_read "$data_dir/managed-default-endpoints.json" || true)"
+managed_default_state_json="$(runtime_file_read "$data_dir/managed-default-endpoints.json" || true)"
+emit_value managed_default_state_json "$managed_default_state_json"
 echo "sync_node_meta=$(sync_node_meta && printf true || printf false)"
 if [ "$require_xray_public_listener" = true ]; then
   emit_value xray_public_ports "$(xray_public_ports || true)"
@@ -685,6 +693,10 @@ if [ "$mode" = container ]; then
   docker_published_ports_after="$(bounded_command docker_cmd port "$container" "${container_port_target}/tcp" 2>/dev/null)" || exit 1
   [ "$docker_published_ports_after" = "$docker_published_ports" ] || exit 1
 fi
+ddns_state_json_after="$(runtime_file_read "$data_dir/ddns_state.json" || true)"
+[ "$ddns_state_json_after" = "$ddns_state_json" ] || exit 1
+managed_default_state_json_after="$(runtime_file_read "$data_dir/managed-default-endpoints.json" || true)"
+[ "$managed_default_state_json_after" = "$managed_default_state_json" ] || exit 1
 containers_after="$(xp_containers_from_inventory "$docker_inventory_after")" || exit 1
 [ "$containers_after" = "$containers" ] || exit 1
 if [ "$env_probe" = absent ]; then

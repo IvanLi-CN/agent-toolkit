@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
 import { main } from "./xp-infra-compose-image-check.ts";
 
-process.exitCode = main(Bun.argv.slice(2), await Bun.stdin.text());
+const args = Bun.argv.slice(2);
+process.exitCode = main(args, args.length === 1 && Boolean(args[0]) ? await Bun.stdin.text() : "");

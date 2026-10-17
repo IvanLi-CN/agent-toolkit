@@ -1,4 +1,6 @@
 #!/usr/bin/env bun
 import { main } from "./xp-infra-audit-local.ts";
 
-process.exitCode = main(Bun.argv.slice(2), await Bun.stdin.text());
+const args = Bun.argv.slice(2);
+const input = args.length === 1 && (args[0] === "basic" || args[0] === "public-health") ? await Bun.stdin.text() : "";
+process.exitCode = main(args, input);

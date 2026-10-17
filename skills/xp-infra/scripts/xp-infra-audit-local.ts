@@ -22,6 +22,7 @@ export function main(args: string[] = Bun.argv.slice(2), input = ""): number {
 }
 
 if (import.meta.main) {
-  const input = await Bun.stdin.text();
-  process.exitCode = main(Bun.argv.slice(2), input);
+  const args = Bun.argv.slice(2);
+  const input = args.length === 1 && (args[0] === "basic" || args[0] === "public-health") ? await Bun.stdin.text() : "";
+  process.exitCode = main(args, input);
 }

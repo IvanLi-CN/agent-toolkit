@@ -157,7 +157,7 @@ export function parseRestrictedYaml(text: string): unknown {
           result[entry.key] = nested.value;
           cursor = nested.next;
         } else {
-          result[entry.key] = Object.create(null) as JsonRecord;
+          result[entry.key] = entry.key === "node_overrides" ? null : Object.create(null) as JsonRecord;
           cursor += 1;
         }
       } else {
@@ -220,7 +220,7 @@ function expectBoolean(value: unknown, name: string): boolean {
 }
 
 function expectDnsName(value: unknown, name: string): string {
-  if (typeof value !== "string" || !/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/i.test(value)) fail(`${name} must be a valid DNS name`);
+  if (typeof value !== "string" || !validDnsName(value)) fail(`${name} must be a valid DNS name`);
   return value;
 }
 
@@ -323,7 +323,7 @@ class StrictJsonParser {
   }
 
   private skipWhitespace(): void {
-    while (/\s/.test(this.text[this.index] ?? "")) this.index += 1;
+    while ([" ", "\t", "\n", "\r"].includes(this.text[this.index] ?? "")) this.index += 1;
   }
 
   private parseValue(): unknown {
@@ -472,10 +472,52 @@ function boundedInterval(value: string, defaultValue: number): number {
   return Math.min(parsed, 3600);
 }
 
+function validCalendarDate(year: number, month: number, day: number): boolean {
+  const candidate = new Date(0);
+  candidate.setUTCHours(0, 0, 0, 0);
+  candidate.setUTCFullYear(year, month - 1, day);
+  return candidate.getUTCFullYear() === year && candidate.getUTCMonth() === month - 1 && candidate.getUTCDate() === day;
+}
+
+const TIMESTAMP_DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})(?:(?:[Tt ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:[ \t]*(?:[Zz]|[+-]\d{2}:?\d{2}))?)?)?$/;
+const TIMESTAMP_SLASH_DATE_PATTERN = /^(\d{4})\/(\d{1,2})\/(\d{1,2})(?:(?:[Tt ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:[ \t]*(?:[Zz]|[+-]\d{2}:?\d{2}))?)?)?$/;
+const TIMESTAMP_MONTHS: Record<string, number> = {
+  jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6,
+  jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
+};
+
 export function parseTimestamp(value: unknown): Date | undefined {
-  if (typeof value !== "string" || !value) return undefined;
-  const timestamp = Date.parse(value);
+  if (typeof value !== "string") return undefined;
+  const text = value.trim();
+  if (!text || /^\d{1,4}(?:-\d{1,2})?$/.test(text)) return undefined;
+
+  const dateMatch = text.match(TIMESTAMP_DATE_PATTERN) ?? text.match(TIMESTAMP_SLASH_DATE_PATTERN);
+  if (dateMatch) {
+    const year = Number(dateMatch[1]);
+    const month = Number(dateMatch[2]);
+    const day = Number(dateMatch[3]);
+    if (!validCalendarDate(year, month, day)) return undefined;
+  } else if (/^\d{4}[-/]/.test(text)) {
+    return undefined;
+  } else {
+    const monthFirst = text.match(/^([A-Za-z]{3,9})[ ,]+(\d{1,2})[ ,]+(\d{4})(?:\b|$)/);
+    const dayFirst = text.match(/^(\d{1,2})[ -]+([A-Za-z]{3,9})[ -]+(\d{4})(?:\b|$)/);
+    const named = monthFirst ? [monthFirst[1], monthFirst[2], monthFirst[3]] : dayFirst ? [dayFirst[2], dayFirst[1], dayFirst[3]] : undefined;
+    if (named) {
+      const month = TIMESTAMP_MONTHS[named[0]!.slice(0, 3).toLowerCase()];
+      if (!month || !validCalendarDate(Number(named[2]), month, Number(named[1]))) return undefined;
+    }
+  }
+  if (!/^[A-Za-z0-9,.:+/\- TZt]+$/.test(text)) return undefined;
+  const timestamp = Date.parse(text);
   return Number.isFinite(timestamp) ? new Date(timestamp) : undefined;
+}
+
+function optionalTimestamp(value: unknown, name: string): Date | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  const parsed = parseTimestamp(value);
+  if (!parsed) fail(`${name} is invalid`);
+  return parsed;
 }
 
 export function auditNow(testEpoch?: string): Date {
@@ -497,15 +539,22 @@ function apiBaseHost(value: string): string {
   if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.search || parsed.hash || !["", "/"].includes(parsed.pathname)) {
     fail("api_base must be an HTTPS origin");
   }
-  const host = parsed.hostname;
   const authority = value.match(/^https:\/\/([^/?#]+)/i)?.[1] ?? "";
+  if (authority.includes("@")) fail("api_base must be an HTTPS origin");
+  const host = parsed.hostname;
   const authorityHost = authority.startsWith("[") ? authority.slice(0, authority.indexOf("]") + 1) : authority.split(":")[0] ?? "";
-  if (!host || authorityHost !== authorityHost.toLowerCase() || host !== host.toLowerCase()) fail("api_base host must be lowercase");
+  if (!host || !validDnsName(host, true) || authorityHost !== authorityHost.toLowerCase() || host !== host.toLowerCase()) fail("api_base host must be lowercase");
   return host;
 }
 
+function validDnsName(value: string, requireDot = false): boolean {
+  if (value.length === 0 || value.length > 253 || (requireDot && !value.includes("."))) return false;
+  const labels = value.split(".");
+  return labels.every((label) => label.length > 0 && label.length <= 63 && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(label));
+}
+
 function validHost(value: string): boolean {
-  return /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/i.test(value) && value.includes(".");
+  return validDnsName(value, true);
 }
 
 function validNodeName(value: string): boolean {
@@ -608,14 +657,14 @@ export function normalizeBasic(text: string, now = auditNow()): BasicAudit {
     snapshot = Object.create(null) as JsonRecord;
   }
   const snapshotRecord = snapshot as JsonRecord;
-  const fastUntil = parseTimestamp(snapshotRecord.fast_mode_until);
+  const fastUntil = optionalTimestamp(snapshotRecord.fast_mode_until, "fast_mode_until");
   const monitorMode = String(records.ddns_monitor_mode) || String(records.ddns_restart_mode);
   const interval = fastUntil && fastUntil.getTime() > now.getTime()
     ? boundedInterval(String(records.ddns_fast_interval), 30)
     : monitorMode && monitorMode !== "none"
       ? boundedInterval(String(records.ddns_monitored_interval), 300)
       : boundedInterval(String(records.ddns_unmonitored_interval), 60);
-  const lastSync = parseTimestamp(snapshotRecord.last_sync_at);
+  const lastSync = optionalTimestamp(snapshotRecord.last_sync_at, "last_sync_at");
   const age = lastSync ? (now.getTime() - lastSync.getTime()) / 1000 : Number.POSITIVE_INFINITY;
   const ddnsOk = ddnsEnabled && Boolean(lastSync) && lastSync!.getTime() <= now.getTime() && age <= interval * 2 + 60 && snapshotRecord.status === "up" && !String(snapshotRecord.last_error ?? "");
 
@@ -642,7 +691,7 @@ export function normalizeBasic(text: string, now = auditNow()): BasicAudit {
   const containerXrayToken = String(records.container_xray_token);
   if (runtimeMode === "container") {
     if (!/^[0-9a-f]{64}$/.test(containerIdentity)) fail("container_identity is invalid");
-    if (!parseTimestamp(containerStartedAt)) fail("container_started_at is invalid");
+    if (!optionalTimestamp(containerStartedAt, "container_started_at")) fail("container_started_at is invalid");
     if (String(records.host_xray_pid) || String(records.host_xray_starttime)) fail("container runtime has host Xray identity");
     if (!/^[1-9][0-9]*:[1-9][0-9]*$/.test(containerXrayToken)) fail("container_xray_token is invalid");
   } else {
@@ -654,11 +703,11 @@ export function normalizeBasic(text: string, now = auditNow()): BasicAudit {
   const xray = nestedObject(health, "xray", "health_json.xray");
   const cloudflared = nestedObject(health, "cloudflared", "health_json.cloudflared");
   const canary = nestedObject(health, "vless_https_canary", "health_json.vless_https_canary");
-  const certificateExpiry = parseTimestamp(canary.cert_not_after);
+  const certificateExpiry = optionalTimestamp(canary.cert_not_after, "cert_not_after");
   const certificateOk = canary.enabled === true && canary.last_error == null && Boolean(certificateExpiry && certificateExpiry.getTime() > now.getTime());
   const canaryPort = loopbackBindPort(canary.bind);
   const result: BasicAudit = Object.create(null) as BasicAudit;
-  for (const key of ["xp_service", "xray_service", "cloudflared_service"]) result[key] = String(records[key]) === "true" ? "true" : "false";
+  for (const key of ["xp_service", "xray_service", "cloudflared_service"]) result[key] = String(explicitBoolean(String(records[key]), key));
   result.cloudflare_ddns_enabled = String(ddnsEnabled);
   result.cloudflare_ddns = String(ddnsOk);
   result.ip_geo_enrichment = String(geoOk);
@@ -678,7 +727,7 @@ export function normalizeBasic(text: string, now = auditNow()): BasicAudit {
   result.node_name_valid = validNodeName(nodeName) ? "true" : "false";
   result.api_host = apiHost;
   result.access_host = accessHost;
-  result.cluster_sync = String(records.sync_node_meta) === "true" ? "true" : "false";
+  result.cluster_sync = String(explicitBoolean(String(records.sync_node_meta), "sync_node_meta"));
   result.tunnel_declaration = declaration;
   result.managed_default_vless = vlessManaged ? "true" : "false";
   result.managed_default_ss2022 = ssManaged ? "true" : "false";
@@ -920,14 +969,27 @@ function isLiteralIp(value: string): boolean {
     return false;
   }
 }
-function cidrContains(address: IpAddress, cidr: string): boolean {
-  const separator = cidr.indexOf("/");
-  const network = parseIp(cidr.slice(0, separator));
-  const prefix = Number(cidr.slice(separator + 1));
+type ParsedCidr = { network: IpAddress; prefix: number };
+
+function parseCidr(cidr: string): ParsedCidr {
+  const match = cidr.match(/^([^/]+)\/([0-9]+)$/);
+  if (!match) fail(`invalid CIDR ${cidr}`);
+  const network = parseIp(match[1]!);
+  const prefix = Number(match[2]);
+  const bits = network.family === 4 ? 32 : 128;
+  if (!Number.isSafeInteger(prefix) || prefix < 0 || prefix > bits) fail(`invalid CIDR ${cidr}`);
+  return { network, prefix };
+}
+
+function cidrContainsParsed(address: IpAddress, { network, prefix }: ParsedCidr): boolean {
   const bits = address.family === 4 ? 32n : 128n;
-  if (network.family !== address.family || !Number.isInteger(prefix) || prefix < 0 || BigInt(prefix) > bits) return false;
+  if (network.family !== address.family) return false;
   const mask = prefix === 0 ? 0n : ((1n << bits) - 1n) ^ ((1n << (bits - BigInt(prefix))) - 1n);
   return (address.value & mask) === (network.value & mask);
+}
+
+function cidrContains(address: IpAddress, cidr: string): boolean {
+  return cidrContainsParsed(address, parseCidr(cidr));
 }
 
 const DENIED_NETWORKS = [
@@ -958,8 +1020,9 @@ export async function validatePublicTarget(target: string, expectedPath: string,
   } catch {
     fail("public target is invalid");
   }
-  if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.search || parsed.hash || parsed.pathname !== expectedPath || !parsed.hostname.includes(".")) fail("public target is unsafe");
   const host = parsed.hostname.toLowerCase();
+  const authority = target.match(/^https:\/\/([^/?#]*)/i)?.[1] ?? "";
+  if (parsed.protocol !== "https:" || parsed.username || parsed.password || authority.includes("@") || parsed.search || parsed.hash || parsed.pathname !== expectedPath || !validHost(host)) fail("public target is unsafe");
   if (isLiteralIp(host)) fail("public target must use a DNS hostname");
   const addresses = await resolver(host);
   if (!addresses.length) fail("public target has no DNS evidence");
@@ -977,7 +1040,8 @@ export function isCloudflareAddress(address: string, rangesText: string): boolea
     const parsed = parseIp(address);
     const ranges = rangesText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
     if (!ranges.length) return false;
-    return ranges.every((range) => range.includes("/")) && ranges.some((range) => cidrContains(parsed, range));
+    const parsedRanges = ranges.map((range) => parseCidr(range));
+    return parsedRanges.some((range) => cidrContainsParsed(parsed, range));
   } catch {
     return false;
   }

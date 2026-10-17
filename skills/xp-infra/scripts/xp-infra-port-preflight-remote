@@ -108,7 +108,7 @@ if [ "$container_count" -eq 1 ]; then
   case "$data_dir" in /*) ;; *) exit 1 ;; esac
   state_path="$data_dir/managed-default-endpoints.json"
   legacy_state_path="$data_dir/container/managed_default_endpoints.json"
-  state_selector=container
+  state_selector=absent
 elif [ "$host_env" = true ]; then
   xray_systemd_unit="$(host_env_value XP_XRAY_SYSTEMD_UNIT)" || exit 1
   xray_openrc_service="$(host_env_value XP_XRAY_OPENRC_SERVICE)" || exit 1
@@ -125,23 +125,53 @@ elif [ "$host_env" = true ]; then
   data_dir="$(normalize_env_value "$data_dir")"
   [ -n "$data_dir" ] || data_dir=/var/lib/xp/data
   case "$data_dir" in /*) ;; *) exit 1 ;; esac
+  bounded_preflight_command sudo -n sh -c 'data_dir=$1; [ -d "$data_dir" ] && [ -r "$data_dir" ] && [ -x "$data_dir" ]' sh "$data_dir" 2>/dev/null || exit 1
   state_path="$data_dir/managed-default-endpoints.json"
   legacy_state_path="$data_dir/container/managed_default_endpoints.json"
-  state_selector="$(bounded_preflight_command sudo -n sh -c 'data_dir=$1; state_path=$2; legacy_state_path=$3; [ -d "$data_dir" ] && [ -r "$data_dir" ] && [ -x "$data_dir" ] || exit 1; if [ -e "$state_path" ]; then printf %s current; elif [ -e "$legacy_state_path" ]; then printf %s legacy; else printf %s absent; fi' sh "$data_dir" "$state_path" "$legacy_state_path" 2>/dev/null)" || exit 1
+  state_selector=absent
 fi
-read_managed_state() {
-  if [ "$container_count" -eq 1 ]; then
-    bounded_preflight_command sudo -n "$docker_path" exec "$container" sh -c 'path=$1; legacy_path=$2; limit=$3; if [ -e "$path" ]; then dd if="$path" bs="$((limit + 1))" count=1 2>/dev/null; elif [ -e "$legacy_path" ]; then dd if="$legacy_path" bs="$((limit + 1))" count=1 2>/dev/null; else printf %s "{}"; fi' sh "$state_path" "$legacy_state_path" "$MAX_PREFLIGHT_STATE_BYTES"
-    return
+state_file_status() {
+  path="$1"
+  if [ -z "$path" ]; then
+    printf %s absent
+  elif [ "$container_count" -eq 1 ]; then
+    bounded_preflight_command sudo -n "$docker_path" exec "$container" sh -c 'path=$1; if [ -e "$path" ]; then [ -r "$path" ] || exit 1; printf %s present; else printf %s absent; fi' sh "$path" 2>/dev/null
+  else
+    bounded_preflight_command sudo -n sh -c 'path=$1; if [ -e "$path" ]; then [ -r "$path" ] || exit 1; printf %s present; else printf %s absent; fi' sh "$path" 2>/dev/null
   fi
-  case "$state_selector" in
-    current) bounded_preflight_command sudo -n dd if="$state_path" bs="$((MAX_PREFLIGHT_STATE_BYTES + 1))" count=1 2>/dev/null ;;
-    legacy) bounded_preflight_command sudo -n dd if="$legacy_state_path" bs="$((MAX_PREFLIGHT_STATE_BYTES + 1))" count=1 2>/dev/null ;;
-    absent) printf %s '{}' ;;
-    *) return 1 ;;
-  esac
 }
-state="$(read_managed_state)" || exit 1
+read_state_file() {
+  path="$1"
+  if [ "$container_count" -eq 1 ]; then
+    bounded_preflight_command sudo -n "$docker_path" exec "$container" dd if="$path" bs="$((MAX_PREFLIGHT_STATE_BYTES + 1))" count=1 2>/dev/null
+  else
+    bounded_preflight_command sudo -n dd if="$path" bs="$((MAX_PREFLIGHT_STATE_BYTES + 1))" count=1 2>/dev/null
+  fi
+}
+state_current='{}'
+state_legacy='{}'
+if [ -n "$state_path" ]; then
+  state_current_status="$(state_file_status "$state_path")" || exit 1
+  state_legacy_status="$(state_file_status "$legacy_state_path")" || exit 1
+  case "$state_current_status:$state_legacy_status" in
+    present:present)
+      state_current="$(read_state_file "$state_path")" || exit 1
+      state_legacy="$(read_state_file "$legacy_state_path")" || exit 1
+      [ "$state_current" = "$state_legacy" ] || exit 1
+      state_selector=current
+      ;;
+    present:absent) state_current="$(read_state_file "$state_path")" || exit 1; state_selector=current ;;
+    absent:present) state_legacy="$(read_state_file "$legacy_state_path")" || exit 1; state_selector=legacy ;;
+    absent:absent) state_selector=absent ;;
+    *) exit 1 ;;
+  esac
+fi
+case "$state_selector" in
+  current) state="$state_current" ;;
+  legacy) state="$state_legacy" ;;
+  absent) state='{}' ;;
+  *) exit 1 ;;
+esac
 case "$xray_api_addr" in
   127.*:*)
     xray_api_host="${xray_api_addr%:*}"
@@ -262,6 +292,14 @@ read_xray_pid() {
     bounded_preflight_command sudo -n sh -c 'if pid_output=$(pidof xray 2>/dev/null); then set -- $pid_output; [ "$#" -eq 1 ] || exit 1; printf %s "$1"; else status=$?; [ "$status" -eq 1 ] || exit "$status"; fi' 2>/dev/null
   fi
 }
+read_xray_starttime() {
+  runtime_pid="$1"
+  if [ -n "$container" ]; then
+    bounded_preflight_command sudo -n "$docker_path" exec "$container" sh -c 'stat_file="/proc/$1/stat"; [ -r "$stat_file" ] || exit 1; line=$(cat "$stat_file") || exit 1; line=${line#*) }; set -- $line; starttime="${20:-}"; case "$starttime" in ""|*[!0-9]*) exit 1 ;; esac; printf %s "$starttime"' sh "$runtime_pid" 2>/dev/null
+  else
+    bounded_preflight_command sudo -n sh -c 'stat_file="/proc/$1/stat"; [ -r "$stat_file" ] || exit 1; line=$(cat "$stat_file") || exit 1; line=${line#*) }; set -- $line; starttime="${20:-}"; case "$starttime" in ""|*[!0-9]*) exit 1 ;; esac; printf %s "$starttime"' sh "$runtime_pid" 2>/dev/null
+  fi
+}
 read_ephemeral_range() {
   if [ -n "$container" ]; then
     bounded_preflight_command sudo -n "$docker_path" exec "$container" sh -c 'sysctl -n net.ipv4.ip_local_port_range 2>/dev/null || cat /proc/sys/net/ipv4/ip_local_port_range' 2>/dev/null
@@ -323,6 +361,7 @@ if [ -n "$container" ]; then
   reserved_ports="$(read_reserved_ports)" || exit 1
   unprivileged_port_start="$(read_unprivileged_port_start)" || exit 1
   xray_runtime_pid="$(read_xray_pid)" || exit 1
+  if [ -n "$xray_runtime_pid" ]; then xray_runtime_starttime="$(read_xray_starttime "$xray_runtime_pid")" || exit 1; else xray_runtime_starttime=""; fi
   xray_api_json="$(read_xray_api)" || exit 1
   if [ -n "$xray_runtime_pid" ]; then
     xray_security="$(read_xray_process_security)" || exit 1
@@ -356,6 +395,7 @@ else
   reserved_ports="$(read_reserved_ports)" || exit 1
   unprivileged_port_start="$(read_unprivileged_port_start)" || exit 1
   xray_runtime_pid="$(read_xray_pid)" || exit 1
+  if [ -n "$xray_runtime_pid" ]; then xray_runtime_starttime="$(read_xray_starttime "$xray_runtime_pid")" || exit 1; else xray_runtime_starttime=""; fi
   xray_api_json="$(read_xray_api)" || exit 1
   if [ -n "$xray_runtime_pid" ]; then
     xray_security="$(read_xray_process_security)" || exit 1
@@ -397,8 +437,6 @@ host_env_status_after="$(bounded_preflight_command sudo -n sh -c 'if [ -e "$1" ]
 if [ "$host_env" = true ]; then
   host_env_snapshot_after="$(bounded_preflight_command sudo -n sh -c 'env_file=$1; [ -r "$env_file" ] || exit 1; cat "$env_file"' sh "$env_file" 2>/dev/null)" || exit 1
   [ "$host_env_snapshot_after" = "$host_env_snapshot" ] || exit 1
-  state_selector_after="$(bounded_preflight_command sudo -n sh -c 'data_dir=$1; state_path=$2; legacy_state_path=$3; [ -d "$data_dir" ] && [ -r "$data_dir" ] && [ -x "$data_dir" ] || exit 1; if [ -e "$state_path" ]; then printf %s current; elif [ -e "$legacy_state_path" ]; then printf %s legacy; else printf %s absent; fi' sh "$data_dir" "$state_path" "$legacy_state_path" 2>/dev/null)" || exit 1
-  [ "$state_selector_after" = "$state_selector" ] || exit 1
 fi
 docker_path_after="$(bounded_preflight_command sudo -n sh -c 'docker_path="$(command -v docker 2>/dev/null || true)"; for candidate in "$docker_path" /usr/bin/docker /usr/local/bin/docker; do if [ -n "$candidate" ] && [ -x "$candidate" ]; then printf %s "$candidate"; exit 0; fi; done; printf %s absent' 2>/dev/null)" || exit 1
 [ "$docker_path_after" = "$docker_path" ] || exit 1
@@ -418,9 +456,26 @@ else
   [ "$containers_after" = "$containers" ] || exit 1
   [ "$container_count_after" = "$container_count" ] || exit 1
 fi
-state_after="$(read_managed_state)" || exit 1
-[ "$(printf '%s' "$state_after" | wc -c | tr -d '[:space:]')" -le "$MAX_PREFLIGHT_STATE_BYTES" ] || exit 1
-[ "$state_after" = "$state" ] || exit 1
+state_current_after='{}'
+state_legacy_after='{}'
+if [ -n "$state_path" ]; then
+  state_current_status_after="$(state_file_status "$state_path")" || exit 1
+  state_legacy_status_after="$(state_file_status "$legacy_state_path")" || exit 1
+  [ "$state_current_status_after:$state_legacy_status_after" = "$state_current_status:$state_legacy_status" ] || exit 1
+  case "$state_current_status_after:$state_legacy_status_after" in
+    present:present)
+      state_current_after="$(read_state_file "$state_path")" || exit 1
+      state_legacy_after="$(read_state_file "$legacy_state_path")" || exit 1
+      [ "$state_current_after" = "$state_legacy_after" ] || exit 1
+      ;;
+    present:absent) state_current_after="$(read_state_file "$state_path")" || exit 1 ;;
+    absent:present) state_legacy_after="$(read_state_file "$legacy_state_path")" || exit 1 ;;
+    absent:absent) ;;
+    *) exit 1 ;;
+  esac
+fi
+[ "$state_current_after" = "$state_current" ] || exit 1
+[ "$state_legacy_after" = "$state_legacy" ] || exit 1
 published_ports_after="$(collect_published_ports)" || exit 1
 [ "$published_ports_after" = "$published_ports" ] || exit 1
 ephemeral_range_after="$(read_ephemeral_range)" || exit 1
@@ -435,6 +490,10 @@ runtime_listeners_after="$(collect_runtime_listeners)" || exit 1
 [ "$runtime_listeners_after" = "$runtime_listeners" ] || exit 1
 xray_runtime_pid_after="$(read_xray_pid)" || exit 1
 [ "$xray_runtime_pid_after" = "$xray_runtime_pid" ] || exit 1
+if [ -n "$xray_runtime_pid" ]; then
+  xray_runtime_starttime_after="$(read_xray_starttime "$xray_runtime_pid_after")" || exit 1
+  [ "$xray_runtime_starttime_after" = "$xray_runtime_starttime" ] || exit 1
+fi
 xray_api_json_after="$(read_xray_api)" || exit 1
 [ "$xray_api_json_after" = "$xray_api_json" ] || exit 1
 if [ -n "$xray_runtime_pid" ]; then

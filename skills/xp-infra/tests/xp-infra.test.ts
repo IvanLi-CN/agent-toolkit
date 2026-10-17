@@ -9,6 +9,8 @@ import {
   parseInventory,
   parseRestrictedYaml,
   parseStrictJson,
+  parseTimestamp,
+  isCloudflareAddress,
   validatePolicyDocument,
   validatePublicTarget,
 } from "../scripts/xp-infra-core.ts";
@@ -98,15 +100,36 @@ test("rejects duplicate, incomplete, and broadened YAML policy constructs", () =
   expect(() => parseRestrictedYaml("node_overrides: &defaults {}\n")).toThrow("unsupported YAML construct");
   expect(() => parseRestrictedYaml("---\nschema_version: 1\n")).toThrow("unsupported YAML document");
   expect(() => validatePolicyDocument(parseRestrictedYaml(POLICY_TEXT.replace("owner_confirmed: true", "owner_confirmed: false")), ["fixture-node"])).toThrow("owner_confirmed must be true");
+  expect(() => validatePolicyDocument(parseRestrictedYaml(POLICY_TEXT.replace("node_overrides: {}", "node_overrides:")), ["fixture-node"])).toThrow("node_overrides must be a mapping");
   expect(() => parseInventory("fixture-node\nfixture-node\n")).toThrow("duplicate");
 });
 
 test("rejects duplicate JSON members and malformed normalized observations", () => {
   expect(() => parseStrictJson('{"status":"ok","status":"bad"}', "health_json")).toThrow("duplicate");
+  expect(() => parseStrictJson('{"status":\u00a0"ok"}', "health_json")).toThrow("invalid");
+  expect(() => parseStrictJson('{"status":"ok"}\u00a0', "health_json")).toThrow("invalid");
   expect(() => normalizePublicHealth('{"status":"ok","xray":{"status":"up"},"xray":{"status":"down"}}')).toThrow("duplicate");
   expect(() => normalizeBasic(validBasicRecords().replace("ddns_enabled=true", "ddns_enabled=maybe"), new Date("2025-01-01T00:00:00Z"))).toThrow("ddns_enabled is invalid");
   expect(() => normalizeBasic(validBasicRecords().replace("xray_public_ports=443", "xray_public_ports=443,443"), new Date("2025-01-01T00:00:00Z"))).toThrow("duplicates");
   expect(() => normalizeBasic(validBasicRecords().replace("runtime_mode=host", "runtime_mode=container"), new Date("2025-01-01T00:00:00Z"))).toThrow("container_identity");
+});
+
+test("rejects partial, normalized, and injected timestamps while preserving missing values", () => {
+  expect(parseTimestamp("1")).toBeUndefined();
+  expect(parseTimestamp("2025-01")).toBeUndefined();
+  expect(parseTimestamp("2025-02-30")).toBeUndefined();
+  expect(parseTimestamp("2025-01-01$(id)")).toBeUndefined();
+  expect(parseTimestamp("2025-01-01T00:00:00.000000000Z")).toEqual(new Date("2025-01-01T00:00:00Z"));
+  expect(() => normalizeBasic(validBasicRecords().replace("2024-12-31T23:59:30Z", "1"), new Date("2025-01-01T00:00:00Z"))).toThrow("last_sync_at is invalid");
+  expect(() => normalizeBasic(validBasicRecords().replace("2025-02-01T00:00:00Z", "2025-02-30"), new Date("2025-01-01T00:00:00Z"))).toThrow("cert_not_after is invalid");
+  const containerRecords = validBasicRecords()
+    .replace("runtime_mode=host", "runtime_mode=container")
+    .replace("container_identity=", "container_identity=" + "a".repeat(64))
+    .replace("container_started_at=", "container_started_at=2025-01-01$(id)")
+    .replace("host_xray_pid=123\n", "host_xray_pid=\n")
+    .replace("host_xray_starttime=456\n", "host_xray_starttime=\n")
+    .replace("container_xray_token=\n", "container_xray_token=123:456\n");
+  expect(() => normalizeBasic(containerRecords, new Date("2025-01-01T00:00:00Z"))).toThrow("container_started_at is invalid");
 });
 
 test("normalizes a valid observation without reading secrets", () => {
@@ -128,6 +151,10 @@ test("normalizes public health without accepting duplicate JSON members", () => 
     public_health: "false",
     public_health_json_ok: "false",
   });
+  expect(normalizePublicHealth(JSON.stringify({ status: "ok", xray: { status: "down" } }))).toEqual({
+    public_health: "false",
+    public_health_json_ok: "true",
+  });
 });
 
 test("accepts exactly one expected compose image and ignores only blank lines", () => {
@@ -147,6 +174,18 @@ test("validates public targets against injected DNS evidence", async () => {
   await expect(validatePublicTarget("https://127.0.0.1/api/health", "/api/health", resolver)).rejects.toThrow("DNS hostname");
   await expect(validatePublicTarget("https://api.example.test/api/health", "/api/health", async () => [{ address: "192.0.2.10", family: 4 }])).rejects.toThrow("non-public");
   await expect(validatePublicTarget("https://api.example.test/api/health?redirect=1", "/api/health", resolver)).rejects.toThrow("unsafe");
+  await expect(validatePublicTarget("https://:@api.example.test/api/health", "/api/health", resolver)).rejects.toThrow("unsafe");
+  await expect(validatePublicTarget("https://a..example.com/api/health", "/api/health", resolver)).rejects.toThrow("unsafe");
+});
+
+test("validates every Cloudflare CIDR before matching", () => {
+  expect(isCloudflareAddress("93.184.216.34", "93.184.216.0/24\nnot-a-cidr/garbage\n")).toBe(false);
+  expect(isCloudflareAddress("93.184.216.34", "93.184.216.0/24\n93.184.217.0/24\n")).toBe(true);
+});
+
+test("rejects non-boolean service and sync records", () => {
+  expect(() => normalizeBasic(validBasicRecords().replace("xp_service=true", "xp_service=maybe"), new Date("2025-01-01T00:00:00Z"))).toThrow("xp_service is invalid");
+  expect(() => normalizeBasic(validBasicRecords().replace("sync_node_meta=true", "sync_node_meta=maybe"), new Date("2025-01-01T00:00:00Z"))).toThrow("sync_node_meta is invalid");
 });
 
 test("interprets managed and bootstrap VLESS preflight records deterministically", () => {

@@ -3,7 +3,7 @@
 import { isExactComposeImage } from "./xp-infra-core.ts";
 
 export function main(args: string[] = Bun.argv.slice(2), input = ""): number {
-  if (args.length !== 1) {
+  if (args.length !== 1 || !args[0]) {
     console.error("usage: xp-infra-compose-image-check EXPECTED_IMAGE");
     return 2;
   }
@@ -11,5 +11,6 @@ export function main(args: string[] = Bun.argv.slice(2), input = ""): number {
 }
 
 if (import.meta.main) {
-  process.exitCode = main(Bun.argv.slice(2), await Bun.stdin.text());
+  const args = Bun.argv.slice(2);
+  process.exitCode = main(args, args.length === 1 && Boolean(args[0]) ? await Bun.stdin.text() : "");
 }

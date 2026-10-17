@@ -34,6 +34,7 @@ class NativeCommands extends CommandRunner {
   proxyAllowed = true;
   imageAvailable = true;
   imageType = "virtual-machine";
+  guestToolsAvailable = true;
   onWait: ((name: string, condition: string) => void) | undefined;
   onStart: ((name: string) => void) | undefined;
   onConfigSet: ((name: string, key: string, value: string) => void) | undefined;
@@ -175,6 +176,10 @@ class NativeCommands extends CommandRunner {
     const joined = guestArgs.join(" ");
     if (joined.includes("ssh_host_ed25519_key.pub")) return result(["incus", ...command], KEY);
     if (guestArgs[0] === "cat" && guestArgs[1] === "/proc/sys/kernel/random/boot_id") return result(["incus", ...command], instance.boot_id);
+    if (guestArgs[0] === "sh" && joined.includes("command -v")) {
+      if (!this.guestToolsAvailable) throw new ControlError("command_failed", "required guest tool is missing", { returncode: 127, stderr: "bun: command not found" });
+      return result(["incus", ...command]);
+    }
     if (guestArgs[0] === "bun") return result(["incus", ...command], { virtual_bytes: instance.guest_disk_bytes, filesystem_before: instance.guest_disk_bytes - 1024, filesystem_bytes: instance.guest_disk_bytes, filesystem: "ext4" });
     return result(["incus", ...command]);
   }
@@ -259,6 +264,15 @@ test("loads Bun as the managed guest prerequisite", () => {
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("rejects invalid identity, protocol, action and generation before native writes", async () => {
+  const f = fixture();
+  await expectCode(f.control.dispatch({ protocol: 3, action: "acquire", session_id: "thread-a", generation: 0, operation_id: "old-protocol", public_key: KEY }), "protocol_mismatch");
+  await expectCode(f.control.dispatch({ protocol: PROTOCOL_VERSION, action: "status" }), "invalid_request");
+  await expectCode(f.control.dispatch({ protocol: PROTOCOL_VERSION, action: "not-an-action", session_id: "thread-a" }), "unknown_action");
+  await expectCode(f.control.dispatch({ protocol: PROTOCOL_VERSION, action: "acquire", session_id: "thread-a", generation: 1, operation_id: "wrong-generation", public_key: KEY }), "generation_mismatch");
+  expect(f.runner.calls).toHaveLength(0);
+});
+
 test("keeps SQLite integer reservations exact beyond the JS safe range", () => {
   const root = mkdtempSync("/tmp/agent-vm-sqlite-test-");
   const store = new StateStore(join(root, "state.sqlite3"));
@@ -269,6 +283,31 @@ test("keeps SQLite integer reservations exact beyond the JS safe range", () => {
     expect(typeof task?.reservation_bytes).toBe("bigint");
     expect(task?.reservation_bytes).toBe(exact);
   } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("replays an accepted persisted operation without changing its digest or native state", async () => {
+  const root = mkdtempSync("/tmp/agent-vm-baseline-test-");
+  const dbPath = join(root, "state.sqlite3");
+  const store = new StateStore(dbPath);
+  const digest = "c3dccc911349ced563eb9615fb6db8ffa5801d121c9542c29c5a3fc0575a768a";
+  const response = {
+    ok: true, protocol: PROTOCOL_VERSION, server_time: "2026-10-04T00:00:00+00:00", action: "acquire", session_id: "legacy",
+    generation: 0, operation_id: "legacy-op", outcome: "success", result: { state: "active" }, _request_digest: digest,
+  };
+  (store.db as any).run("INSERT INTO operations(operation_id, action, session_id, generation, response_json, created_at) VALUES (?, ?, ?, ?, ?, ?)", "legacy-op", "acquire", "legacy", 0, JSON.stringify(response), "2026-10-04T00:00:00+00:00");
+  const runner = new NativeCommands();
+  const control = new Control({ state_db: dbPath, timer_dir: root }, { store, runner });
+  try {
+    const replay = await control.dispatch({ protocol: PROTOCOL_VERSION, action: "acquire", session_id: "legacy", generation: 0, operation_id: "legacy-op", public_key: KEY });
+    expect(replay.outcome).toBe("replayed");
+    expect(replay.result).toEqual({ state: "active" });
+    expect(runner.calls).toHaveLength(0);
+    await expectCode(control.dispatch({ protocol: PROTOCOL_VERSION, action: "acquire", session_id: "legacy", generation: 0, operation_id: "legacy-op", public_key: `${KEY} conflict` }), "operation_conflict");
+    expect(JSON.parse(String((store.db.query("SELECT response_json FROM operations WHERE operation_id = ?") as any).get("legacy-op").response_json))._request_digest).toBe(digest);
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("keeps bounded output and reaps a timed out process group", async () => {
@@ -314,6 +353,29 @@ test("acquire is idempotent and binds Bun guest growth to the allocated generati
   expect(replay.outcome).toBe("replayed");
   expect(replay.result.lease_expires_at).toBe(first.lease_expires_at);
   expect(f.runner.calls.filter(({ args }) => args[3] === "init")).toHaveLength(1);
+});
+
+test("missing guest Bun fails before guest writes", async () => {
+  const f = fixture();
+  f.runner.guestToolsAvailable = false;
+  await expectCode(f.call("acquire", { public_key: KEY }, "op-missing-bun"), "command_failed");
+  expect(f.runner.calls.some(({ args }) => args.some((arg) => arg.includes("command -v")))).toBe(true);
+  expect(f.runner.calls.some(({ args }) => args.includes("authorized_keys"))).toBe(false);
+  expect(f.runner.calls.some(({ args }) => args[0] === "incus" && args.includes("bun"))).toBe(false);
+});
+
+test("partial live-memory failure keeps conservative allocation and no restart fallback", async () => {
+  const f = fixture();
+  await f.call("acquire", { public_key: KEY }, "op-partial-create");
+  f.runner.onConfigSet = () => { throw new ControlError("command_timeout", "uncertain native memory update"); };
+  const resizeStart = f.runner.calls.length;
+  await expectCode(f.call("resize", { memory_mib: 2048, live_memory: true }, "op-partial-memory"), "resize_partial");
+  const status = await f.call("status");
+  expect(status.state).toBe("active");
+  expect(status.effective_lease).toBe(true);
+  expect(status.resources.memory_mib).toBe(4096);
+  expect(status.last_error.error.code).toBe("command_timeout");
+  expect(f.runner.calls.slice(resizeStart).some(({ args }) => ["start", "stop", "delete"].includes(args[3] ?? ""))).toBe(false);
 });
 
 test("release caches the VM and reacquire advances the generation without renewing the lease", async () => {

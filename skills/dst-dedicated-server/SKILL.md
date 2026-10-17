@@ -13,6 +13,7 @@ Use this Skill for a configured server whose SSH alias, user and local client di
 - `DST_USER` is the remote operator account.
 - `DST_LOCAL_DIR` is the optional local client data directory.
 - `DST_CLUSTER` selects the cluster on the remote host.
+- The local CLI uses the Bun installed on the host. Remote collection keeps its native Shell boundary and does not require Bun on the game server.
 
 Set these values outside tracked files or pass them to the scripts. Missing host configuration fails closed; do not guess an address or path.
 
@@ -22,16 +23,18 @@ Treat cluster tokens, server tokens, passwords and provider credentials as secre
 
 ## Workflow
 
-1. Run `scripts/dst_snapshot.sh --host "$DST_HOST" --user "$DST_USER" --local-dir "$DST_LOCAL_DIR"`.
+1. Run `bun scripts/dst_snapshot.ts --host "$DST_HOST" --user "$DST_USER" --local-dir "$DST_LOCAL_DIR"`.
 2. Classify the failure as master, caves, shared configuration, binary/runtime or mod related.
 3. Read the remote runbook and log paths discovered by the snapshot; redact before sharing.
 4. Make one minimal authorized change and verify that the affected shard stays ready for several minutes.
 
-`scripts/dst_mods_from_modoverrides.sh` reads only shard `modoverrides.lua` and prints Workshop IDs plus enabled state; it does not read cluster secrets.
+`bun scripts/dst_mods_from_modoverrides.ts` reads only shard `modoverrides.lua` through the remote Shell collector and prints Workshop IDs plus enabled state; it does not read cluster secrets or execute Lua.
 
 ## References
 
 - `references/environment.md`: required external configuration and secret boundary.
 - `references/dst-paths.md`: layout checklist with placeholders.
-- `scripts/dst_snapshot.sh`: redacted baseline collection.
-- `scripts/dst_mods_from_modoverrides.sh`: safe mod summary.
+- `scripts/dst_snapshot.ts`: local options, filesystem reads, bounded report composition, and remote SSH orchestration.
+- `scripts/dst_snapshot_remote.sh`: native commands executed on the remote host for the redacted baseline.
+- `scripts/dst_mods_from_modoverrides.ts`: local safe parser, summaries, and shard comparison.
+- `scripts/dst_mods_remote_collect.sh`: remote byte collection of `modoverrides.lua` only.

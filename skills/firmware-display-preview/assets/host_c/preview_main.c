@@ -5,7 +5,7 @@
 // - Call render_scene() (from scene.c)
 // - Dump the firmware framebuffer to framebuffer.bin
 //
-// Then run fb_to_png.py to convert framebuffer.bin -> preview.png.
+// Then run fb_to_png.ts with Bun to convert framebuffer.bin -> preview.png.
 
 #include <stddef.h>
 #include <stdint.h>

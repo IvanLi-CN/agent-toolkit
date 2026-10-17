@@ -49,6 +49,14 @@ class SessionContractTests(unittest.TestCase):
         command = run_command.call_args.args[0]
         self.assertEqual(command[-2:], ["--session-id", "explicit"])
 
+    def test_control_uses_bun_for_the_remote_controller(self):
+        response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "status", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "result": {}}
+        process = CLI.subprocess.CompletedProcess([], 0, CLI.json.dumps(response).encode(), b"")
+        with mock.patch.object(CLI.subprocess, "run", return_value=process) as run:
+            CLI.control_request("status", session="thread")
+        remote = run.call_args.args[0][-1]
+        self.assertEqual(remote, "bun /opt/agent-vm-native/agent_vm_control.ts")
+
 
 if __name__ == "__main__":
     unittest.main()

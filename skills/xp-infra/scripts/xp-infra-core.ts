@@ -70,36 +70,174 @@ function stripYamlComment(line: string): string {
   return line;
 }
 
+function parseYamlInteger(value: string, lineNumber: number): number | undefined {
+  const normalized = value.replaceAll("_", "");
+  const sign = normalized.startsWith("-") ? -1 : 1;
+  const unsigned = /^[+-]/.test(normalized) ? normalized.slice(1) : normalized;
+  let parsed: number | undefined;
+  if (/^0x[0-9a-f]+$/i.test(unsigned)) {
+    parsed = sign * Number.parseInt(unsigned.slice(2), 16);
+  } else if (/^0b[01]+$/i.test(unsigned)) {
+    parsed = sign * Number.parseInt(unsigned.slice(2), 2);
+  } else if (/^0[0-7]*$/.test(unsigned)) {
+    parsed = sign * Number.parseInt(unsigned, 8);
+  } else if (/^[1-9][0-9]*$/.test(unsigned) || unsigned === "0") {
+    parsed = sign * Number(unsigned);
+  } else if (/^[0-9][0-9,]*[0-9]$/.test(unsigned) && unsigned.includes(",")) {
+    parsed = sign * Number(unsigned.replaceAll(",", ""));
+  } else if (/^[0-9]+(?::[0-9]+)+$/.test(unsigned)) {
+    const parts = unsigned.split(":");
+    if (parts.slice(1).every((part) => Number(part) >= 0 && Number(part) < 60)) {
+      parsed = sign * parts.reduce((total, part) => total * 60 + Number(part), 0);
+    }
+  }
+  if (parsed === undefined) return undefined;
+  if (!Number.isSafeInteger(parsed)) fail(`YAML integer is out of range at line ${lineNumber}`);
+  return parsed;
+}
+
+function parseYamlFloat(value: string): number | undefined {
+  const normalized = value.replaceAll("_", "");
+  if (/^[+-]?\.inf$/i.test(normalized)) return normalized.startsWith("-") ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY;
+  if (/^\.nan$/i.test(normalized)) return Number.NaN;
+  if (!/^[+-]?(?:[0-9]+\.[0-9]*|\.[0-9]+)$/.test(normalized) && !/^[+-]?[0-9]+\.[0-9]+[eE][+-]?[0-9]+$/.test(normalized)) return undefined;
+  return Number(normalized);
+}
+
+function parseYamlDoubleQuoted(value: string, lineNumber: number): string {
+  if (!value.endsWith('"') || value.length < 2) fail(`invalid double-quoted YAML scalar at line ${lineNumber}`);
+  let result = "";
+  for (let index = 1; index < value.length - 1; index += 1) {
+    const character = value[index];
+    if (character !== "\\") {
+      result += character;
+      continue;
+    }
+    const escape = value[++index];
+    if (escape === undefined) fail(`invalid double-quoted YAML scalar at line ${lineNumber}`);
+    const simpleEscapes: Record<string, string> = {
+      "0": "\0", a: "\x07", b: "\b", t: "\t", n: "\n", v: "\v", f: "\f", r: "\r", e: "\x1b",
+      " ": " ", '"': '"', "/": "/", "\\": "\\", N: "\u0085", _: "\u00a0", L: "\u2028", P: "\u2029",
+    };
+    if (escape in simpleEscapes) {
+      result += simpleEscapes[escape]!;
+      continue;
+    }
+    const width = escape === "x" ? 2 : escape === "u" ? 4 : escape === "U" ? 8 : 0;
+    if (!width) fail(`invalid double-quoted YAML escape at line ${lineNumber}`);
+    const digits = value.slice(index + 1, index + 1 + width);
+    if (digits.length !== width || !new RegExp(`^[0-9a-fA-F]{${width}}$`).test(digits)) {
+      fail(`invalid double-quoted YAML escape at line ${lineNumber}`);
+    }
+    const codePoint = Number.parseInt(digits, 16);
+    if (codePoint > 0x10ffff) fail(`invalid double-quoted YAML escape at line ${lineNumber}`);
+    result += String.fromCodePoint(codePoint);
+    index += width;
+  }
+  return result;
+}
+
+function splitFlowMapping(text: string, lineNumber: number): string[] {
+  if (!text.startsWith("{") || !text.endsWith("}")) fail(`invalid YAML flow mapping at line ${lineNumber}`);
+  const inner = text.slice(1, -1).trim();
+  if (!inner) return [];
+  const entries: string[] = [];
+  let start = 0;
+  let quote: "'" | '"' | null = null;
+  let depth = 0;
+  for (let index = 0; index < inner.length; index += 1) {
+    const character = inner[index];
+    if (quote === "'") {
+      if (character === "'" && inner[index + 1] === "'") index += 1;
+      else if (character === "'") quote = null;
+      continue;
+    }
+    if (quote === '"') {
+      if (character === "\\") index += 1;
+      else if (character === '"') quote = null;
+      continue;
+    }
+    if (character === "'" || character === '"') quote = character;
+    else if (character === "{" || character === "[") depth += 1;
+    else if (character === "}" || character === "]") {
+      depth -= 1;
+      if (depth < 0) fail(`invalid YAML flow mapping at line ${lineNumber}`);
+    } else if (character === "," && depth === 0) {
+      const entry = inner.slice(start, index).trim();
+      if (!entry) fail(`invalid YAML flow mapping at line ${lineNumber}`);
+      entries.push(entry);
+      start = index + 1;
+    }
+  }
+  if (quote !== null || depth !== 0) fail(`invalid YAML flow mapping at line ${lineNumber}`);
+  const finalEntry = inner.slice(start).trim();
+  if (!finalEntry) fail(`invalid YAML flow mapping at line ${lineNumber}`);
+  entries.push(finalEntry);
+  return entries;
+}
+
+function flowMappingColon(entry: string, lineNumber: number): number {
+  let quote: "'" | '"' | null = null;
+  let depth = 0;
+  for (let index = 0; index < entry.length; index += 1) {
+    const character = entry[index];
+    if (quote === "'") {
+      if (character === "'" && entry[index + 1] === "'") index += 1;
+      else if (character === "'") quote = null;
+      continue;
+    }
+    if (quote === '"') {
+      if (character === "\\") index += 1;
+      else if (character === '"') quote = null;
+      continue;
+    }
+    if (character === "'" || character === '"') quote = character;
+    else if (character === "{" || character === "[") depth += 1;
+    else if (character === "}" || character === "]") depth -= 1;
+    else if (character === ":" && depth === 0) return index;
+  }
+  fail(`invalid YAML flow mapping at line ${lineNumber}`);
+}
+
+function parseFlowMapping(text: string, lineNumber: number): JsonRecord {
+  const result = Object.create(null) as JsonRecord;
+  for (const entry of splitFlowMapping(text, lineNumber)) {
+    const separator = flowMappingColon(entry, lineNumber);
+    const rawKey = entry.slice(0, separator).trim();
+    const key = rawKey.startsWith('"') ? parseYamlDoubleQuoted(rawKey, lineNumber) : rawKey.startsWith("'") ? parseYamlScalar(rawKey, lineNumber) : rawKey;
+    if (typeof key !== "string" || !/^[A-Za-z_][A-Za-z0-9_-]*$/.test(key)) fail(`invalid YAML mapping key at line ${lineNumber}`);
+    if (hasOwn(result, key)) fail(`duplicate YAML key ${key}`);
+    const rawValue = entry.slice(separator + 1).trim();
+    result[key] = rawValue ? parseYamlScalar(rawValue, lineNumber) : null;
+  }
+  return result;
+}
+
 function parseYamlScalar(rawValue: string, lineNumber: number): unknown {
   const value = rawValue.trim();
   if (!value) return Object.create(null) as JsonRecord;
-  if (value === "{}") return Object.create(null) as JsonRecord;
+  if (value.startsWith("{")) return parseFlowMapping(value, lineNumber);
   if (value === "[]") return [];
-  if (value.startsWith("[") || value.startsWith("{") || value.endsWith(",")) {
+  if (value.startsWith("[") || value.endsWith(",")) {
     fail(`unsupported YAML collection at line ${lineNumber}`);
   }
   if (/^(?:---|\.\.\.)$/.test(value) || /^[&*!%@`]/.test(value)) {
     fail(`unsupported YAML construct at line ${lineNumber}`);
   }
-  if (value === "true") return true;
-  if (value === "false") return false;
-  if (/^-?(?:0|[1-9][0-9]*)$/.test(value)) {
-    const number = Number(value);
-    if (!Number.isSafeInteger(number)) fail(`YAML integer is out of range at line ${lineNumber}`);
-    return number;
-  }
-  if (value === "null" || value === "~") return null;
+  const normalized = value.toLowerCase();
+  if (["true", "yes", "on"].includes(normalized)) return true;
+  if (["false", "no", "off"].includes(normalized)) return false;
+  if (normalized === "null" || value === "~") return null;
+  const integer = parseYamlInteger(value, lineNumber);
+  if (integer !== undefined) return integer;
+  const float = parseYamlFloat(value);
+  if (float !== undefined) return float;
   if (value.startsWith("'")) {
     if (!value.endsWith("'") || value.length < 2) fail(`invalid single-quoted YAML scalar at line ${lineNumber}`);
     return value.slice(1, -1).replaceAll("''", "'");
   }
   if (value.startsWith('"')) {
-    if (!value.endsWith('"')) fail(`invalid double-quoted YAML scalar at line ${lineNumber}`);
-    try {
-      return JSON.parse(value) as string;
-    } catch {
-      fail(`invalid double-quoted YAML scalar at line ${lineNumber}`);
-    }
+    return parseYamlDoubleQuoted(value, lineNumber);
   }
   if (value.includes("\n") || value.startsWith("|") || value.startsWith(">")) {
     fail(`unsupported YAML scalar at line ${lineNumber}`);
@@ -117,23 +255,99 @@ function parseYamlEntry(line: YamlLine): { key: string; value: string } {
   return { key, value: line.content.slice(separator + 1) };
 }
 
+type YamlBlockScalar = { value: string; nextIndex: number };
+
+function parseYamlBlockScalar(
+  rawLines: readonly string[],
+  startIndex: number,
+  parentIndent: number,
+  style: "|" | ">",
+  chomping: "" | "+" | "-",
+  indentIndicator: number | undefined,
+  lineNumber: number,
+): YamlBlockScalar {
+  const body: string[] = [];
+  let contentIndent = indentIndicator === undefined ? undefined : parentIndent + indentIndicator;
+  let cursor = startIndex;
+  while (cursor < rawLines.length) {
+    const rawLine = rawLines[cursor] ?? "";
+    if (rawLine.includes("\0") || rawLine.includes("\t")) fail(`invalid YAML whitespace at line ${cursor + 1}`);
+    const leading = rawLine.length - rawLine.trimStart().length;
+    const blank = rawLine.trim() === "";
+    if (!blank && leading <= parentIndent) break;
+    if (!blank && contentIndent === undefined) contentIndent = leading;
+    if (!blank && contentIndent !== undefined && leading < contentIndent) {
+      fail(`invalid YAML block scalar indentation at line ${lineNumber}`);
+    }
+    body.push(rawLine);
+    cursor += 1;
+  }
+  if (contentIndent === undefined || body.every((line) => line.trim() === "")) {
+    return { value: "", nextIndex: cursor };
+  }
+
+  const normalized = body.map((line) => {
+    if (line.trim() === "") return "";
+    const leading = line.length - line.trimStart().length;
+    return line.slice(Math.min(contentIndent!, leading));
+  });
+  let value = "";
+  for (const [index, line] of normalized.entries()) {
+    if (index === 0) {
+      value = line;
+      continue;
+    }
+    const previous = normalized[index - 1] ?? "";
+    if (style === "|" || line === "" || previous === "" || line.startsWith(" ") || previous.startsWith(" ")) {
+      value += "\n" + line;
+    } else {
+      value += " " + line;
+    }
+  }
+  if (normalized.length > 0) value += "\n";
+  if (chomping === "-") value = value.replace(/\n+$/, "");
+  else if (chomping === "") value = value.replace(/\n+$/, "") + "\n";
+  return { value, nextIndex: cursor };
+}
+
 /**
- * Parse the deliberately small policy dialect. The policy has no sequences,
- * anchors, tags, aliases or multi-document stream, so accepting those would
- * silently widen the contract that the former safe YAML loader enforced.
+ * Parse the deliberately small policy dialect. The policy supports mappings,
+ * safe flow mappings, and string block scalars. It has no sequences, anchors,
+ * tags, aliases or multi-document stream, so accepting those would silently
+ * widen the contract that the former safe YAML loader enforced.
  */
 export function parseRestrictedYaml(text: string): unknown {
   if (text.length > 65536) fail("deployment policy is too large");
   const lines: YamlLine[] = [];
-  for (const [index, rawLine] of text.replaceAll("\r\n", "\n").replaceAll("\r", "\n").split("\n").entries()) {
+  const rawLines = text.replaceAll("\r\n", "\n").replaceAll("\r", "\n").split("\n");
+  for (let index = 0; index < rawLines.length; index += 1) {
+    const rawLine = rawLines[index] ?? "";
     if (rawLine.includes("\0") || rawLine.includes("\t")) fail(`invalid YAML whitespace at line ${index + 1}`);
     const withoutComment = stripYamlComment(rawLine);
     if (!withoutComment.trim()) continue;
     const indent = withoutComment.length - withoutComment.trimStart().length;
-    if (indent % 2 !== 0) fail(`YAML indentation must use pairs of spaces at line ${index + 1}`);
     const content = withoutComment.trim();
     if (content === "---" || content === "..." || content.startsWith("- ") || content === "-") {
       fail(`unsupported YAML document or sequence at line ${index + 1}`);
+    }
+    const blockHeader = content.match(/^([A-Za-z_][A-Za-z0-9_-]*):[ ]*([|>][0-9+-]*)$/);
+    if (blockHeader) {
+      const header = blockHeader[2]!;
+      let chomping: "" | "+" | "-" = "";
+      let indentIndicator: number | undefined;
+      for (const indicator of header.slice(1)) {
+        if (indicator === "+" || indicator === "-") {
+          if (chomping !== "") fail(`invalid YAML block scalar header at line ${index + 1}`);
+          chomping = indicator;
+        } else {
+          if (indentIndicator !== undefined || indicator === "0") fail(`invalid YAML block scalar header at line ${index + 1}`);
+          indentIndicator = Number(indicator);
+        }
+      }
+      const block = parseYamlBlockScalar(rawLines, index + 1, indent, header[0] as "|" | ">", chomping, indentIndicator, index + 1);
+      lines.push({ lineNumber: index + 1, indent, content: blockHeader[1] + ": " + JSON.stringify(block.value) });
+      index = block.nextIndex - 1;
+      continue;
     }
     lines.push({ lineNumber: index + 1, indent, content });
   }
@@ -479,8 +693,13 @@ function validCalendarDate(year: number, month: number, day: number): boolean {
   return candidate.getUTCFullYear() === year && candidate.getUTCMonth() === month - 1 && candidate.getUTCDate() === day;
 }
 
-const TIMESTAMP_DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})(?:(?:[Tt ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:[ \t]*(?:[Zz]|[+-]\d{2}:?\d{2}))?)?)?$/;
-const TIMESTAMP_SLASH_DATE_PATTERN = /^(\d{4})\/(\d{1,2})\/(\d{1,2})(?:(?:[Tt ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:[ \t]*(?:[Zz]|[+-]\d{2}:?\d{2}))?)?)?$/;
+const TIMESTAMP_DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})(?:[Tt ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?(?:[ \t]*(Z|[+-]\d{2}:?\d{2}))?)?$/;
+const TIMESTAMP_SLASH_DATE_PATTERN = /^(\d{4})\/(\d{1,2})\/(\d{1,2})(?:[Tt ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?(?:[ \t]*(Z|[+-]\d{2}:?\d{2}))?)?$/;
+const TIMESTAMP_WEEKDAY_PREFIX = "(?:(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat)[, ]+)?";
+const TIMESTAMP_ZONE = "(?:Z|UTC|GMT|UT|GMT[+-]\\d{4}|[+-]\\d{2}:?\\d{2}|[A-Z]{1,5})";
+const TIMESTAMP_NAMED_MONTH_FIRST = new RegExp(`^${TIMESTAMP_WEEKDAY_PREFIX}([A-Za-z]{3,9})[ ,]+(\\d{1,2})[ ,]+(\\d{4})(?:[ \\t]+(\\d{1,2}):(\\d{2})(?::(\\d{2})(?:\\.\\d{1,9})?)?(?:[ \\t]*(${TIMESTAMP_ZONE}))?(?:[ \\t]+\\([A-Za-z][A-Za-z ]*\\))?)?$`);
+const TIMESTAMP_NAMED_DAY_FIRST = new RegExp(`^${TIMESTAMP_WEEKDAY_PREFIX}(\\d{1,2})[ -]+([A-Za-z]{3,9})[ -]+(\\d{4})(?:[ \\t]+(\\d{1,2}):(\\d{2})(?::(\\d{2})(?:\\.\\d{1,9})?)?(?:[ \\t]*(${TIMESTAMP_ZONE}))?(?:[ \\t]+\\([A-Za-z][A-Za-z ]*\\))?)?$`);
+const TIMESTAMP_OPENSSL = new RegExp(`^${TIMESTAMP_WEEKDAY_PREFIX}([A-Za-z]{3,9})[ \\t]+(\\d{1,2})[ \\t]+(\\d{2}):(\\d{2})(?::(\\d{2})(?:\\.\\d{1,9})?)?[ \\t]+(\\d{4})(?:[ \\t]+(${TIMESTAMP_ZONE}))?(?:[ \\t]+\\([A-Za-z][A-Za-z ]*\\))?$`);
 const TIMESTAMP_MONTHS: Record<string, number> = {
   jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6,
   jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
@@ -534,6 +753,26 @@ function parseCompactNumericTimestamp(text: string): Date | undefined {
   }
 }
 
+function validTimestampClock(hour: string | undefined, minute: string | undefined, second: string | undefined): boolean {
+  if (hour === undefined) return minute === undefined && second === undefined;
+  const hourValue = Number(hour);
+  const minuteValue = Number(minute ?? 0);
+  const secondValue = Number(second ?? 0);
+  return Number.isInteger(hourValue) && Number.isInteger(minuteValue) && Number.isInteger(secondValue)
+    && hourValue >= 0 && hourValue <= 23
+    && minuteValue >= 0 && minuteValue <= 59
+    && secondValue >= 0 && secondValue <= 59;
+}
+
+function validTimestampZone(zone: string | undefined): boolean {
+  if (!zone || /^(?:Z|UTC|GMT|UT)$/i.test(zone) || /^[A-Z]{1,5}$/.test(zone)) return true;
+  const offset = zone.match(/^(?:GMT)?([+-])(\d{2}):?(\d{2})$/i);
+  if (!offset) return false;
+  const hour = Number(offset[2]);
+  const minute = Number(offset[3]);
+  return hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59;
+}
+
 export function parseTimestamp(value: unknown): Date | undefined {
   if (typeof value !== "string") return undefined;
   const text = value.trim();
@@ -546,19 +785,50 @@ export function parseTimestamp(value: unknown): Date | undefined {
     const year = Number(dateMatch[1]);
     const month = Number(dateMatch[2]);
     const day = Number(dateMatch[3]);
-    if (!validCalendarDate(year, month, day)) return undefined;
+    if (!validCalendarDate(year, month, day) || !validTimestampClock(dateMatch[4], dateMatch[5], dateMatch[6]) || !validTimestampZone(dateMatch[7])) return undefined;
   } else if (/^\d{4}[-/]/.test(text)) {
     return undefined;
   } else {
-    const monthFirst = text.match(/^([A-Za-z]{3,9})[ ,]+(\d{1,2})[ ,]+(\d{4})(?:\b|$)/);
-    const dayFirst = text.match(/^(\d{1,2})[ -]+([A-Za-z]{3,9})[ -]+(\d{4})(?:\b|$)/);
-    const named = monthFirst ? [monthFirst[1], monthFirst[2], monthFirst[3]] : dayFirst ? [dayFirst[2], dayFirst[1], dayFirst[3]] : undefined;
-    if (named) {
-      const month = TIMESTAMP_MONTHS[named[0]!.slice(0, 3).toLowerCase()];
-      if (!month || !validCalendarDate(Number(named[2]), month, Number(named[1]))) return undefined;
+    const monthFirst = text.match(TIMESTAMP_NAMED_MONTH_FIRST);
+    const dayFirst = text.match(TIMESTAMP_NAMED_DAY_FIRST);
+    const openssl = text.match(TIMESTAMP_OPENSSL);
+    let year: number;
+    let monthName: string;
+    let day: number;
+    let hour: string | undefined;
+    let minute: string | undefined;
+    let second: string | undefined;
+    let zone: string | undefined;
+    if (monthFirst) {
+      monthName = monthFirst[1]!;
+      day = Number(monthFirst[2]);
+      year = Number(monthFirst[3]);
+      hour = monthFirst[4];
+      minute = monthFirst[5];
+      second = monthFirst[6];
+      zone = monthFirst[7];
+    } else if (dayFirst) {
+      day = Number(dayFirst[1]);
+      monthName = dayFirst[2]!;
+      year = Number(dayFirst[3]);
+      hour = dayFirst[4];
+      minute = dayFirst[5];
+      second = dayFirst[6];
+      zone = dayFirst[7];
+    } else if (openssl) {
+      monthName = openssl[1]!;
+      day = Number(openssl[2]);
+      hour = openssl[3];
+      minute = openssl[4];
+      second = openssl[5];
+      year = Number(openssl[6]);
+      zone = openssl[7];
+    } else {
+      return undefined;
     }
+    const month = TIMESTAMP_MONTHS[monthName.slice(0, 3).toLowerCase()];
+    if (!month || !validCalendarDate(year, month, day) || !validTimestampClock(hour, minute, second) || !validTimestampZone(zone)) return undefined;
   }
-  if (!/^[A-Za-z0-9,.:+/\- TZt]+$/.test(text)) return undefined;
   const timestamp = Date.parse(text);
   return Number.isFinite(timestamp) ? new Date(timestamp) : undefined;
 }

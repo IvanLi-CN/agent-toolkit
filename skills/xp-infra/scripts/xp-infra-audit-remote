@@ -54,13 +54,28 @@ bounded_command() (
   [ "$bounded_status" -eq 0 ] && [ "$command_status" = 0 ]
 )
 
+private_path_safe() {
+  path="$1"
+  case "$path" in /*) ;; *) return 1 ;; esac
+  while [ "$path" != "/" ]; do
+    [ ! -L "$path" ] || return 1
+    parent=${path%/*}
+    [ -n "$parent" ] || parent=/
+    [ "$parent" != "$path" ] || return 1
+    path="$parent"
+  done
+}
+
 direct_docker_host_environment_absent() {
   env_dir="${env_file%/*}"
-  if [ -e "$env_file" ] || [ -L "$env_file" ]; then return 1; fi
-  if [ -e "$env_dir" ] || [ -L "$env_dir" ]; then
+  private_path_safe "$env_file" || return 1
+  [ ! -e "$env_file" ] && [ ! -L "$env_file" ] || return 1
+  [ -n "$env_dir" ] || env_dir=/
+  if [ -e "$env_dir" ]; then
     [ -d "$env_dir" ] && [ -r "$env_dir" ] && [ -x "$env_dir" ] || return 1
   else
     env_parent="${env_dir%/*}"
+    [ -n "$env_parent" ] || env_parent=/
     [ -d "$env_parent" ] && [ -r "$env_parent" ] && [ -x "$env_parent" ] || return 1
   fi
   return 0
@@ -75,7 +90,23 @@ xp_containers_from_inventory() {
   '
 }
 
-if env_probe="$(sudo -n sh -c 'if [ -e "$1" ] || [ -L "$1" ]; then [ -r "$1" ] || exit 2; printf %s readable; else printf %s absent; fi' sh "$env_file" 2>/dev/null)"; then
+if env_probe="$(sudo -n sh -c '
+  path="$1"
+  case "$path" in /*) ;; *) exit 2 ;; esac
+  while [ "$path" != "/" ]; do
+    [ ! -L "$path" ] || exit 2
+    parent=${path%/*}
+    [ -n "$parent" ] || parent=/
+    [ "$parent" != "$path" ] || exit 2
+    path="$parent"
+  done
+  if [ -e "$1" ] || [ -L "$1" ]; then
+    [ -r "$1" ] || exit 2
+    printf %s readable
+  else
+    printf %s absent
+  fi
+' sh "$env_file" 2>/dev/null)"; then
   case "$env_probe" in
     readable|absent) ;;
     *) exit 1 ;;
@@ -94,10 +125,6 @@ else
   env_probe=absent
   docker_access=direct
   command -v docker >/dev/null 2>&1 && docker_cmd ps >/dev/null 2>&1 || exit 1
-fi
-env_snapshot=""
-if [ "$env_probe" = readable ]; then
-  env_snapshot="$(bounded_command sudo -n cat "$env_file" 2>/dev/null)" || exit 1
 fi
 docker_inventory=""
 docker_available=false
@@ -162,8 +189,57 @@ env_value() {
       printf '%s' "$READ_ERROR_SENTINEL"
     fi
   else
-    printf '%s\n' "$env_snapshot" | awk -v key="$key" ' { line = $0; sub(/^[[:space:]]+/, "", line); sub(/^export[[:space:]]+/, "", line); split(line, pair, "="); if (pair[1] == key) { value = substr(line, index(line, "=") + 1); found = 1 } } END { if (found) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); gsub(/^['\''"]|['\''"]$/, "", value); print value } }' | bounded_output
+    bounded_command sudo -n sh -c '
+      env_file="$1"
+      key="$2"
+      path="$env_file"
+      case "$path" in /*) ;; *) exit 2 ;; esac
+      while [ "$path" != "/" ]; do
+        [ ! -L "$path" ] || exit 2
+        parent=${path%/*}
+        [ -n "$parent" ] || parent=/
+        [ "$parent" != "$path" ] || exit 2
+        path="$parent"
+      done
+      [ -r "$env_file" ] || exit 2
+      awk -v key="$key" "
+        {
+          line = \$0
+          sub(/^[[:space:]]+/, \"\", line)
+          sub(/^export[[:space:]]+/, \"\", line)
+          split(line, pair, \"=\")
+          if (pair[1] == key) { value = substr(line, index(line, \"=\") + 1); found = 1 }
+        }
+        END {
+          if (found) {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, \"\", value)
+            gsub(/^[\\047\"]|[\\047\"]$/, \"\", value)
+            print value
+          }
+        }
+      " "$env_file"
+    ' sh "$env_file" "$key" 2>/dev/null
   fi
+}
+
+env_file_fingerprint() {
+  if [ "$env_probe" = absent ]; then
+    printf %s absent
+    return 0
+  fi
+  bounded_command sudo -n sh -c '
+    path="$1"
+    case "$path" in /*) ;; *) exit 2 ;; esac
+    while [ "$path" != "/" ]; do
+      [ ! -L "$path" ] || exit 2
+      parent=${path%/*}
+      [ -n "$parent" ] || parent=/
+      [ "$parent" != "$path" ] || exit 2
+      path="$parent"
+    done
+    [ -r "$1" ] || exit 2
+    cksum "$1"
+  ' sh "$env_file" 2>/dev/null
 }
 
 raw_env_payload() {
@@ -176,15 +252,11 @@ raw_env_payload() {
       marker="$3"
       env_file="/proc/$runtime_pid/environ"
       [ -r "$env_file" ] || exit 1
-      env_dump="$(mktemp)" || exit 1
-      tr "\\000" "\\n" < "$env_file" > "$env_dump" || exit 1
-      if env_value_line="$(grep -m1 "^$key=" "$env_dump")"; then
-        rm -f "$env_dump"
+      if env_value_line="$(tr "\\000" "\\n" < "$env_file" | grep -m1 "^$key=")"; then
         printf "%s" "$env_value_line"
         printf "%s" "$marker"
       else
         status=$?
-        rm -f "$env_dump"
         [ "$status" -eq 1 ] && { printf "%s" "$marker"; exit 0; }
         exit "$status"
       fi
@@ -204,15 +276,11 @@ raw_env_payload() {
       marker="$3"
       env_file="/proc/$runtime_pid/environ"
       [ -r "$env_file" ] || exit 1
-      env_dump="$(mktemp)" || exit 1
-      tr "\\000" "\\n" < "$env_file" > "$env_dump" || exit 1
-      if env_value_line="$(grep -m1 "^$key=" "$env_dump")"; then
-        rm -f "$env_dump"
+      if env_value_line="$(tr "\\000" "\\n" < "$env_file" | grep -m1 "^$key=")"; then
         printf "%s" "$env_value_line"
         printf "%s" "$marker"
       else
         status=$?
-        rm -f "$env_dump"
         [ "$status" -eq 1 ] && { printf "%s" "$marker"; exit 0; }
         exit "$status"
       fi
@@ -411,36 +479,52 @@ runtime_file_probe() {
   if [ "$mode" = container ]; then
     bounded_command docker_cmd exec "$container" sh -c '
       path="$1"
-      if [ -L "$path" ]; then exit 2; fi
-      if [ ! -e "$path" ]; then
-        parent_dir=${path%/*}
-        if [ -L "$parent_dir" ]; then exit 2; fi
+      case "$path" in /*) ;; *) exit 2 ;; esac
+      target_path="$path"
+      while [ "$path" != "/" ]; do
+        [ ! -L "$path" ] || exit 2
+        parent=${path%/*}
+        [ -n "$parent" ] || parent=/
+        [ "$parent" != "$path" ] || exit 2
+        path="$parent"
+      done
+      if [ ! -e "$target_path" ]; then
+        parent_dir=${target_path%/*}
+        [ -n "$parent_dir" ] || parent_dir=/
         if [ -e "$parent_dir" ]; then
           [ -d "$parent_dir" ] && [ -r "$parent_dir" ] && [ -x "$parent_dir" ] || exit 2
         fi
         printf %s __XP_INFRA_FILE_ABSENT__
         exit 0
       fi
-      [ -f "$path" ] && [ -r "$path" ] || exit 2
+      [ -f "$target_path" ] && [ -r "$target_path" ] || exit 2
       printf %s __XP_INFRA_FILE_PRESENT__
-      cat "$path"
+      cat "$target_path"
     ' sh "$path" 2>/dev/null
   else
     bounded_command sudo -n sh -c '
       path="$1"
-      if [ -L "$path" ]; then exit 2; fi
-      if [ ! -e "$path" ]; then
-        parent_dir=${path%/*}
-        if [ -L "$parent_dir" ]; then exit 2; fi
+      case "$path" in /*) ;; *) exit 2 ;; esac
+      target_path="$path"
+      while [ "$path" != "/" ]; do
+        [ ! -L "$path" ] || exit 2
+        parent=${path%/*}
+        [ -n "$parent" ] || parent=/
+        [ "$parent" != "$path" ] || exit 2
+        path="$parent"
+      done
+      if [ ! -e "$target_path" ]; then
+        parent_dir=${target_path%/*}
+        [ -n "$parent_dir" ] || parent_dir=/
         if [ -e "$parent_dir" ]; then
           [ -d "$parent_dir" ] && [ -r "$parent_dir" ] && [ -x "$parent_dir" ] || exit 2
         fi
         printf %s __XP_INFRA_FILE_ABSENT__
         exit 0
       fi
-      [ -f "$path" ] && [ -r "$path" ] || exit 2
+      [ -f "$target_path" ] && [ -r "$target_path" ] || exit 2
       printf %s __XP_INFRA_FILE_PRESENT__
-      cat "$path"
+      cat "$target_path"
     ' sh "$path" 2>/dev/null
   fi
 }
@@ -487,6 +571,8 @@ strict_env_value() {
   [ "$value" = "$sanitized" ] || exit 1
   printf '%s' "$value"
 }
+
+env_snapshot_fingerprint="$(env_file_fingerprint)" || exit 1
 
 sync_node_meta() {
   if [ "$mode" = container ]; then
@@ -551,13 +637,212 @@ xray_listener_pids() {
   ' | sort -n | paste -sd, -
 }
 
+project_xray_api() {
+  awk '
+    function json_field(object, wanted, body, n, i, ch, key, value_start, value_end, depth, in_string, escaped, candidate) {
+      body = substr(object, 2, length(object) - 2)
+      n = length(body)
+      i = 1
+      while (i <= n) {
+        while (i <= n && substr(body, i, 1) ~ /[[:space:],]/) i++
+        if (i > n || substr(body, i, 1) != "\"") return ""
+        i++
+        key = ""
+        escaped = 0
+        while (i <= n) {
+          ch = substr(body, i, 1)
+          if (escaped) {
+            key = key ch
+            escaped = 0
+          } else if (ch == "\\") {
+            escaped = 1
+          } else if (ch == "\"") {
+            i++
+            break
+          } else {
+            key = key ch
+          }
+          i++
+        }
+        while (i <= n && substr(body, i, 1) ~ /[[:space:]]/) i++
+        if (i > n || substr(body, i, 1) != ":") return ""
+        i++
+        while (i <= n && substr(body, i, 1) ~ /[[:space:]]/) i++
+        value_start = i
+        depth = 0
+        in_string = 0
+        escaped = 0
+        while (i <= n) {
+          ch = substr(body, i, 1)
+          if (in_string) {
+            if (escaped) escaped = 0
+            else if (ch == "\\") escaped = 1
+            else if (ch == "\"") in_string = 0
+          } else if (ch == "\"") {
+            in_string = 1
+          } else if (ch == "{" || ch == "[") {
+            depth++
+          } else if (ch == "}" || ch == "]") {
+            if (depth > 0) depth--
+          } else if (ch == "," && depth == 0) {
+            break
+          }
+          i++
+        }
+        value_end = i - 1
+        candidate = substr(body, value_start, value_end - value_start + 1)
+        if (key == wanted) return candidate
+        if (i <= n && substr(body, i, 1) == ",") i++
+      }
+      return ""
+    }
+    function string_field(object, field, value) {
+      value = json_field(object, field)
+      sub(/^[[:space:]]*/, "", value)
+      sub(/[[:space:]]*$/, "", value)
+      if (value !~ /^"[^"]*"$/) return ""
+      sub(/^"/, "", value)
+      sub(/"$/, "", value)
+      return value
+    }
+    function emit_inbound(object, tag, receiver, receiver_type, port, value) {
+      tag = string_field(object, "tag")
+      if (tag == "" || tag !~ /^[A-Za-z0-9_.:@\/-]+$/) return
+      receiver = json_field(object, "receiverSettings")
+      if (receiver == "") receiver = json_field(object, "receiver_settings")
+      printf "%s{\"tag\":\"%s\"", comma, tag
+      if (receiver != "") {
+        receiver_type = string_field(receiver, "type")
+        if (receiver_type == "") receiver_type = string_field(receiver, "_TypedMessage_")
+        if (receiver_type ~ /^[A-Za-z0-9._-]+$/) {
+          port = json_field(receiver, "portList")
+          sub(/^[[:space:]]*/, "", port)
+          sub(/[[:space:]]*$/, "", port)
+          if (port ~ /^[0-9]+$/) {
+            printf ",\"receiverSettings\":{\"type\":\"%s\",\"portList\":%s}", receiver_type, port
+          } else {
+            value = string_field(receiver, "value")
+            if (value ~ /^[A-Za-z0-9+\/=_-]+$/) {
+              printf ",\"receiverSettings\":{\"type\":\"%s\",\"value\":\"%s\"}", receiver_type, value
+            }
+          }
+        }
+      }
+      printf "}"
+      comma = ","
+    }
+    BEGIN { raw = "" }
+    { raw = raw $0 }
+    END {
+      if (raw == "") exit 1
+      printf "{\"inbounds\":["
+      comma = ""
+      if (!match(raw, /"inbounds"[[:space:]]*:[[:space:]]*\[/)) {
+        print "]}"
+        exit
+      }
+      remaining = substr(raw, RSTART + RLENGTH)
+      array_depth = 1
+      array_end = 0
+      in_string = 0
+      escaped = 0
+      for (pos = 1; pos <= length(remaining); pos++) {
+        ch = substr(remaining, pos, 1)
+        if (in_string) {
+          if (escaped) escaped = 0
+          else if (ch == "\\") escaped = 1
+          else if (ch == "\"") in_string = 0
+        } else if (ch == "\"") {
+          in_string = 1
+        } else if (ch == "[") {
+          array_depth++
+        } else if (ch == "]") {
+          array_depth--
+          if (array_depth == 0) {
+            array_end = pos - 1
+            break
+          }
+        }
+      }
+      array_text = substr(remaining, 1, array_end)
+      object_depth = 0
+      object_start = 0
+      in_string = 0
+      escaped = 0
+      for (pos = 1; pos <= length(array_text); pos++) {
+        ch = substr(array_text, pos, 1)
+        if (in_string) {
+          if (escaped) escaped = 0
+          else if (ch == "\\") escaped = 1
+          else if (ch == "\"") in_string = 0
+        } else if (ch == "\"") {
+          in_string = 1
+        } else if (ch == "{") {
+          if (object_depth == 0) object_start = pos
+          object_depth++
+        } else if (ch == "}") {
+          object_depth--
+          if (object_depth == 0 && object_start > 0) {
+            emit_inbound(substr(array_text, object_start, pos - object_start + 1))
+            object_start = 0
+          }
+        }
+      }
+      print "]}"
+    }
+  '
+}
+
+bounded_projected_command() (
+  status_file="$(mktemp)" || exit 1
+  trap 'rm -f "$status_file"' 0 HUP INT TERM
+  if (
+    set +e
+    "$@" | project_xray_api
+    command_status=$?
+    printf '%s\n' "$command_status" > "$status_file"
+  ) | bounded_output; then
+    bounded_status=0
+  else
+    bounded_status=$?
+  fi
+  command_status="$(cat "$status_file" 2>/dev/null || true)"
+  [ "$bounded_status" -eq 0 ] && [ "$command_status" = 0 ]
+)
+
 read_xray_api() {
+  [ "$xray_api_required" = true ] || return 0
   [ -n "$xray_runtime_pid" ] || return 0
   if [ "$mode" = container ]; then
-    bounded_command docker_cmd exec "$container" xray api lsi --server="$xray_api_addr" --isOnlyTags=false 2>/dev/null
+    bounded_projected_command docker_cmd exec "$container" xray api lsi --server="$xray_api_addr" --isOnlyTags=false 2>/dev/null
   else
-    bounded_command sudo -n xray api lsi --server="$xray_api_addr" --isOnlyTags=false 2>/dev/null
+    bounded_projected_command sudo -n xray api lsi --server="$xray_api_addr" --isOnlyTags=false 2>/dev/null
   fi
+}
+
+validate_xray_api_addr() {
+  address="$1"
+  case "$address" in
+    127.*:*)
+      xray_api_host="${address%:*}"
+      old_ifs="$IFS"
+      IFS=.
+      set -- $xray_api_host
+      IFS="$old_ifs"
+      [ "$#" -eq 4 ] || return 1
+      for octet in "$@"; do
+        case "$octet" in
+          [0-9]|[0-9][0-9]|[0-9][0-9][0-9]) ;;
+          *) return 1 ;;
+        esac
+        [ "$octet" -le 255 ] || return 1
+      done
+      ;;
+    \[::1\]:*) ;;
+    *) return 1 ;;
+  esac
+  xray_api_port="${address##*:}"
+  [ "$xray_api_port" -ge 1 ] && [ "$xray_api_port" -le 65535 ]
 }
 
 if [ "$mode" = container ]; then
@@ -628,6 +913,7 @@ data_dir="$(env_value XP_DATA_DIR)"
 xray_api_addr="$(env_value XP_XRAY_API_ADDR)"
 [ "$xray_api_addr" != "$READ_ERROR_SENTINEL" ] || exit 1
 [ -n "$xray_api_addr" ] || xray_api_addr=127.0.0.1:10085
+validate_xray_api_addr "$xray_api_addr" || exit 1
 bind="$(env_value XP_BIND)"
 [ "$bind" != "$READ_ERROR_SENTINEL" ] || exit 1
 if [ -z "$bind" ]; then
@@ -701,6 +987,16 @@ case "$managed_current_status:$managed_legacy_status" in
   absent:absent) managed_default_state_json="" ;;
   *) exit 1 ;;
 esac
+state_compact="$(printf '%s' "$managed_default_state_json" | tr -d '[:space:]')"
+xray_api_required=false
+case "$state_compact" in
+  *'"vless_endpoint_id":'*)
+    case "$state_compact" in
+      *'"vless_endpoint_id":null'*) ;;
+      *) xray_api_required=true ;;
+    esac
+    ;;
+esac
 emit_value managed_default_state_json "$managed_default_state_json"
 echo "sync_node_meta=$(sync_node_meta && printf true || printf false)"
 if [ "$require_xray_public_listener" = true ]; then
@@ -721,12 +1017,26 @@ fi
 emit_value xray_api_b64 "$xray_api_b64"
 
 if [ "$docker_access" = sudo ]; then
-  env_probe_after="$(sudo -n sh -c 'if [ -e "$1" ] || [ -L "$1" ]; then [ -r "$1" ] || exit 2; printf %s readable; else printf %s absent; fi' sh "$env_file" 2>/dev/null)" || exit 1
+  env_probe_after="$(sudo -n sh -c '
+    path="$1"
+    case "$path" in /*) ;; *) exit 2 ;; esac
+    while [ "$path" != "/" ]; do
+      [ ! -L "$path" ] || exit 2
+      parent=${path%/*}
+      [ -n "$parent" ] || parent=/
+      [ "$parent" != "$path" ] || exit 2
+      path="$parent"
+    done
+    if [ -e "$1" ] || [ -L "$1" ]; then
+      [ -r "$1" ] || exit 2
+      printf %s readable
+    else
+      printf %s absent
+    fi
+  ' sh "$env_file" 2>/dev/null)" || exit 1
   [ "$env_probe_after" = "$env_probe" ] || exit 1
-  if [ "$env_probe" = readable ]; then
-    env_snapshot_after="$(bounded_command sudo -n cat "$env_file" 2>/dev/null)" || exit 1
-    [ "$env_snapshot_after" = "$env_snapshot" ] || exit 1
-  fi
+  env_snapshot_fingerprint_after="$(env_file_fingerprint)" || exit 1
+  [ "$env_snapshot_fingerprint_after" = "$env_snapshot_fingerprint" ] || exit 1
 elif [ "$docker_access" = direct ]; then
   direct_docker_host_environment_absent || exit 1
 else

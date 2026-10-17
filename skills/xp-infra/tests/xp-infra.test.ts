@@ -126,9 +126,13 @@ test("rejects partial, normalized, and injected timestamps while preserving miss
   expect(parseTimestamp("2025-01")).toBeUndefined();
   expect(parseTimestamp("12345")?.getTime()).toBeLessThan(new Date("2025-01-01T00:00:00Z").getTime());
   expect(parseTimestamp("20250101123045")?.toISOString()).toBe("2025-01-01T12:30:45.000Z");
+  expect(parseTimestamp("01 Jan 2025 00:00:00 UTC")?.toISOString()).toBe("2025-01-01T00:00:00.000Z");
+  expect(parseTimestamp("Jan  1 00:00:00 2025 GMT")?.toISOString()).toBe("2025-01-01T00:00:00.000Z");
   expect(parseTimestamp("20250230123045")).toBeUndefined();
   expect(parseTimestamp("2025-02-30")).toBeUndefined();
   expect(parseTimestamp("2025-01-01$(id)")).toBeUndefined();
+  expect(parseTimestamp("01 Jan 2025 00:00:00+2500")).toBeUndefined();
+  expect(parseTimestamp("01 Jan 2025 junk")).toBeUndefined();
   expect(parseTimestamp("2025-01-01T00:00:00.000000000Z")).toEqual(new Date("2025-01-01T00:00:00Z"));
   expect(() => normalizeBasic(validBasicRecords().replace("2024-12-31T23:59:30Z", "1"), new Date("2025-01-01T00:00:00Z"))).toThrow("last_sync_at is invalid");
   expect(() => normalizeBasic(validBasicRecords().replace("2025-02-01T00:00:00Z", "2025-02-30"), new Date("2025-01-01T00:00:00Z"))).toThrow("cert_not_after is invalid");
@@ -140,6 +144,36 @@ test("rejects partial, normalized, and injected timestamps while preserving miss
     .replace("host_xray_starttime=456\n", "host_xray_starttime=\n")
     .replace("container_xray_token=\n", "container_xray_token=123:456\n");
   expect(() => normalizeBasic(containerRecords, new Date("2025-01-01T00:00:00Z"))).toThrow("container_started_at is invalid");
+});
+
+test("preserves baseline YAML scalar spellings without reopening unsafe constructs", () => {
+  expect(parseRestrictedYaml("schema_version: 01\n")).toEqual({ schema_version: 1 });
+  expect(parseRestrictedYaml("schema_version: 0x1\n")).toEqual({ schema_version: 1 });
+  expect(parseRestrictedYaml("schema_version: 010\n")).toEqual({ schema_version: 8 });
+  expect(parseRestrictedYaml("schema_version: 08\n")).toEqual({ schema_version: "08" });
+  expect(parseRestrictedYaml("owner_confirmed: yes\n")).toEqual({ owner_confirmed: true });
+  expect(parseRestrictedYaml("owner_confirmed: ON\n")).toEqual({ owner_confirmed: true });
+  expect(parseRestrictedYaml("owner_confirmed: off\n")).toEqual({ owner_confirmed: false });
+  expect(parseRestrictedYaml("reason: 1.5\n")).toEqual({ reason: 1.5 });
+  expect(parseRestrictedYaml("node_overrides:\n  fixture-node:\n    reason: fixture\n")).toEqual({
+    node_overrides: { "fixture-node": { reason: "fixture" } },
+  });
+  expect(() => parseRestrictedYaml("node_overrides: &defaults {}\n")).toThrow("unsupported YAML construct");
+  expect(() => parseRestrictedYaml("---\nschema_version: 1\n")).toThrow("unsupported YAML document");
+});
+
+test("preserves safe YAML quoted, flow-mapping, and block-scalar forms", () => {
+  expect(parseRestrictedYaml("reason: \"fixture\\x2C\"\n")).toEqual({ reason: "fixture," });
+  expect(parseRestrictedYaml("defaults: {cloudflare_tunnel: true, managed_default_ss2022: false}\n")).toEqual({
+    defaults: { cloudflare_tunnel: true, managed_default_ss2022: false },
+  });
+  expect(parseRestrictedYaml("reason: |\n  approved exception\n")).toEqual({ reason: "approved exception\n" });
+  expect(parseRestrictedYaml("reason: |\n approved exception\n")).toEqual({ reason: "approved exception\n" });
+  expect(parseRestrictedYaml("reason: >\n  approved\n  exception\n")).toEqual({ reason: "approved exception\n" });
+  expect(parseRestrictedYaml("reason: |-\n  approved\n")).toEqual({ reason: "approved" });
+  expect(parseRestrictedYaml("reason: |\n  approved # remains data\n")).toEqual({ reason: "approved # remains data\n" });
+  expect(() => parseRestrictedYaml("defaults: {cloudflare_tunnel: true, cloudflare_tunnel: false}\n")).toThrow("duplicate YAML key");
+  expect(() => parseRestrictedYaml("defaults: [true, false]\n")).toThrow("unsupported YAML collection");
 });
 
 test("normalizes a valid observation without reading secrets", () => {

@@ -4,7 +4,7 @@ Install the matching client, one-shot control script and systemd assets from one
 
 | Surface | Deployment input |
 | --- | --- |
-| Control script | `/opt/agent-vm-native/agent_vm_control.py` or an explicitly configured path |
+| Control script | `/opt/agent-vm-native/agent_vm_control.ts` or an explicitly configured path |
 | Configuration | root-owned JSON at `/etc/agent-vm-native/config.json` |
 | Durable state | configured local state database and lock directory |
 | Native units | systemd assets copied atomically into the configured unit directory |

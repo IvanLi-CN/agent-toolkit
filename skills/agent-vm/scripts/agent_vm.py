@@ -25,14 +25,14 @@ import uuid
 
 PROTOCOL_VERSION = 4
 VERSION = "0.4.0-native"
-REMOTE_CONTROL = "/opt/agent-vm-native/agent_vm_control.py"
+REMOTE_CONTROL = "/opt/agent-vm-native/agent_vm_control.ts"
 DEFAULT_CONTROL_TIMEOUT_SECONDS = 240
 LONG_CONTROL_TIMEOUT_SECONDS = 600
 SESSION_ENV = "AGENT_VM_SESSION_ID"
 CONTROL_HOST_ENV = "AGENT_VM_CONTROL_HOST"
 REMOTE_CONTROL_ENV = "AGENT_VM_REMOTE_CONTROL"
 DEFAULT_CONTROL_HOST = "agent-vm-host"
-DEFAULT_REMOTE_CONTROL = "/opt/agent-vm-native/agent_vm_control.py"
+DEFAULT_REMOTE_CONTROL = "/opt/agent-vm-native/agent_vm_control.ts"
 LOCAL_CONFIG_ROOT = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "agent-vm"
 LOCAL_STATE_ROOT = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "agent-vm"
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.:@/-]{1,160}$")
@@ -149,7 +149,7 @@ def control_request(action: str, *, session: str | None, generation: int | None 
         control_host = os.environ.get(CONTROL_HOST_ENV, DEFAULT_CONTROL_HOST)
         remote_control = os.environ.get(REMOTE_CONTROL_ENV, DEFAULT_REMOTE_CONTROL)
         process = subprocess.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", control_host,
-                                  shlex.join(["python3", remote_control])],
+                                  shlex.join(["bun", remote_control])],
                                  input=json.dumps(request, sort_keys=True).encode(), stdout=subprocess.PIPE,
                                  stderr=None, check=False, timeout=control_timeout(action, fields))
     except FileNotFoundError: fail("command_missing", "ssh is not installed")

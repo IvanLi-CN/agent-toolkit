@@ -35,6 +35,38 @@ export const TASK_TIMER_RE = /^[a-z0-9][a-z0-9-]{0,47}-g[0-9]+$/;
 
 type Dict = Record<string, any>;
 
+export const GUEST_GROWTH_SCRIPT = `
+import { existsSync, readFileSync, statfsSync } from "node:fs";
+function text(bytes) { return new TextDecoder().decode(bytes).trim(); }
+function run(args) { const result = Bun.spawnSync(args, { stdout: "pipe", stderr: "pipe" }); if (result.exitCode !== 0) throw new Error(text(result.stderr) || "native command failed"); return text(result.stdout); }
+const root = Bun.argv[2] || "";
+const rootPath = (path) => root ? root.replace(/\\/$/, "") + path : path;
+const rootMount = rootPath("/");
+const source = run(["realpath", run(["findmnt", "-n", "-o", "SOURCE", rootMount])]);
+const fstype = run(["findmnt", "-n", "-o", "FSTYPE", rootMount]);
+const name = source.split("/").at(-1);
+const partition = rootPath("/sys/class/block/" + name + "/partition");
+if (!existsSync(partition) || !["ext4", "xfs"].includes(fstype)) throw new Error("automatic growth supports a direct ext4/xfs root partition only");
+const number = readFileSync(partition, "utf8").trim();
+const parent = run(["lsblk", "-n", "-o", "PKNAME", source]);
+if (!parent || parent.includes("/")) throw new Error("ambiguous root disk");
+const disk = "/dev/" + parent;
+const requested = BigInt(Bun.argv[1] || "0") * 1024n ** 3n;
+const size = BigInt(run(["blockdev", "--getsize64", disk]));
+if (size < requested) throw new Error("guest virtual disk size is stale");
+const beforeStats = statfsSync(rootMount, { bigint: true });
+const before = beforeStats.blocks * beforeStats.frsize;
+const grown = Bun.spawnSync(["growpart", disk, number], { stdout: "pipe", stderr: "pipe" });
+const grownOut = text(grown.stdout);
+if (grown.exitCode !== 0 && !(grown.exitCode === 1 && grownOut.includes("NOCHANGE"))) throw new Error("growpart failed: " + text(grown.stderr));
+run(fstype === "ext4" ? ["resize2fs", source] : ["xfs_growfs", rootMount]);
+const afterStats = statfsSync(rootMount, { bigint: true });
+const after = afterStats.blocks * afterStats.frsize;
+if (after <= before && after * 100n < size * 85n) throw new Error("root filesystem did not grow");
+const safe = (value) => { if (value > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("guest capacity exceeds safe reporting range"); return Number(value); };
+console.log(JSON.stringify({ virtual_bytes: safe(size), filesystem_before: safe(before), filesystem_bytes: safe(after), filesystem: fstype }));
+`;
+
 export class ControlError extends Error {
   readonly code: string;
   readonly detail: unknown;
@@ -157,6 +189,16 @@ function requiredString(value: unknown, field: string, pattern?: RegExp): string
   if (typeof value !== "string" || value.length === 0) throw new ControlError("invalid_request", `${field} must be a non-empty string`);
   if (pattern && !pattern.test(value)) throw new ControlError("invalid_request", `${field} contains unsupported characters`);
   return value;
+}
+
+function configString(value: unknown, field: string, pattern?: RegExp): string {
+  try { return requiredString(value, field, pattern); }
+  catch (error) { if (error instanceof ControlError && error.code === "invalid_request") throw new ControlError("config_invalid", error.message, error.detail); throw error; }
+}
+
+function configInteger(value: unknown, field: string, minimum?: number, maximum?: number): number {
+  try { return numberFromInteger(value, field, minimum, maximum); }
+  catch (error) { if (error instanceof ControlError && error.code === "invalid_request") throw new ControlError("config_invalid", error.message, error.detail); throw error; }
 }
 
 function requireBoolean(value: unknown, field: string): boolean {
@@ -333,17 +375,17 @@ export function loadConfig(path = DEFAULT_CONFIG_PATH): Dict {
   };
   const missing = REQUIRED_ENVIRONMENT_FIELDS.filter((field) => !(field in raw) || raw[field] === null || raw[field] === "");
   if (missing.length) throw new ControlError("config_missing", "required environment configuration is missing", { fields: missing });
-  for (const field of ["project", "profile", "image_alias", "image_fingerprint", "network", "network_acl", "pool"]) requiredString(config[field], field);
+  for (const field of ["project", "profile", "image_alias", "image_fingerprint", "network", "network_acl", "pool"]) configString(config[field], field);
   if (typeof config.image_fingerprint !== "string" || !/^[0-9a-f]{64}$/.test(config.image_fingerprint)) throw new ControlError("config_invalid", "image_fingerprint must be a 64-character lowercase hex fingerprint");
-  config.port_start = numberFromInteger(config.port_start, "port_start", 1024, 65535);
-  config.port_end = numberFromInteger(config.port_end, "port_end", config.port_start, 65535);
-  for (const field of ["initial_lease_seconds", "renew_seconds", "max_lease_seconds", "cache_seconds"]) config[field] = numberFromInteger(config[field], field, 1);
+  config.port_start = configInteger(config.port_start, "port_start", 1024, 65535);
+  config.port_end = configInteger(config.port_end, "port_end", config.port_start, 65535);
+  for (const field of ["initial_lease_seconds", "renew_seconds", "max_lease_seconds", "cache_seconds"]) config[field] = configInteger(config[field], field, 1);
   if (config.renew_seconds > config.max_lease_seconds) throw new ControlError("config_invalid", "renew_seconds exceeds max_lease_seconds");
-  for (const field of ["cpu_budget", "memory_budget_mib"]) config[field] = numberFromInteger(config[field], field, 0);
+  for (const field of ["cpu_budget", "memory_budget_mib"]) config[field] = configInteger(config[field], field, 0);
   for (const field of ["create_cost_bytes", "resume_cost_bytes", "resize_cost_bytes"]) config[field] = bigintFromInteger(config[field], field);
   config.cpu_overcommit_ratio = ratio(config.cpu_overcommit_ratio, "cpu_overcommit_ratio");
   config.memory_overcommit_ratio = ratio(config.memory_overcommit_ratio, "memory_overcommit_ratio");
-  for (const field of ["host_address", "vm_ip_start", "vm_ip_end", "gateway_ip"]) requiredString(config[field], field);
+  for (const field of ["host_address", "vm_ip_start", "vm_ip_end", "gateway_ip"]) configString(config[field], field);
   const host = ipv4ToInt(config.host_address);
   const vmStart = ipv4ToInt(config.vm_ip_start);
   const vmEnd = ipv4ToInt(config.vm_ip_end);
@@ -353,10 +395,10 @@ export function loadConfig(path = DEFAULT_CONFIG_PATH): Dict {
   config.vm_ip_start = intToIpv4(vmStart);
   config.vm_ip_end = intToIpv4(vmEnd);
   config.gateway_ip = intToIpv4(gateway);
-  config.network_acl = requiredString(config.network_acl, "network_acl", PORT_NAME_RE);
-  config.storage_path = requiredString(config.storage_path, "storage_path");
-  config.state_db = requiredString(config.state_db, "state_db");
-  config.timer_dir = requiredString(config.timer_dir, "timer_dir");
+  config.network_acl = configString(config.network_acl, "network_acl", PORT_NAME_RE);
+  config.storage_path = configString(config.storage_path, "storage_path");
+  config.state_db = configString(config.state_db, "state_db");
+  config.timer_dir = configString(config.timer_dir, "timer_dir");
   if (!Array.isArray(config.required_guest_tools) || !config.required_guest_tools.every((item: unknown) => typeof item === "string" && item.length > 0)) throw new ControlError("config_invalid", "required_guest_tools must be a list of strings");
   return config;
 }
@@ -2082,35 +2124,7 @@ export class Control {
   }
 
   private async growGuestRoot(task: Dict, diskGib: number): Promise<Dict> {
-    const script = `
-import { existsSync, readFileSync, statfsSync } from "node:fs";
-function text(bytes) { return new TextDecoder().decode(bytes).trim(); }
-function run(args) { const result = Bun.spawnSync(args, { stdout: "pipe", stderr: "pipe" }); if (result.exitCode !== 0) throw new Error(text(result.stderr) || "native command failed"); return text(result.stdout); }
-const source = run(["realpath", run(["findmnt", "-n", "-o", "SOURCE", "/"])]);
-const fstype = run(["findmnt", "-n", "-o", "FSTYPE", "/"]);
-const name = source.split("/").at(-1);
-const partition = "/sys/class/block/" + name + "/partition";
-if (!existsSync(partition) || !["ext4", "xfs"].includes(fstype)) throw new Error("automatic growth supports a direct ext4/xfs root partition only");
-const number = readFileSync(partition, "utf8").trim();
-const parent = run(["lsblk", "-n", "-o", "PKNAME", source]);
-if (!parent || parent.includes("/")) throw new Error("ambiguous root disk");
-const disk = "/dev/" + parent;
-const requested = BigInt(Bun.argv[1] || "0") * 1024n ** 3n;
-const size = BigInt(run(["blockdev", "--getsize64", disk]));
-if (size < requested) throw new Error("guest virtual disk size is stale");
-const beforeStats = statfsSync("/", { bigint: true });
-const before = beforeStats.blocks * beforeStats.frsize;
-const grown = Bun.spawnSync(["growpart", disk, number], { stdout: "pipe", stderr: "pipe" });
-const grownOut = text(grown.stdout);
-if (grown.exitCode !== 0 && !(grown.exitCode === 1 && grownOut.includes("NOCHANGE"))) throw new Error("growpart failed: " + text(grown.stderr));
-run(fstype === "ext4" ? ["resize2fs", source] : ["xfs_growfs", "/"]);
-const afterStats = statfsSync("/", { bigint: true });
-const after = afterStats.blocks * afterStats.frsize;
-if (after <= before && after * 100n < size * 85n) throw new Error("root filesystem did not grow");
-const safe = (value) => { if (value > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("guest capacity exceeds safe reporting range"); return Number(value); };
-console.log(JSON.stringify({ virtual_bytes: safe(size), filesystem_before: safe(before), filesystem_bytes: safe(after), filesystem: fstype }));
-`;
-    const result = await this.incus.exec(String(task.instance_name), ["bun", "-e", script, String(diskGib)], { timeout: 120 });
+    const result = await this.incus.exec(String(task.instance_name), ["bun", "-e", GUEST_GROWTH_SCRIPT, String(diskGib)], { timeout: 120 });
     try {
       const value = JSON.parse(decode(result.stdout));
       if (!isDict(value) || typeof value.virtual_bytes !== "number" || value.virtual_bytes < diskGib * 1024 ** 3) throw new Error("report");

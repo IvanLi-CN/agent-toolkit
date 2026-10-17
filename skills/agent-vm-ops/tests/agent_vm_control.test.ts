@@ -1,5 +1,5 @@
-import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, expect, setDefaultTimeout, test } from "bun:test";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -7,6 +7,7 @@ import {
   Control,
   ControlError,
   CTResources,
+  GUEST_GROWTH_SCRIPT,
   IncusClient,
   PROTOCOL_VERSION,
   StateStore,
@@ -16,14 +17,61 @@ import {
 
 const GIB = 1024 ** 3;
 const KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestfixture";
+setDefaultTimeout(15_000);
 
 type Dict = Record<string, any>;
 type RunnerOptions = { inputData?: Uint8Array | string; timeout?: number; check?: boolean };
 type ProcessResult = { args: string[]; returncode: number; stdout: Uint8Array; stderr: Uint8Array; stdoutTruncated?: boolean };
+type GuestFixtureOptions = { fstype?: "ext4" | "xfs"; parent?: string; virtualBytes?: number; includeGrowpart?: boolean };
+type GuestFixture = { root: string; bin: string; log: string; env: Record<string, string> };
 
 function result(args: readonly string[], stdout: string | Dict | Dict[] = "", returncode = 0, stderr = ""): ProcessResult {
   const text = typeof stdout === "string" ? stdout : JSON.stringify(stdout);
   return { args: [...args], returncode, stdout: new TextEncoder().encode(text), stderr: new TextEncoder().encode(stderr) };
+}
+
+function createGuestFixture(base: string, options: GuestFixtureOptions = {}): GuestFixture {
+  const root = join(base, "guest-root");
+  const bin = join(base, "guest-bin");
+  const log = join(base, "guest-commands.log");
+  mkdirSync(join(root, "sys/class/block/vda1"), { recursive: true });
+  mkdirSync(join(root, "dev"), { recursive: true });
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(root, "sys/class/block/vda1/partition"), "1\n");
+  const writeCommand = (name: string, body: string): void => {
+    const path = join(bin, name);
+    writeFileSync(path, `#!/bin/sh\nset -eu\n${body}\n`);
+    chmodSync(path, 0o755);
+  };
+  writeCommand("findmnt", 'case "$*" in *SOURCE*) printf \'%s/dev/vda1\\n\' "$AGENT_GUEST_ROOT" ;; *FSTYPE*) printf \'%s\\n\' "$AGENT_GUEST_FSTYPE" ;; *) exit 2 ;; esac');
+  writeCommand("realpath", 'printf \'%s\\n\' "$1"');
+  writeCommand("lsblk", 'printf \'%s\\n\' "$AGENT_GUEST_PARENT"');
+  writeCommand("blockdev", 'printf \'%s\\n\' "$AGENT_GUEST_VIRTUAL_BYTES"');
+  if (options.includeGrowpart !== false) writeCommand("growpart", 'printf \'growpart\\n\' >> "$AGENT_GUEST_LOG"; printf \'CHANGED\\n\'');
+  writeCommand("resize2fs", 'printf \'resize2fs\\n\' >> "$AGENT_GUEST_LOG"');
+  writeCommand("xfs_growfs", 'printf \'xfs_growfs\\n\' >> "$AGENT_GUEST_LOG"');
+  return {
+    root,
+    bin,
+    log,
+    env: {
+      AGENT_GUEST_ROOT: root,
+      AGENT_GUEST_FSTYPE: options.fstype ?? "ext4",
+      AGENT_GUEST_PARENT: options.parent ?? "vda",
+      AGENT_GUEST_VIRTUAL_BYTES: String(options.virtualBytes ?? 2 * GIB),
+      AGENT_GUEST_LOG: log,
+    },
+  };
+}
+
+function runGuestGrowth(guest: GuestFixture, diskGib: number, script = GUEST_GROWTH_SCRIPT, virtualBytes?: number): { exitCode: number; stdout: string; stderr: string } {
+  const inherited = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined));
+  const child = Bun.spawnSync([process.execPath, "-e", script, String(diskGib), guest.root], {
+    env: { ...inherited, ...guest.env, ...(virtualBytes === undefined ? {} : { AGENT_GUEST_VIRTUAL_BYTES: String(virtualBytes) }), PATH: `${guest.bin}:${inherited.PATH ?? ""}` },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  return { exitCode: child.exitCode, stdout: new TextDecoder().decode(child.stdout), stderr: new TextDecoder().decode(child.stderr) };
 }
 
 class NativeCommands extends CommandRunner {
@@ -38,6 +86,9 @@ class NativeCommands extends CommandRunner {
   onWait: ((name: string, condition: string) => void) | undefined;
   onStart: ((name: string) => void) | undefined;
   onConfigSet: ((name: string, key: string, value: string) => void) | undefined;
+  guestFixture: GuestFixture | undefined;
+
+  configureGuest(root: string): void { this.guestFixture = createGuestFixture(root, { virtualBytes: 20 * GIB }); }
 
   override async run(argv: readonly string[], options: RunnerOptions = {}): Promise<ProcessResult> {
     const args = [...argv];
@@ -180,6 +231,11 @@ class NativeCommands extends CommandRunner {
       if (!this.guestToolsAvailable) throw new ControlError("command_failed", "required guest tool is missing", { returncode: 127, stderr: "bun: command not found" });
       return result(["incus", ...command]);
     }
+    if (guestArgs[0] === "bun" && guestArgs[1] === "-e" && this.guestFixture) {
+      const growth = runGuestGrowth(this.guestFixture, Number(instance.guest_disk_bytes) / GIB, guestArgs[2], instance.guest_disk_bytes);
+      if (growth.exitCode !== 0) throw new ControlError("command_failed", "guest growth program failed", { returncode: growth.exitCode, stderr: growth.stderr.slice(-4000) });
+      return result(["incus", ...command], growth.stdout);
+    }
     if (guestArgs[0] === "bun") return result(["incus", ...command], { virtual_bytes: instance.guest_disk_bytes, filesystem_before: instance.guest_disk_bytes - 1024, filesystem_bytes: instance.guest_disk_bytes, filesystem: "ext4" });
     return result(["incus", ...command]);
   }
@@ -206,6 +262,9 @@ class Fixture {
   readonly systemd: SystemdManager;
   readonly control: Control;
   now = new Date("2026-10-04T00:00:00.000Z");
+  memoryAvailable = 24 * GIB;
+  storageFree = 80 * GIB;
+  storeClosed = false;
   readonly config: Dict;
 
   constructor() {
@@ -218,9 +277,10 @@ class Fixture {
       cpu_budget: 4, memory_budget_mib: 16384, cpu_overcommit_ratio: 4, memory_overcommit_ratio: 4,
       required_guest_tools: ["bun", "sshd", "rsync", "docker"], state_db: join(this.root, "state.sqlite3"), timer_dir: join(this.root, "systemd"),
     };
+    this.runner.configureGuest(this.root);
     this.store = new StateStore(this.config.state_db);
     this.systemd = new SystemdManager(this.runner, this.config, false);
-    const resources = { cpu: () => 16, memory: () => ({ scope: "ct-memory", sources: ["lxcfs"], limit_bytes: 32 * GIB, available_bytes: 24 * GIB, threshold_bytes: 4 * GIB }) };
+    const resources = { cpu: () => 16, memory: () => ({ scope: "ct-memory", sources: ["lxcfs"], limit_bytes: 32 * GIB, available_bytes: this.memoryAvailable, threshold_bytes: 4 * GIB }) };
     this.control = new Control(this.config, {
       runner: this.runner,
       store: this.store,
@@ -229,19 +289,24 @@ class Fixture {
       clock: () => this.now,
       which: (command) => command === "conntrack" ? "/usr/sbin/conntrack" : null,
     });
-    (this.control as any).ensureCapacityVerified = () => ({ scope: "ct-filesystem", observed_at: this.now.toISOString(), layers: [{ label: "ct-filesystem", total: 100 * GIB, free: 80 * GIB, kind: "data", low: 1 * GIB, target: 2 * GIB }] });
+    (this.control as any).ensureCapacityVerified = () => ({ scope: "ct-filesystem", observed_at: this.now.toISOString(), layers: [{ label: "ct-filesystem", total: 100 * GIB, free: this.storageFree, kind: "data", low: 1 * GIB, target: 2 * GIB }] });
     (this.control as any).ephemeralPorts = () => new Set<number>();
   }
 
-  close(): void { this.store.close(); rmSync(this.root, { recursive: true, force: true }); }
+  close(): void { if (!this.storeClosed) { this.store.close(); this.storeClosed = true; } rmSync(this.root, { recursive: true, force: true }); }
 
-  request(action: string, fields: Dict = {}, operation?: string): Dict {
-    const task = this.store.getTask({ sessionId: "thread-a" });
-    return { protocol: PROTOCOL_VERSION, action, session_id: "thread-a", generation: Number(task?.generation ?? 0), operation_id: operation ?? `op-${Math.random().toString(16).slice(2)}`, ...fields };
+  request(action: string, fields: Dict = {}, operation?: string, sessionId = "thread-a"): Dict {
+    const task = this.store.getTask({ sessionId });
+    return { protocol: PROTOCOL_VERSION, action, session_id: sessionId, generation: Number(task?.generation ?? 0), operation_id: operation ?? `op-${Math.random().toString(16).slice(2)}`, ...fields };
   }
 
   async call(action: string, fields: Dict = {}, operation?: string): Promise<Dict> {
     const response = await this.control.dispatch(this.request(action, fields, operation));
+    return response.result;
+  }
+
+  async callFor(sessionId: string, action: string, fields: Dict = {}, operation?: string): Promise<Dict> {
+    const response = await this.control.dispatch(this.request(action, fields, operation, sessionId));
     return response.result;
   }
 }
@@ -255,12 +320,54 @@ async function expectCode(action: Promise<unknown>, code: string): Promise<void>
   catch (error) { if (error instanceof Error && error.message === `expected ${code}`) throw error; expect((error as ControlError).code).toBe(code); }
 }
 
+function expectSyncCode(action: () => unknown, code: string): void {
+  try { action(); throw new Error(`expected ${code}`); }
+  catch (error) { if (error instanceof Error && error.message === `expected ${code}`) throw error; expect((error as ControlError).code).toBe(code); }
+}
+
+function writeLegacyOperation(dbPath: string, response: Dict): void {
+  const fixtureScript = join(import.meta.dir, "fixtures", "legacy_state_fixture.py");
+  const child = Bun.spawnSync(["python3", fixtureScript, dbPath, JSON.stringify(response)], { stdout: "pipe", stderr: "pipe" });
+  if (child.exitCode !== 0) throw new Error(`legacy fixture failed: ${new TextDecoder().decode(child.stderr)}`);
+}
+
 test("loads Bun as the managed guest prerequisite", () => {
   const root = mkdtempSync("/tmp/agent-vm-config-test-");
   try {
     const config = { project: "agents", profile: "agent-vm", image_alias: "image", image_fingerprint: "a".repeat(64), network: "agentsbr0", network_acl: "agent-vm-isolation", pool: "agents", host_address: "198.51.100.19", port_start: 20000, port_end: 20030, vm_ip_start: "198.51.100.20", vm_ip_end: "198.51.100.250", gateway_ip: "198.51.100.1", storage_path: root, state_db: join(root, "state.sqlite3"), timer_dir: root };
     writeFileSync(join(root, "config.json"), JSON.stringify(config));
     expect(loadConfig(join(root, "config.json")).required_guest_tools).toEqual(["bun", "sshd", "rsync", "docker", "growpart"]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("fails closed on missing or invalid environment config before native writes", () => {
+  const root = mkdtempSync("/tmp/agent-vm-config-contract-test-");
+  const base: Dict = { project: "agents", profile: "agent-vm", image_alias: "image", image_fingerprint: "a".repeat(64), network: "agentsbr0", network_acl: "agent-vm-isolation", pool: "agents", host_address: "198.51.100.19", port_start: 20000, port_end: 20030, vm_ip_start: "198.51.100.20", vm_ip_end: "198.51.100.250", gateway_ip: "198.51.100.1", storage_path: root, state_db: join(root, "state.sqlite3"), timer_dir: join(root, "systemd") };
+  const required = ["project", "profile", "image_alias", "image_fingerprint", "network", "network_acl", "pool", "host_address", "port_start", "port_end", "vm_ip_start", "vm_ip_end", "gateway_ip", "storage_path", "state_db", "timer_dir"];
+  const runner = new NativeCommands();
+  try {
+    expectSyncCode(() => loadConfig(join(root, "missing.json")), "config_missing");
+    for (const field of required) {
+      const config = { ...base };
+      delete config[field];
+      const path = join(root, `missing-${field}.json`);
+      writeFileSync(path, JSON.stringify(config));
+      expectSyncCode(() => loadConfig(path), "config_missing");
+    }
+    const invalid: Dict[] = [
+      { ...base, image_fingerprint: "A".repeat(64) },
+      { ...base, port_start: "20000" },
+      { ...base, renew_seconds: 7201 },
+      { ...base, cpu_overcommit_ratio: "0.99" },
+      { ...base, required_guest_tools: ["bun", 7] },
+      { ...base, vm_ip_start: "198.51.100.250", vm_ip_end: "198.51.100.20" },
+    ];
+    for (const [index, config] of invalid.entries()) {
+      const path = join(root, `invalid-${index}.json`);
+      writeFileSync(path, JSON.stringify(config));
+      expectSyncCode(() => loadConfig(path), "config_invalid");
+    }
+    expect(runner.calls).toHaveLength(0);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -288,13 +395,13 @@ test("keeps SQLite integer reservations exact beyond the JS safe range", () => {
 test("replays an accepted persisted operation without changing its digest or native state", async () => {
   const root = mkdtempSync("/tmp/agent-vm-baseline-test-");
   const dbPath = join(root, "state.sqlite3");
-  const store = new StateStore(dbPath);
   const digest = "c3dccc911349ced563eb9615fb6db8ffa5801d121c9542c29c5a3fc0575a768a";
   const response = {
     ok: true, protocol: PROTOCOL_VERSION, server_time: "2026-10-04T00:00:00+00:00", action: "acquire", session_id: "legacy",
     generation: 0, operation_id: "legacy-op", outcome: "success", result: { state: "active" }, _request_digest: digest,
   };
-  (store.db as any).run("INSERT INTO operations(operation_id, action, session_id, generation, response_json, created_at) VALUES (?, ?, ?, ?, ?, ?)", "legacy-op", "acquire", "legacy", 0, JSON.stringify(response), "2026-10-04T00:00:00+00:00");
+  writeLegacyOperation(dbPath, response);
+  const store = new StateStore(dbPath);
   const runner = new NativeCommands();
   const control = new Control({ state_db: dbPath, timer_dir: root }, { store, runner });
   try {
@@ -307,6 +414,79 @@ test("replays an accepted persisted operation without changing its digest or nat
   } finally {
     store.close();
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects a pending legacy operation without rewriting its journal", async () => {
+  const root = mkdtempSync("/tmp/agent-vm-pending-baseline-test-");
+  const dbPath = join(root, "state.sqlite3");
+  const digest = "c3dccc911349ced563eb9615fb6db8ffa5801d121c9542c29c5a3fc0575a768a";
+  const response = { protocol: PROTOCOL_VERSION, action: "acquire", session_id: "legacy", generation: 0, operation_id: "legacy-op", outcome: "pending", _request_digest: digest };
+  writeLegacyOperation(dbPath, response);
+  const store = new StateStore(dbPath);
+  const runner = new NativeCommands();
+  const control = new Control({ state_db: dbPath, timer_dir: root }, { store, runner });
+  try {
+    await expectCode(control.dispatch({ protocol: PROTOCOL_VERSION, action: "acquire", session_id: "legacy", generation: 0, operation_id: "legacy-op", public_key: KEY }), "operation_incomplete");
+    expect(store.operation("legacy-op")).toEqual(response);
+    expect(runner.calls).toHaveLength(0);
+  } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("replays an accepted operation after restart and preserves an updated renewal deadline", async () => {
+  const f = fixture();
+  const acquireRequest = f.request("acquire", { public_key: KEY }, "op-restart-acquire");
+  const first = (await f.control.dispatch(acquireRequest)).result;
+  const renewalRequest = f.request("renew", {}, "op-deadline");
+  const renewed = (await f.control.dispatch(renewalRequest)).result;
+  expect(renewed.lease_expires_at).not.toBe(first.lease_expires_at);
+  f.now = new Date("2026-10-04T00:00:20.000Z");
+  const replayedRenewal = await f.control.dispatch(renewalRequest);
+  expect(replayedRenewal.outcome).toBe("replayed");
+  expect((await f.call("status")).lease_expires_at).toBe(renewed.lease_expires_at);
+
+  f.store.close();
+  f.storeClosed = true;
+  const restartedRunner = new NativeCommands();
+  restartedRunner.configureGuest(join(f.root, "restarted-guest"));
+  const restartedStore = new StateStore(f.config.state_db);
+  const restartedResources = { cpu: () => 16, memory: () => ({ scope: "ct-memory", sources: ["fixture"], limit_bytes: 32 * GIB, available_bytes: f.memoryAvailable, threshold_bytes: 4 * GIB }) };
+  const restarted = new Control(f.config, { runner: restartedRunner, store: restartedStore, systemd: new SystemdManager(restartedRunner, f.config, false), resources: restartedResources as unknown as CTResources, clock: () => f.now, which: (command) => command === "conntrack" ? "/usr/sbin/conntrack" : null });
+  try {
+    const replay = await restarted.dispatch(acquireRequest);
+    expect(replay.outcome).toBe("replayed");
+    expect(replay.result.lease_expires_at).toBe(first.lease_expires_at);
+    expect(restartedRunner.calls).toHaveLength(0);
+  } finally { restartedStore.close(); }
+});
+
+test("executes the embedded guest growth program for ext4 and xfs", () => {
+  for (const fstype of ["ext4", "xfs"] as const) {
+    const root = mkdtempSync(`/tmp/agent-vm-guest-${fstype}-`);
+    try {
+      const guest = createGuestFixture(root, { fstype, virtualBytes: 2 * GIB });
+      const run = runGuestGrowth(guest, 1);
+      expect(run.exitCode).toBe(0);
+      expect(JSON.parse(run.stdout)).toMatchObject({ virtual_bytes: 2 * GIB, filesystem: fstype });
+      expect(readFileSync(guest.log, "utf8")).toBe(`growpart\n${fstype === "ext4" ? "resize2fs" : "xfs_growfs"}\n`);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }
+});
+
+test("refuses ambiguous guest roots and missing growth commands", () => {
+  const ambiguousRoot = mkdtempSync("/tmp/agent-vm-guest-ambiguous-");
+  const missingCommandRoot = mkdtempSync("/tmp/agent-vm-guest-missing-command-");
+  try {
+    const ambiguous = runGuestGrowth(createGuestFixture(ambiguousRoot, { parent: "vda/mapper", virtualBytes: 2 * GIB }), 1);
+    expect(ambiguous.exitCode).not.toBe(0);
+    expect(ambiguous.stderr).toContain("ambiguous root disk");
+    const missingGuest = createGuestFixture(missingCommandRoot, { includeGrowpart: false, virtualBytes: 2 * GIB });
+    const missing = runGuestGrowth(missingGuest, 1);
+    expect(missing.exitCode).not.toBe(0);
+    expect(existsSync(missingGuest.log)).toBe(false);
+  } finally {
+    rmSync(ambiguousRoot, { recursive: true, force: true });
+    rmSync(missingCommandRoot, { recursive: true, force: true });
   }
 });
 
@@ -362,6 +542,96 @@ test("missing guest Bun fails before guest writes", async () => {
   expect(f.runner.calls.some(({ args }) => args.some((arg) => arg.includes("command -v")))).toBe(true);
   expect(f.runner.calls.some(({ args }) => args.includes("authorized_keys"))).toBe(false);
   expect(f.runner.calls.some(({ args }) => args[0] === "incus" && args.includes("bun"))).toBe(false);
+});
+
+test("uses exact ratio floors, reservation ceilings and bigint capacity boundaries", async () => {
+  const f = fixture();
+  const config = (f.control as any).config as Dict;
+  config.cpu_budget = 15;
+  config.memory_budget_mib = 12288;
+  config.cpu_overcommit_ratio = 4;
+  config.memory_overcommit_ratio = 4;
+  let policy = await (f.control as any).resourcePolicy();
+  expect(policy.limits).toEqual({ cpu: 60, memory_mib: 49152 });
+  config.cpu_overcommit_ratio = "1.1";
+  config.memory_overcommit_ratio = "1.01";
+  policy = await (f.control as any).resourcePolicy();
+  expect(policy.limits).toEqual({ cpu: 16, memory_mib: 12410 });
+
+  config.cpu_budget = 4;
+  config.memory_budget_mib = 4096;
+  config.cpu_overcommit_ratio = 1;
+  config.memory_overcommit_ratio = 1;
+  const first = (f.control as any).baseTask("one", 1) as Dict;
+  first.lease_expires_at = new Date(f.now.getTime() + 1800 * 1000).toISOString();
+  first.resources_json = JSON.stringify({ cpu: 4, memory_mib: 4096, disk_gib: 20 });
+  await (f.control as any).reserveResources(first, { cpu: 4, memory_mib: 4096, disk_gib: 20 });
+  const second = (f.control as any).baseTask("two", 1) as Dict;
+  second.lease_expires_at = new Date(f.now.getTime() + 1800 * 1000).toISOString();
+  second.resources_json = JSON.stringify({ cpu: 4, memory_mib: 4096, disk_gib: 20 });
+  await expectCode((f.control as any).reserveResources(second, { cpu: 4, memory_mib: 4096, disk_gib: 20 }), "resource_insufficient");
+  expect(f.runner.calls.some(({ args }) => args[0] === "incus" && ["init", "start", "stop", "delete"].includes(args[3] ?? ""))).toBe(false);
+
+  const exact = 9007199254740993n;
+  f.store.updateTask(String(first.task_id), { reservation_bytes: 1n });
+  const facts = { layers: [{ free: exact + 6n, low: exact + 2n }] };
+  expect(await (f.control as any).spaceSufficient(facts, 3n, "low")).toBe(true);
+  expect(await (f.control as any).spaceSufficient(facts, 4n, "low")).toBe(false);
+});
+
+test("drain protects active leases and reclaim never deletes them", async () => {
+  const f = fixture();
+  const active = await f.call("acquire", { public_key: KEY }, "op-protected-active");
+  await f.control.dispatch(f.request("drain-enter", {}, "op-drain-enter"));
+  await expectCode(f.callFor("new-session", "acquire", { public_key: KEY }, "op-drain-acquire"), "draining");
+  await expectCode(f.call("renew", {}, "op-drain-renew"), "draining");
+  await f.control.dispatch(f.request("drain-exit", {}, "op-drain-exit"));
+
+  const cached = await f.callFor("cached-session", "acquire", { public_key: KEY }, "op-protected-cache");
+  await f.callFor("cached-session", "release", {}, "op-protected-cache-release");
+  f.storageFree = 0;
+  f.runner.failure = (args) => args[0] === "incus" && args[3] === "delete";
+  await expectCode(f.callFor("new-session", "acquire", { public_key: KEY }, "op-reclaim-failure"), "reclaim_failed");
+  expect(f.store.getTask({ taskId: String(active.task_id) })?.state).toBe("active");
+  expect(f.store.getTask({ taskId: String(cached.task_id) })?.state).toBe("deleting");
+  const deletes = f.runner.calls.filter(({ args }) => args[0] === "incus" && args[3] === "delete");
+  expect(deletes.every(({ args }) => !args.includes(active.instance_name))).toBe(true);
+});
+
+test("retains conservative accounting after cleanup failure and reconciles on retry", async () => {
+  const f = fixture();
+  const active = await f.call("acquire", { public_key: KEY }, "op-cleanup-active");
+  (f.control as any).systemd = new SystemdManager(f.runner, f.config, true);
+  f.runner.failure = (args) => args[0] === "conntrack" && args[1] === "-D";
+  await expectCode(f.call("release", {}, "op-cleanup-failure"), "cleanup_incomplete");
+  const closing = f.store.getTask({ taskId: String(active.task_id) })!;
+  expect(closing.state).toBe("closing");
+  expect(closing.resource_reservation_json).toBe("{}");
+  expect((f.control as any).allocationTotals()).toEqual({ cpu: 2, memory_mib: 4096 });
+  expect(f.runner.calls.some(({ args }) => args[0] === "systemctl" && args[1] === "start" && args[2] === "--no-block")).toBe(true);
+
+  f.runner.failure = undefined;
+  const reconciled = await f.control.dispatch(f.request("admin-reconcile", { apply: true }, "op-cleanup-reconcile"));
+  expect(reconciled.result.dry_run).toBe(false);
+  expect(f.store.getTask({ taskId: String(active.task_id) })?.state).toBe("cached");
+  expect(f.store.getPorts(String(active.task_id))).toHaveLength(0);
+  expect(f.runner.instances.get(active.instance_name)?.status).toBe("Stopped");
+});
+
+test("GC previews and deletes only eligible stopped caches", async () => {
+  const f = fixture();
+  const old = await f.callFor("old-session", "acquire", { public_key: KEY }, "op-gc-old");
+  await f.callFor("old-session", "release", {}, "op-gc-old-release");
+  f.now = new Date(f.now.getTime() + 25 * 60 * 60 * 1000);
+  const active = await f.call("acquire", { public_key: KEY }, "op-gc-active");
+  const preview = await f.control.dispatch(f.request("admin-gc", {}, "op-gc-preview"));
+  expect(preview.result.dry_run).toBe(true);
+  expect(preview.result.candidates.map((item: Dict) => item.task_id)).toContain(old.task_id);
+  await f.control.dispatch(f.request("admin-gc", { apply: true }, "op-gc-apply"));
+  expect(f.store.getTask({ taskId: String(old.task_id) })?.state).toBe("absent");
+  expect(f.store.getTask({ taskId: String(active.task_id) })?.state).toBe("active");
+  expect(f.runner.instances.has(old.instance_name)).toBe(false);
+  expect(f.runner.instances.has(active.instance_name)).toBe(true);
 });
 
 test("partial live-memory failure keeps conservative allocation and no restart fallback", async () => {

@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { CommandRunner, Control, StateStore } from "../scripts/agent_vm_control.ts";
+import { CommandRunner, Control, ControlError, StateStore } from "../scripts/agent_vm_control.ts";
 
 type Dict = Record<string, any>;
 
@@ -46,7 +46,35 @@ test("records native prerequisite availability", () => {
     systemd_analyze: Bun.which("systemd-analyze"),
   };
   console.log(`native-prerequisites=${JSON.stringify(prerequisites)}`);
-  expect(prerequisites.platform).toBe(process.platform);
+  expect(["linux", "darwin"]).toContain(prerequisites.platform);
+  expect(typeof prerequisites.root).toBe("boolean");
+  expect(prerequisites.euid === null || Number.isInteger(prerequisites.euid)).toBe(true);
+});
+
+test("rejects a missing guest prerequisite before the guest write boundary", async () => {
+  const probeRoot = root("agent-vm-prerequisite");
+  class MissingGuestRunner extends CommandRunner {
+    readonly calls: string[][] = [];
+
+    override async run(argv: readonly string[], _options: Dict = {}): Promise<any> {
+      const args = [...argv];
+      this.calls.push(args);
+      if (args[0] === "incus" && args.includes("exec")) throw new ControlError("command_failed", "required guest tool is missing", { returncode: 127, stderr: "bun: command not found" });
+      throw new Error(`unexpected command: ${args.join(" ")}`);
+    }
+  }
+  const runner = new MissingGuestRunner();
+  const dbPath = join(probeRoot, "state.sqlite3");
+  const store = new StateStore(dbPath);
+  const control = new Control({ project: "agents", state_db: dbPath, timer_dir: probeRoot, required_guest_tools: ["bun", "sshd", "rsync", "docker", "growpart"] }, { store, runner });
+  try {
+    let failure: any;
+    try { await (control as any).verifyGuestTools("agent-vm-prerequisite"); }
+    catch (error) { failure = error; }
+    expect(failure?.code).toBe("command_failed");
+    expect(runner.calls.some((args) => args.some((arg) => arg.includes("command -v")))).toBe(true);
+    expect(runner.calls.some((args) => args.some((arg) => arg.includes("authorized_keys")))).toBe(false);
+  } finally { store.close(); }
 });
 
 const roots: string[] = [];

@@ -44,6 +44,10 @@ function encodedJson(value: unknown): string {
   return Buffer.from(JSON.stringify(value), "utf8").toString("base64");
 }
 
+const VALID_XRAY_API_B64 = encodedJson({
+  inbounds: [{ tag: "vless-vision-endpoint-1", receiverSettings: { type: "xray.app.proxyman.ReceiverConfig", portList: 443 } }],
+});
+
 function records(values: Record<string, string>): string {
   return Object.entries(values).map(([key, value]) => key + "=" + value).join("\n") + "\n";
 }
@@ -85,6 +89,9 @@ function validBasicRecords(): string {
     managed_default_state_json: JSON.stringify({ schema_version: 1, vless_endpoint_id: "endpoint-1", ss_endpoint_id: null }),
     sync_node_meta: "true",
     xray_public_ports: "443",
+    xray_listener_pids: "123",
+    xray_runtime_pid: "123",
+    xray_api_b64: VALID_XRAY_API_B64,
   });
 }
 
@@ -117,6 +124,9 @@ test("rejects duplicate JSON members and malformed normalized observations", () 
 test("rejects partial, normalized, and injected timestamps while preserving missing values", () => {
   expect(parseTimestamp("1")).toBeUndefined();
   expect(parseTimestamp("2025-01")).toBeUndefined();
+  expect(parseTimestamp("12345")?.getTime()).toBeLessThan(new Date("2025-01-01T00:00:00Z").getTime());
+  expect(parseTimestamp("20250101123045")?.toISOString()).toBe("2025-01-01T12:30:45.000Z");
+  expect(parseTimestamp("20250230123045")).toBeUndefined();
   expect(parseTimestamp("2025-02-30")).toBeUndefined();
   expect(parseTimestamp("2025-01-01$(id)")).toBeUndefined();
   expect(parseTimestamp("2025-01-01T00:00:00.000000000Z")).toEqual(new Date("2025-01-01T00:00:00Z"));
@@ -140,6 +150,19 @@ test("normalizes a valid observation without reading secrets", () => {
   expect(result.canary_local_target).toBe("https://fixture-node-ep.example.test:10443/generate_204");
   expect(result.vless_public_target).toBe("https://fixture-node-ep.example.test:443/generate_204");
   expect(result).not.toHaveProperty("admin_token");
+});
+
+test("requires managed VLESS ownership evidence instead of canary-only evidence", () => {
+  const wrongTagApiB64 = encodedJson({
+    inbounds: [{ tag: "vless-vision-other", receiverSettings: { type: "xray.app.proxyman.ReceiverConfig", portList: 443 } }],
+  });
+  const wrongPortApiB64 = encodedJson({
+    inbounds: [{ tag: "vless-vision-endpoint-1", receiverSettings: { type: "xray.app.proxyman.ReceiverConfig", portList: 8443 } }],
+  });
+  expect(() => normalizeBasic(validBasicRecords().replace("xray_listener_pids=123", "xray_listener_pids=124"), new Date("2025-01-01T00:00:00Z"))).toThrow("verified Xray listener");
+  expect(() => normalizeBasic(validBasicRecords().replace(`xray_api_b64=${VALID_XRAY_API_B64}`, "xray_api_b64="), new Date("2025-01-01T00:00:00Z"))).toThrow("readable Xray API inventory");
+  expect(() => normalizeBasic(validBasicRecords().replace(VALID_XRAY_API_B64, wrongTagApiB64), new Date("2025-01-01T00:00:00Z"))).toThrow("absent from the Xray API inventory");
+  expect(() => normalizeBasic(validBasicRecords().replace(VALID_XRAY_API_B64, wrongPortApiB64), new Date("2025-01-01T00:00:00Z"))).toThrow("not owned by its Xray inbound");
 });
 
 test("normalizes public health without accepting duplicate JSON members", () => {
@@ -181,6 +204,8 @@ test("validates public targets against injected DNS evidence", async () => {
 test("validates every Cloudflare CIDR before matching", () => {
   expect(isCloudflareAddress("93.184.216.34", "93.184.216.0/24\nnot-a-cidr/garbage\n")).toBe(false);
   expect(isCloudflareAddress("93.184.216.34", "93.184.216.0/24\n93.184.217.0/24\n")).toBe(true);
+  expect(isCloudflareAddress("2001:4860:4860:0:0:0:0:8888::", "2000::/3\n")).toBe(false);
+  expect(isCloudflareAddress("2001:4860:4860::8888", "2000::/3\n")).toBe(true);
 });
 
 test("rejects non-boolean service and sync records", () => {

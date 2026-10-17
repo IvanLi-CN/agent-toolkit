@@ -486,10 +486,60 @@ const TIMESTAMP_MONTHS: Record<string, number> = {
   jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
 };
 
+function compactNumericYear(value: number): number {
+  return value <= 68 ? 2000 + value : 1900 + value;
+}
+
+function utcDateTime(year: number, month: number, day: number, hour = 0, minute = 0, second = 0): Date | undefined {
+  if (!validCalendarDate(year, month, day)) return undefined;
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) return undefined;
+  const result = new Date(0);
+  result.setUTCFullYear(year, month - 1, day);
+  result.setUTCHours(hour, minute, second, 0);
+  return result;
+}
+
+function utcDate(year: number, month: number, day: number): Date | undefined {
+  return utcDateTime(year, month, day);
+}
+
+function utcOrdinalDate(year: number, ordinal: number): Date | undefined {
+  const maxOrdinal = validCalendarDate(year, 2, 29) ? 366 : 365;
+  if (!Number.isInteger(ordinal) || ordinal < 1 || ordinal > maxOrdinal) return undefined;
+  const result = new Date(0);
+  result.setUTCHours(0, 0, 0, 0);
+  result.setUTCFullYear(year, 0, ordinal);
+  return result;
+}
+
+function parseCompactNumericTimestamp(text: string): Date | undefined {
+  if (!/^\d+$/.test(text)) return undefined;
+  switch (text.length) {
+    case 5:
+      return utcOrdinalDate(compactNumericYear(Number(text.slice(0, 2))), Number(text.slice(2)));
+    case 6:
+      return utcDate(compactNumericYear(Number(text.slice(0, 2))), Number(text.slice(2, 4)), Number(text.slice(4)));
+    case 7:
+      return utcOrdinalDate(Number(text.slice(0, 4)), Number(text.slice(4)));
+    case 8:
+      return utcDate(Number(text.slice(0, 4)), Number(text.slice(4, 6)), Number(text.slice(6)));
+    case 10:
+      return utcDateTime(Number(text.slice(0, 4)), Number(text.slice(4, 6)), Number(text.slice(6, 8)), Number(text.slice(8)));
+    case 12:
+      return utcDateTime(Number(text.slice(0, 4)), Number(text.slice(4, 6)), Number(text.slice(6, 8)), Number(text.slice(8, 10)), Number(text.slice(10)));
+    case 14:
+      return utcDateTime(Number(text.slice(0, 4)), Number(text.slice(4, 6)), Number(text.slice(6, 8)), Number(text.slice(8, 10)), Number(text.slice(10, 12)), Number(text.slice(12)));
+    default:
+      return undefined;
+  }
+}
+
 export function parseTimestamp(value: unknown): Date | undefined {
   if (typeof value !== "string") return undefined;
   const text = value.trim();
-  if (!text || /^\d{1,4}(?:-\d{1,2})?$/.test(text)) return undefined;
+  if (!text) return undefined;
+  if (/^\d+$/.test(text)) return parseCompactNumericTimestamp(text);
+  if (/^\d{1,4}(?:-\d{1,2})?$/.test(text)) return undefined;
 
   const dateMatch = text.match(TIMESTAMP_DATE_PATTERN) ?? text.match(TIMESTAMP_SLASH_DATE_PATTERN);
   if (dateMatch) {
@@ -577,15 +627,15 @@ function tunnelDeclaration(records: JsonRecord, apiHost: string): string {
   return "mismatch";
 }
 
-function managedDefaults(records: JsonRecord): [boolean, boolean] {
+function managedDefaults(records: JsonRecord): [boolean, boolean, JsonRecord | undefined] {
   const state = parseJsonObject(String(records.managed_default_state_json ?? ""), "managed_default_state_json");
-  if (!state) return [false, false];
+  if (!state) return [false, false, undefined];
   if (state.schema_version !== 1) fail("managed_default_state_json schema_version is unsupported");
   const vless = state.vless_endpoint_id;
   const ss = state.ss_endpoint_id;
   if (vless !== null && vless !== undefined && !(typeof vless === "string" && vless.length > 0)) fail("managed_default_state_json.vless_endpoint_id is invalid");
   if (ss !== null && ss !== undefined && !(typeof ss === "string" && ss.length > 0)) fail("managed_default_state_json.ss_endpoint_id is invalid");
-  return [vless !== null && vless !== undefined, ss !== null && ss !== undefined];
+  return [vless !== null && vless !== undefined, ss !== null && ss !== undefined, state];
 }
 
 function publicXrayPorts(value: string): number[] {
@@ -616,6 +666,7 @@ const BASIC_REQUIRED_FIELDS = [
   "geo_enabled", "geo_origin", "geo_response_json", "health_json", "cluster_json",
   "node_name", "api_base", "access_host", "cloudflare_enabled", "cloudflare_hostname",
   "cloudflare_settings_json", "managed_default_state_json", "sync_node_meta", "xray_public_ports",
+  "xray_listener_pids", "xray_runtime_pid", "xray_api_b64",
 ] as const;
 
 const BASIC_ALLOWED_FIELDS = new Set<string>([...BASIC_REQUIRED_FIELDS, "vless_ingress"]);
@@ -682,7 +733,7 @@ export function normalizeBasic(text: string, now = auditNow()): BasicAudit {
   if (accessHost !== accessHost.toLowerCase()) fail("access_host must be lowercase");
   const nodeName = String(records.node_name);
   const declaration = tunnelDeclaration(records, apiHost);
-  const [vlessManaged, ssManaged] = managedDefaults(records);
+  const [vlessManaged, ssManaged, managedState] = managedDefaults(records);
   const publicPorts = publicXrayPorts(String(records.xray_public_ports));
   const runtimeMode = String(records.runtime_mode);
   if (runtimeMode !== "host" && runtimeMode !== "container") fail("runtime_mode is invalid");
@@ -698,6 +749,25 @@ export function normalizeBasic(text: string, now = auditNow()): BasicAudit {
     if (containerIdentity || containerStartedAt || containerXrayToken) fail("host runtime has container identity");
     if (!/^[1-9][0-9]*$/.test(String(records.host_xray_pid))) fail("host_xray_pid is invalid");
     if (!/^[1-9][0-9]*$/.test(String(records.host_xray_starttime))) fail("host_xray_starttime is invalid");
+  }
+
+  const xrayListenerPids = parsePidList(records, "xray_listener_pids");
+  const xrayRuntimePid = String(records.xray_runtime_pid);
+  const xrayApi = records.xray_api_b64 ? parseStrictJson(new TextDecoder().decode(decodeBase64Strict(String(records.xray_api_b64), "xray_api_b64")), "Xray API inventory") : undefined;
+  const xrayServiceActive = explicitBoolean(String(records.xray_service), "xray_service");
+  if (vlessManaged) {
+    const endpointId = managedState?.vless_endpoint_id;
+    if (typeof endpointId !== "string" || !endpointId) fail("managed VLESS endpoint identity is missing");
+    const expectedRuntimePid = runtimeMode === "container" ? String(containerXrayToken).split(":", 1)[0] : String(records.host_xray_pid);
+    if (xrayRuntimePid !== expectedRuntimePid) fail("managed VLESS runtime PID does not match the observed Xray identity");
+    validateManagedVlessOwnership({
+      endpointId,
+      xrayPorts: publicPorts,
+      listenerPids: xrayListenerPids,
+      runtimePid: xrayRuntimePid,
+      xrayService: xrayServiceActive ? "active" : "inactive",
+      xrayApi,
+    });
   }
 
   const xray = nestedObject(health, "xray", "health_json.xray");
@@ -852,6 +922,31 @@ function protoPort(inbound: JsonRecord): number {
   return ports[0]!;
 }
 
+export type ManagedVlessOwnershipEvidence = {
+  endpointId: string;
+  xrayPorts: readonly number[];
+  listenerPids: readonly number[];
+  runtimePid: string;
+  xrayService: string;
+  xrayApi: unknown;
+};
+
+export function validateManagedVlessOwnership(evidence: ManagedVlessOwnershipEvidence): number {
+  if (!evidence.endpointId) fail("managed VLESS endpoint identity is missing");
+  if (evidence.xrayPorts.length !== 1) fail("managed VLESS endpoint requires exactly one active public Xray listener");
+  if (evidence.listenerPids.length !== 1 || evidence.runtimePid !== String(evidence.listenerPids[0])) fail("managed VLESS endpoint requires one verified Xray listener process");
+  if (evidence.xrayService !== "active") fail("managed VLESS endpoint requires the target Xray service");
+  if (!evidence.xrayApi) fail("managed VLESS endpoint requires a readable Xray API inventory");
+  const inbounds = Array.isArray(evidence.xrayApi) ? evidence.xrayApi : isRecord(evidence.xrayApi) && Array.isArray(evidence.xrayApi.inbounds) ? evidence.xrayApi.inbounds : undefined;
+  if (!inbounds) fail("managed VLESS endpoint has invalid Xray API inventory");
+  const tag = `vless-vision-${evidence.endpointId}`;
+  const matches = inbounds.filter((item): item is JsonRecord => isRecord(item) && item.tag === tag);
+  if (matches.length !== 1) fail("managed VLESS endpoint is absent from the Xray API inventory");
+  const port = protoPort(matches[0]!);
+  if (port !== evidence.xrayPorts[0]) fail("managed VLESS endpoint listener is not owned by its Xray inbound");
+  return port;
+}
+
 function parseReservedPorts(value: string): Array<[number, number]> {
   if (!value) return [];
   return value.split(",").map((entry) => {
@@ -883,19 +978,16 @@ export function interpretPortPreflight(text: string, host: string): number {
   const runtimePid = String(records.xray_runtime_pid);
   if (runtimePid && !/^[1-9][0-9]*$/.test(runtimePid)) fail("invalid Xray runtime PID");
   if (managed) {
-    if (xrayPorts.length !== 1) fail("managed VLESS endpoint requires exactly one active public Xray listener");
-    if (listenerPids.length !== 1 || runtimePid !== String(listenerPids[0])) fail("managed VLESS endpoint requires one verified Xray listener process");
-    if (records.xray_service !== "active") fail("managed VLESS endpoint requires the target Xray service");
     if (!records.xray_api_b64) fail("managed VLESS endpoint requires a readable Xray API inventory");
     const api = parseStrictJson(new TextDecoder().decode(decodeBase64Strict(String(records.xray_api_b64), "Xray API inventory")), "Xray API inventory");
-    const inbounds = Array.isArray(api) ? api : isRecord(api) && Array.isArray(api.inbounds) ? api.inbounds : undefined;
-    if (!inbounds) fail("managed VLESS endpoint has invalid Xray API inventory");
-    const tag = `vless-vision-${endpointId}`;
-    const matches = inbounds.filter((item): item is JsonRecord => isRecord(item) && item.tag === tag);
-    if (matches.length !== 1) fail("managed VLESS endpoint is absent from the Xray API inventory");
-    const port = protoPort(matches[0]!);
-    if (port !== xrayPorts[0]) fail("managed VLESS endpoint listener is not owned by its Xray inbound");
-    return port;
+    return validateManagedVlessOwnership({
+      endpointId: endpointId!,
+      xrayPorts,
+      listenerPids,
+      runtimePid,
+      xrayService: String(records.xray_service),
+      xrayApi: api,
+    });
   }
   if (xrayPorts.length !== 0) fail("public Xray listener exists without managed VLESS endpoint state");
   const occupied = new Set(parsePortList(records, "occupied_ports"));
@@ -954,6 +1046,7 @@ function parseIp(value: string): IpAddress {
   };
   const left = expand(pieces[0] ?? "");
   const right = expand(pieces[1] ?? "");
+  if (pieces.length === 2 && left.length + right.length >= 8) fail(`invalid IPv6 address ${value}`);
   const groups = pieces.length === 2 ? [...left, ...Array(8 - left.length - right.length).fill("0"), ...right] : left;
   if (groups.length !== 8) fail(`invalid IPv6 address ${value}`);
   let number = 0n;

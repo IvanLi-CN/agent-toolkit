@@ -1,4 +1,5 @@
 import { chmod, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { Buffer } from "node:buffer";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
 
@@ -71,6 +72,9 @@ test("managed audit fails when public JSON is healthy but Xray evidence is down"
     const fakeBin = join(root, "bin");
     const containerIdentity = "a".repeat(64);
     const containerStartedAt = "2025-01-01 00:00:00 +0000";
+    const xrayApiB64 = Buffer.from(JSON.stringify({
+      inbounds: [{ tag: "vless-vision-endpoint-1", receiverSettings: { type: "xray.app.proxyman.ReceiverConfig", portList: 443 } }],
+    }), "utf8").toString("base64");
     await mkdir(configDir, { recursive: true });
     await mkdir(fakeBin, { recursive: true });
     await writeFile(join(configDir, "hosts.txt"), "fixture-node\n");
@@ -144,6 +148,9 @@ test("managed audit fails when public JSON is healthy but Xray evidence is down"
       "managed_default_state_json={\"schema_version\":1,\"vless_endpoint_id\":\"endpoint-1\",\"ss_endpoint_id\":null}",
       "sync_node_meta=true",
       "xray_public_ports=443",
+      "xray_listener_pids=123",
+      "xray_runtime_pid=123",
+      `xray_api_b64=${xrayApiB64}`,
       "EOF",
       "  exit 0",
       "fi",

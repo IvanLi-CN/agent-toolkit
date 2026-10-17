@@ -401,9 +401,10 @@ async function curlText(url: string): Promise<string> {
   const result = await runProcess([
     "curl", "-fsS", "--noproxy", "*", "--max-time", "15", "--max-filesize", String(MAX_AUDIT_RESPONSE_BYTES), "-D", "-", "--", url,
   ], { timeoutMs: 20_000, maxBuffer: MAX_AUDIT_RESPONSE_BYTES });
-  if (result.exitCode !== 0 || result.timedOut) return "";
+  if (result.exitCode !== 0 || result.timedOut) die("Cloudflare IP ranges request failed");
   const response = parseCurlHeaders(result.stdout);
-  return isSuccessfulHttpStatus(response.status) ? response.body : "";
+  if (!isSuccessfulHttpStatus(response.status) || !response.body.trim()) die("Cloudflare IP ranges response is incomplete");
+  return response.body;
 }
 
 function hasHeader(headers: string, name: string, expected?: string): boolean {

@@ -102,7 +102,12 @@ state_path=""
 legacy_state_path=""
 state_selector=absent
 if [ "$container_count" -eq 1 ]; then
-  container="$containers"
+  container_name="$containers"
+  container="$container_name"
+  container_identity="$(bounded_preflight_command sudo -n "$docker_path" inspect --format '{{.Id}}' "$container_name" 2>/dev/null)" || exit 1
+  container_started_at="$(bounded_preflight_command sudo -n "$docker_path" inspect --format '{{.State.StartedAt}}' "$container_name" 2>/dev/null)" || exit 1
+  [ -n "$container_identity" ] && [ -n "$container_started_at" ] || exit 1
+  container="$container_identity"
   data_dir="$(bounded_preflight_command sudo -n "$docker_path" exec "$container" sh -c 'if [ -n "${XP_DATA_DIR:-}" ]; then printf %s "$XP_DATA_DIR"; else printf %s /var/lib/xp/data; fi' 2>/dev/null)" || exit 1
   xray_api_addr="$(bounded_preflight_command sudo -n "$docker_path" exec "$container" sh -c 'printf %s "${XP_XRAY_API_ADDR:-127.0.0.1:10085}"' 2>/dev/null)" || exit 1
   case "$data_dir" in /*) ;; *) exit 1 ;; esac
@@ -135,17 +140,45 @@ state_file_status() {
   if [ -z "$path" ]; then
     printf %s absent
   elif [ "$container_count" -eq 1 ]; then
-    bounded_preflight_command sudo -n "$docker_path" exec "$container" sh -c 'path=$1; if [ -e "$path" ]; then [ -r "$path" ] || exit 1; printf %s present; else printf %s absent; fi' sh "$path" 2>/dev/null
+    bounded_preflight_command sudo -n "$docker_path" exec "$container" sh -c '
+      path=$1
+      [ ! -L "$path" ] || exit 1
+      if [ -e "$path" ]; then
+        [ -f "$path" ] && [ -r "$path" ] || exit 1
+        printf %s present
+      else
+        parent_dir=${path%/*}
+        [ ! -L "$parent_dir" ] || exit 1
+        if [ -e "$parent_dir" ]; then
+          [ -d "$parent_dir" ] && [ -r "$parent_dir" ] && [ -x "$parent_dir" ] || exit 1
+        fi
+        printf %s absent
+      fi
+    ' sh "$path" 2>/dev/null
   else
-    bounded_preflight_command sudo -n sh -c 'path=$1; if [ -e "$path" ]; then [ -r "$path" ] || exit 1; printf %s present; else printf %s absent; fi' sh "$path" 2>/dev/null
+    bounded_preflight_command sudo -n sh -c '
+      path=$1
+      [ ! -L "$path" ] || exit 1
+      if [ -e "$path" ]; then
+        [ -f "$path" ] && [ -r "$path" ] || exit 1
+        printf %s present
+      else
+        parent_dir=${path%/*}
+        [ ! -L "$parent_dir" ] || exit 1
+        if [ -e "$parent_dir" ]; then
+          [ -d "$parent_dir" ] && [ -r "$parent_dir" ] && [ -x "$parent_dir" ] || exit 1
+        fi
+        printf %s absent
+      fi
+    ' sh "$path" 2>/dev/null
   fi
 }
 read_state_file() {
   path="$1"
   if [ "$container_count" -eq 1 ]; then
-    bounded_preflight_command sudo -n "$docker_path" exec "$container" dd if="$path" bs="$((MAX_PREFLIGHT_STATE_BYTES + 1))" count=1 2>/dev/null
+    bounded_preflight_command sudo -n "$docker_path" exec "$container" sh -c 'path=$1; limit=$2; [ ! -L "$path" ] && [ -f "$path" ] && [ -r "$path" ] || exit 1; dd if="$path" bs="$((limit + 1))" count=1 2>/dev/null' sh "$path" "$MAX_PREFLIGHT_STATE_BYTES" 2>/dev/null
   else
-    bounded_preflight_command sudo -n dd if="$path" bs="$((MAX_PREFLIGHT_STATE_BYTES + 1))" count=1 2>/dev/null
+    bounded_preflight_command sudo -n sh -c 'path=$1; limit=$2; [ ! -L "$path" ] && [ -f "$path" ] && [ -r "$path" ] || exit 1; dd if="$path" bs="$((limit + 1))" count=1 2>/dev/null' sh "$path" "$MAX_PREFLIGHT_STATE_BYTES" 2>/dev/null
   fi
 }
 state_current='{}'
@@ -455,6 +488,10 @@ else
   [ "$container_count_after" -le 1 ] || exit 1
   [ "$containers_after" = "$containers" ] || exit 1
   [ "$container_count_after" = "$container_count" ] || exit 1
+  container_identity_after="$(bounded_preflight_command sudo -n "$docker_path" inspect --format '{{.Id}}' "$container" 2>/dev/null)" || exit 1
+  [ "$container_identity_after" = "$container_identity" ] || exit 1
+  container_started_at_after="$(bounded_preflight_command sudo -n "$docker_path" inspect --format '{{.State.StartedAt}}' "$container" 2>/dev/null)" || exit 1
+  [ "$container_started_at_after" = "$container_started_at" ] || exit 1
 fi
 state_current_after='{}'
 state_legacy_after='{}'

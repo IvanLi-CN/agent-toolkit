@@ -1,6 +1,5 @@
 #!/usr/bin/env bun
 
-import { lookup } from "node:dns/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -32,6 +31,14 @@ type Paths = { configDir: string; hostsFile: string; policyFile: string };
 type ProcessOptions = { input?: Blob; timeoutMs?: number; maxBuffer?: number };
 type ProcessResult = { stdout: string; stderr: string; exitCode: number; timedOut: boolean };
 type PolicyContext = { inventory: string[]; policy: PolicyDefinition };
+
+const DNS_LOOKUP_SCRIPT = [
+  "import { lookup } from 'node:dns/promises';",
+  "const hostname = process.argv[1];",
+  "if (!hostname) process.exit(2);",
+  "const addresses = await lookup(hostname, { all: true, verbatim: true });",
+  "process.stdout.write(JSON.stringify(addresses));",
+].join("\n");
 
 function die(message: string): never {
   throw new ValidationError(message);
@@ -328,15 +335,19 @@ function checkTrue(key: string, actual: string): boolean {
 
 async function resolvePublicTarget(target: string, path: string): Promise<ValidatedPublicTarget> {
   return validatePublicTarget(target, path, async (hostname) => {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new ValidationError("public target DNS lookup timed out")), PUBLIC_NETWORK_TIMEOUT_MS);
+    const result = await runProcess([process.execPath, "-e", DNS_LOOKUP_SCRIPT, hostname], {
+      timeoutMs: PUBLIC_NETWORK_TIMEOUT_MS,
+      maxBuffer: MAX_AUDIT_RESPONSE_BYTES,
     });
+    if (result.timedOut) die("public target DNS lookup timed out");
+    if (result.exitCode !== 0) die("public target DNS lookup failed");
     let addresses: Array<{ address: string; family: number }>;
     try {
-      addresses = await Promise.race([lookup(hostname, { all: true, verbatim: true }), timeout]);
-    } finally {
-      if (timer) clearTimeout(timer);
+      const parsed = JSON.parse(result.stdout) as unknown;
+      if (!Array.isArray(parsed)) throw new Error("not an array");
+      addresses = parsed as Array<{ address: string; family: number }>;
+    } catch {
+      die("public target DNS lookup returned invalid data");
     }
     return addresses.map((address) => ({ address: address.address, family: address.family }));
   });

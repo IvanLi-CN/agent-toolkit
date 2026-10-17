@@ -5,6 +5,11 @@ skill_dir="$(cd "$(dirname "$0")/.." && pwd)"
 for required in \
   "$skill_dir/scripts/xp-infra" \
   "$skill_dir/scripts/xp-infra-audit-local" \
+  "$skill_dir/scripts/xp-infra-core.ts" \
+  "$skill_dir/scripts/xp-infra.ts" \
+  "$skill_dir/scripts/xp-infra-compose-image-check" \
+  "$skill_dir/scripts/xp-infra-compose-image-check.ts" \
+  "$skill_dir/scripts/xp-infra-port-preflight-remote" \
   "$skill_dir/scripts/xp-infra-audit-remote" \
   "$skill_dir/references/deployment-policy.yaml.example" \
   "$skill_dir/references/hosts.txt.example" \
@@ -12,6 +17,18 @@ for required in \
   "$skill_dir/references/xp.env.template"; do
   test -e "$required" || { echo "missing required file: $required" >&2; exit 1; }
 done
+
+if grep -Eiq '(^|[^A-Za-z])(ruby|python)([^A-Za-z]|$)' \
+  "$skill_dir/scripts/xp-infra" \
+  "$skill_dir/scripts/xp-infra-audit-local" \
+  "$skill_dir/scripts/xp-infra.ts" \
+  "$skill_dir/scripts/xp-infra-audit-local.ts" \
+  "$skill_dir/scripts/xp-infra-core.ts" \
+  "$skill_dir/scripts/xp-infra-compose-image-check" \
+  "$skill_dir/scripts/xp-infra-compose-image-check.ts"; then
+  echo "xp-infra local entrypoints retain a removed interpreter dependency" >&2
+  exit 1
+fi
 
 "$skill_dir/scripts/xp-infra" --help >/dev/null
 

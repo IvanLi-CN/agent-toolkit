@@ -17,9 +17,37 @@ const UNIT_PATHS = [
 
 const getEuid = (process as unknown as { geteuid?: () => number }).geteuid;
 const isRoot = typeof getEuid === "function" && getEuid() === 0;
-const linuxTest = process.platform === "linux" ? test : test.skip;
-const systemdTest = process.platform === "linux" && existsSync("/usr/bin/bun") ? test : test.skip;
-const transportTest = process.platform === "linux" && isRoot ? test : test.skip;
+const isLinux = process.platform === "linux";
+const hasSystemdPrerequisites = isLinux && existsSync("/usr/bin/bun") && Bun.which("systemd-analyze") !== null;
+
+type TestCallback = () => void | Promise<void>;
+
+function linuxTest(name: string, callback: TestCallback): void {
+  if (isLinux) test(name, callback);
+  else test.skip(name, callback);
+}
+
+function systemdTest(name: string, callback: TestCallback): void {
+  if (hasSystemdPrerequisites) test(name, callback);
+  else test.skip(name, callback);
+}
+
+function transportTest(name: string, callback: TestCallback): void {
+  if (isLinux && isRoot) test(name, callback);
+  else test.skip(name, callback);
+}
+
+test("records native prerequisite availability", () => {
+  const prerequisites = {
+    platform: process.platform,
+    euid: typeof getEuid === "function" ? getEuid() : null,
+    root: isRoot,
+    managed_bun: existsSync("/usr/bin/bun"),
+    systemd_analyze: Bun.which("systemd-analyze"),
+  };
+  console.log(`native-prerequisites=${JSON.stringify(prerequisites)}`);
+  expect(prerequisites.platform).toBe(process.platform);
+});
 
 const roots: string[] = [];
 

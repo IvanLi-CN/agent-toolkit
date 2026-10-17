@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   CommandRunner,
+  COMMAND_OUTPUT_LIMIT,
   Control,
   ControlError,
   CTResources,
@@ -87,6 +88,7 @@ class NativeCommands extends CommandRunner {
   imageAvailable = true;
   imageType = "virtual-machine";
   guestToolsAvailable = true;
+  missingGuestTool: string | undefined;
   onWait: ((name: string, condition: string) => void) | undefined;
   onStart: ((name: string) => void) | undefined;
   onConfigSet: ((name: string, key: string, value: string) => void) | undefined;
@@ -94,6 +96,7 @@ class NativeCommands extends CommandRunner {
   malformedInventory = false;
   malformedListRecord = false;
   invalidDeviceMaps = false;
+  conntrackListOutput = "";
 
   configureGuest(root: string): void { this.guestFixture = createGuestFixture(root, { virtualBytes: 20 * GIB }); }
 
@@ -102,7 +105,7 @@ class NativeCommands extends CommandRunner {
     this.calls.push({ args, options });
     if (this.failure?.(args)) throw new ControlError("command_failed", "injected native failure", { returncode: 1, stderr: "injected native failure" });
     if (args[0] === "ss") return result(args);
-    if (args[0] === "conntrack") return result(args);
+    if (args[0] === "conntrack") return result(args, args[1] === "-L" ? this.conntrackListOutput : "");
     if (args[0] === "systemctl") return result(args);
     if (args[0] !== "incus") throw new Error(`unexpected command: ${args.join(" ")}`);
     if (args[1] === "query") return this.query(args);
@@ -238,7 +241,7 @@ class NativeCommands extends CommandRunner {
     if (joined.includes("ssh_host_ed25519_key.pub")) return result(["incus", ...command], KEY);
     if (guestArgs[0] === "cat" && guestArgs[1] === "/proc/sys/kernel/random/boot_id") return result(["incus", ...command], instance.boot_id);
     if (guestArgs[0] === "sh" && joined.includes("command -v")) {
-      if (!this.guestToolsAvailable) throw new ControlError("command_failed", "required guest tool is missing", { returncode: 127, stderr: "bun: command not found" });
+      if (!this.guestToolsAvailable || (this.missingGuestTool && joined.includes(`'${this.missingGuestTool}'`))) throw new ControlError("command_failed", "required guest tool is missing", { returncode: 127, stderr: `${this.missingGuestTool ?? "bun"}: command not found` });
       return result(["incus", ...command]);
     }
     if (guestArgs[0] === "bun" && guestArgs[1] === "-e" && this.guestFixture) {
@@ -285,7 +288,7 @@ class Fixture {
       initial_lease_seconds: 1800, renew_seconds: 900, max_lease_seconds: 7200, cache_seconds: 86400,
       create_cost_bytes: 4 * GIB, resume_cost_bytes: GIB, resize_cost_bytes: GIB, storage_path: this.root,
       cpu_budget: 4, memory_budget_mib: 16384, cpu_overcommit_ratio: 4, memory_overcommit_ratio: 4,
-      required_guest_tools: ["bun", "sshd", "rsync", "docker"], state_db: join(this.root, "state.sqlite3"), timer_dir: join(this.root, "systemd"),
+      required_guest_tools: ["bun", "python3", "sshd", "rsync", "docker"], state_db: join(this.root, "state.sqlite3"), timer_dir: join(this.root, "systemd"),
     };
     this.runner.configureGuest(this.root);
     this.store = new StateStore(this.config.state_db);
@@ -348,12 +351,12 @@ async function collect(child: any): Promise<{ exit: number; stdout: string; stde
   return { exit, stdout: await stdout, stderr: await stderr };
 }
 
-test("loads Bun as the managed guest prerequisite", () => {
+test("loads Bun and Python 3 as managed guest prerequisites", () => {
   const root = mkdtempSync("/tmp/agent-vm-config-test-");
   try {
     const config = { project: "agents", profile: "agent-vm", image_alias: "image", image_fingerprint: "a".repeat(64), network: "agentsbr0", network_acl: "agent-vm-isolation", pool: "agents", host_address: "198.51.100.19", port_start: 20000, port_end: 20030, vm_ip_start: "198.51.100.20", vm_ip_end: "198.51.100.250", gateway_ip: "198.51.100.1", storage_path: root, state_db: join(root, "state.sqlite3"), timer_dir: root };
     writeFileSync(join(root, "config.json"), JSON.stringify(config));
-    expect(loadConfig(join(root, "config.json")).required_guest_tools).toEqual(["bun", "sshd", "rsync", "docker", "growpart"]);
+    expect(loadConfig(join(root, "config.json")).required_guest_tools).toEqual(["bun", "python3", "sshd", "rsync", "docker", "growpart"]);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -660,6 +663,20 @@ test("keeps a successful command outcome when the child closes stdin early", asy
   expect(completed.returncode).toBe(0);
 });
 
+test("rejects truncated ordinary output and native JSON consumers", async () => {
+  const runner = new CommandRunner();
+  const blocks = Math.floor(COMMAND_OUTPUT_LIMIT / 1024) + 1;
+  await expectCode(runner.run(["/bin/sh", "-c", `dd if=/dev/zero bs=1024 count=${blocks} status=none`], { timeout: 5, check: false }), "command_output_truncated");
+
+  class TruncatedRunner extends CommandRunner {
+    override async run(argv: readonly string[], _options: RunnerOptions = {}): Promise<ProcessResult> {
+      return { ...result(argv, "{}"), stdoutTruncated: true };
+    }
+  }
+  const client = new IncusClient(new TruncatedRunner(), { project: "agents" });
+  await expectCode(client.listInstances(), "command_output_truncated");
+});
+
 test("flushes a large response before a child exits", async () => {
   const child = Bun.spawn([process.execPath, "-e", `const { writeProcessOutput } = await import(process.env.CONTROL_PATH); await writeProcessOutput(JSON.stringify({ ok: true, data: "x".repeat(16 * 1024 * 1024) })); process.exit(0);`], {
     env: { ...process.env, CONTROL_PATH: fileURLToPath(new URL("../scripts/agent_vm_control.ts", import.meta.url)) },
@@ -702,10 +719,20 @@ test("acquire is idempotent and binds Bun guest growth to the allocated generati
   expect(f.runner.calls.filter(({ args }) => args[3] === "init")).toHaveLength(1);
 });
 
-test("missing guest Bun fails before guest writes", async () => {
+test("missing guest Bun remains mandatory when custom tools omit it", async () => {
   const f = fixture();
-  f.runner.guestToolsAvailable = false;
+  (f.control as any).config.required_guest_tools = ["python3", "sshd", "rsync", "docker"];
+  f.runner.missingGuestTool = "bun";
   await expectCode(f.call("acquire", { public_key: KEY }, "op-missing-bun"), "command_failed");
+  expect(f.runner.calls.some(({ args }) => args.some((arg) => arg.includes("command -v")))).toBe(true);
+  expect(f.runner.calls.some(({ args }) => args.includes("authorized_keys"))).toBe(false);
+  expect(f.runner.calls.some(({ args }) => args[0] === "incus" && args.includes("bun"))).toBe(false);
+});
+
+test("default guest prerequisites reject an image without Python 3 before guest writes", async () => {
+  const f = fixture();
+  f.runner.missingGuestTool = "python3";
+  await expectCode(f.call("acquire", { public_key: KEY }, "op-missing-python3"), "command_failed");
   expect(f.runner.calls.some(({ args }) => args.some((arg) => arg.includes("command -v")))).toBe(true);
   expect(f.runner.calls.some(({ args }) => args.includes("authorized_keys"))).toBe(false);
   expect(f.runner.calls.some(({ args }) => args[0] === "incus" && args.includes("bun"))).toBe(false);
@@ -746,6 +773,21 @@ test("uses exact ratio floors, reservation ceilings and bigint capacity boundari
   expect(await (f.control as any).spaceSufficient(facts, 4n, "low")).toBe(false);
 });
 
+test("keeps high-ratio policy limits and admission remaining exact", async () => {
+  const f = fixture();
+  const config = (f.control as any).config as Dict;
+  config.cpu_budget = 4;
+  config.cpu_overcommit_ratio = "1e308";
+  config.memory_overcommit_ratio = 1;
+  await f.call("acquire", { public_key: KEY }, "op-high-ratio-acquire");
+  const status = await f.call("status");
+  const exactLimit = 4n * 10n ** 308n;
+  expect(status.admission.limits.cpu).toBe(exactLimit);
+  expect(status.admission.ratios.cpu).toBe(1e308);
+  expect(status.admission.allocated_and_reserved.cpu).toBe(2);
+  expect(status.admission.remaining.cpu).toBe(exactLimit - 2n);
+});
+
 test("drain protects active leases and reclaim never deletes them", async () => {
   const f = fixture();
   const active = await f.call("acquire", { public_key: KEY }, "op-protected-active");
@@ -783,6 +825,22 @@ test("retains conservative accounting after cleanup failure and reconciles on re
   expect(f.store.getTask({ taskId: String(active.task_id) })?.state).toBe("cached");
   expect(f.store.getPorts(String(active.task_id))).toHaveLength(0);
   expect(f.runner.instances.get(active.instance_name)?.status).toBe("Stopped");
+});
+
+test("treats whitespace-only conntrack output as no flows and blocks real flows", async () => {
+  const clean = fixture();
+  await clean.call("acquire", { public_key: KEY }, "op-whitespace-create");
+  clean.runner.conntrackListOutput = " \n\t";
+  expect((await clean.call("release", {}, "op-whitespace-release")).state).toBe("cached");
+
+  const blocked = fixture();
+  const active = await blocked.call("acquire", { public_key: KEY }, "op-flow-create");
+  blocked.runner.conntrackListOutput = "tcp      6 431999 ESTABLISHED\n";
+  await expectCode(blocked.call("release", {}, "op-flow-release"), "cleanup_incomplete");
+  expect(blocked.store.getTask({ taskId: String(active.task_id) })?.state).toBe("closing");
+  const reconciled = await blocked.control.dispatch(blocked.request("admin-reconcile", { apply: true }, "op-flow-reconcile"));
+  expect(reconciled.result.actions.some((item: Dict) => item.error?.code === "cleanup_incomplete")).toBe(true);
+  expect(blocked.store.getTask({ taskId: String(active.task_id) })?.state).toBe("closing");
 });
 
 test("keeps an orphan native proxy retryable and refuses cached resume", async () => {
@@ -920,6 +978,18 @@ test("project port mappings are durable before native exposure and removable exa
   expect(removed.removed).toBe(true);
   expect((await f.call("status")).task_id).toBe(active.task_id);
   expect((await f.call("port-list", {})).ports.map((port: Dict) => port.port_name)).toEqual(["ssh"]);
+});
+
+test("explicit null port protocols and admin apply values fail before native writes", async () => {
+  const f = fixture();
+  await f.call("acquire", { public_key: KEY }, "op-null-fields-create");
+  const nativeWrites = (): number => f.runner.calls.filter(({ args }) => args[0] === "incus" && args[3] === "config" && args[4] === "device" && ["add", "remove"].includes(args[5] ?? "")).length;
+  const before = nativeWrites();
+  await expectCode(f.call("port-add", { name: "null-add", vm_port: 8080, port_protocol: null }, "op-null-port-add"), "invalid_request");
+  await expectCode(f.call("port-remove", { name: "ssh", port_protocol: null }, "op-null-port-remove"), "invalid_request");
+  await expectCode(f.control.dispatch(f.request("admin-reconcile", { apply: null }, "op-null-reconcile")), "invalid_request");
+  await expectCode(f.control.dispatch(f.request("admin-gc", { apply: null }, "op-null-gc")), "invalid_request");
+  expect(nativeWrites()).toBe(before);
 });
 
 test("fails closed on a mixed native inventory before allocating a project port", async () => {

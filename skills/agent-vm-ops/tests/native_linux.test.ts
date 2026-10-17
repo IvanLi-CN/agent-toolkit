@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { CommandRunner, Control, ControlError, StateStore } from "../scripts/agent_vm_control.ts";
+import { COMMAND_OUTPUT_LIMIT, CommandRunner, Control, ControlError, IncusClient, StateStore } from "../scripts/agent_vm_control.ts";
 
 type Dict = Record<string, any>;
 
@@ -153,6 +153,20 @@ linuxTest("drains noisy stdout and stderr and reaps a real descendant", async ()
     await Bun.sleep(10);
   }
   expect(state === undefined || state === "Z").toBe(true);
+});
+
+linuxTest("rejects truncated ordinary output before native JSON inventory use", async () => {
+  class NoisyIncusRunner extends CommandRunner {
+    override async run(_argv: readonly string[], options: Dict = {}): Promise<any> {
+      const blocks = Math.floor(COMMAND_OUTPUT_LIMIT / 1024) + 1;
+      return super.run(["/bin/sh", "-c", `dd if=/dev/zero bs=1024 count=${blocks} status=none`], options);
+    }
+  }
+  const client = new IncusClient(new NoisyIncusRunner(), { project: "agents" });
+  let failure: any;
+  try { await client.listInstances(); }
+  catch (error) { failure = error; }
+  expect(failure?.code).toBe("command_output_truncated");
 });
 
 linuxTest("enforces one deadline across descendant pipes and stdin backpressure", async () => {

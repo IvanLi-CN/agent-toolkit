@@ -18,7 +18,7 @@ The control entrypoint and every bundled systemd unit read the same canonical pa
 
 Before any mutation, inspect the actual Incus identities, proxy permission, ACL ownership, guest isolation, local filesystem capacity, timers and protocol versions. Keep credentials and connection material outside source. Do not add a resident broker, HTTP listener, extra SSH daemon, gateway or automatic keepalive.
 
-Prepare and verify the pinned guest image separately. Confirm fresh guests generate distinct host keys, reach readiness and expose only the configured services. Verify expiry, exact mapping cleanup, cache reclamation, capacity pressure and generation handling with isolated resources; do not use production operations as a migration gate.
+Prepare and verify the pinned guest image separately with Bun, Python 3, OpenSSH, rsync, Docker/Compose and growpart. Confirm fresh guests generate distinct host keys, reach readiness and expose only the configured services. Verify expiry, exact mapping cleanup, cache reclamation, capacity pressure and generation handling with isolated resources; do not use production operations as a migration gate.
 
 Protocol upgrades enter drain, converge pending operations without replay, replace matching client/control files atomically and preserve the state database, generations and journals. A health failure keeps drain enabled. Daily requests never edit Incus project policy. Keep run records and any live infrastructure evidence outside the public repository.
 

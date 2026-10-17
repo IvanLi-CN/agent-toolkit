@@ -22,6 +22,7 @@ export const GUEST_READINESS_DIAGNOSTIC_SECONDS = 120;
 export const DIAGNOSTIC_COMMAND_TIMEOUT_SECONDS = 5;
 export const DIAGNOSTIC_LOG_LIMIT = 8192;
 export const DIAGNOSTIC_LOG_TRUNCATION_MARKER = "\n[TRUNCATED BY DIAGNOSTIC LIMIT]";
+export const COMMAND_OUTPUT_LIMIT = 1024 * 1024;
 export const DEFAULT_CONFIG_PATH = "/etc/agent-vm-native/config.json";
 export const DEFAULT_TIMER_DIR = "/etc/systemd/system";
 export const REQUIRED_ENVIRONMENT_FIELDS = [
@@ -312,6 +313,15 @@ function numberFromInteger(value: unknown, field: string, minimum?: number, maxi
   return integerForJson(integer);
 }
 
+function maxIntegerValue(...values: unknown[]): IntegerValue {
+  let maximum = 0n;
+  for (const value of values) {
+    const current = integerBigInt(value, "integer");
+    if (current > maximum) maximum = current;
+  }
+  return integerForJson(maximum);
+}
+
 function bigintFromInteger(value: unknown, field: string, minimum = 0n): bigint {
   let result: bigint;
   if (typeof value === "bigint") result = value;
@@ -598,7 +608,7 @@ export function loadConfig(path = DEFAULT_CONFIG_PATH): Dict {
     initial_lease_seconds: 1800, renew_seconds: 900, max_lease_seconds: 7200, cache_seconds: 86400,
     cpu_budget: 0, memory_budget_mib: 0, cpu_overcommit_ratio: 4, memory_overcommit_ratio: 4,
     create_cost_bytes: 4 * 1024 ** 3, resume_cost_bytes: 1024 ** 3, resize_cost_bytes: 1024 ** 3,
-    required_guest_tools: ["bun", "sshd", "rsync", "docker", "growpart"], timer_dir: DEFAULT_TIMER_DIR,
+    required_guest_tools: ["bun", "python3", "sshd", "rsync", "docker", "growpart"], timer_dir: DEFAULT_TIMER_DIR,
     ...raw,
   };
   const missing = REQUIRED_ENVIRONMENT_FIELDS.filter((field) => !(field in raw) || raw[field] === null || raw[field] === "");
@@ -727,7 +737,8 @@ function killProcessGroupMembers(pgid: number): { killed: boolean; error: string
 
 export class CommandRunner {
   async run(argv: readonly string[], options: RunOptions = {}): Promise<CompletedProcess> {
-    const result = await this.runBounded(argv, { timeout: options.timeout ?? 60, stdoutLimit: Number.MAX_SAFE_INTEGER, stderrLimit: 4000, check: options.check ?? true, inputData: options.inputData });
+    const result = await this.runBounded(argv, { timeout: options.timeout ?? 60, stdoutLimit: COMMAND_OUTPUT_LIMIT, stderrLimit: 4000, check: options.check ?? true, inputData: options.inputData });
+    if (result.stdoutTruncated) throw new ControlError("command_output_truncated", `command stdout exceeded retained limit: ${argv[0]}`, { limit: COMMAND_OUTPUT_LIMIT });
     return result;
   }
 
@@ -797,7 +808,9 @@ export class IncusClient {
   }
 
   async call(args: readonly string[], options: RunOptions = {}): Promise<CompletedProcess> {
-    return this.runner.run([...this.prefix, ...args], { ...options, timeout: options.timeout ?? 60 });
+    const result = await this.runner.run([...this.prefix, ...args], { ...options, timeout: options.timeout ?? 60 });
+    if (result.stdoutTruncated) throw new ControlError("command_output_truncated", "Incus command output was truncated", { limit: COMMAND_OUTPUT_LIMIT });
+    return result;
   }
 
   async json(args: readonly string[], timeout = 60): Promise<unknown> {
@@ -1504,8 +1517,8 @@ export class Control {
     const cpuCapacity = this.resources.cpu();
     const memory = this.resources.memory();
     const base = { cpu: cpuBudget, memory_mib: memoryBudget };
-    const capacity = { cpu: cpuCapacity, memory_mib: Math.floor(Number(memory.limit_bytes) / 1024 ** 2) };
-    if (base.cpu > capacity.cpu || base.memory_mib > capacity.memory_mib) throw new ControlError("resource_budget_invalid", "base budget exceeds CT-visible capacity", { base, ct_capacity: capacity });
+    const capacity = { cpu: integerForJson(BigInt(cpuCapacity)), memory_mib: integerForJson(BigInt(memory.limit_bytes) / 1024n ** 2n) };
+    if (integerBigInt(base.cpu, "cpu_budget") > integerBigInt(capacity.cpu, "cpu capacity") || integerBigInt(base.memory_mib, "memory_budget_mib") > integerBigInt(capacity.memory_mib, "memory capacity")) throw new ControlError("resource_budget_invalid", "base budget exceeds CT-visible capacity", { base, ct_capacity: capacity });
     const project = await this.incus.query(`/1.0/projects/${quotePath(String(this.config.project))}`, { project: "default" });
     if (!isDict(project) || !isDict(project.config)) throw new ControlError("resource_unverified", "project resource configuration cannot be inspected");
     const conflicts: Dict = {};
@@ -1513,26 +1526,26 @@ export class Control {
     if (Object.keys(conflicts).length) throw new ControlError("project_resource_limits_conflict", "project aggregate quotas count stopped caches; authorized deployment must remove them", { project: this.config.project, conflicting_limits: conflicts });
     const countLimits = this.instanceCountLimits(project.config);
     if (Object.keys(countLimits).length) throw new ControlError("project_instance_limits_conflict", "project instance quotas include stopped caches; authorized deployment must remove them", { project: this.config.project, conflicting_limits: countLimits, instance_count: (await this.incus.listInstances()).length });
-    return { base, ratios: { cpu: Number(cpuRatio.numerator) / Number(cpuRatio.denominator), memory_mib: Number(memoryRatio.numerator) / Number(memoryRatio.denominator) }, limits: { cpu: Number(floorRatio(BigInt(base.cpu), cpuRatio)), memory_mib: Number(floorRatio(BigInt(base.memory_mib), memoryRatio)) }, ct_capacity: capacity, memory: { ...memory, observed_at: isoTime(this.now()) } };
+    return { base, ratios: { cpu: Number(cpuRatio.text), memory_mib: Number(memoryRatio.text) }, limits: { cpu: integerForJson(floorRatio(integerBigInt(base.cpu, "cpu_budget"), cpuRatio)), memory_mib: integerForJson(floorRatio(integerBigInt(base.memory_mib, "memory_budget_mib"), memoryRatio)) }, ct_capacity: capacity, memory: { ...memory, observed_at: isoTime(this.now()) } };
   }
 
   private allocationTotals(excludeTaskId?: string): Dict {
-    const totals = { cpu: 0, memory_mib: 0 };
+    const totals = { cpu: 0n, memory_mib: 0n };
     for (const task of this.store.listTasks()) {
       if (task.task_id === excludeTaskId || ["absent", "cached"].includes(String(task.state))) continue;
       try {
         const values = parseJson(String(task.resources_json || "{}")) as Dict;
         const reservation = parseJson(String(task.resource_reservation_json || "{}")) as Dict;
         for (const key of ["cpu", "memory_mib"]) {
-          const current = numberFromInteger(values[key], key, 0, 65536);
-          const reserved = reservation[key] === undefined ? 0 : numberFromInteger(reservation[key], key, 0, 65536);
-          totals[key as "cpu" | "memory_mib"] += Math.max(current, reserved);
+          const current = integerBigInt(values[key], key);
+          const reserved = reservation[key] === undefined ? 0n : integerBigInt(reservation[key], key);
+          totals[key as "cpu" | "memory_mib"] += current > reserved ? current : reserved;
         }
       } catch {
         throw new ControlError("resource_unverified", "occupied object lacks verified resource sizes");
       }
     }
-    return totals;
+    return { cpu: integerForJson(totals.cpu), memory_mib: integerForJson(totals.memory_mib) };
   }
 
   private async runningInventoryGuard(): Promise<void> {
@@ -1549,7 +1562,7 @@ export class Control {
       const policy = await this.resourcePolicy();
       await this.runningInventoryGuard();
       const allocated = await this.globalLock(() => this.store.transaction(() => this.allocationTotals()));
-      return { verified: true, ...policy, allocated_and_reserved: allocated, remaining: { cpu: policy.limits.cpu - allocated.cpu, memory_mib: policy.limits.memory_mib - allocated.memory_mib }, memory_pressure: policy.memory.available_bytes < policy.memory.threshold_bytes };
+      return { verified: true, ...policy, allocated_and_reserved: allocated, remaining: { cpu: integerForJson(integerBigInt(policy.limits.cpu, "cpu limit") - integerBigInt(allocated.cpu, "allocated cpu")), memory_mib: integerForJson(integerBigInt(policy.limits.memory_mib, "memory limit") - integerBigInt(allocated.memory_mib, "allocated memory")) }, memory_pressure: policy.memory.available_bytes < policy.memory.threshold_bytes };
     } catch (error) {
       return { verified: false, error: error instanceof ControlError ? error.asDict() : { code: "internal_error", message: (error as Error).name } };
     }
@@ -1616,8 +1629,9 @@ export class Control {
         this.requireActive(current);
       } else if (current && !["absent", "cached"].includes(String(current.state)) && integerBigInt(current.generation, "generation") + 1n !== integerBigInt(task.generation, "generation")) throw new ControlError("generation_mismatch", "allocation slot changed before reservation");
       const totals = this.allocationTotals(String(task.task_id));
-      const projected = { cpu: totals.cpu + resources.cpu, memory_mib: totals.memory_mib + resources.memory_mib };
-      const exceeded = policy ? ["cpu", "memory_mib"].filter((key) => (projected as Dict)[key] > (policy.limits as Dict)[key]) : [];
+      const projectedBig = { cpu: integerBigInt(totals.cpu, "allocated cpu") + integerBigInt(resources.cpu, "cpu"), memory_mib: integerBigInt(totals.memory_mib, "allocated memory") + integerBigInt(resources.memory_mib, "memory_mib") };
+      const projected = { cpu: integerForJson(projectedBig.cpu), memory_mib: integerForJson(projectedBig.memory_mib) };
+      const exceeded = policy ? ["cpu", "memory_mib"].filter((key) => (projectedBig as Dict)[key] > integerBigInt((policy.limits as Dict)[key], `${key} limit`)) : [];
       if (exceeded.length) throw new ControlError("resource_insufficient", `allocation ceiling exceeded: ${exceeded.join(", ")}`, { dimensions: exceeded, requested: resources, other_allocated: totals, projected, base: policy?.base, limits: policy?.limits });
       const record = { ...task, resource_reservation_json: stableJson(resources), resources_json: task.resources_json || stableJson(resources) };
       this.store.putTask(record);
@@ -1937,7 +1951,8 @@ export class Control {
   private shellQuote(value: string): string { return `'${value.replaceAll("'", "'\\''")}'`; }
 
   private async verifyGuestTools(instanceName: string): Promise<void> {
-    const tools = (this.config.required_guest_tools as string[]).map((tool) => this.shellQuote(tool)).join(" ");
+    const configured = Array.isArray(this.config.required_guest_tools) ? this.config.required_guest_tools as string[] : [];
+    const tools = [...new Set(["bun", ...configured])].map((tool) => this.shellQuote(tool)).join(" ");
     const script = `set -eu; for tool in ${tools}; do command -v "$tool" >/dev/null; done; if docker compose version >/dev/null 2>&1; then :; elif command -v docker-compose >/dev/null 2>&1; then :; else exit 1; fi`;
     await this.incus.exec(instanceName, ["sh", "-lc", script]);
   }
@@ -2018,7 +2033,7 @@ export class Control {
     const result = await this.runner.run(["conntrack", "-D", ...match], { check: false, timeout: 2 });
     if (result.returncode !== 0 && !(result.returncode === 1 && decode(result.stderr).includes("0 flow entries"))) throw new ControlError("conntrack_delete_failed", "exact conntrack deletion failed", { returncode: result.returncode, stderr: decode(result.stderr) });
     const remaining = await this.runner.run(["conntrack", "-L", ...match], { check: false, timeout: 2 });
-    if (remaining.returncode !== 0 || remaining.stdout.length) throw new ControlError("conntrack_unverified", "matching flows remain or cannot be inspected");
+    if (remaining.returncode !== 0 || decode(remaining.stdout).trim().length) throw new ControlError("conntrack_unverified", "matching flows remain or cannot be inspected");
   }
 
   private async cleanupCurrent(task: Dict): Promise<Dict | undefined> {
@@ -2169,7 +2184,7 @@ export class Control {
     if (cached) Object.assign(task, { previous_generation: expected, inactive_since: existing?.inactive_since, cleanup_after: existing?.cleanup_after });
     task.resources_json = stableJson(cached ? old : resources);
     task.lease_expires_at = isoTime(new Date(this.now().getTime() + Number(this.config.initial_lease_seconds) * 1000));
-    const reserved = cached ? Object.fromEntries(Object.keys(old).map((key) => [key, Math.max(old[key], resources[key])])) : resources;
+    const reserved = cached ? Object.fromEntries(Object.keys(old).map((key) => [key, maxIntegerValue(old[key], resources[key])])) : resources;
     task = await this.reserveResources(task, reserved);
     let phase = "reservation";
     const completed: string[] = [];
@@ -2349,7 +2364,7 @@ export class Control {
     if (stableJson(await this.nativeResources(task)) !== stableJson(old)) throw new ControlError("resize_unverified", "native configuration differs from the recorded allocation");
     const before = await this.guestBootId(task);
     if (stableJson(target) === stableJson(old)) return { applied: false, mode: "live-memory", plan: "unchanged", ...this.stateSummary(task) };
-    const reserved = Object.fromEntries(Object.keys(old).map((key) => [key, Math.max(old[key], target[key])])) as Dict;
+    const reserved = Object.fromEntries(Object.keys(old).map((key) => [key, maxIntegerValue(old[key], target[key])])) as Dict;
     await this.reserveResources(task, reserved, target.memory_mib < old.memory_mib);
     try {
       const current = this.store.getTask({ taskId: String(task.task_id) });
@@ -2436,7 +2451,7 @@ export class Control {
     const cost = target.disk_gib > old.disk_gib ? bigintFromInteger(this.config.resize_cost_bytes, "resize_cost_bytes") : 0n;
     let reclaimed: string[] = [];
     if (needsRestart) {
-      const reserved = Object.fromEntries(Object.keys(old).map((key) => [key, Math.max(old[key], target[key], previousReservation[key] ?? 0)]));
+      const reserved = Object.fromEntries(Object.keys(old).map((key) => [key, maxIntegerValue(old[key], target[key], previousReservation[key] ?? 0)]));
       await this.reserveResources(task, reserved);
       try { reclaimed = await this.reclaimCapacity(cost, String(task.task_id)); await this.reserveNative(task, cost); } catch (error) { await this.cancelResourceReservation(task); throw error; }
     }
@@ -2491,7 +2506,7 @@ export class Control {
     await this.ownership(task);
     const name = requiredString(request.name, "name", PORT_NAME_RE);
     if (name === "ssh") throw new ControlError("invalid_request", "ssh is reserved");
-    const protocol = request.port_protocol ?? "tcp";
+    const protocol = hasOwn(request, "port_protocol") ? request.port_protocol : "tcp";
     if (!["tcp", "udp"].includes(String(protocol))) throw new ControlError("invalid_request", "unsupported port protocol");
     const guest = numberFromInteger(request.vm_port, "vm_port", 1, 65535);
     const existing = this.store.getPort(String(task.task_id), name, String(protocol));
@@ -2535,7 +2550,7 @@ export class Control {
     this.checkGeneration(task, request);
     this.requireActive(task);
     const name = requiredString(request.name, "name", PORT_NAME_RE);
-    const protocol = request.port_protocol ?? "tcp";
+    const protocol = hasOwn(request, "port_protocol") ? request.port_protocol : "tcp";
     if (name === "ssh" || !["tcp", "udp"].includes(String(protocol))) throw new ControlError("invalid_request", "invalid project mapping");
     const port = this.store.getPort(String(task.task_id), name, String(protocol));
     if (port) { this.store.updatePort(String(task.task_id), name, String(protocol), { state: "closing" }); await this.nativeLock(task, async () => { await this.removeProxy(task, port); await this.conntrackDelete(port, task); this.store.removePort(String(task.task_id), name, String(protocol)); }); }
@@ -2553,7 +2568,7 @@ export class Control {
   async adminSessionList(_request: Dict, _sessionId?: string): Promise<Dict> { return { tasks: await Promise.all(this.store.listTasks().map((task) => this.runtimeSummary(task))) }; }
 
   async adminReconcile(request: Dict, _sessionId?: string): Promise<Dict> {
-    const apply = requireBoolean(request.apply ?? false, "reconcile apply");
+    const apply = requireBoolean(hasOwn(request, "apply") ? request.apply : false, "reconcile apply");
     const actions: Dict[] = [];
     for (const snapshot of this.store.listTasks()) {
       try {
@@ -2592,7 +2607,7 @@ export class Control {
   }
 
   async adminGc(request: Dict, _sessionId?: string, ageFiltered = false): Promise<Dict> {
-    const apply = requireBoolean(request.apply ?? false, "GC apply");
+    const apply = requireBoolean(hasOwn(request, "apply") ? request.apply : false, "GC apply");
     const candidates: Dict[] = [];
     for (const snapshot of this.store.listTasks()) {
       try {

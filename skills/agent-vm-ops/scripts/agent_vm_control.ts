@@ -34,6 +34,7 @@ export const PORT_NAME_RE = /^[a-z][a-z0-9-]{0,30}$/;
 export const TASK_TIMER_RE = /^[a-z0-9][a-z0-9-]{0,47}-g[0-9]+$/;
 
 type Dict = Record<string, any>;
+type IntegerValue = number | bigint;
 
 export const GUEST_GROWTH_SCRIPT = `
 import { existsSync, readFileSync, statfsSync } from "node:fs";
@@ -96,12 +97,31 @@ function isDict(value: unknown): value is Dict {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function dictArray(value: unknown, code: string, message: string): Dict[] {
+  if (!Array.isArray(value) || value.some((entry) => !isDict(entry))) throw new ControlError(code, message);
+  return value as Dict[];
+}
+
+function inventoryString(value: unknown, code: string, field: string): string {
+  if (typeof value !== "string" || value.length === 0) throw new ControlError(code, `${field} is invalid`);
+  return value;
+}
+
+function compareUnicodeCodePoints(left: string, right: string): number {
+  const a = Array.from(left, (character) => character.codePointAt(0)!);
+  const b = Array.from(right, (character) => character.codePointAt(0)!);
+  for (let index = 0; index < Math.min(a.length, b.length); index += 1) {
+    if (a[index] !== b[index]) return a[index]! - b[index]!;
+  }
+  return a.length - b.length;
+}
+
 function jsonValue(value: unknown): unknown {
   if (typeof value === "bigint") return value;
   if (Array.isArray(value)) return value.map(jsonValue);
   if (isDict(value)) {
     const result: Dict = {};
-    for (const key of Object.keys(value).sort()) {
+    for (const key of Object.keys(value).sort(compareUnicodeCodePoints)) {
       if (value[key] !== undefined) result[key] = jsonValue(value[key]);
     }
     return result;
@@ -115,7 +135,7 @@ export function stableJson(value: unknown): string {
   if (typeof normalized === "bigint") return normalized.toString(10);
   if (Array.isArray(normalized)) return `[${normalized.map(stableJson).join(",")}]`;
   if (isDict(normalized)) {
-    return `{${Object.keys(normalized).sort().map((key) => `${JSON.stringify(key)}:${stableJson(normalized[key])}`).join(",")}}`;
+    return `{${Object.keys(normalized).sort(compareUnicodeCodePoints).map((key) => `${JSON.stringify(key)}:${stableJson(normalized[key])}`).join(",")}}`;
   }
   const result = JSON.stringify(normalized);
   if (result === undefined) return "null";
@@ -154,25 +174,39 @@ function requestDigest(request: Dict): string {
     if (typeof value === "number") return JSON.stringify(value) ?? "null";
     if (typeof value === "string") return asciiJsonString(value);
     if (Array.isArray(value)) return `[${value.map(canonical).join(", ")}]`;
-    if (isDict(value)) return `{${Object.keys(value).sort().map((key) => `${asciiJsonString(key)}: ${canonical(value[key])}`).join(", ")}}`;
+    if (isDict(value)) return `{${Object.keys(value).sort(compareUnicodeCodePoints).map((key) => `${asciiJsonString(key)}: ${canonical(value[key])}`).join(", ")}}`;
     return "null";
   };
   return sha256(canonical(request));
 }
 
-function numberFromInteger(value: unknown, field: string, minimum?: number, maximum?: number): number {
-  if (typeof value === "bigint") {
-    if (value < BigInt(Number.MIN_SAFE_INTEGER) || value > BigInt(Number.MAX_SAFE_INTEGER)) {
-      throw new ControlError("invalid_request", `${field} exceeds the supported safe integer range`);
-    }
-    value = Number(value);
-  }
-  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
-    throw new ControlError("invalid_request", `${field} must be an integer`);
-  }
-  if (minimum !== undefined && value < minimum) throw new ControlError("invalid_request", `${field} must be >= ${minimum}`);
-  if (maximum !== undefined && value > maximum) throw new ControlError("invalid_request", `${field} must be <= ${maximum}`);
-  return value;
+function integerBigInt(value: unknown, field: string, code = "invalid_request"): bigint {
+  if (typeof value === "bigint") return value;
+  if (typeof value === "number" && Number.isSafeInteger(value)) return BigInt(value);
+  throw new ControlError(code, `${field} must be an integer`);
+}
+
+function integerForJson(value: unknown): IntegerValue {
+  const integer = integerBigInt(value, "integer");
+  return integer >= BigInt(Number.MIN_SAFE_INTEGER) && integer <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(integer) : integer;
+}
+
+function integerText(value: unknown): string {
+  return integerBigInt(value, "integer").toString(10);
+}
+
+function sameInteger(left: unknown, right: unknown): boolean {
+  try { return integerBigInt(left, "integer") === integerBigInt(right, "integer"); }
+  catch { return false; }
+}
+
+function numberFromInteger(value: unknown, field: string, minimum: number, maximum: number): number;
+function numberFromInteger(value: unknown, field: string, minimum?: number, maximum?: number): IntegerValue;
+function numberFromInteger(value: unknown, field: string, minimum?: number, maximum?: number): IntegerValue {
+  const integer = integerBigInt(value, field);
+  if (minimum !== undefined && integer < BigInt(minimum)) throw new ControlError("invalid_request", `${field} must be >= ${minimum}`);
+  if (maximum !== undefined && integer > BigInt(maximum)) throw new ControlError("invalid_request", `${field} must be <= ${maximum}`);
+  return integerForJson(integer);
 }
 
 function bigintFromInteger(value: unknown, field: string, minimum = 0n): bigint {
@@ -196,7 +230,7 @@ function configString(value: unknown, field: string, pattern?: RegExp): string {
   catch (error) { if (error instanceof ControlError && error.code === "invalid_request") throw new ControlError("config_invalid", error.message, error.detail); throw error; }
 }
 
-function configInteger(value: unknown, field: string, minimum?: number, maximum?: number): number {
+function configInteger(value: unknown, field: string, minimum?: number, maximum?: number): IntegerValue {
   try { return numberFromInteger(value, field, minimum, maximum); }
   catch (error) { if (error instanceof ControlError && error.code === "invalid_request") throw new ControlError("config_invalid", error.message, error.detail); throw error; }
 }
@@ -210,11 +244,18 @@ function ratio(value: unknown, name: string): { numerator: bigint; denominator: 
   if (typeof value !== "number" && typeof value !== "string" && typeof value !== "bigint") {
     throw new ControlError("config_invalid", `${name} must be a finite number at least one`);
   }
+  if (typeof value === "number" && !Number.isFinite(value)) throw new ControlError("config_invalid", `${name} must be a finite number at least one`);
   const text = String(value);
-  if (!/^(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)$/.test(text)) throw new ControlError("config_invalid", `${name} must be a finite number at least one`);
-  const [whole, fraction = ""] = text.split(".");
-  const denominator = 10n ** BigInt(fraction.length);
-  const numerator = BigInt(whole || "0") * denominator + BigInt(fraction || "0");
+  const match = /^(?<sign>-?)(?<digits>(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))(?:[eE](?<exponent>[+-]?[0-9]+))?$/.exec(text);
+  if (!match || match.groups?.sign === "-") throw new ControlError("config_invalid", `${name} must be a finite number at least one`);
+  const digits = match.groups?.digits ?? "";
+  const exponent = Number(match.groups?.exponent ?? "0");
+  if (!Number.isSafeInteger(exponent)) throw new ControlError("config_invalid", `${name} must be a finite number at least one`);
+  const [whole, fraction = ""] = digits.split(".");
+  const mantissa = BigInt(`${whole || "0"}${fraction}`);
+  const scale = exponent - fraction.length;
+  const denominator = scale >= 0 ? 1n : 10n ** BigInt(-scale);
+  const numerator = scale >= 0 ? mantissa * 10n ** BigInt(scale) : mantissa;
   if (numerator < denominator) throw new ControlError("config_invalid", `${name} must be a finite number at least one`);
   return { numerator, denominator, text };
 }
@@ -257,6 +298,85 @@ function decode(value: Uint8Array): string {
 
 function encode(value: string): Uint8Array {
   return new TextEncoder().encode(value);
+}
+
+function decodeUtf8Strict(value: Uint8Array): string {
+  return new TextDecoder("utf-8", { fatal: true }).decode(value);
+}
+
+function parseJson(raw: string): unknown {
+  let index = 0;
+  const fail = (): never => { throw new SyntaxError(`invalid JSON at byte ${index}`); };
+  const skipWhitespace = (): void => { while (/[ \t\r\n]/.test(raw[index] ?? "")) index += 1; };
+  const parseString = (): string => {
+    if (raw[index] !== '"') return fail();
+    const start = index;
+    index += 1;
+    while (index < raw.length) {
+      const character = raw[index]!;
+      if (character === "\\") { index += 2; continue; }
+      if (character === '"') { index += 1; return JSON.parse(raw.slice(start, index)) as string; }
+      if (character < " ") return fail();
+      index += 1;
+    }
+    return fail();
+  };
+  const parseNumber = (): IntegerValue => {
+    const matcher = /-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/y;
+    matcher.lastIndex = index;
+    const token = matcher.exec(raw)?.[0];
+    if (!token) return fail();
+    index += token.length;
+    if (!token.includes(".") && !/[eE]/i.test(token)) return integerForJson(BigInt(token));
+    const number = Number(token);
+    if (!Number.isFinite(number)) return fail();
+    return number;
+  };
+  const parseValue = (): unknown => {
+    skipWhitespace();
+    const character = raw[index];
+    if (character === '"') return parseString();
+    if (character === "{") {
+      const object: Dict = {};
+      index += 1;
+      skipWhitespace();
+      if (raw[index] === "}") { index += 1; return object; }
+      while (true) {
+        skipWhitespace();
+        const key = parseString();
+        skipWhitespace();
+        if (raw[index] !== ":") return fail();
+        index += 1;
+        object[key] = parseValue();
+        skipWhitespace();
+        if (raw[index] === "}") { index += 1; return object; }
+        if (raw[index] !== ",") return fail();
+        index += 1;
+      }
+    }
+    if (character === "[") {
+      const array: unknown[] = [];
+      index += 1;
+      skipWhitespace();
+      if (raw[index] === "]") { index += 1; return array; }
+      while (true) {
+        array.push(parseValue());
+        skipWhitespace();
+        if (raw[index] === "]") { index += 1; return array; }
+        if (raw[index] !== ",") return fail();
+        index += 1;
+      }
+    }
+    if (raw.startsWith("true", index)) { index += 4; return true; }
+    if (raw.startsWith("false", index)) { index += 5; return false; }
+    if (raw.startsWith("null", index)) { index += 4; return null; }
+    if (character === "-" || (character !== undefined && /[0-9]/.test(character))) return parseNumber();
+    return fail();
+  };
+  const value = parseValue();
+  skipWhitespace();
+  if (index !== raw.length) return fail();
+  return value;
 }
 
 function ipv4ToInt(value: string): number {
@@ -353,7 +473,7 @@ export class CTResources {
 
 export function readJsonFile(path: string): Dict {
   try {
-    const value = JSON.parse(readFileSync(path, "utf8"));
+    const value = parseJson(decodeUtf8Strict(readFileSync(path)));
     if (!isDict(value)) throw new Error("root");
     return value;
   } catch (error) {
@@ -499,7 +619,7 @@ function killProcessGroupMembers(pgid: number): { killed: boolean; error: string
 
 export class CommandRunner {
   async run(argv: readonly string[], options: RunOptions = {}): Promise<CompletedProcess> {
-    const result = await this.runBounded(argv, { timeout: options.timeout ?? 30, stdoutLimit: Number.MAX_SAFE_INTEGER, stderrLimit: 4000, check: options.check ?? true, inputData: options.inputData });
+    const result = await this.runBounded(argv, { timeout: options.timeout ?? 60, stdoutLimit: Number.MAX_SAFE_INTEGER, stderrLimit: 4000, check: options.check ?? true, inputData: options.inputData });
     return result;
   }
 
@@ -512,37 +632,42 @@ export class CommandRunner {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new ControlError("command_missing", `command not found: ${argv[0]}`);
       throw error;
     }
-    if (options.inputData !== undefined && processHandle.stdin) {
-      const input = typeof options.inputData === "string" ? encode(options.inputData) : options.inputData;
-      await processHandle.stdin.write(input);
-      processHandle.stdin.end();
-    }
     const readAbort = new AbortController();
     const stdoutPromise = readBounded(processHandle.stdout, options.stdoutLimit ?? DIAGNOSTIC_LOG_LIMIT, false, readAbort.signal);
     const stderrPromise = readBounded(processHandle.stderr, options.stderrLimit ?? 4000, true, readAbort.signal);
-    const timeoutMs = (options.timeout ?? 30) * 1000;
+    const timeoutMs = (options.timeout ?? 60) * 1000;
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
     const exit = processHandle.exited;
     const timeout = new Promise<"timeout">((resolveTimeout) => { timeoutHandle = setTimeout(() => { resolveTimeout("timeout"); }, timeoutMs); });
-    const exitResult = await Promise.race([exit.then(() => "exit" as const), timeout]);
-    if (timeoutHandle) clearTimeout(timeoutHandle);
-    let processGroupKilled = true;
-    let processGroupCleanupError: string | null = null;
-    if (exitResult === "timeout") {
-      killProcessGroup(processHandle.pid, 9);
-      const fallback = killProcessGroupMembers(processHandle.pid);
-      processGroupKilled = fallback.killed;
-      processGroupCleanupError = fallback.error;
-      try { processHandle.kill("SIGKILL"); } catch { /* The leader may already be gone. */ }
-      const reaped = await Promise.race([exit.then(() => true), sleep(1000).then(() => false)]);
-      readAbort.abort();
-      void Promise.allSettled([stdoutPromise, stderrPromise]);
-      throw new ControlError("command_timeout", `command timed out: ${argv[0]}`, { reaped, process_group_killed: processGroupKilled, process_group_cleanup_error: processGroupCleanupError });
+    const inputPromise = (async (): Promise<void> => {
+      if (options.inputData === undefined || !processHandle.stdin) return;
+      const input = typeof options.inputData === "string" ? encode(options.inputData) : options.inputData;
+      await processHandle.stdin.write(input);
+      processHandle.stdin.end();
+    })();
+    const communication = Promise.all([inputPromise, stdoutPromise, stderrPromise, exit]);
+    try {
+      const outcome = await Promise.race([communication.then((value) => ({ kind: "complete" as const, value })), timeout.then(() => ({ kind: "timeout" as const }))]);
+      if (outcome.kind === "timeout") {
+        const groupKilled = killProcessGroup(processHandle.pid, 9);
+        const fallback = killProcessGroupMembers(processHandle.pid);
+        let processGroupKilled = groupKilled || fallback.killed;
+        let processGroupCleanupError = fallback.error;
+        try { processHandle.kill("SIGKILL"); } catch { /* The leader may already be gone. */ }
+        const reaped = await Promise.race([exit.then(() => true), sleep(1000).then(() => false)]);
+        readAbort.abort();
+        try { processHandle.stdin?.end(); } catch { /* The pipe may already be closed. */ }
+        await Promise.race([Promise.allSettled([inputPromise, stdoutPromise, stderrPromise, exit]), sleep(1000)]);
+        if (!processGroupKilled && !processGroupCleanupError) processGroupCleanupError = "process_group_kill_failed";
+        throw new ControlError("command_timeout", `command timed out: ${argv[0]}`, { reaped, process_group_killed: processGroupKilled, process_group_cleanup_error: processGroupCleanupError });
+      }
+      const [, stdout, stderr, returncode] = outcome.value;
+      const result: CompletedProcess = { args: [...argv], returncode, stdout: stdout.bytes, stderr: stderr.bytes, stdoutTruncated: stdout.truncated };
+      if ((options.check ?? true) && returncode !== 0) throw new ControlError("command_failed", `command failed (${returncode}): ${argv[0]}`, { returncode, stderr: decode(stderr.bytes).trim().slice(-4000) });
+      return result;
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
     }
-    const [stdout, stderr, returncode] = await Promise.all([stdoutPromise, stderrPromise, exit]);
-    const result: CompletedProcess = { args: [...argv], returncode, stdout: stdout.bytes, stderr: stderr.bytes, stdoutTruncated: stdout.truncated };
-    if ((options.check ?? true) && returncode !== 0) throw new ControlError("command_failed", `command failed (${returncode}): ${argv[0]}`, { returncode, stderr: decode(stderr.bytes).trim().slice(-4000) });
-    return result;
   }
 }
 
@@ -558,13 +683,13 @@ export class IncusClient {
   }
 
   async call(args: readonly string[], options: RunOptions = {}): Promise<CompletedProcess> {
-    return this.runner.run([...this.prefix, ...args], options);
+    return this.runner.run([...this.prefix, ...args], { ...options, timeout: options.timeout ?? 60 });
   }
 
   async json(args: readonly string[], timeout = 60): Promise<unknown> {
     const result = await this.call([...args, "--format", "json"], { timeout });
     try {
-      return JSON.parse(decode(result.stdout));
+      return parseJson(decodeUtf8Strict(result.stdout));
     } catch {
       throw new ControlError("incus_invalid_output", "Incus returned invalid JSON");
     }
@@ -572,8 +697,7 @@ export class IncusClient {
 
   async listInstances(): Promise<Dict[]> {
     const value = await this.json(["list"]);
-    if (!Array.isArray(value)) throw new ControlError("incus_invalid_output", "Incus list output is not an array");
-    return value.filter(isDict);
+    return dictArray(value, "incus_invalid_output", "Incus list output contains an invalid instance record");
   }
 
   async instanceInfo(name: string, options: { timeout?: number; bounded?: boolean } = {}): Promise<Dict> {
@@ -627,8 +751,7 @@ export class IncusClient {
 
   async networkForwards(): Promise<Dict[]> {
     const value = await this.json(["network", "forward", "list", String(this.config.network)]);
-    if (!Array.isArray(value)) throw new ControlError("incus_invalid_output", "Incus network forwards output is not an array");
-    return value.filter(isDict);
+    return dictArray(value, "incus_invalid_output", "Incus network forward output contains an invalid record");
   }
 
   async query(path: string, options: { project?: string; timeout?: number; bounded?: boolean } = {}): Promise<unknown> {
@@ -638,7 +761,7 @@ export class IncusClient {
       : await this.runner.run(["incus", "query", queryPath], { timeout: options.timeout ?? 30 });
     if (options.bounded && result.stdoutTruncated) throw new ControlError("incus_invalid_output", "query output was truncated");
     try {
-      return JSON.parse(decode(result.stdout));
+      return parseJson(decodeUtf8Strict(result.stdout));
     } catch {
       throw new ControlError("incus_invalid_output", "Incus query did not return JSON");
     }
@@ -666,7 +789,7 @@ export class IncusClient {
   }
 
   async exec(name: string, argv: readonly string[], options: RunOptions = {}): Promise<CompletedProcess> {
-    return this.call(["exec", name, "--", ...argv], options);
+    return this.call(["exec", name, "--", ...argv], { ...options, timeout: options.timeout ?? 60 });
   }
 }
 
@@ -701,6 +824,7 @@ export class StateStore {
     }
     this.db = new Database(path, { safeIntegers: true });
     try { chmodPrivate(path); } catch { /* SQLite may create the file lazily. */ }
+    this.db.run("PRAGMA busy_timeout=10000");
     this.db.run("PRAGMA journal_mode=WAL");
     this.db.run("PRAGMA synchronous=FULL");
     this.db.run("PRAGMA foreign_keys=ON");
@@ -817,7 +941,7 @@ export class StateStore {
 
   operation(operationId: string): Dict | undefined {
     const row = this.row("SELECT response_json FROM operations WHERE operation_id = ?", [operationId]);
-    return row ? JSON.parse(String(row.response_json)) as Dict : undefined;
+    return row ? parseJson(String(row.response_json)) as Dict : undefined;
   }
 
   recordOperation(operationId: string, action: string, sessionId: string | undefined, generation: unknown, response: Dict): void {
@@ -865,16 +989,16 @@ export class SystemdManager {
 
   private get timerDir(): string { return String(this.config.timer_dir); }
 
-  static timerUnit(taskId: string, generation: number): string {
-    if (!TASK_ID_RE.test(taskId) || generation < 1) throw new ControlError("invalid_timer", "invalid task timer identity");
-    return `agent-vm-native-expire-${taskId}-g${generation}.timer`;
+  static timerUnit(taskId: string, generation: IntegerValue): string {
+    if (!TASK_ID_RE.test(taskId) || integerBigInt(generation, "generation") < 1n) throw new ControlError("invalid_timer", "invalid task timer identity");
+    return `agent-vm-native-expire-${taskId}-g${integerText(generation)}.timer`;
   }
 
-  static instanceName(taskId: string, generation: number): string { return `${taskId}-g${generation}`; }
+  static instanceName(taskId: string, generation: IntegerValue): string { return `${taskId}-g${integerText(generation)}`; }
 
   private async systemctl(...args: string[]): Promise<void> { if (this.enabled) await this.runner.run(["systemctl", ...args], { timeout: 30 }); }
 
-  async scheduleExpiry(taskId: string, generation: number, expiresAt: string): Promise<string> {
+  async scheduleExpiry(taskId: string, generation: IntegerValue, expiresAt: string): Promise<string> {
     const unit = SystemdManager.timerUnit(taskId, generation);
     const date = parseTime(expiresAt);
     if (!date) throw new ControlError("lease_missing", "active task has no lease expiry");
@@ -895,7 +1019,7 @@ export class SystemdManager {
     return unit;
   }
 
-  async removeExpiry(taskId: string, generation: number): Promise<string> {
+  async removeExpiry(taskId: string, generation: IntegerValue): Promise<string> {
     const unit = SystemdManager.timerUnit(taskId, generation);
     const path = join(this.timerDir, unit);
     try {
@@ -917,7 +1041,7 @@ export class SystemdManager {
   }
 
   async enablePeriodicUnits(): Promise<void> { await this.systemctl("daemon-reload"); await this.systemctl("enable", "--now", "agent-vm-native-age-gc.timer"); await this.systemctl("enable", "agent-vm-native-reconcile.service"); }
-  async retryCleanup(taskId: string, generation: number): Promise<void> { await this.systemctl("start", "--no-block", `agent-vm-native-expire@${SystemdManager.instanceName(taskId, generation)}.service`); }
+  async retryCleanup(taskId: string, generation: IntegerValue): Promise<void> { await this.systemctl("start", "--no-block", `agent-vm-native-expire@${SystemdManager.instanceName(taskId, generation)}.service`); }
 }
 
 export class Control {
@@ -996,7 +1120,7 @@ export class Control {
     let task: Dict | undefined;
     await this.globalLock(() => this.store.transaction(() => {
       task = this.store.getTask({ taskId });
-      if (!task || Number(task.generation) !== generation) return;
+      if (!task || !sameInteger(task.generation, generation)) return;
       const expiry = parseTime(task.lease_expires_at);
       if (!Control.ACTIVE_STATES.has(String(task.state)) || (expiry && expiry.getTime() > this.now().getTime())) return;
       const inactive = parseTime(task.inactive_since) ?? new Date(Math.min(this.now().getTime(), expiry?.getTime() ?? this.now().getTime()));
@@ -1048,21 +1172,25 @@ export class Control {
       }
       if (!("generation" in request)) throw new ControlError("invalid_request", "write request requires generation");
       numberFromInteger(request.generation, "generation", 0);
-      if (action !== "renew") this.store.recordOperation(operationId, action, sessionId, request.generation, { outcome: "pending", _request_digest: digest });
+      if (action !== "renew") await this.globalLock(() => this.store.recordOperation(operationId, action, sessionId, request.generation, { outcome: "pending", _request_digest: digest }));
     }
     try {
       const result = await this.dispatchAction(action, request, sessionId);
       const response: Dict = { ok: true, protocol: PROTOCOL_VERSION, server_time: isoTime(this.now()), action, session_id: sessionId ?? null, generation: request.generation ?? null, operation_id: operationId ?? null, outcome: "success", result };
-      if (operationId && Control.WRITE_ACTIONS.has(action) && action !== "renew") this.store.recordOperation(operationId, action, sessionId, request.generation, { ...response, _request_digest: digest });
-      if (sessionId) this.store.audit(action, "ok", result, undefined, sessionId, request.generation);
+      await this.globalLock(() => {
+        if (operationId && Control.WRITE_ACTIONS.has(action) && action !== "renew") this.store.recordOperation(operationId, action, sessionId, request.generation, { ...response, _request_digest: digest });
+        if (sessionId) this.store.audit(action, "ok", result, undefined, sessionId, request.generation);
+      });
       return response;
     } catch (error) {
       if (error instanceof ControlError) {
-        if (operationId && Control.WRITE_ACTIONS.has(action)) {
-          const saved = this.store.operation(operationId);
-          if (!saved || saved.outcome !== "success") this.store.recordOperation(operationId, action, sessionId, request.generation, { outcome: "error", error: error.asDict(), _request_digest: digest });
-        }
-        if (sessionId) this.store.audit(action, "error", error.asDict(), undefined, sessionId, request.generation);
+        await this.globalLock(() => {
+          if (operationId && Control.WRITE_ACTIONS.has(action)) {
+            const saved = this.store.operation(operationId);
+            if (!saved || saved.outcome !== "success") this.store.recordOperation(operationId, action, sessionId, request.generation, { outcome: "error", error: error.asDict(), _request_digest: digest });
+          }
+          if (sessionId) this.store.audit(action, "error", error.asDict(), undefined, sessionId, request.generation);
+        });
       }
       throw error;
     }
@@ -1105,10 +1233,10 @@ export class Control {
   private checkGeneration(task: Dict | undefined, request: Dict): void {
     if (!task) throw new ControlError("task_missing", "task not found");
     const generation = numberFromInteger(request.generation, "generation", 0);
-    if (generation !== Number(task.generation)) throw new ControlError("generation_mismatch", "request generation does not match current task generation", { current_generation: Number(task.generation) });
+    if (!sameInteger(generation, task.generation)) throw new ControlError("generation_mismatch", "request generation does not match current task generation", { current_generation: integerForJson(task.generation) });
   }
 
-  private baseTask(sessionId: string, generation: number): Dict {
+  private baseTask(sessionId: string, generation: IntegerValue): Dict {
     const taskId = `avm-${randomBytes(8).toString("hex")}`;
     const now = isoTime(this.now());
     return { task_id: taskId, session_id: sessionId, generation, state: "preparing", instance_name: `agent-vm-${taskId}`, vm_ip: null, ssh_host_port: null, lease_expires_at: null, inactive_since: null, cleanup_after: null, created_at: now, updated_at: now, last_error: null, image_fingerprint: this.config.image_fingerprint };
@@ -1128,7 +1256,7 @@ export class Control {
   private async nativeOperationCurrent(task: Dict): Promise<Dict> {
     const current = this.store.getTask({ taskId: String(task.task_id) });
     const expiry = current ? parseTime(current.lease_expires_at) : undefined;
-    if (!current || Number(current.generation) !== Number(task.generation) || current.instance_name !== task.instance_name || !["preparing", "active"].includes(String(current.state)) || !expiry || expiry.getTime() <= this.now().getTime()) throw new ControlError("lease_expired", "native operation was revoked before its effect");
+    if (!current || !sameInteger(current.generation, task.generation) || current.instance_name !== task.instance_name || !["preparing", "active"].includes(String(current.state)) || !expiry || expiry.getTime() <= this.now().getTime()) throw new ControlError("lease_expired", "native operation was revoked before its effect");
     return current;
   }
 
@@ -1136,11 +1264,11 @@ export class Control {
   private async stopInstance(task: Dict): Promise<void> { await this.nativeLock(task, async () => { const current = await this.nativeOperationCurrent(task); await this.ownership(current); await this.incus.stop(String(current.instance_name), true); }); }
 
   private stateSummary(task: Dict): Dict {
-    const result: Dict = { task_id: task.task_id, session_id: task.session_id, generation: Number(task.generation), state: task.state, instance_name: task.instance_name, vm_ip: task.vm_ip, ssh_host_port: task.ssh_host_port === null ? null : Number(task.ssh_host_port), lease_expires_at: task.lease_expires_at, inactive_since: task.inactive_since, cleanup_after: task.cleanup_after };
-    if (task.last_error) result.last_error = JSON.parse(String(task.last_error));
+    const result: Dict = { task_id: task.task_id, session_id: task.session_id, generation: integerForJson(task.generation), state: task.state, instance_name: task.instance_name, vm_ip: task.vm_ip, ssh_host_port: task.ssh_host_port === null ? null : Number(task.ssh_host_port), lease_expires_at: task.lease_expires_at, inactive_since: task.inactive_since, cleanup_after: task.cleanup_after };
+    if (task.last_error) result.last_error = parseJson(String(task.last_error));
     result.ports = this.store.getPorts(String(task.task_id));
-    result.resources = JSON.parse(String(task.resources_json || "{}"));
-    result.resource_reservation = JSON.parse(String(task.resource_reservation_json || "{}"));
+    result.resources = parseJson(String(task.resources_json || "{}"));
+    result.resource_reservation = parseJson(String(task.resource_reservation_json || "{}"));
     const expiry = parseTime(task.lease_expires_at);
     result.effective_lease = task.state === "active" && Boolean(expiry && expiry.getTime() > this.now().getTime());
     return result;
@@ -1179,16 +1307,13 @@ export class Control {
     const totalBig = usage.blocks * usage.bsize;
     const freeBig = usage.bavail * usage.bsize;
     if (totalBig <= 0n || freeBig < 0n || freeBig > totalBig) throw new ControlError("capacity_unverified", "invalid CT filesystem capacity");
-    const toNumber = (value: bigint): number => {
-      if (value > BigInt(Number.MAX_SAFE_INTEGER)) throw new ControlError("capacity_unverified", "CT filesystem capacity exceeds safe reporting range");
-      return Number(value);
-    };
-    const total = toNumber(totalBig);
-    const free = toNumber(freeBig);
+    const reportInteger = (value: bigint): IntegerValue => integerForJson(value);
     const lowMinimum = bigintFromInteger(this.config.disk_low_bytes ?? 10n * 1024n ** 3n, "disk_low_bytes");
     const targetMinimum = bigintFromInteger(this.config.disk_target_bytes ?? 20n * 1024n ** 3n, "disk_target_bytes");
-    const layer: Dict = { label: "ct-filesystem", total, free, kind: "data", low: Math.max(Number(lowMinimum), Math.floor(total * 15 / 100)), target: Math.max(Number(targetMinimum), Math.floor(total * 25 / 100)) };
-    if (layer.target >= total || layer.low >= layer.target) throw new ControlError("watermarks_unreachable", "configure reachable CT storage watermarks", layer);
+    const low = lowMinimum > (totalBig * 15n) / 100n ? lowMinimum : (totalBig * 15n) / 100n;
+    const target = targetMinimum > (totalBig * 25n) / 100n ? targetMinimum : (totalBig * 25n) / 100n;
+    const layer: Dict = { label: "ct-filesystem", total: reportInteger(totalBig), free: reportInteger(freeBig), kind: "data", low: reportInteger(low), target: reportInteger(target) };
+    if (target >= totalBig || low >= target) throw new ControlError("watermarks_unreachable", "configure reachable CT storage watermarks", layer);
     return { scope: "ct-filesystem", observed_at: isoTime(this.now()), layers: [layer] };
   }
 
@@ -1206,7 +1331,7 @@ export class Control {
   private async eligibleCache(snapshot: Dict): Promise<Dict> {
     const task = this.store.getTask({ taskId: String(snapshot.task_id) });
     if (!task || task.state !== "cached" || !task.inactive_since) throw new ControlError("cache_ineligible", "not an eligible stopped cache");
-    if (Number(task.generation) !== Number(snapshot.generation) || task.session_id !== snapshot.session_id) throw new ControlError("cache_ineligible", "cache ownership or generation changed");
+    if (!sameInteger(task.generation, snapshot.generation) || task.session_id !== snapshot.session_id) throw new ControlError("cache_ineligible", "cache ownership or generation changed");
     const expiry = parseTime(task.lease_expires_at);
     if (expiry && expiry.getTime() > this.now().getTime()) throw new ControlError("cache_ineligible", "cache still has an effective deadline");
     const info = await this.ownership(task);
@@ -1275,11 +1400,11 @@ export class Control {
     for (const task of this.store.listTasks()) {
       if (task.task_id === excludeTaskId || ["absent", "cached"].includes(String(task.state))) continue;
       try {
-        const values = JSON.parse(String(task.resources_json || "{}"));
-        const reservation = JSON.parse(String(task.resource_reservation_json || "{}"));
+        const values = parseJson(String(task.resources_json || "{}")) as Dict;
+        const reservation = parseJson(String(task.resource_reservation_json || "{}")) as Dict;
         for (const key of ["cpu", "memory_mib"]) {
-          const current = numberFromInteger(values[key], key, 0);
-          const reserved = reservation[key] === undefined ? 0 : numberFromInteger(reservation[key], key, 0);
+          const current = numberFromInteger(values[key], key, 0, 65536);
+          const reserved = reservation[key] === undefined ? 0 : numberFromInteger(reservation[key], key, 0, 65536);
           totals[key as "cpu" | "memory_mib"] += Math.max(current, reserved);
         }
       } catch {
@@ -1355,8 +1480,8 @@ export class Control {
   private async reserveResources(task: Dict, resources: Dict, memoryReduction = false): Promise<Dict> {
     let policy: Dict | undefined;
     if (memoryReduction) {
-      const old = JSON.parse(String(task.resources_json));
-      if (task.state !== "active" || stableJson(resources) !== stableJson(old) || Object.keys(JSON.parse(String(task.resource_reservation_json || "{}"))).length) throw new ControlError("resize_unverified", "memory reduction requires an intact current allocation");
+      const old = parseJson(String(task.resources_json)) as Dict;
+      if (task.state !== "active" || stableJson(resources) !== stableJson(old) || Object.keys(parseJson(String(task.resource_reservation_json || "{}")) as Dict).length) throw new ControlError("resize_unverified", "memory reduction requires an intact current allocation");
     } else {
       policy = await this.resourcePolicy();
       if (policy.memory.available_bytes < policy.memory.threshold_bytes) throw new ControlError("memory_pressure", "CT memory headroom is below the admission threshold", policy.memory);
@@ -1366,9 +1491,9 @@ export class Control {
       if (this.store.getMeta("draining") === "1") throw new ControlError("draining", "new leases and capacity changes are refused while draining");
       const current = this.store.getTask({ taskId: String(task.task_id) });
       if (task.state === "active") {
-        if (!current || Number(current.generation) !== Number(task.generation)) throw new ControlError("generation_mismatch", "reservation generation changed");
+        if (!current || !sameInteger(current.generation, task.generation)) throw new ControlError("generation_mismatch", "reservation generation changed");
         this.requireActive(current);
-      } else if (current && !["absent", "cached"].includes(String(current.state)) && Number(current.generation) + 1 !== Number(task.generation)) throw new ControlError("generation_mismatch", "allocation slot changed before reservation");
+      } else if (current && !["absent", "cached"].includes(String(current.state)) && integerBigInt(current.generation, "generation") + 1n !== integerBigInt(task.generation, "generation")) throw new ControlError("generation_mismatch", "allocation slot changed before reservation");
       const totals = this.allocationTotals(String(task.task_id));
       const projected = { cpu: totals.cpu + resources.cpu, memory_mib: totals.memory_mib + resources.memory_mib };
       const exceeded = policy ? ["cpu", "memory_mib"].filter((key) => (projected as Dict)[key] > (policy.limits as Dict)[key]) : [];
@@ -1384,7 +1509,7 @@ export class Control {
     const nativeIps = inventory ? await this.nativeIps(String(task.instance_name)) : new Set<string>();
     return this.globalLock(() => this.store.transaction(() => {
       const current = this.store.getTask({ taskId: String(task.task_id) });
-      if (!current || Number(current.generation) !== Number(task.generation) || !["active", "preparing"].includes(String(current.state))) throw new ControlError("generation_mismatch", "reservation changed before native admission");
+      if (!current || !sameInteger(current.generation, task.generation) || !["active", "preparing"].includes(String(current.state))) throw new ControlError("generation_mismatch", "reservation changed before native admission");
       const expiry = parseTime(current.lease_expires_at);
       if (!expiry || expiry.getTime() <= this.now().getTime()) throw new ControlError("lease_expired", "lease expired before native admission");
       if (this.store.getMeta("draining") === "1") throw new ControlError("draining", "native admission is drained");
@@ -1404,7 +1529,7 @@ export class Control {
   private async cancelResourceReservation(previous: Dict): Promise<void> {
     await this.globalLock(() => this.store.transaction(() => {
       const current = this.store.getTask({ taskId: String(previous.task_id) });
-      if (current && Number(current.generation) === Number(previous.generation) && current.state === "active") this.store.updateTask(String(previous.task_id), { resource_reservation_json: previous.resource_reservation_json, reservation_bytes: previous.reservation_bytes });
+      if (current && sameInteger(current.generation, previous.generation) && current.state === "active") this.store.updateTask(String(previous.task_id), { resource_reservation_json: previous.resource_reservation_json, reservation_bytes: previous.reservation_bytes });
     }));
   }
 
@@ -1434,27 +1559,34 @@ export class Control {
   private async nativePorts(): Promise<Set<number>> {
     const ports = new Set<number>();
     const projects = await this.incus.query("/1.0/projects?recursion=1", { project: "default" });
-    if (!Array.isArray(projects)) throw new ControlError("port_inventory_unverified", "project inventory is unavailable");
-    for (const project of projects.filter(isDict)) {
-      const name = requiredString(project.name, "project name");
+    for (const project of dictArray(projects, "port_inventory_unverified", "project inventory contains an invalid record")) {
+      const name = inventoryString(project.name, "port_inventory_unverified", "project name");
       const instances = await this.incus.query("/1.0/instances?recursion=1", { project: name });
       const networks = await this.incus.query("/1.0/networks?recursion=1", { project: name });
-      if (!Array.isArray(instances) || !Array.isArray(networks)) throw new ControlError("port_inventory_unverified", "native inventory is unavailable");
-      for (const instance of instances.filter(isDict)) {
-        if (!isDict(instance.expanded_devices)) continue;
-        for (const device of Object.values(instance.expanded_devices)) if (isDict(device) && device.type === "proxy") {
-          const listen = String(device.listen ?? "");
-          if (listen.startsWith("tcp:") || listen.startsWith("udp:")) for (const port of this.portNumbers(listen.split(":").at(-1) ?? "")) ports.add(port);
+      for (const instance of dictArray(instances, "port_inventory_unverified", "instance inventory contains an invalid record")) {
+        inventoryString(instance.name, "port_inventory_unverified", "instance name");
+        if (!isDict(instance.expanded_devices)) throw new ControlError("port_inventory_unverified", "instance device inventory is unavailable");
+        for (const device of Object.values(instance.expanded_devices)) {
+          if (!isDict(device)) throw new ControlError("port_inventory_unverified", "instance device inventory contains an invalid record");
+          if (typeof device.type !== "string") throw new ControlError("port_inventory_unverified", "instance device type is invalid");
+          if (device.type === "proxy") {
+            if (typeof device.listen !== "string") throw new ControlError("port_inventory_unverified", "proxy device listen endpoint is invalid");
+            const listen = device.listen;
+            if (listen.startsWith("tcp:") || listen.startsWith("udp:")) for (const port of this.portNumbers(listen.split(":").at(-1) ?? "")) ports.add(port);
+          }
         }
       }
-      for (const network of networks.filter(isDict)) {
+      for (const network of dictArray(networks, "port_inventory_unverified", "network inventory contains an invalid record")) {
+        inventoryString(network.name, "port_inventory_unverified", "network name");
+        if (typeof network.managed !== "boolean" || typeof network.type !== "string") throw new ControlError("port_inventory_unverified", "network inventory fields are invalid");
         if (!network.managed || network.type !== "bridge") continue;
         const forwards = await this.incus.query(`/1.0/networks/${quotePath(String(network.name))}/forwards?recursion=1`, { project: name });
-        if (!Array.isArray(forwards)) throw new ControlError("port_inventory_unverified", "network forward inventory is unavailable");
-        for (const forward of forwards.filter(isDict)) {
-          const config = isDict(forward.config) ? forward.config : {};
+        for (const forward of dictArray(forwards, "port_inventory_unverified", "network forward inventory contains an invalid record")) {
+          if (!isDict(forward.config) || !Array.isArray(forward.ports) || forward.ports.some((item: unknown) => !isDict(item))) throw new ControlError("port_inventory_unverified", "network forward fields are invalid");
+          const config = forward.config;
+          if (config.target_address !== undefined && typeof config.target_address !== "string") throw new ControlError("port_inventory_unverified", "network forward target address is invalid");
           if (config.target_address) for (let port = Number(this.config.port_start); port <= Number(this.config.port_end); port += 1) ports.add(port);
-          if (Array.isArray(forward.ports)) for (const item of forward.ports.filter(isDict)) for (const port of this.portNumbers(String(item.listen_port ?? ""))) ports.add(port);
+          for (const item of forward.ports as Dict[]) for (const port of this.portNumbers(inventoryString(item.listen_port, "port_inventory_unverified", "forward listen_port"))) ports.add(port);
         }
       }
     }
@@ -1511,25 +1643,36 @@ export class Control {
     let ownMac: string | undefined;
     let ownIp: string | undefined;
     const projects = await this.incus.query("/1.0/projects?recursion=1", { project: "default" });
-    if (!Array.isArray(projects)) throw new ControlError("vm_ip_unverified", "native project inventory is unavailable");
-    for (const project of projects.filter(isDict)) {
+    for (const project of dictArray(projects, "vm_ip_unverified", "native project inventory contains an invalid record")) {
+      const projectName = inventoryString(project.name, "vm_ip_unverified", "project name");
       const instances = await this.incus.query("/1.0/instances?recursion=1", { project: String(project.name) });
-      if (!Array.isArray(instances)) throw new ControlError("vm_ip_unverified", "native instance inventory is unavailable");
-      for (const instance of instances.filter(isDict)) {
-        if (project.name === this.config.project && instance.name === ownName) {
-          const devices = isDict(instance.expanded_devices) ? instance.expanded_devices : {};
-          const nic = isDict(devices.eth0) ? devices.eth0 : {};
-          ownMac = String(nic.hwaddr ?? (isDict(instance.config) ? instance.config["volatile.eth0.hwaddr"] ?? "" : ""));
-          ownIp = typeof nic["ipv4.address"] === "string" ? nic["ipv4.address"] : undefined;
+      for (const instance of dictArray(instances, "vm_ip_unverified", "native instance inventory contains an invalid record")) {
+        const instanceName = inventoryString(instance.name, "vm_ip_unverified", "instance name");
+        if (!isDict(instance.expanded_devices)) throw new ControlError("vm_ip_unverified", "native device inventory is unavailable");
+        for (const device of Object.values(instance.expanded_devices)) {
+          if (!isDict(device) || typeof device.type !== "string") throw new ControlError("vm_ip_unverified", "native device inventory contains an invalid record");
+          for (const field of ["network", "parent", "ipv4.address", "hwaddr"]) if (device[field] !== undefined && typeof device[field] !== "string") throw new ControlError("vm_ip_unverified", "native device inventory field is invalid");
+        }
+        if (projectName === this.config.project && instanceName === ownName) {
+          const devices = instance.expanded_devices;
+          if (!isDict(devices.eth0)) throw new ControlError("vm_ip_unverified", "managed instance NIC inventory is unavailable");
+          const nic = devices.eth0;
+          const volatileMac = isDict(instance.config) ? instance.config["volatile.eth0.hwaddr"] : undefined;
+          if (volatileMac !== undefined && typeof volatileMac !== "string") throw new ControlError("vm_ip_unverified", "managed instance hardware address is invalid");
+          ownMac = nic.hwaddr ?? volatileMac;
+          ownIp = nic["ipv4.address"];
+          if (!ownMac || !ownIp) throw new ControlError("vm_ip_unverified", "managed instance address inventory is incomplete");
           continue;
         }
-        if (!isDict(instance.expanded_devices)) continue;
         for (const device of Object.values(instance.expanded_devices)) if (isDict(device) && (device.network === this.config.network || device.parent === this.config.network) && device["ipv4.address"]) used.add(String(device["ipv4.address"]));
       }
     }
     const leases = await this.incus.query(`/1.0/networks/${quotePath(String(this.config.network))}/leases`, { project: "default" });
-    if (!Array.isArray(leases)) throw new ControlError("vm_ip_unverified", "network lease inventory is unavailable");
-    for (const lease of leases.filter(isDict)) if (!(ownMac && String(lease.hwaddr ?? "").toLowerCase() === ownMac.toLowerCase() && lease.address === ownIp) && lease.address) used.add(String(lease.address));
+    for (const lease of dictArray(leases, "vm_ip_unverified", "network lease inventory contains an invalid record")) {
+      const address = inventoryString(lease.address, "vm_ip_unverified", "lease address");
+      if (lease.hwaddr !== undefined && typeof lease.hwaddr !== "string") throw new ControlError("vm_ip_unverified", "network lease hardware address is invalid");
+      if (!(ownMac && String(lease.hwaddr ?? "").toLowerCase() === ownMac.toLowerCase() && address === ownIp)) used.add(address);
+    }
     return used;
   }
 
@@ -1604,7 +1747,7 @@ export class Control {
 
   private async emitSlowStartDiagnostic(task: Dict, phase: string, started: number, readiness: Dict, deadline?: number): Promise<Dict> {
     const errors: Dict[] = [];
-    const payload: Dict = { event: "agent-vm-slow-start", task_id: task.task_id, session_id: task.session_id, generation: Number(task.generation), phase, elapsed_seconds: Math.round(Math.max(0, (nowMs() - started) / 1000) * 1000) / 1000, budget_seconds: GUEST_READINESS_BUDGET_SECONDS, stage_timings: { ...readiness.stage_timings }, readiness: { ...readiness }, native_status: {}, cpu_psi: {}, qemu_schedstat: {}, startup_log: {} };
+    const payload: Dict = { event: "agent-vm-slow-start", task_id: task.task_id, session_id: task.session_id, generation: integerForJson(task.generation), phase, elapsed_seconds: Math.round(Math.max(0, (nowMs() - started) / 1000) * 1000) / 1000, budget_seconds: GUEST_READINESS_BUDGET_SECONDS, stage_timings: { ...readiness.stage_timings }, readiness: { ...readiness }, native_status: {}, cpu_psi: {}, qemu_schedstat: {}, startup_log: {} };
     try {
       const info = await this.incus.instanceInfo(String(task.instance_name), { timeout: this.diagnosticTimeout(deadline), bounded: true });
       payload.native_status = Object.fromEntries(["status", "pid", "processes"].filter((key) => key in info).map((key) => [key, info[key]]));
@@ -1613,7 +1756,7 @@ export class Control {
     try { payload.cpu_psi = this.parseCpuPsi(readText("/proc/pressure/cpu")); } catch (error) { errors.push({ source: "cpu_psi", ...this.diagnosticError(error) }); }
     try { payload.startup_log = this.redactStartupLog(await this.incus.instanceLog(String(task.instance_name), this.diagnosticTimeout(deadline))); } catch (error) { errors.push({ source: "startup_log", ...this.diagnosticError(error) }); }
     if (errors.length) payload.errors = errors;
-    try { this.store.audit("boot-diagnostic", errors.length ? "partial" : "ok", payload, String(task.task_id), String(task.session_id), task.generation); } catch (error) { (payload.errors ??= []).push({ source: "audit", ...this.diagnosticError(error) }); }
+    try { await this.globalLock(() => this.store.audit("boot-diagnostic", errors.length ? "partial" : "ok", payload, String(task.task_id), String(task.session_id), task.generation)); } catch (error) { (payload.errors ??= []).push({ source: "audit", ...this.diagnosticError(error) }); }
     try { process.stderr.write(`${emitJson(payload)}\n`); } catch (error) { (payload.errors ??= []).push({ source: "stderr", ...this.diagnosticError(error) }); }
     return payload;
   }
@@ -1632,7 +1775,7 @@ export class Control {
     const remaining = (condition: string): number => {
       const current = this.store.getTask({ taskId: String(task.task_id) });
       const expiry = current ? parseTime(current.lease_expires_at) : undefined;
-      if (!current || Number(current.generation) !== Number(task.generation) || !["preparing", "active"].includes(String(current.state)) || !expiry) throw new ControlError("lease_expired", "guest preparation was revoked");
+      if (!current || !sameInteger(current.generation, task.generation) || !["preparing", "active"].includes(String(current.state)) || !expiry) throw new ControlError("lease_expired", "guest preparation was revoked");
       if (expiry.getTime() <= this.now().getTime()) throw new ControlError("lease_expired", "lease expired while waiting for guest readiness");
       const seconds = Math.floor(GUEST_READINESS_BUDGET_SECONDS - (nowMs() - started) / 1000);
       if (seconds < 1) this.readinessTimeout(condition, started, readiness, diagnostic);
@@ -1730,13 +1873,15 @@ export class Control {
     await this.nativeLock(task, async () => {
       const current = await this.nativeOperationCurrent(task);
       const info = await this.ownership(current);
-      const devices = isDict(info.devices) ? info.devices : {};
+      if (!isDict(info.devices) || !isDict(info.expanded_devices)) throw new ControlError("mapping_unverified", "native device maps are unavailable");
+      const devices = info.devices;
       const native = devices[port.device_name];
       const expected = this.proxyProperties(current, port);
       if (native) { if (Object.entries(expected).some(([key, value]) => native[key] !== value)) throw new ControlError("ownership_mismatch", "native device does not match reservation"); return; }
       await this.incus.deviceAdd(String(current.instance_name), String(port.device_name), "proxy", Object.fromEntries(Object.entries(expected).filter(([key]) => key !== "type")));
       const after = await this.ownership(current);
-      const afterDevices = isDict(after.devices) ? after.devices : {};
+      if (!isDict(after.devices) || !isDict(after.expanded_devices)) throw new ControlError("mapping_unverified", "native device maps are unavailable after addition");
+      const afterDevices = after.devices;
       if (Object.entries(expected).some(([key, value]) => afterDevices[port.device_name]?.[key] !== value)) throw new ControlError("mapping_unverified", "native proxy addition was not confirmed");
     });
   }
@@ -1753,7 +1898,7 @@ export class Control {
   private async cleanupCurrent(task: Dict): Promise<Dict | undefined> {
     return this.globalLock(() => this.store.transaction(() => {
       const current = this.store.getTask({ taskId: String(task.task_id) });
-      if (!current || Number(current.generation) !== Number(task.generation) || current.state !== "closing" || current.instance_name !== task.instance_name) return undefined;
+      if (!current || !sameInteger(current.generation, task.generation) || current.state !== "closing" || current.instance_name !== task.instance_name) return undefined;
       return current;
     }));
   }
@@ -1799,21 +1944,24 @@ export class Control {
 
   private async removeProxy(task: Dict, port: Dict): Promise<void> {
     const info = await this.ownership(task);
-    const devices = isDict(info.devices) ? info.devices : {};
+    if (!isDict(info.devices) || !isDict(info.expanded_devices)) throw new ControlError("mapping_unverified", "native device maps are unavailable");
+    const devices = info.devices;
+    const expandedBefore = info.expanded_devices;
     const native = devices[port.device_name];
+    if (!native && port.device_name in expandedBefore) throw new ControlError("mapping_unverified", "native device maps disagree");
     if (native) {
       const expected = this.proxyProperties(task, port);
       if (Object.entries(expected).some(([key, value]) => native[key] !== value)) throw new ControlError("ownership_mismatch", "native mapping differs from its reservation");
       await this.incus.deviceRemove(String(task.instance_name), String(port.device_name));
     }
     const after = await this.ownership(task);
-    const expanded = isDict(after.expanded_devices) ? after.expanded_devices : isDict(after.devices) ? after.devices : {};
-    if (port.device_name in expanded) throw new ControlError("mapping_unverified", "native mapping is still present");
+    if (!isDict(after.devices) || !isDict(after.expanded_devices)) throw new ControlError("mapping_unverified", "native device maps are unavailable after removal");
+    if (port.device_name in after.devices || port.device_name in after.expanded_devices) throw new ControlError("mapping_unverified", "native mapping is still present");
   }
 
   private async scheduleExpiry(task: Dict): Promise<void> {
     if (!task.lease_expires_at) throw new ControlError("lease_missing", "active task has no lease expiry");
-    await this.systemd.scheduleExpiry(String(task.task_id), Number(task.generation), String(task.lease_expires_at));
+    await this.systemd.scheduleExpiry(String(task.task_id), task.generation, String(task.lease_expires_at));
   }
 
   private async imageGuard(): Promise<void> {
@@ -1861,14 +2009,14 @@ export class Control {
       this.checkGeneration(existing, request);
       this.requireActive(existing);
       await this.ownership(existing);
-      const resources = JSON.parse(String(existing.resources_json));
+      const resources = parseJson(String(existing.resources_json)) as Dict;
       const target = this.requestedResources(request, resources, true);
       if (stableJson(target) !== stableJson(resources)) throw new ControlError("resource_config_mismatch", "active lease configuration differs; use resize explicitly", { current: resources, requested: target, differences: Object.keys(resources).filter((key) => resources[key] !== target[key]) });
       return this.runtimeSummary(existing);
     }
     if (existing && !["absent", "cached"].includes(String(existing.state))) throw new ControlError("task_transition", "session slot is not available until reconciliation completes");
-    const expected = existing ? Number(existing.generation) : 0;
-    if (Number(request.generation) !== expected) throw new ControlError("generation_mismatch", "acquire requires the latest observed generation", { current_generation: expected });
+    const expected = existing ? integerBigInt(existing.generation, "generation") : 0n;
+    if (!sameInteger(request.generation, expected)) throw new ControlError("generation_mismatch", "acquire requires the latest observed generation", { current_generation: integerForJson(expected) });
     if (this.store.getMeta("draining") === "1") throw new ControlError("draining", "new leases are refused");
     await this.networkGuard();
     const publicKey = requiredString(request.public_key, "public_key");
@@ -1879,12 +2027,12 @@ export class Control {
       await this.ownership(existing as Dict);
       if (String((await this.incus.instanceInfo(String(existing?.instance_name))).status).toLowerCase() !== "stopped" || this.store.getPorts(String(existing?.task_id)).length) throw new ControlError("cache_ineligible", "cached instance is not safely stopped");
     }
-    const old = cached ? JSON.parse(String(existing?.resources_json)) : { cpu: 2, memory_mib: 4096, disk_gib: 20 };
+    const old = cached ? parseJson(String(existing?.resources_json)) as Dict : { cpu: 2, memory_mib: 4096, disk_gib: 20 };
     if (cached && stableJson(await this.nativeResources(existing as Dict)) !== stableJson(old)) throw new ControlError("resource_unverified", "cached native sizes differ from durable resource sizes");
     const resources = this.requestedResources(request, old);
     let cost = bigintFromInteger(cached ? this.config.resume_cost_bytes : this.config.create_cost_bytes, "resume_cost_bytes");
     if (cached && resources.disk_gib > old.disk_gib) cost += bigintFromInteger(this.config.resize_cost_bytes, "resize_cost_bytes");
-    let task = this.baseTask(sessionId, expected + 1);
+    let task = this.baseTask(sessionId, expected + 1n);
     if (existing) Object.assign(task, { task_id: existing.task_id, instance_name: existing.instance_name, created_at: existing.created_at, vm_ip: cached ? existing.vm_ip : null });
     if (cached) Object.assign(task, { previous_generation: expected, inactive_since: existing?.inactive_since, cleanup_after: existing?.cleanup_after });
     task.resources_json = stableJson(cached ? old : resources);
@@ -1981,7 +2129,7 @@ export class Control {
     const requestedState = inputTask.state;
     return this.objectLock(`cleanup:${inputTask.session_id}`, async () => {
       const current = this.store.getTask({ taskId: String(inputTask.task_id) });
-      if (!current || Number(current.generation) !== Number(inputTask.generation)) throw new ControlError("generation_mismatch", "cleanup generation changed");
+      if (!current || !sameInteger(current.generation, inputTask.generation)) throw new ControlError("generation_mismatch", "cleanup generation changed");
       let task = current;
       if (["cached", "absent"].includes(String(task.state)) && requestedState !== "closing") return this.stateSummary(task);
       const expiry = parseTime(task.lease_expires_at);
@@ -1990,10 +2138,10 @@ export class Control {
       const [errors, completed] = await this.cleanupTask(task);
       if (errors.length) {
         this.store.updateTask(String(task.task_id), { last_error: stableJson({ errors, completed }) });
-        await this.systemd.retryCleanup(String(task.task_id), Number(task.generation));
+        await this.systemd.retryCleanup(String(task.task_id), task.generation);
         throw new ControlError("cleanup_incomplete", "entry/port reservations remain closed until reconciliation succeeds", errors);
       }
-      await this.systemd.removeExpiry(String(task.task_id), Number(task.generation));
+      await this.systemd.removeExpiry(String(task.task_id), task.generation);
       const absent = !(await this.incus.listInstances()).some((item) => item.name === task.instance_name);
       if (!absent && task.previous_generation !== null && task.previous_generation !== undefined) { await this.ownership(task); await this.incus.configSet(String(task.instance_name), "user.agent-vm.generation", String(task.generation)); }
       const resources = absent ? {} : await this.nativeResources(task);
@@ -2065,7 +2213,7 @@ export class Control {
 
   private async resizeLiveMemory(task: Dict, request: Dict, old: Dict, target: Dict): Promise<Dict> {
     await this.requireWindow(task, 180);
-    if (Object.keys(JSON.parse(String(task.resource_reservation_json || "{}"))).length) throw new ControlError("resize_incomplete", "a previous partial resize requires inspection and explicit restart recovery or release");
+    if (Object.keys(parseJson(String(task.resource_reservation_json || "{}")) as Dict).length) throw new ControlError("resize_incomplete", "a previous partial resize requires inspection and explicit restart recovery or release");
     if (stableJson(await this.nativeResources(task)) !== stableJson(old)) throw new ControlError("resize_unverified", "native configuration differs from the recorded allocation");
     const before = await this.guestBootId(task);
     if (stableJson(target) === stableJson(old)) return { applied: false, mode: "live-memory", plan: "unchanged", ...this.stateSummary(task) };
@@ -2097,14 +2245,14 @@ export class Control {
         this.checkGeneration(current, request);
         this.requireActive(current!);
         await this.requireWindow(current!, MEMORY_SETTLE_SECONDS + 60);
-        if (stableJson(JSON.parse(String(current?.resource_reservation_json || "{}"))) !== stableJson(reserved) || stableJson(await this.nativeResources(task)) !== stableJson(old) || await this.guestBootId(task) !== before) throw new ControlError("resize_unverified", "native rollback or guest continuity is unverified after balloon timeout");
+        if (stableJson(parseJson(String(current?.resource_reservation_json || "{}"))) !== stableJson(reserved) || stableJson(await this.nativeResources(task)) !== stableJson(old) || await this.guestBootId(task) !== before) throw new ControlError("resize_unverified", "native rollback or guest continuity is unverified after balloon timeout");
         await this.reserveResources(task, reserved, true);
         await sleep(MEMORY_SETTLE_SECONDS * 1000);
         current = this.store.getTask({ taskId: String(task.task_id) });
         this.checkGeneration(current, request);
         this.requireActive(current!);
         await this.requireWindow(current!, 60);
-        if (stableJson(JSON.parse(String(current?.resource_reservation_json || "{}"))) !== stableJson(reserved) || stableJson(await this.nativeResources(task)) !== stableJson(old) || await this.guestBootId(task) !== before) throw new ControlError("resize_unverified", "native rollback, reservation or guest continuity changed during balloon settlement");
+        if (stableJson(parseJson(String(current?.resource_reservation_json || "{}"))) !== stableJson(reserved) || stableJson(await this.nativeResources(task)) !== stableJson(old) || await this.guestBootId(task) !== before) throw new ControlError("resize_unverified", "native rollback, reservation or guest continuity changed during balloon settlement");
         await this.reserveResources(task, reserved, true);
         await applyMemory();
       }
@@ -2118,7 +2266,7 @@ export class Control {
     } catch (error) {
       const controlError = error instanceof ControlError ? error : new ControlError("internal_error", (error as Error).name);
       const detail = { code: "resize_partial", mode: "live-memory", completed, requested: { ...target }, native_attempts: attempts, error: controlError.asDict() };
-      await this.globalLock(() => this.store.transaction(() => { const current = this.store.getTask({ taskId: String(task.task_id) }); if (current && Number(current.generation) === Number(task.generation)) this.store.updateTask(String(task.task_id), { last_error: stableJson(detail) }); }));
+      await this.globalLock(() => this.store.transaction(() => { const current = this.store.getTask({ taskId: String(task.task_id) }); if (current && sameInteger(current.generation, task.generation)) this.store.updateTask(String(task.task_id), { last_error: stableJson(detail) }); }));
       throw new ControlError("resize_partial", "live memory adjustment is unverified; conservative allocation retained, no restart fallback", detail);
     }
   }
@@ -2126,7 +2274,7 @@ export class Control {
   private async growGuestRoot(task: Dict, diskGib: number): Promise<Dict> {
     const result = await this.incus.exec(String(task.instance_name), ["bun", "-e", GUEST_GROWTH_SCRIPT, String(diskGib)], { timeout: 120 });
     try {
-      const value = JSON.parse(decode(result.stdout));
+      const value = parseJson(decodeUtf8Strict(result.stdout));
       if (!isDict(value) || typeof value.virtual_bytes !== "number" || value.virtual_bytes < diskGib * 1024 ** 3) throw new Error("report");
       return value;
     } catch { throw new ControlError("guest_resize_unverified", "guest capacity report is invalid"); }
@@ -2137,7 +2285,7 @@ export class Control {
     this.checkGeneration(task, request);
     this.requireActive(task);
     await this.ownership(task);
-    const old = JSON.parse(String(task.resources_json));
+    const old = parseJson(String(task.resources_json)) as Dict;
     const values = { cpu: request.cpu, memory_mib: request.memory_mib, disk_gib: request.disk_gib };
     if (Object.values(values).every((value) => value === undefined || value === null)) throw new ControlError("invalid_request", "resize requires at least one resource");
     const target = this.requestedResources(request, old);
@@ -2147,7 +2295,7 @@ export class Control {
       if (values.memory_mib === undefined || values.cpu !== undefined || values.disk_gib !== undefined || allowRestart) throw new ControlError("invalid_request", "live resize requires memory only and forbids restart allowance");
       return this.resizeLiveMemory(task, request, old, target);
     }
-    const previousReservation = JSON.parse(String(task.resource_reservation_json || "{}"));
+    const previousReservation = parseJson(String(task.resource_reservation_json || "{}")) as Dict;
     const recovering = Object.keys(previousReservation).length > 0;
     const needsRestart = stableJson(target) !== stableJson(old) || recovering;
     if (needsRestart && !allowRestart) return { applied: false, plan: "restart-required-for-resource-change", requested: target, ...this.stateSummary(task) };
@@ -2198,10 +2346,10 @@ export class Control {
     this.requireActive(task);
     await this.ownership(task);
     const port = this.store.getPort(String(task.task_id), "ssh", "tcp");
-    if (!port || port.state !== "active" || Number(port.generation) !== Number(task.generation)) throw new ControlError("mapping_unverified", "managed SSH reservation is not active");
+    if (!port || port.state !== "active" || !sameInteger(port.generation, task.generation)) throw new ControlError("mapping_unverified", "managed SSH reservation is not active");
     const hostKey = await this.guestHostKey(String(task.instance_name));
     this.requireActive(this.store.getTask({ taskId: String(task.task_id) })!);
-    return { task_id: task.task_id, generation: Number(task.generation), host: this.config.host_address, port: Number(task.ssh_host_port), user: "root", host_key_alias: `agent-vm-${task.task_id}-g${task.generation}`, host_key: hostKey };
+    return { task_id: task.task_id, generation: integerForJson(task.generation), host: this.config.host_address, port: Number(task.ssh_host_port), user: "root", host_key_alias: `agent-vm-${task.task_id}-g${integerText(task.generation)}`, host_key: hostKey };
   }
 
   async portAdd(request: Dict, sessionId: string): Promise<Dict> {
@@ -2222,10 +2370,10 @@ export class Control {
       try { await this.addProxy(task, existing); await this.globalLock(() => this.store.transaction(() => { const current = this.store.getTask({ taskId: String(task.task_id) }); this.checkGeneration(current, request); this.requireActive(current!); })); return this.store.getPort(String(task.task_id), name, String(protocol))!; }
       catch (error) {
         const current = this.store.getTask({ taskId: String(task.task_id) });
-        const sameGeneration = Boolean(current && Number(current.generation) === Number(existing.generation) && Number(existing.generation) === Number(task.generation));
+        const sameGeneration = Boolean(current && sameInteger(current.generation, existing.generation) && sameInteger(existing.generation, task.generation));
         let stale = !sameGeneration || !current || current.state !== "active";
         if (sameGeneration && current && current.state === "active") { const expiry = parseTime(current.lease_expires_at); stale = !expiry || expiry.getTime() <= this.now().getTime(); }
-        if (stale && sameGeneration) try { await this.nativeLock(task, async () => { const latest = this.store.getTask({ taskId: String(task.task_id) }); if (latest && Number(latest.generation) === Number(existing.generation) && latest.state !== "absent") { const currentPort = this.store.getPort(String(task.task_id), name, String(protocol)); if (!currentPort || Number(currentPort.generation) === Number(existing.generation)) { const cleanupPort = currentPort ?? existing; await this.removeProxy(task, cleanupPort); await this.conntrackDelete(cleanupPort, task); if (currentPort) this.store.removePort(String(task.task_id), name, String(protocol)); } } }); } catch { const currentPort = this.store.getPort(String(task.task_id), name, String(protocol)); if (currentPort && Number(currentPort.generation) === Number(existing.generation)) this.store.updatePort(String(task.task_id), name, String(protocol), { state: "closing" }); }
+        if (stale && sameGeneration) try { await this.nativeLock(task, async () => { const latest = this.store.getTask({ taskId: String(task.task_id) }); if (latest && sameInteger(latest.generation, existing.generation) && latest.state !== "absent") { const currentPort = this.store.getPort(String(task.task_id), name, String(protocol)); if (!currentPort || sameInteger(currentPort.generation, existing.generation)) { const cleanupPort = currentPort ?? existing; await this.removeProxy(task, cleanupPort); await this.conntrackDelete(cleanupPort, task); if (currentPort) this.store.removePort(String(task.task_id), name, String(protocol)); } } }); } catch { const currentPort = this.store.getPort(String(task.task_id), name, String(protocol)); if (currentPort && sameInteger(currentPort.generation, existing.generation)) this.store.updatePort(String(task.task_id), name, String(protocol), { state: "closing" }); }
         throw error;
       }
     }
@@ -2237,8 +2385,8 @@ export class Control {
       await this.globalLock(() => this.store.transaction(() => { const current = this.store.getTask({ taskId: String(task.task_id) }); this.checkGeneration(current, request); this.requireActive(current!); this.store.updatePort(String(task.task_id), name, String(protocol), { state: "active" }); }));
       return this.store.getPort(String(task.task_id), name, String(protocol))!;
     } catch (error) {
-      try { await this.nativeLock(task, async () => { const current = this.store.getTask({ taskId: String(task.task_id) }); if (current && Number(current.generation) === Number(port!.generation)) { await this.removeProxy(task, port!); await this.conntrackDelete(port!, task); const currentPort = this.store.getPort(String(task.task_id), name, String(protocol)); if (currentPort && Number(currentPort.generation) === Number(port!.generation)) this.store.removePort(String(task.task_id), name, String(protocol)); } }); }
-      catch { const currentPort = this.store.getPort(String(task.task_id), name, String(protocol)); if (currentPort && Number(currentPort.generation) === Number(port!.generation)) this.store.updatePort(String(task.task_id), name, String(protocol), { state: "closing" }); }
+      try { await this.nativeLock(task, async () => { const current = this.store.getTask({ taskId: String(task.task_id) }); if (current && sameInteger(current.generation, port!.generation)) { await this.removeProxy(task, port!); await this.conntrackDelete(port!, task); const currentPort = this.store.getPort(String(task.task_id), name, String(protocol)); if (currentPort && sameInteger(currentPort.generation, port!.generation)) this.store.removePort(String(task.task_id), name, String(protocol)); } }); }
+      catch { const currentPort = this.store.getPort(String(task.task_id), name, String(protocol)); if (currentPort && sameInteger(currentPort.generation, port!.generation)) this.store.updatePort(String(task.task_id), name, String(protocol), { state: "closing" }); }
       throw error;
     }
   }
@@ -2318,10 +2466,10 @@ export class Control {
       try {
         await this.objectLock(`session:${snapshot.session_id}`, async () => {
           const task = this.store.getTask({ taskId: String(snapshot.task_id) });
-          if (!task || task.state !== "cached" || !task.inactive_since || Number(task.generation) !== Number(snapshot.generation)) return;
+          if (!task || task.state !== "cached" || !task.inactive_since || !sameInteger(task.generation, snapshot.generation)) return;
           if (ageFiltered) { const inactive = parseTime(task.inactive_since); if (!inactive || inactive.getTime() + Number(this.config.cache_seconds) * 1000 > this.now().getTime()) return; }
           const eligible = await this.eligibleCache(task);
-          const candidate = { task_id: eligible.task_id, instance_name: eligible.instance_name, generation: Number(eligible.generation), inactive_since: eligible.inactive_since };
+          const candidate = { task_id: eligible.task_id, instance_name: eligible.instance_name, generation: integerForJson(eligible.generation), inactive_since: eligible.inactive_since };
           if (apply) await this.deleteCache(eligible);
           candidates.push(candidate);
         }, false);
@@ -2337,7 +2485,7 @@ export class Control {
     const taskId = requiredString(request.task_id, "task_id", TASK_ID_RE);
     const generation = numberFromInteger(request.generation, "generation", 1);
     const task = this.store.getTask({ taskId });
-    if (!task || Number(task.generation) !== generation) return { task_id: taskId, reason: task ? "stale-generation" : "missing", action: "noop" };
+    if (!task || !sameInteger(task.generation, generation)) return { task_id: taskId, reason: task ? "stale-generation" : "missing", action: "noop" };
     if (task.state === "closing") return this.releaseTask(task);
     if (!["active", "preparing"].includes(String(task.state))) return { action: "noop", reason: "inactive" };
     const expiry = parseTime(task.lease_expires_at);
@@ -2349,25 +2497,61 @@ export class Control {
   async timerReconcile(_request: Dict, sessionId?: string): Promise<Dict> { return this.adminReconcile({ apply: true }, sessionId); }
 }
 
-function requestFromStdin(): Promise<Dict> {
-  return Bun.stdin.text().then((raw) => {
-    if (Buffer.byteLength(raw, "utf8") > 2 * 1024 * 1024) throw new ControlError("request_too_large", "request exceeds 2 MiB");
-    let value: unknown;
-    try { value = JSON.parse(raw); } catch { throw new ControlError("invalid_request", "stdin must contain one UTF-8 JSON object"); }
+export const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
+
+export function parseRequestBytes(bytes: Uint8Array): Dict {
+  if (bytes.byteLength > MAX_REQUEST_BYTES) throw new ControlError("request_too_large", "request exceeds 2 MiB");
+  try {
+    const value = parseJson(decodeUtf8Strict(bytes));
     if (!isDict(value)) throw new ControlError("invalid_request", "stdin JSON root must be an object");
     return value;
-  });
+  } catch (error) {
+    if (error instanceof ControlError) throw error;
+    throw new ControlError("invalid_request", "stdin must contain one UTF-8 JSON object");
+  }
+}
+
+async function requestFromStdin(): Promise<Dict> {
+  const reader = Bun.stdin.stream().getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    while (bytes <= MAX_REQUEST_BYTES) {
+      const item = await reader.read();
+      if (item.done) break;
+      const remaining = MAX_REQUEST_BYTES + 1 - bytes;
+      const chunk = item.value.slice(0, remaining);
+      bytes += chunk.length;
+      chunks.push(chunk);
+      if (bytes > MAX_REQUEST_BYTES) {
+        await reader.cancel();
+        throw new ControlError("request_too_large", "request exceeds 2 MiB");
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const rawBytes = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.length, 0));
+  let offset = 0;
+  for (const chunk of chunks) { rawBytes.set(chunk, offset); offset += chunk.length; }
+  return parseRequestBytes(rawBytes);
 }
 
 function parseTimerArgs(argv: readonly string[]): Dict | undefined {
   if (argv.length === 2 && argv[0] === "--timer-expire") {
     const match = /^([a-z0-9][a-z0-9-]{0,47})-g([0-9]+)$/.exec(argv[1] ?? "");
     if (!match) throw new ControlError("invalid_timer", "invalid expiry timer instance");
-    return { protocol: PROTOCOL_VERSION, action: "timer-expire", task_id: match[1], generation: Number(match[2]) };
+    return { protocol: PROTOCOL_VERSION, action: "timer-expire", task_id: match[1], generation: integerForJson(BigInt(match[2]!)) };
   }
   if (argv.length === 1 && argv[0] === "--timer-age-gc") return { protocol: PROTOCOL_VERSION, action: "timer-age-gc" };
   if (argv.length === 1 && argv[0] === "--timer-reconcile") return { protocol: PROTOCOL_VERSION, action: "timer-reconcile" };
   return undefined;
+}
+
+export function writeProcessOutput(value: string): Promise<void> {
+  return new Promise((resolveWrite, rejectWrite) => {
+    process.stdout.write(value, (error?: Error | null) => error ? rejectWrite(error) : resolveWrite());
+  });
 }
 
 export async function runMain(argv: readonly string[] = Bun.argv.slice(2)): Promise<number> {
@@ -2378,12 +2562,12 @@ export async function runMain(argv: readonly string[] = Bun.argv.slice(2)): Prom
     const request = timerRequest ?? await requestFromStdin();
     const control = new Control(config);
     const response = await control.dispatch(request);
-    process.stdout.write(`${emitJson(response)}\n`);
+    await writeProcessOutput(`${emitJson(response)}\n`);
     control.store.close();
     return 0;
   } catch (error) {
-    if (error instanceof ControlError) { process.stderr.write(`${emitJson({ ok: false, error: error.asDict() })}\n`); return 2; }
-    process.stderr.write(`${emitJson({ ok: false, error: { code: "internal_error", message: error instanceof Error ? error.name : "Error" } })}\n`);
+    if (error instanceof ControlError) { await new Promise<void>((resolveWrite) => process.stderr.write(`${emitJson({ ok: false, error: error.asDict() })}\n`, () => resolveWrite())); return 2; }
+    await new Promise<void>((resolveWrite) => process.stderr.write(`${emitJson({ ok: false, error: { code: "internal_error", message: error instanceof Error ? error.name : "Error" } })}\n`, () => resolveWrite()));
     return 3;
   }
 }

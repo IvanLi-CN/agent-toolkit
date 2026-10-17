@@ -155,6 +155,74 @@ linuxTest("drains noisy stdout and stderr and reaps a real descendant", async ()
   expect(state === undefined || state === "Z").toBe(true);
 });
 
+linuxTest("enforces one deadline across descendant pipes and stdin backpressure", async () => {
+  const runner = new CommandRunner();
+  for (const [argv, options] of [
+    [["/bin/sh", "-c", "sleep 1 & exit 0"], { timeout: 0.05 }],
+    [["/bin/sh", "-c", "sleep 1; cat >/dev/null"], { timeout: 0.05, inputData: new Uint8Array(1024 * 1024) }],
+  ] as const) {
+    const started = performance.now();
+    let failure: any;
+    try { await runner.runBounded(argv, options); }
+    catch (error) { failure = error; }
+    expect(failure?.code).toBe("command_timeout");
+    expect(performance.now() - started).toBeLessThan(500);
+  }
+});
+
+linuxTest("waits for an independent SQLite writer and preserves durable failure metadata", async () => {
+  const probeRoot = root("agent-vm-sqlite-writer");
+  const dbPath = join(probeRoot, "state.sqlite3");
+  const initial = new StateStore(dbPath);
+  initial.close();
+  const worker = `
+    const { existsSync } = await import("node:fs");
+    const { StateStore } = await import(process.env.CONTROL_PATH);
+    const root = process.env.PROBE_ROOT;
+    const store = new StateStore(root + "/state.sqlite3");
+    try {
+      if (process.env.PROBE_MODE === "hold") {
+        store.db.run("BEGIN IMMEDIATE");
+        await Bun.write(root + "/held", "1");
+        while (!existsSync(root + "/release")) await Bun.sleep(10);
+        store.db.run("ROLLBACK");
+        console.log("holder-released");
+      } else {
+        await Bun.write(root + "/writer-start", "1");
+        const started = Date.now();
+        store.recordOperation("op-sqlite-competition", "acquire", "session-sqlite", 1, { outcome: "error", error: { code: "synthetic_failure" } });
+        store.audit("acquire", "error", { code: "synthetic_failure" }, undefined, "session-sqlite", 1);
+        store.setMeta("last_failure", "synthetic_failure");
+        await Bun.write(root + "/writer-done", String(Date.now() - started));
+        console.log(JSON.stringify({ elapsed: Date.now() - started }));
+      }
+    } finally { store.close(); }
+  `;
+  const env = { PROBE_ROOT: probeRoot };
+  const holder = spawnWorker(worker, { ...env, PROBE_MODE: "hold" });
+  expect(await waitFor(join(probeRoot, "held"))).toBe(true);
+  const writer = spawnWorker(worker, { ...env, PROBE_MODE: "writer" });
+  expect(await waitFor(join(probeRoot, "writer-start"))).toBe(true);
+  await Bun.sleep(250);
+  expect(existsSync(join(probeRoot, "writer-done"))).toBe(false);
+  await Bun.sleep(500);
+  await Bun.write(join(probeRoot, "release"), "1");
+  const holderResult = await collect(holder);
+  const writerResult = await collect(writer);
+  expect(holderResult.exit).toBe(0);
+  expect(writerResult.exit).toBe(0);
+  expect(Number(readFileSync(join(probeRoot, "writer-done"), "utf8"))).toBeGreaterThanOrEqual(600);
+
+  const store = new StateStore(dbPath);
+  try {
+    expect(store.operation("op-sqlite-competition")).toMatchObject({ outcome: "error", error: { code: "synthetic_failure" } });
+    expect(store.getMeta("last_failure")).toBe("synthetic_failure");
+    const audits = (store.db.query("SELECT action, outcome, detail_json FROM audit WHERE session_id = ?").all("session-sqlite") as Dict[]);
+    expect(audits).toHaveLength(1);
+    expect(audits[0]).toMatchObject({ action: "acquire", outcome: "error" });
+  } finally { store.close(); }
+});
+
 linuxTest("serializes object locks across real control processes", async () => {
   const probeRoot = root("agent-vm-object-lock");
   const worker = `

@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import { join } from "node:path";
+import { redactSensitiveText } from "./dst_snapshot.ts";
 
 export type ModState = "true" | "false" | "unknown";
 
@@ -43,42 +44,61 @@ function braceDelta(line: string): number {
   return opens - closes;
 }
 
-export function parseModOverrides(source: string): ModRecord[] {
-  const records: ModRecord[] = [];
-  let current: string | undefined;
-  let state: ModState = "unknown";
-  let inConfig = false;
-  let configDepth = 0;
-  const finish = () => {
-    if (current !== undefined) records.push({ id: current, state });
-  };
-  for (const line of source.split(/\r?\n/)) {
+export class ModOverrideParser {
+  private readonly records: ModRecord[] = [];
+  private current: string | undefined;
+  private state: ModState = "unknown";
+  private inConfig = false;
+  private configDepth = 0;
+  private remainder = "";
+
+  private finishCurrent(): void {
+    if (this.current !== undefined) this.records.push({ id: this.current, state: this.state });
+  }
+
+  private consumeLine(line: string): void {
     const start = isRecordStart(line);
     if (start !== null) {
-      finish();
-      current = start[1]!;
-      state = "unknown";
-      inConfig = false;
-      configDepth = 0;
+      this.finishCurrent();
+      this.current = start[1]!;
+      this.state = "unknown";
+      this.inConfig = false;
+      this.configDepth = 0;
     }
-    if (current === undefined) continue;
+    if (this.current === undefined) return;
 
-    if (!inConfig && line.includes("configuration_options")) {
-      configDepth += braceDelta(line);
-      if (configDepth > 0) inConfig = true;
-    } else if (inConfig) {
-      configDepth += braceDelta(line);
-      if (configDepth <= 0) {
-        inConfig = false;
-        configDepth = 0;
+    if (!this.inConfig && line.includes("configuration_options")) {
+      this.configDepth += braceDelta(line);
+      if (this.configDepth > 0) this.inConfig = true;
+    } else if (this.inConfig) {
+      this.configDepth += braceDelta(line);
+      if (this.configDepth <= 0) {
+        this.inConfig = false;
+        this.configDepth = 0;
       }
     }
 
-    if (state === "unknown" && !inConfig && /enabled\s*=\s*true/.test(line)) state = "true";
-    if (state === "unknown" && !inConfig && /enabled\s*=\s*false/.test(line)) state = "false";
+    if (this.state === "unknown" && !this.inConfig && /enabled\s*=\s*true/.test(line)) this.state = "true";
+    if (this.state === "unknown" && !this.inConfig && /enabled\s*=\s*false/.test(line)) this.state = "false";
   }
-  finish();
-  return records.sort((left, right) => Number(left.id) - Number(right.id) || left.id.localeCompare(right.id));
+
+  consume(text: string): void {
+    const lines = `${this.remainder}${text}`.split(/\r?\n/);
+    this.remainder = lines.pop() ?? "";
+    for (const line of lines) this.consumeLine(line);
+  }
+
+  finish(): ModRecord[] {
+    if (this.remainder.length > 0) this.consumeLine(this.remainder);
+    this.finishCurrent();
+    return this.records.sort((left, right) => Number(left.id) - Number(right.id) || left.id.localeCompare(right.id));
+  }
+}
+
+export function parseModOverrides(source: string): ModRecord[] {
+  const parser = new ModOverrideParser();
+  parser.consume(source);
+  return parser.finish();
 }
 
 function listIds(records: ModRecord[], state: ModState): string[] {
@@ -140,13 +160,7 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\"'\"'")}'`;
 }
 
-interface RemoteResult {
-  exitCode: number;
-  stdout: Uint8Array;
-  stderr: Uint8Array;
-}
-
-async function collectRemote(script: string, options: ModOptions, shard: "Master" | "Caves"): Promise<RemoteResult> {
+function startRemote(script: string, options: ModOptions, shard: "Master" | "Caves") {
   const target = `${options.user}@${options.host}`;
   const remoteCommand = `bash -s -- ${shellQuote(options.cluster)} ${shellQuote(shard)}`;
   const child = Bun.spawn(
@@ -155,28 +169,113 @@ async function collectRemote(script: string, options: ModOptions, shard: "Master
   );
   child.stdin.write(script);
   child.stdin.end();
-  const [exitCode, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).bytes(),
-    new Response(child.stderr).bytes(),
-  ]);
-  return { exitCode, stdout, stderr };
+  return child;
 }
 
-function parseRemoteResult(cluster: string, shard: "Master" | "Caves", filePath: string, result: RemoteResult): ShardSummary {
-  const textDecoder = new TextDecoder();
-  const headerEnd = result.stdout.indexOf(10);
-  const header = textDecoder.decode(headerEnd < 0 ? result.stdout : result.stdout.slice(0, headerEnd));
-  if (header === "MISSING" || header.startsWith("MISSING ")) {
-    return { shard, present: false, filePath: header.startsWith("MISSING ") ? header.slice("MISSING ".length) : filePath, mods: [] };
+async function readText(stream: ReadableStream<Uint8Array>, maxBytes = 64 * 1024): Promise<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  let remaining = maxBytes;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (remaining <= 0) continue;
+      const chunk = value ?? new Uint8Array();
+      const portion = chunk.byteLength > remaining ? chunk.slice(0, remaining) : chunk;
+      text += decoder.decode(portion, { stream: true });
+      remaining -= portion.byteLength;
+    }
+    return text + decoder.decode();
+  } finally {
+    reader.releaseLock();
   }
-  if (header === "CLUSTER_MISSING") throw new Error(`remote cluster not found: ${cluster}`);
-  const match = /^PRESENT (\d+)$/.exec(header);
-  if (match === null || headerEnd < 0) throw new Error("remote mod collection returned an invalid response");
-  const length = Number(match[1]);
-  const content = result.stdout.slice(headerEnd + 1, headerEnd + 1 + length);
-  if (content.byteLength !== length) throw new Error("remote mod collection returned a truncated file");
-  return { shard, present: true, filePath, mods: parseModOverrides(textDecoder.decode(content)) };
+}
+
+async function drain(stream: ReadableStream<Uint8Array>): Promise<void> {
+  const reader = stream.getReader();
+  try {
+    while (!(await reader.read()).done) {
+      // Keep consuming a failed child process so its pipe cannot remain blocked.
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+export async function parseRemoteResponseStream(
+  cluster: string,
+  shard: "Master" | "Caves",
+  filePath: string,
+  stream: ReadableStream<Uint8Array>,
+): Promise<ShardSummary> {
+  const reader = stream.getReader();
+  const headerBytes: number[] = [];
+  let header: string | undefined;
+  let bodyRemaining = 0;
+  let parser: ModOverrideParser | undefined;
+  let bodyDecoder: TextDecoder | undefined;
+  let trailingBytes = false;
+
+  const consumeBody = (bytes: Uint8Array): void => {
+    if (bytes.byteLength === 0) return;
+    if (parser === undefined || bodyDecoder === undefined || bodyRemaining === 0) {
+      trailingBytes = true;
+      return;
+    }
+    const portion = bytes.byteLength > bodyRemaining ? bytes.slice(0, bodyRemaining) : bytes;
+    bodyRemaining -= portion.byteLength;
+    parser.consume(bodyDecoder.decode(portion, { stream: true }));
+    if (portion.byteLength < bytes.byteLength) trailingBytes = true;
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const bytes = value ?? new Uint8Array();
+      if (header === undefined) {
+        const newline = bytes.indexOf(10);
+        if (newline < 0) {
+          headerBytes.push(...bytes);
+          if (headerBytes.length > 4096) throw new Error("remote mod collection returned an invalid response");
+          continue;
+        }
+        headerBytes.push(...bytes.slice(0, newline));
+        header = new TextDecoder().decode(Uint8Array.from(headerBytes)).replace(/\r$/, "");
+        const rest = bytes.slice(newline + 1);
+        if (header === "MISSING" || header.startsWith("MISSING ")) {
+          if (rest.byteLength > 0) trailingBytes = true;
+        } else if (header === "CLUSTER_MISSING") {
+          throw new Error(`remote cluster not found: ${cluster}`);
+        } else {
+          const match = /^PRESENT (\d+)$/.exec(header);
+          if (match === null) throw new Error("remote mod collection returned an invalid response");
+          const length = Number(match[1]);
+          if (!Number.isSafeInteger(length) || length < 0) throw new Error("remote mod collection returned an invalid response");
+          bodyRemaining = length;
+          parser = new ModOverrideParser();
+          bodyDecoder = new TextDecoder();
+          consumeBody(rest);
+        }
+      } else {
+        consumeBody(bytes);
+      }
+    }
+
+    if (header === undefined) throw new Error("remote mod collection returned an invalid response");
+    if (header === "MISSING" || header.startsWith("MISSING ")) {
+      if (trailingBytes) throw new Error("remote mod collection returned an invalid response");
+      return { shard, present: false, filePath: header.startsWith("MISSING ") ? header.slice("MISSING ".length) : filePath, mods: [] };
+    }
+    if (bodyRemaining !== 0) throw new Error("remote mod collection returned a truncated file");
+    if (parser === undefined || bodyDecoder === undefined || trailingBytes) throw new Error("remote mod collection returned an invalid response");
+    parser.consume(bodyDecoder.decode());
+    return { shard, present: true, filePath, mods: parser.finish() };
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 function optionValue(args: string[], index: number, option: string): [string, number] {
@@ -248,15 +347,25 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     const shards: Array<"Master" | "Caves"> = parsed.shard === "both" ? ["Master", "Caves"] : [parsed.shard];
     const summaries: ShardSummary[] = [];
     for (const shard of shards) {
-      const result = await collectRemote(script, parsed, shard);
+      const child = startRemote(script, parsed, shard);
       const filePath = `~/.klei/DoNotStarveTogether/${parsed.cluster}/${shard}/modoverrides.lua`;
-      const responseHeader = new TextDecoder().decode(result.stdout.slice(0, result.stdout.indexOf(10) < 0 ? result.stdout.length : result.stdout.indexOf(10)));
-      if (responseHeader === "CLUSTER_MISSING") throw new Error(`remote cluster not found: ${parsed.cluster}`);
-      if (result.exitCode !== 0) {
-        const detail = new TextDecoder().decode(result.stderr).trim();
+      const stderrPromise = readText(child.stderr);
+      let summary: ShardSummary;
+      try {
+        summary = await parseRemoteResponseStream(parsed.cluster, shard, filePath, child.stdout);
+      } catch (error) {
+        await drain(child.stdout);
+        const [exitCode, stderr] = await Promise.all([child.exited, stderrPromise]);
+        const detail = redactSensitiveText(stderr.trim());
+        if (exitCode !== 0 && detail.length > 0) throw new Error(detail);
+        throw error;
+      }
+      const [exitCode, stderr] = await Promise.all([child.exited, stderrPromise]);
+      if (exitCode !== 0) {
+        const detail = redactSensitiveText(stderr.trim());
         throw new Error(detail || `SSH collection failed for ${shard}`);
       }
-      summaries.push(parseRemoteResult(parsed.cluster, shard, filePath, result));
+      summaries.push(summary);
     }
     const output = summaries.map((summary) => renderSummary(parsed.cluster, summary)).join("\n");
     const diff = parsed.shard === "both" ? renderDiff(parsed.cluster, summaries[0]!, summaries[1]!) : "";

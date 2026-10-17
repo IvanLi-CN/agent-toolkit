@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { inflateSync } from "node:zlib";
 import { join } from "node:path";
-import { convertFramebuffer, encodePng, main, type ConvertOptions } from "../scripts/fb_to_png.ts";
+import { convertFramebuffer, encodePng, expandUser, main, type ConvertOptions } from "../scripts/fb_to_png.ts";
 
 function crc32(data: Uint8Array): number {
   let value = 0xffffffff;
@@ -116,5 +117,25 @@ describe("framebuffer to PNG helper", () => {
     expect(mainSource).toContain("main(");
     expect(mainSource).toContain("framebuffer");
     expect(await main(["--help"])).toBe(0);
+  });
+
+  test("uses explicit HOME and account-home fallback for tilde paths", () => {
+    const previousHome = process.env.HOME;
+    try {
+      process.env.HOME = "/tmp/fixture-home";
+      expect(expandUser("~/frame.raw")).toBe("/tmp/fixture-home/frame.raw");
+      delete process.env.HOME;
+      expect(expandUser("~")).toBe(homedir());
+      expect(expandUser("~/frame.raw")).toBe(join(homedir(), "frame.raw"));
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
+  });
+
+  test("returns argparse failures as exit code 2", async () => {
+    expect(await main(["--unknown"])).toBe(2);
+    expect(await main(["--width"])).toBe(2);
+    expect(await main(["--format", "invalid", "--width", "1", "--height", "1", "--in", "fixture", "--out", "fixture"])).toBe(2);
   });
 });

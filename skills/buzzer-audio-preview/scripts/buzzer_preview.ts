@@ -60,20 +60,32 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+const NUMERIC_STRING = /^[+-]?(?:(?:\d(?:_?\d)*)(?:\.(?:\d(?:_?\d)*)?)?|\.(?:\d(?:_?\d)*))(?:[eE][+-]?\d(?:_?\d)*)?$/;
+
 function numberValue(value: unknown, label: string): number {
   if (typeof value === "number") {
     if (!Number.isFinite(value)) throw new Error(`${label} must be finite`);
     return value;
   }
   if (typeof value === "string" && value.trim() !== "") {
-    const number = Number(value);
-    if (Number.isFinite(number)) return number;
+    const normalized = value.trim();
+    if (NUMERIC_STRING.test(normalized)) {
+      const number = Number(normalized.replaceAll("_", ""));
+      if (Number.isFinite(number)) return number;
+    }
   }
   if (typeof value === "boolean") return value ? 1 : 0;
   throw new Error(`${label} must be a number`);
 }
 
 function integerValue(value: unknown, label: string): number {
+  if (typeof value === "string") {
+    const normalized = value.trim();
+    if (!/^[+-]?\d(?:_?\d)*$/.test(normalized)) throw new Error(`${label} must be an integer`);
+    const number = Number(normalized.replaceAll("_", ""));
+    if (!Number.isSafeInteger(number)) throw new Error(`${label} must be a safe integer`);
+    return number;
+  }
   const number = Math.trunc(numberValue(value, label));
   if (!Number.isSafeInteger(number)) throw new Error(`${label} must be a safe integer`);
   return number;
@@ -137,17 +149,17 @@ function durationSeconds(tempoBpm: number, beats: number | undefined, ms: number
 export function parseScore(raw: unknown): { config: ScoreConfig; events: ScoreEvent[] } {
   if (!isRecord(raw)) throw new Error("score root must be a JSON object");
 
-  const tempoBpm = numberValue(raw.tempo_bpm ?? 120, "tempo_bpm");
+  const tempoBpm = numberValue(raw.tempo_bpm === undefined ? 120 : raw.tempo_bpm, "tempo_bpm");
   if (tempoBpm <= 0) throw new Error(`tempo_bpm must be > 0, got ${tempoBpm}`);
-  const ppqn = integerValue(raw.ppqn ?? 480, "ppqn");
+  const ppqn = integerValue(raw.ppqn === undefined ? 480 : raw.ppqn, "ppqn");
   if (ppqn <= 0) throw new Error(`ppqn must be > 0, got ${ppqn}`);
 
   const midiRawValue = raw.midi || {};
   if (!isRecord(midiRawValue)) throw new Error("midi must be an object");
   const midi: MidiConfig = {
-    channel: integerValue(midiRawValue.channel ?? 0, "midi.channel"),
-    program: integerValue(midiRawValue.program ?? 80, "midi.program"),
-    velocity: integerValue(midiRawValue.velocity ?? 96, "midi.velocity"),
+    channel: integerValue(midiRawValue.channel === undefined ? 0 : midiRawValue.channel, "midi.channel"),
+    program: integerValue(midiRawValue.program === undefined ? 80 : midiRawValue.program, "midi.program"),
+    velocity: integerValue(midiRawValue.velocity === undefined ? 96 : midiRawValue.velocity, "midi.velocity"),
   };
   if (midi.channel < 0 || midi.channel > 15) throw new Error("midi.channel must be 0..15");
   if (midi.program < 0 || midi.program > 127) throw new Error("midi.program must be 0..127");
@@ -155,18 +167,52 @@ export function parseScore(raw: unknown): { config: ScoreConfig; events: ScoreEv
 
   const audioRawValue = raw.audio || {};
   if (!isRecord(audioRawValue)) throw new Error("audio must be an object");
-  const waveformValue = String(audioRawValue.waveform ?? raw.waveform ?? "square").toLowerCase();
+  const waveformValue = String(
+    audioRawValue.waveform === undefined
+      ? raw.waveform === undefined
+        ? "square"
+        : raw.waveform
+      : audioRawValue.waveform,
+  ).toLowerCase();
   if (waveformValue !== "square" && waveformValue !== "sine") {
     throw new Error("audio.waveform must be 'square' or 'sine'");
   }
-  const sampleRateHz = integerValue(audioRawValue.sample_rate_hz ?? raw.sample_rate_hz ?? 44_100, "sample_rate_hz");
+  const sampleRateHz = integerValue(
+    audioRawValue.sample_rate_hz === undefined
+      ? raw.sample_rate_hz === undefined
+        ? 44_100
+        : raw.sample_rate_hz
+      : audioRawValue.sample_rate_hz,
+    "sample_rate_hz",
+  );
   if (sampleRateHz <= 0) throw new Error("sample_rate_hz must be > 0");
   const audio: AudioConfig = {
     sampleRateHz,
     waveform: waveformValue,
-    dutyCycle: clamp01(numberValue(audioRawValue.duty_cycle ?? raw.duty_cycle ?? 0.5, "duty_cycle")),
-    volume: clamp01(numberValue(audioRawValue.volume ?? raw.volume ?? 0.7, "volume")),
-    fadeMs: Math.max(0, integerValue(audioRawValue.fade_ms ?? raw.fade_ms ?? 2, "fade_ms")),
+    dutyCycle: clamp01(numberValue(
+      audioRawValue.duty_cycle === undefined
+        ? raw.duty_cycle === undefined
+          ? 0.5
+          : raw.duty_cycle
+        : audioRawValue.duty_cycle,
+      "duty_cycle",
+    )),
+    volume: clamp01(numberValue(
+      audioRawValue.volume === undefined
+        ? raw.volume === undefined
+          ? 0.7
+          : raw.volume
+        : audioRawValue.volume,
+      "volume",
+    )),
+    fadeMs: Math.max(0, integerValue(
+      audioRawValue.fade_ms === undefined
+        ? raw.fade_ms === undefined
+          ? 2
+          : raw.fade_ms
+        : audioRawValue.fade_ms,
+      "fade_ms",
+    )),
   };
 
   const eventsRaw = raw.events;
@@ -194,7 +240,10 @@ export function parseScore(raw: unknown): { config: ScoreConfig; events: ScoreEv
         freqHz = numberValue(eventValue.freq_hz, `events[${index}].freq_hz`);
         midiNote = freqToNearestMidi(freqHz);
       }
-      const velocity = integerValue(eventValue.velocity ?? midi.velocity, `events[${index}].velocity`);
+      const velocity = integerValue(
+        eventValue.velocity === undefined ? midi.velocity : eventValue.velocity,
+        `events[${index}].velocity`,
+      );
       if (velocity < 0 || velocity > 127) throw new Error(`events[${index}].velocity must be 0..127`);
       events.push({ kind: "note", durationS, midiNote, freqHz, velocity });
       continue;
@@ -240,9 +289,18 @@ function midiEvent(deltaTicks: number, payload: Uint8Array): Uint8Array {
   return concatBytes(varLen(deltaTicks), payload);
 }
 
+const UINT32_MAX = 0xffff_ffff;
+
+function uint32Value(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < 0 || value > UINT32_MAX) {
+    throw new Error(`${label} must fit an unsigned 32-bit field`);
+  }
+  return value;
+}
+
 function writeUint32BE(value: number): Uint8Array {
   const bytes = new Uint8Array(4);
-  new DataView(bytes.buffer).setUint32(0, value, false);
+  new DataView(bytes.buffer).setUint32(0, uint32Value(value, "MIDI field"), false);
   return bytes;
 }
 
@@ -274,6 +332,7 @@ export function encodeMidi(config: ScoreConfig, events: ScoreEvent[]): Uint8Arra
   }
   trackParts.push(midiEvent(pendingDelta, Uint8Array.from([0xff, 0x2f, 0x00])));
   const track = concatBytes(...trackParts);
+  uint32Value(track.byteLength, "MIDI track length");
   const header = concatBytes(
     new TextEncoder().encode("MThd"),
     writeUint32BE(6),
@@ -296,14 +355,33 @@ function pushInt16LE(output: number[], sample: number): void {
 
 export function encodeWav(config: ScoreConfig, events: ScoreEvent[]): Uint8Array {
   const sampleRate = config.audio.sampleRateHz;
+  uint32Value(sampleRate, "sample rate");
+  uint32Value(sampleRate * 2, "WAV byte rate");
   const fadeSamples = Math.max(0, roundTiesToEven(sampleRate * config.audio.fadeMs / 1000));
   const volume = clamp01(config.audio.volume) * 0.9;
+  const frameCounts: number[] = [];
+  let totalFrames = 0;
+  for (const event of events) {
+    const rawCount = event.durationS * sampleRate;
+    if (!Number.isFinite(rawCount) || rawCount < 0 || rawCount > UINT32_MAX / 2) {
+      throw new Error("WAV frame count is outside the representable range");
+    }
+    const count = roundTiesToEven(rawCount);
+    if (!Number.isSafeInteger(count) || count < 0) throw new Error("WAV frame count is outside the representable range");
+    totalFrames += count;
+    if (!Number.isSafeInteger(totalFrames) || totalFrames > UINT32_MAX / 2) {
+      throw new Error("WAV data length is outside the representable range");
+    }
+    frameCounts.push(count);
+  }
+  const dataByteLength = uint32Value(totalFrames * 2, "WAV data length");
+  const riffChunkLength = uint32Value(36 + dataByteLength, "WAV RIFF chunk length");
   const frames: number[] = [];
   const twoPi = 2 * Math.PI;
   let phase = 0;
 
-  for (const event of events) {
-    const count = roundTiesToEven(event.durationS * sampleRate);
+  for (const [eventIndex, event] of events.entries()) {
+    const count = frameCounts[eventIndex]!;
     if (count <= 0) continue;
     if (event.kind === "rest") {
       for (let i = 0; i < count; i += 1) pushInt16LE(frames, 0);
@@ -336,17 +414,17 @@ export function encodeWav(config: ScoreConfig, events: ScoreEvent[]): Uint8Array
   const header = new Uint8Array(44);
   const view = new DataView(header.buffer);
   header.set(new TextEncoder().encode("RIFF"), 0);
-  view.setUint32(4, 36 + data.byteLength, true);
+  view.setUint32(4, riffChunkLength, true);
   header.set(new TextEncoder().encode("WAVEfmt "), 8);
   view.setUint32(16, 16, true);
   view.setUint16(20, 1, true);
   view.setUint16(22, 1, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * 2, true);
+  view.setUint32(24, uint32Value(sampleRate, "WAV sample rate"), true);
+  view.setUint32(28, uint32Value(sampleRate * 2, "WAV byte rate"), true);
   view.setUint16(32, 2, true);
   view.setUint16(34, 16, true);
   header.set(new TextEncoder().encode("data"), 36);
-  view.setUint32(40, data.byteLength, true);
+  view.setUint32(40, uint32Value(data.byteLength, "WAV data length"), true);
   return concatBytes(header, data);
 }
 
@@ -354,9 +432,15 @@ function expandUser(path: string): string {
   return path === "~" ? homedir() : path.startsWith("~/") ? `${homedir()}/${path.slice(2)}` : path;
 }
 
+class CliError extends Error {
+  constructor(message: string, readonly exitCode = 2) {
+    super(message);
+  }
+}
+
 function optionValue(args: string[], index: number, option: string): [string, number] {
   const value = args[index + 1];
-  if (value === undefined || value.startsWith("--")) throw new Error(`${option} requires a value`);
+  if (value === undefined || value.startsWith("--")) throw new CliError(`${option} requires a value`);
   return [value, index + 2];
 }
 
@@ -379,9 +463,9 @@ export function parseArgs(args: string[]): { input: string; outDir: string; stem
       [stem, index] = optionValue(args, index, "--stem");
       continue;
     }
-    throw new Error(`Unknown arg: ${arg}`);
+    throw new CliError(`Unknown arg: ${arg}`);
   }
-  if (input === undefined) throw new Error("--in is required");
+  if (input === undefined) throw new CliError("--in is required");
   return { input, outDir, stem };
 }
 
@@ -408,7 +492,7 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     return 0;
   } catch (error) {
     console.error(`error: ${error instanceof Error ? error.message : String(error)}`);
-    return 1;
+    return error instanceof CliError ? error.exitCode : 1;
   }
 }
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { deflateSync } from "node:zlib";
 import { resolve } from "node:path";
 
@@ -190,21 +191,27 @@ export function convertFramebuffer(data: Uint8Array, format: FramebufferFormat, 
   }
 }
 
-function expandUser(path: string): string {
-  const home = process.env.HOME ?? "";
+export function expandUser(path: string): string {
+  const home = process.env.HOME ?? homedir();
   return path === "~" ? home : path.startsWith("~/") ? `${home}/${path.slice(2)}` : path;
+}
+
+class CliError extends Error {
+  constructor(message: string, readonly exitCode = 2) {
+    super(message);
+  }
 }
 
 function optionValue(args: string[], index: number, option: string): [string, number] {
   const value = args[index + 1];
-  if (value === undefined || value.startsWith("--")) throw new Error(`${option} requires a value`);
+  if (value === undefined || value.startsWith("--")) throw new CliError(`${option} requires a value`);
   return [value, index + 2];
 }
 
 function integerOption(value: string, option: string): number {
-  if (!/^-?\d+$/.test(value)) throw new Error(`${option} must be an integer`);
+  if (!/^-?\d+$/.test(value)) throw new CliError(`${option} must be an integer`);
   const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed)) throw new Error(`${option} must be a safe integer`);
+  if (!Number.isSafeInteger(parsed)) throw new CliError(`${option} must be a safe integer`);
   return parsed;
 }
 
@@ -243,7 +250,7 @@ export function parseArgs(args: string[]): CliOptions | "help" {
     if (["--format", "--width", "--height", "--in", "--out", "--stride-bytes", "--endian", "--bit-order", "--ssd1306-bit-order"].includes(arg)) {
       const [value, next] = optionValue(args, index, arg);
       if (arg === "--format") {
-        if (!["ssd1306", "mono1", "gray8", "rgb565", "rgb888"].includes(value)) throw new Error(`invalid --format: ${value}`);
+        if (!["ssd1306", "mono1", "gray8", "rgb565", "rgb888"].includes(value)) throw new CliError(`invalid --format: ${value}`);
         format = value as FramebufferFormat;
       } else if (arg === "--width") width = integerOption(value, arg);
       else if (arg === "--height") height = integerOption(value, arg);
@@ -251,22 +258,22 @@ export function parseArgs(args: string[]): CliOptions | "help" {
       else if (arg === "--out") output = value;
       else if (arg === "--stride-bytes") strideBytes = integerOption(value, arg);
       else if (arg === "--endian") {
-        if (value !== "le" && value !== "be") throw new Error(`invalid --endian: ${value}`);
+        if (value !== "le" && value !== "be") throw new CliError(`invalid --endian: ${value}`);
         endian = value;
       } else if (arg === "--bit-order") {
-        if (value !== "msb" && value !== "lsb") throw new Error(`invalid --bit-order: ${value}`);
+        if (value !== "msb" && value !== "lsb") throw new CliError(`invalid --bit-order: ${value}`);
         bitOrder = value;
       } else {
-        if (value !== "lsb" && value !== "msb") throw new Error(`invalid --ssd1306-bit-order: ${value}`);
+        if (value !== "lsb" && value !== "msb") throw new CliError(`invalid --ssd1306-bit-order: ${value}`);
         ssd1306BitOrder = value;
       }
       index = next;
       continue;
     }
-    throw new Error(`Unknown arg: ${arg}`);
+    throw new CliError(`Unknown arg: ${arg}`);
   }
   if (format === undefined || width === undefined || height === undefined || input === undefined || output === undefined) {
-    throw new Error("--format, --width, --height, --in, and --out are required");
+    throw new CliError("--format, --width, --height, --in, and --out are required");
   }
   return { format, width, height, input, output, strideBytes, endian, bitOrder, ssd1306BitOrder, invert };
 }
@@ -293,7 +300,7 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     return 0;
   } catch (error) {
     console.error(`error: ${error instanceof Error ? error.message : String(error)}`);
-    return 1;
+    return error instanceof CliError ? error.exitCode : 1;
   }
 }
 

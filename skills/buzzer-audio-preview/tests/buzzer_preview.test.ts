@@ -7,6 +7,7 @@ import {
   encodeWav,
   main,
   parseScore,
+  parseArgs,
   type ScoreConfig,
   type ScoreEvent,
 } from "../scripts/buzzer_preview.ts";
@@ -144,6 +145,30 @@ describe("buzzer MIDI and WAV helper", () => {
     expect(() => parseScore({ events: [{ note: "C4", beats: 1, ms: 10 }] })).toThrow(/ambiguous duration/);
   });
 
+  test("preserves explicit null rejection and Python-compatible numeric conversions", () => {
+    const parsed = parseScore({ ppqn: 480.5, midi: null, audio: null, events: [{ note: "C4", beats: 1 }] });
+    expect(parsed.config.ppqn).toBe(480);
+    expect(parsed.config.midi.channel).toBe(0);
+    expect(parsed.config.audio.sampleRateHz).toBe(44_100);
+    expect(() => parseScore({ tempo_bpm: null, events: [{ note: "C4", beats: 1 }] })).toThrow(/tempo_bpm must be a number/);
+    expect(() => parseScore({ ppqn: "480.5", events: [{ note: "C4", beats: 1 }] })).toThrow(/ppqn must be an integer/);
+    expect(() => parseScore({ sample_rate_hz: "8000.5", events: [{ note: "C4", beats: 1 }] })).toThrow(/sample_rate_hz must be an integer/);
+    expect(() => parseScore({ midi: { channel: null }, events: [{ note: "C4", beats: 1 }] })).toThrow(/midi.channel must be a number/);
+    expect(() => parseScore({ audio: { volume: null }, events: [{ note: "C4", beats: 1 }] })).toThrow(/volume must be a number/);
+    expect(() => parseScore({ events: [{ note: "C4", beats: 1, velocity: null }] })).toThrow(/velocity must be a number/);
+  });
+
+  test("rejects WAV values that cannot fit fixed-width fields", () => {
+    expect(() => encodeWav(
+      { ...config, audio: { ...config.audio, sampleRateHz: 0x1_0000_0000 } },
+      [{ kind: "rest", durationS: 0 }],
+    )).toThrow(/sample rate/);
+    expect(() => encodeWav(
+      { ...config, audio: { ...config.audio, sampleRateHz: 0x8000_0000 } },
+      [{ kind: "rest", durationS: 0 }],
+    )).toThrow(/byte rate/);
+  });
+
   test("writes the direct Bun CLI outputs", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-"));
     try {
@@ -153,6 +178,19 @@ describe("buzzer MIDI and WAV helper", () => {
       expect(await main(["--in", input, "--out-dir", output])).toBe(0);
       expect((await readFile(join(output, "fixture.mid"))).slice(0, 4).toString()).toBe("MThd");
       expect((await readFile(join(output, "fixture.wav"))).slice(0, 4).toString()).toBe("RIFF");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps argparse exit codes distinct from runtime failures", async () => {
+    expect(parseArgs(["--help"])).toBe("help");
+    expect(await main(["--help"])).toBe(0);
+    expect(await main(["--unknown"])).toBe(2);
+    expect(await main(["--in"])).toBe(2);
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-cli-"));
+    try {
+      expect(await main(["--in", join(root, "missing.json"), "--out-dir", join(root, "out")])).toBe(1);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

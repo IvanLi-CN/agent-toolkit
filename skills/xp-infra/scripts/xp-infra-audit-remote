@@ -3,6 +3,8 @@ set -eu
 
 MAX_RAW_BYTES=65536
 READ_ERROR_SENTINEL=__XP_INFRA_READ_ERROR__
+FILE_ABSENT_SENTINEL=__XP_INFRA_FILE_ABSENT__
+FILE_PRESENT_SENTINEL=__XP_INFRA_FILE_PRESENT__
 XP_CONTAINER_IMAGE_PREFIX="${XP_CONTAINER_IMAGE_PREFIX:-ghcr.io/example/xp}"
 
 umask 077
@@ -404,53 +406,62 @@ container_process_token() {
   ' sh "$pattern" 2>/dev/null
 }
 
-runtime_file_read() {
+runtime_file_probe() {
   path="$1"
   if [ "$mode" = container ]; then
-    presence="$(bounded_command docker_cmd exec "$container" sh -c '
-      if [ -e "$1" ] || [ -L "$1" ]; then
-        printf %s present
-      else
-        parent_dir=${1%/*}
-        [ -d "$parent_dir" ] && [ -r "$parent_dir" ] && [ -x "$parent_dir" ] || exit 2
-        printf %s absent
-      fi
-    ' sh "$path" 2>/dev/null)" || {
-      printf '%s' "$READ_ERROR_SENTINEL"
-      return 0
-    }
-  else
-    presence="$(bounded_command sudo -n sh -c '
-      if [ -e "$1" ] || [ -L "$1" ]; then
-        printf %s present
-      else
-        parent_dir=${1%/*}
-        [ -d "$parent_dir" ] && [ -r "$parent_dir" ] && [ -x "$parent_dir" ] || exit 2
-        printf %s absent
-      fi
-    ' sh "$path" 2>/dev/null)" || {
-      printf '%s' "$READ_ERROR_SENTINEL"
-      return 0
-    }
-  fi
-  case "$presence" in
-    absent) return 0 ;;
-    present)
-      if [ "$mode" = container ]; then
-        if value="$(bounded_command docker_cmd exec "$container" cat "$path" 2>/dev/null)"; then
-          printf '%s' "$value"
-        else
-          printf '%s' "$READ_ERROR_SENTINEL"
+    bounded_command docker_cmd exec "$container" sh -c '
+      path="$1"
+      if [ -L "$path" ]; then exit 2; fi
+      if [ ! -e "$path" ]; then
+        parent_dir=${path%/*}
+        if [ -L "$parent_dir" ]; then exit 2; fi
+        if [ -e "$parent_dir" ]; then
+          [ -d "$parent_dir" ] && [ -r "$parent_dir" ] && [ -x "$parent_dir" ] || exit 2
         fi
-      elif value="$(bounded_command sudo -n cat "$path" 2>/dev/null)"; then
-        printf '%s' "$value"
-      else
-        printf '%s' "$READ_ERROR_SENTINEL"
+        printf %s __XP_INFRA_FILE_ABSENT__
+        exit 0
       fi
-      ;;
-    *)
-      printf '%s' "$READ_ERROR_SENTINEL"
-      ;;
+      [ -f "$path" ] && [ -r "$path" ] || exit 2
+      printf %s __XP_INFRA_FILE_PRESENT__
+      cat "$path"
+    ' sh "$path" 2>/dev/null
+  else
+    bounded_command sudo -n sh -c '
+      path="$1"
+      if [ -L "$path" ]; then exit 2; fi
+      if [ ! -e "$path" ]; then
+        parent_dir=${path%/*}
+        if [ -L "$parent_dir" ]; then exit 2; fi
+        if [ -e "$parent_dir" ]; then
+          [ -d "$parent_dir" ] && [ -r "$parent_dir" ] && [ -x "$parent_dir" ] || exit 2
+        fi
+        printf %s __XP_INFRA_FILE_ABSENT__
+        exit 0
+      fi
+      [ -f "$path" ] && [ -r "$path" ] || exit 2
+      printf %s __XP_INFRA_FILE_PRESENT__
+      cat "$path"
+    ' sh "$path" 2>/dev/null
+  fi
+}
+
+runtime_file_read() {
+  probe="$(runtime_file_probe "$1")" || {
+    printf '%s' "$READ_ERROR_SENTINEL"
+    return 0
+  }
+  case "$probe" in
+    "$FILE_ABSENT_SENTINEL") return 0 ;;
+    "$FILE_PRESENT_SENTINEL"*) printf '%s' "${probe#"$FILE_PRESENT_SENTINEL"}" ;;
+    *) printf '%s' "$READ_ERROR_SENTINEL" ;;
+  esac
+}
+
+runtime_file_status_from_probe() {
+  case "$1" in
+    "$FILE_ABSENT_SENTINEL") printf absent ;;
+    "$FILE_PRESENT_SENTINEL"*) printf present ;;
+    *) return 1 ;;
   esac
 }
 
@@ -508,6 +519,47 @@ xray_public_ports() {
   ' | paste -sd, -
 }
 
+xray_listener_pids() {
+  if [ "$mode" = container ]; then
+    if ! raw_listeners="$(bounded_command docker_cmd exec "$container" ss -H -ltnp 2>/dev/null)"; then
+      printf '%s' "$READ_ERROR_SENTINEL"
+      return 0
+    fi
+  else
+    if ! raw_listeners="$(bounded_command sudo -n ss -H -ltnp 2>/dev/null)"; then
+      printf '%s' "$READ_ERROR_SENTINEL"
+      return 0
+    fi
+  fi
+  printf '%s\n' "$raw_listeners" | awk '
+    /users:\(\("xray",pid=[0-9]+/ {
+      value = $0
+      sub(/^.*users:\(\("xray",pid=/, "", value)
+      sub(/[^0-9].*$/, "", value)
+      if (value ~ /^[1-9][0-9]*$/ && !seen[value]++) print value
+      next
+    }
+    /(^|[[:space:]])[1-9][0-9]*\/xray([[:space:]]|$)/ {
+      for (field = 1; field <= NF; field++) {
+        if ($field ~ /^[1-9][0-9]*\/xray$/) {
+          split($field, parts, "/")
+          if (!seen[parts[1]]++) print parts[1]
+          break
+        }
+      }
+    }
+  ' | sort -n | paste -sd, -
+}
+
+read_xray_api() {
+  [ -n "$xray_runtime_pid" ] || return 0
+  if [ "$mode" = container ]; then
+    bounded_command docker_cmd exec "$container" xray api lsi --server="$xray_api_addr" --isOnlyTags=false 2>/dev/null
+  else
+    bounded_command sudo -n xray api lsi --server="$xray_api_addr" --isOnlyTags=false 2>/dev/null
+  fi
+}
+
 if [ "$mode" = container ]; then
   container_running="$(bounded_command docker_cmd inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" || exit 1
   case "$container_running" in true|false) ;; *) exit 1 ;; esac
@@ -518,6 +570,7 @@ if [ "$mode" = container ]; then
   container_xp_pid="${container_xp_token%%:*}"
   case "$container_xp_pid" in ''|*[!0-9]*) exit 1 ;; esac
   container_xray_token="$(container_process_token xray)" || exit 1
+  xray_runtime_pid="${container_xray_token%%:*}"
   container_cloudflared_token="$(container_process_token cloudflared)" || exit 1
   if [ -n "$container_xray_token" ]; then container_xray_running=true; else container_xray_running=false; fi
   if [ -n "$container_cloudflared_token" ]; then container_cloudflared_running=true; else container_cloudflared_running=false; fi
@@ -544,6 +597,7 @@ if [ "$mode" = container ]; then
   echo "container_identity=$docker_container_identity"
   echo "container_started_at=$container_started_at"
   echo "container_xray_token=$container_xray_token"
+  echo "xray_runtime_pid=$xray_runtime_pid"
   echo "host_xray_pid="
   echo "host_xray_starttime="
 else
@@ -555,6 +609,7 @@ else
   fi
   host_xray_pid="$(xray_runtime_pid)" || exit 1
   case "$host_xray_pid" in ''|*[!0-9]*) exit 1 ;; esac
+  xray_runtime_pid="$host_xray_pid"
   host_xray_starttime="$(xray_runtime_starttime "$host_xray_pid")" || exit 1
   if [ "$xray_service_state" = true ]; then
     xray_service_active "$xray_systemd_name" "$xray_openrc_name" || exit 1
@@ -562,6 +617,7 @@ else
   echo "container_identity="
   echo "container_started_at="
   echo "container_xray_token="
+  echo "xray_runtime_pid=$xray_runtime_pid"
   echo "host_xray_pid=$host_xray_pid"
   echo "host_xray_starttime=$host_xray_starttime"
 fi
@@ -569,10 +625,19 @@ fi
 data_dir="$(env_value XP_DATA_DIR)"
 [ "$data_dir" != "$READ_ERROR_SENTINEL" ] || exit 1
 [ -n "$data_dir" ] || data_dir=/var/lib/xp/data
+xray_api_addr="$(env_value XP_XRAY_API_ADDR)"
+[ "$xray_api_addr" != "$READ_ERROR_SENTINEL" ] || exit 1
+[ -n "$xray_api_addr" ] || xray_api_addr=127.0.0.1:10085
 bind="$(env_value XP_BIND)"
 [ "$bind" != "$READ_ERROR_SENTINEL" ] || exit 1
-xp_port="${bind##*:}"
-case "$xp_port" in ''|*[!0-9]*) xp_port=62416 ;; esac
+if [ -z "$bind" ]; then
+  xp_port=62416
+else
+  case "$bind" in *:*) ;; *) exit 1 ;; esac
+  xp_port="${bind##*:}"
+  case "$xp_port" in ''|*[!0-9]*) exit 1 ;; esac
+  [ "$xp_port" -ge 1 ] && [ "$xp_port" -le 65535 ] || exit 1
+fi
 if [ "$mode" = container ]; then
   container_port_target="$xp_port"
   docker_published_ports="$(bounded_command docker_cmd port "$container" "${container_port_target}/tcp" 2>/dev/null)" || exit 1
@@ -588,7 +653,8 @@ emit_value ddns_restart_mode "$(env_value XP_CLOUDFLARED_RESTART_MODE)"
 emit_value ddns_fast_interval "$(env_value XP_CLOUDFLARE_DDNS_FAST_INTERVAL_SECS)"
 emit_value ddns_monitored_interval "$(env_value XP_CLOUDFLARE_DDNS_INTERVAL_SECS_WITH_MONITOR)"
 emit_value ddns_unmonitored_interval "$(env_value XP_CLOUDFLARE_DDNS_INTERVAL_SECS_NO_MONITOR)"
-emit_value ddns_state_json "$(runtime_file_read "$data_dir/ddns_state.json" || true)"
+ddns_state_json="$(runtime_file_read "$data_dir/ddns_state.json" || true)"
+emit_value ddns_state_json "$ddns_state_json"
 # Geo opt-in writes `true`; a missing opt-in remains the supported false default.
 geo_enabled="$(strict_bool_value XP_IP_GEO_ENABLED false)"
 emit_value geo_enabled "$geo_enabled"
@@ -612,17 +678,47 @@ emit_value access_host "$access_host"
 emit_value cloudflare_enabled "$(strict_bool_value XP_ENABLE_CLOUDFLARE)"
 emit_value cloudflare_hostname "$(env_value XP_CLOUDFLARE_HOSTNAME)"
 if [ "$mode" = host ]; then
-  emit_value cloudflare_settings_json "$(runtime_file_read /etc/xp-ops/cloudflare_tunnel/settings.json || true)"
+  cloudflare_settings_json="$(runtime_file_read /etc/xp-ops/cloudflare_tunnel/settings.json || true)"
 else
-  emit_value cloudflare_settings_json ""
+  cloudflare_settings_json=""
 fi
-emit_value managed_default_state_json "$(runtime_file_read "$data_dir/managed-default-endpoints.json" || true)"
+emit_value cloudflare_settings_json "$cloudflare_settings_json"
+managed_state_path="$data_dir/managed-default-endpoints.json"
+managed_legacy_state_path="$data_dir/container/managed_default_endpoints.json"
+managed_current_probe="$(runtime_file_probe "$managed_state_path")" || exit 1
+managed_legacy_probe="$(runtime_file_probe "$managed_legacy_state_path")" || exit 1
+managed_current_status="$(runtime_file_status_from_probe "$managed_current_probe")" || exit 1
+managed_legacy_status="$(runtime_file_status_from_probe "$managed_legacy_probe")" || exit 1
+case "$managed_current_status:$managed_legacy_status" in
+  present:present)
+    managed_current_state="${managed_current_probe#"$FILE_PRESENT_SENTINEL"}"
+    managed_legacy_state="${managed_legacy_probe#"$FILE_PRESENT_SENTINEL"}"
+    [ "$managed_current_state" = "$managed_legacy_state" ] || exit 1
+    managed_default_state_json="$managed_current_state"
+    ;;
+  present:absent) managed_default_state_json="${managed_current_probe#"$FILE_PRESENT_SENTINEL"}" ;;
+  absent:present) managed_default_state_json="${managed_legacy_probe#"$FILE_PRESENT_SENTINEL"}" ;;
+  absent:absent) managed_default_state_json="" ;;
+  *) exit 1 ;;
+esac
+emit_value managed_default_state_json "$managed_default_state_json"
 echo "sync_node_meta=$(sync_node_meta && printf true || printf false)"
 if [ "$require_xray_public_listener" = true ]; then
-  emit_value xray_public_ports "$(xray_public_ports || true)"
+  xray_public_ports_observed="$(xray_public_ports || true)"
+  xray_listener_pids_observed="$(xray_listener_pids || true)"
 else
-  emit_value xray_public_ports ""
+  xray_public_ports_observed=""
+  xray_listener_pids_observed=""
 fi
+emit_value xray_public_ports "$xray_public_ports_observed"
+emit_value xray_listener_pids "$xray_listener_pids_observed"
+xray_api_json="$(read_xray_api || true)"
+if [ -n "$xray_api_json" ]; then
+  xray_api_b64="$(printf '%s' "$xray_api_json" | base64 | tr -d '\r\n')"
+else
+  xray_api_b64=""
+fi
+emit_value xray_api_b64 "$xray_api_b64"
 
 if [ "$docker_access" = sudo ]; then
   env_probe_after="$(sudo -n sh -c 'if [ -e "$1" ] || [ -L "$1" ]; then [ -r "$1" ] || exit 2; printf %s readable; else printf %s absent; fi' sh "$env_file" 2>/dev/null)" || exit 1
@@ -685,6 +781,36 @@ if [ "$mode" = container ]; then
   docker_published_ports_after="$(bounded_command docker_cmd port "$container" "${container_port_target}/tcp" 2>/dev/null)" || exit 1
   [ "$docker_published_ports_after" = "$docker_published_ports" ] || exit 1
 fi
+ddns_state_json_after="$(runtime_file_read "$data_dir/ddns_state.json" || true)"
+[ "$ddns_state_json_after" = "$ddns_state_json" ] || exit 1
+managed_current_probe_after="$(runtime_file_probe "$managed_state_path")" || exit 1
+managed_legacy_probe_after="$(runtime_file_probe "$managed_legacy_state_path")" || exit 1
+managed_current_status_after="$(runtime_file_status_from_probe "$managed_current_probe_after")" || exit 1
+managed_legacy_status_after="$(runtime_file_status_from_probe "$managed_legacy_probe_after")" || exit 1
+[ "$managed_current_status_after:$managed_legacy_status_after" = "$managed_current_status:$managed_legacy_status" ] || exit 1
+case "$managed_current_status_after:$managed_legacy_status_after" in
+  present:present)
+    managed_current_state_after="${managed_current_probe_after#"$FILE_PRESENT_SENTINEL"}"
+    managed_legacy_state_after="${managed_legacy_probe_after#"$FILE_PRESENT_SENTINEL"}"
+    [ "$managed_current_state_after" = "$managed_legacy_state_after" ] || exit 1
+    managed_default_state_json_after="$managed_current_state_after"
+    ;;
+  present:absent) managed_default_state_json_after="${managed_current_probe_after#"$FILE_PRESENT_SENTINEL"}" ;;
+  absent:present) managed_default_state_json_after="${managed_legacy_probe_after#"$FILE_PRESENT_SENTINEL"}" ;;
+  absent:absent) managed_default_state_json_after="" ;;
+  *) exit 1 ;;
+esac
+[ "$managed_default_state_json_after" = "$managed_default_state_json" ] || exit 1
+if [ "$require_xray_public_listener" = true ]; then
+  xray_public_ports_after="$(xray_public_ports || true)"
+  [ "$xray_public_ports_after" != "$READ_ERROR_SENTINEL" ] || exit 1
+  [ "$xray_public_ports_after" = "$xray_public_ports_observed" ] || exit 1
+  xray_listener_pids_after="$(xray_listener_pids || true)"
+  [ "$xray_listener_pids_after" != "$READ_ERROR_SENTINEL" ] || exit 1
+  [ "$xray_listener_pids_after" = "$xray_listener_pids_observed" ] || exit 1
+fi
+xray_api_json_after="$(read_xray_api || true)"
+[ "$xray_api_json_after" = "$xray_api_json" ] || exit 1
 containers_after="$(xp_containers_from_inventory "$docker_inventory_after")" || exit 1
 [ "$containers_after" = "$containers" ] || exit 1
 if [ "$env_probe" = absent ]; then

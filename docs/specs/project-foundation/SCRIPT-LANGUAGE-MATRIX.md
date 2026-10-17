@@ -31,7 +31,7 @@ Local Bun follows the installed host runtime; CI follows the latest stable Bun a
 | `requirements-analysis` | Markdown and template only | No script/runtime | Requirements drafting has no owned executable. |
 | `step-stl-print-repair` | Five Python FreeCAD, Blender, and Gmsh scripts | Python for all five domain scripts | FreeCAD/Blender run through their application Python APIs; Gmsh has an official Python binding. TS would require replacing domain interfaces or maintaining native bindings without a corresponding benefit. |
 | `tavily-hikari-infra` | A short Bash inventory/status/log helper | Shell | Direct role selection and SSH command forwarding have little domain-model complexity. A TS or Python application would add a runtime prerequisite without a clear functional benefit. |
-| `xp-infra` | Bash orchestration, Ruby policy/audit interpretation, POSIX remote probes | TypeScript + Bun for local orchestration, policy, normalization, and decisions; POSIX Shell for remote probes | Policy schema, audit observations, identity revalidation, public target validation, and port-preflight conclusions are complex structured logic. Remote probes retain bounded, authorized native observation without requiring Bun on inspected nodes. |
+| `xp-infra` | TypeScript + Bun local orchestration, policy/audit interpretation, POSIX remote probes | TypeScript + Bun for local orchestration, policy, normalization, and decisions; POSIX Shell for remote probes | Policy schema, audit observations, identity revalidation, public target validation, and port-preflight conclusions are complex structured logic. Remote probes retain bounded, authorized native observation without requiring Bun on inspected nodes. |
 
 ## Exact script responsibilities
 
@@ -51,8 +51,8 @@ Local Bun follows the installed host runtime; CI follows the latest stable Bun a
 
 ### XP operations
 
-- [`xp-infra`](../../../skills/xp-infra/scripts/xp-infra): replace local CLI routing, policy validation, timeouts, target checks, result interpretation, and reporting with TS/Bun. Move complex local Ruby expressions into typed functions; keep remote-native collection at its existing execution boundary.
-- [`xp-infra-audit-local`](../../../skills/xp-infra/scripts/xp-infra-audit-local): replace the Ruby interpretation with TS/Bun. Preserve duplicate-record/member rejection, explicit booleans, schema checks, freshness, identity, public-port and URL rules. `JSON.parse` or a YAML parser alone does not reproduce these validation contracts.
+- [`xp-infra`](../../../skills/xp-infra/scripts/xp-infra): implement local CLI routing, policy validation, timeouts, target checks, result interpretation, and reporting with TS/Bun. Keep remote-native collection at its existing execution boundary.
+- [`xp-infra-audit-local`](../../../skills/xp-infra/scripts/xp-infra-audit-local): implement the local audit interpretation with TS/Bun. Preserve duplicate-record/member rejection, explicit booleans, schema checks, freshness, identity, public-port and URL rules. `JSON.parse` or a YAML parser alone does not reproduce these validation contracts.
 - [`xp-infra-compose-image-check`](../../../skills/xp-infra/scripts/xp-infra-compose-image-check): express its exact-single-image check as a local typed function, rather than keeping an extra parser runtime or wrapper process.
 - [`xp-infra-audit-remote`](../../../skills/xp-infra/scripts/xp-infra-audit-remote) and [`xp-infra-audit-vless-remote`](../../../skills/xp-infra/scripts/xp-infra-audit-vless-remote): retain POSIX Shell for bounded native collection and identity revalidation. Keep permission/runtime observation where it actually occurs. Do not require Bun on arbitrary inspected servers or move remote identity checks into an unverifiable local assumption.
 

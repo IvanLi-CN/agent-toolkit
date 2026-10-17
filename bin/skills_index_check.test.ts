@@ -16,8 +16,17 @@ test("accepts a complete local index and explicit external entry", () => {
   withFixture((root) => {
     mkdirSync(join(root, "skills", "alpha"), { recursive: true });
     writeFileSync(join(root, "skills", "alpha", "SKILL.md"), "# alpha\n");
-    writeFileSync(join(root, "skills", "README.md"), "| Skill | Description | Path |\n|---|---|---|\n| `alpha` | local | `skills/alpha/**` |\n| `external-beta` | external | `~/.agents/skills/external-beta/**` |\n");
+    writeFileSync(join(root, "skills", "README.md"), "| Skill | Description | Path |\n|---|---|---|\n| `alpha` | local | `skills/alpha/**` |\n| `external-beta` | external | `external-skills/external-beta/**` |\n");
     expect(check(root)).toEqual([]);
+  });
+});
+
+test("rejects personal consumer paths anywhere in the public catalog", () => {
+  withFixture((root) => {
+    mkdirSync(join(root, "skills", "alpha"), { recursive: true });
+    writeFileSync(join(root, "skills", "alpha", "SKILL.md"), "# alpha\n");
+    writeFileSync(join(root, "skills", "README.md"), "Third-party source: ~/.agents/skills/alpha/**\n\n| Skill | Description | Path |\n|---|---|---|\n| `alpha` | local | `skills/alpha/**` |\n");
+    expect(check(root)).toEqual(["PERSONAL_CONSUMER_PATH_IN_SKILLS_README"]);
   });
 });
 

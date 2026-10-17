@@ -28,4 +28,4 @@ bun run bin/public_skill_boundary_check.ts
 | `tavily-hikari-infra` | Inspect a configured Tavily Hikari primary/standby deployment read-only. | [Skill source](tavily-hikari-infra/SKILL.md) |
 | `xp-infra` | Validate configured XP self-hosted nodes using explicit private configuration. | [Skill source](xp-infra/SKILL.md) |
 
-Third-party Skills installed under `~/.agents/skills` are external dependencies and are not maintained or indexed here.
+Third-party or consumer-local Skills are external dependencies and are not maintained or indexed here.

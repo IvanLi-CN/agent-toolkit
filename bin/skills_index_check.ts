@@ -6,7 +6,8 @@ import { dirname, join, resolve } from "node:path";
 import { isDirectRegularFile, isPathInside, REPO_ROOT, readText } from "./repo_util.ts";
 
 export const SKILL_NAME_PATTERN = /^`([a-z0-9-]+)`$/;
-export const EXTERNAL_PATH_PATTERN = /~?\/?[^`]*\.agents\/skills\/([a-z0-9-]+)(?:\/|`)/;
+export const EXTERNAL_PATH_PATTERN = /(?:^|[\\/])external-skills[\\/]([a-z0-9-]+)(?:[\\/]|$)/;
+export const PERSONAL_CONSUMER_PATH_PATTERN = /(?:~[\/\\]\.agents[\/\\]+skills|[\/\\](?:Users|home)[\/\\][^\/\\\s]+[\/\\]\.agents[\/\\]+skills)(?:[\/\\\s.,;:)]|$)/i;
 
 export type IndexEntry = {
   name: string;
@@ -83,10 +84,15 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
   if (!isPathInside(repoRoot, skillsRoot)) return ["SYMLINKED_SKILLS_ROOT"];
   if (!isPathInside(repoRoot, readmePath)) return ["SYMLINKED_SKILLS_README"];
   const actual = repositorySkills(skillsRoot);
+  const readme = readText(readmePath);
   const entries = indexEntries(readmePath);
   const localEntries = entries.filter((entry) => !entry.external);
   const indexed = new Set(localEntries.map((entry) => entry.name));
   const findings: string[] = [];
+
+  if (PERSONAL_CONSUMER_PATH_PATTERN.test(readme)) {
+    findings.push("PERSONAL_CONSUMER_PATH_IN_SKILLS_README");
+  }
 
   for (const entry of localEntries) {
     const expected = [`skills/${entry.name}/`, `skills/${entry.name}/**`, `${entry.name}/`, `${entry.name}/**`, `${entry.name}/SKILL.md`];

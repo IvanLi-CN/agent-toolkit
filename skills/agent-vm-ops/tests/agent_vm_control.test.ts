@@ -1,6 +1,7 @@
 import { afterEach, expect, setDefaultTimeout, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   CommandRunner,
@@ -9,7 +10,9 @@ import {
   CTResources,
   GUEST_GROWTH_SCRIPT,
   IncusClient,
+  MAX_REQUEST_BYTES,
   PROTOCOL_VERSION,
+  parseRequestBytes,
   StateStore,
   SystemdManager,
   loadConfig,
@@ -17,6 +20,7 @@ import {
 
 const GIB = 1024 ** 3;
 const KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestfixture";
+const CONTROL_PATH = fileURLToPath(new URL("../scripts/agent_vm_control.ts", import.meta.url));
 setDefaultTimeout(15_000);
 
 type Dict = Record<string, any>;
@@ -87,6 +91,8 @@ class NativeCommands extends CommandRunner {
   onStart: ((name: string) => void) | undefined;
   onConfigSet: ((name: string, key: string, value: string) => void) | undefined;
   guestFixture: GuestFixture | undefined;
+  malformedInventory = false;
+  invalidDeviceMaps = false;
 
   configureGuest(root: string): void { this.guestFixture = createGuestFixture(root, { virtualBytes: 20 * GIB }); }
 
@@ -119,7 +125,10 @@ class NativeCommands extends CommandRunner {
       if (!this.imageAvailable) throw new ControlError("command_failed", "image absent");
       return result(args, { fingerprint: path.split("/").at(-1), type: this.imageType });
     }
-    if (path === "/1.0/instances") return result(args, project === "agents" ? [...this.instances.values()] : []);
+    if (path === "/1.0/instances") {
+      const instances = project === "agents" ? [...this.instances.values()] : [];
+      return result(args, this.malformedInventory && project === "agents" ? [...instances, "malformed-record"] as any : instances);
+    }
     if (path === "/1.0/networks") return result(args, [{ managed: true, type: "bridge", name: "agentsbr0" }]);
     if (path.endsWith("/forwards")) return result(args, []);
     if (path.endsWith("/leases")) return result(args, []);
@@ -130,7 +139,7 @@ class NativeCommands extends CommandRunner {
       if (path.endsWith("/state")) {
         return result(args, { status: instance.status, network: { eth0: { addresses: [{ family: "inet", address: instance.expanded_devices.eth0["ipv4.address"] }] } } });
       }
-      return result(args, instance);
+      return result(args, this.invalidDeviceMaps ? { ...instance, devices: null, expanded_devices: null } : instance);
     }
     throw new Error(`unexpected query: ${path}`);
   }
@@ -153,8 +162,8 @@ class NativeCommands extends CommandRunner {
         status: "Stopped",
         config,
         expanded_config: config,
-        devices: { eth0: { type: "nic", network: "agentsbr0" }, root: { type: "disk", size: "20GiB" } },
-        expanded_devices: { eth0: { type: "nic", network: "agentsbr0" }, root: { type: "disk", size: "20GiB" } },
+        devices: { eth0: { type: "nic", network: "agentsbr0", hwaddr: "00:16:3e:00:00:01" }, root: { type: "disk", size: "20GiB" } },
+        expanded_devices: { eth0: { type: "nic", network: "agentsbr0", hwaddr: "00:16:3e:00:00:01" }, root: { type: "disk", size: "20GiB" } },
         boot_id: "00000000-0000-4000-8000-000000000001",
         guest_disk_bytes: 20 * GIB,
         agent_ready: false,
@@ -331,6 +340,13 @@ function writeLegacyOperation(dbPath: string, response: Dict): void {
   if (child.exitCode !== 0) throw new Error(`legacy fixture failed: ${new TextDecoder().decode(child.stderr)}`);
 }
 
+async function collect(child: any): Promise<{ exit: number; stdout: string; stderr: string }> {
+  const stdout = new Response(child.stdout).text();
+  const stderr = new Response(child.stderr).text();
+  const exit = await child.exited;
+  return { exit, stdout: await stdout, stderr: await stderr };
+}
+
 test("loads Bun as the managed guest prerequisite", () => {
   const root = mkdtempSync("/tmp/agent-vm-config-test-");
   try {
@@ -371,6 +387,52 @@ test("fails closed on missing or invalid environment config before native writes
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("accepts scientific ratios and preserves large integer config and request values", () => {
+  const root = mkdtempSync("/tmp/agent-vm-numeric-contract-test-");
+  const base: Dict = { project: "agents", profile: "agent-vm", image_alias: "image", image_fingerprint: "a".repeat(64), network: "agentsbr0", network_acl: "agent-vm-isolation", pool: "agents", host_address: "198.51.100.19", port_start: 20000, port_end: 20030, vm_ip_start: "198.51.100.20", vm_ip_end: "198.51.100.250", gateway_ip: "198.51.100.1", storage_path: root, state_db: join(root, "state.sqlite3"), timer_dir: join(root, "systemd"), cpu_overcommit_ratio: 1e21, create_cost_bytes: "9007199254740993" };
+  const configPath = join(root, "config.json");
+  const raw = JSON.stringify(base).replace('"create_cost_bytes":"9007199254740993"', '"create_cost_bytes":9007199254740993');
+  writeFileSync(configPath, raw);
+  try {
+    const config = loadConfig(configPath);
+    expect(config.cpu_overcommit_ratio).toEqual({ numerator: 10n ** 21n, denominator: 1n, text: "1e+21" });
+    expect(config.create_cost_bytes).toBe(9007199254740993n);
+
+    const request = parseRequestBytes(new TextEncoder().encode('{"protocol":4,"action":"status","session_id":"large","generation":9007199254740993}'));
+    expect(request.generation).toBe(9007199254740993n);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("rejects invalid UTF-8 at both config and request boundaries", () => {
+  const root = mkdtempSync("/tmp/agent-vm-utf8-contract-test-");
+  const configPath = join(root, "config.json");
+  try {
+    writeFileSync(configPath, Uint8Array.from([0x7b, 0x22, 0x70, 0x72, 0x6f, 0x6a, 0x65, 0x63, 0x74, 0x22, 0x3a, 0xff, 0x7d]));
+    expectSyncCode(() => loadConfig(configPath), "config_invalid");
+    expectSyncCode(() => parseRequestBytes(Uint8Array.from([0x7b, 0x22, 0x78, 0x22, 0x3a, 0xff, 0x7d])), "invalid_request");
+    expectSyncCode(() => parseRequestBytes(new Uint8Array(MAX_REQUEST_BYTES + 1)), "request_too_large");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("uses the sixty-second default for generic and Incus commands while preserving explicit budgets", async () => {
+  class CaptureRunner extends CommandRunner {
+    readonly timeouts: Array<number | undefined> = [];
+
+    override async runBounded(argv: readonly string[], options: RunnerOptions = {}): Promise<ProcessResult> {
+      this.timeouts.push(options.timeout);
+      return result(argv);
+    }
+  }
+  const runner = new CaptureRunner();
+  await runner.run(["true"]);
+  const client = new IncusClient(runner, { project: "agents" });
+  await client.call(["status"]);
+  await client.exec("agent-vm-test", ["true"]);
+  await client.call(["status"], { timeout: 7 });
+  await client.exec("agent-vm-test", ["true"], { timeout: 8 });
+  expect(runner.timeouts).toEqual([60, 60, 60, 7, 8]);
+});
+
 test("rejects invalid identity, protocol, action and generation before native writes", async () => {
   const f = fixture();
   await expectCode(f.control.dispatch({ protocol: 3, action: "acquire", session_id: "thread-a", generation: 0, operation_id: "old-protocol", public_key: KEY }), "protocol_mismatch");
@@ -390,6 +452,35 @@ test("keeps SQLite integer reservations exact beyond the JS safe range", () => {
     expect(typeof task?.reservation_bytes).toBe("bigint");
     expect(task?.reservation_bytes).toBe(exact);
   } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("keeps request digests compatible with Python Unicode code-point ordering", async () => {
+  const f = fixture();
+  const request = f.request("acquire", {
+    public_key: KEY,
+    metadata: { "\uE000": { nested: "\u{10000}" }, "\u{10000}": { nested: "\uE000" } },
+  }, "op-unicode-digest");
+  await f.control.dispatch(request);
+  const journal = f.store.db.query("SELECT response_json FROM operations WHERE operation_id = ?").get("op-unicode-digest") as { response_json: string };
+  const child = Bun.spawnSync(["python3", "-c", "import hashlib,json,sys; print(hashlib.sha256(json.dumps(json.loads(sys.argv[1]), ensure_ascii=True, sort_keys=True, separators=(\", \", \": \" )).encode(\"utf-8\")).hexdigest())", JSON.stringify(request)], { stdout: "pipe", stderr: "pipe" });
+  if (child.exitCode !== 0) throw new Error(new TextDecoder().decode(child.stderr));
+  expect(JSON.parse(journal.response_json)._request_digest).toBe(new TextDecoder().decode(child.stdout).trim());
+});
+
+test("replays a durable response without rounding a large JSON integer", async () => {
+  const f = fixture();
+  const request = f.request("acquire", { public_key: KEY }, "op-large-response");
+  await f.control.dispatch(request);
+  const row = f.store.db.query("SELECT response_json FROM operations WHERE operation_id = ?").get("op-large-response") as { response_json: string };
+  const marker = '"result":';
+  const start = row.response_json.indexOf(marker) + marker.length;
+  const end = row.response_json.indexOf(',"server_time"', start);
+  if (start < marker.length || end < 0) throw new Error("operation result marker missing");
+  const responseJson = `${row.response_json.slice(0, start)}{"exact":9007199254740993}${row.response_json.slice(end)}`;
+  (f.store.db as any).run("UPDATE operations SET response_json = ? WHERE operation_id = ?", responseJson, "op-large-response");
+  const replay = await f.control.dispatch(request);
+  expect(replay.outcome).toBe("replayed");
+  expect(replay.result.exact).toBe(9007199254740993n);
 });
 
 test("replays an accepted persisted operation without changing its digest or native state", async () => {
@@ -505,6 +596,32 @@ test("keeps bounded output and reaps a timed out process group", async () => {
     expect((error as ControlError).detail).toMatchObject({ reaped: true });
     expect(typeof ((error as ControlError).detail as Dict).process_group_killed).toBe("boolean");
   }
+});
+
+test("bounds descendant-held pipes and stdin backpressure by one communication deadline", async () => {
+  const runner = new CommandRunner();
+  for (const [argv, options] of [
+    [["/bin/sh", "-c", "sleep 1 & exit 0"], { timeout: 0.05 }],
+    [["/bin/sh", "-c", "sleep 1; cat >/dev/null"], { timeout: 0.05, inputData: new Uint8Array(1024 * 1024) }],
+  ] as const) {
+    const started = performance.now();
+    await expectCode(runner.runBounded(argv, options), "command_timeout");
+    expect(performance.now() - started).toBeLessThan(500);
+  }
+});
+
+test("flushes a large response before a child exits", async () => {
+  const child = Bun.spawn([process.execPath, "-e", `const { writeProcessOutput } = await import(process.env.CONTROL_PATH); await writeProcessOutput(JSON.stringify({ ok: true, data: "x".repeat(16 * 1024 * 1024) })); process.exit(0);`], {
+    env: { ...process.env, CONTROL_PATH: fileURLToPath(new URL("../scripts/agent_vm_control.ts", import.meta.url)) },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const output = await collect(child);
+  expect(output.exit).toBe(0);
+  expect(output.stderr).toBe("");
+  const parsed = JSON.parse(output.stdout) as Dict;
+  expect(parsed.ok).toBe(true);
+  expect(parsed.data).toHaveLength(16 * 1024 * 1024);
 });
 
 test("removes an orphaned systemd timer only after native absence proof", async () => {
@@ -670,6 +787,26 @@ test("project port mappings are durable before native exposure and removable exa
   expect(removed.removed).toBe(true);
   expect((await f.call("status")).task_id).toBe(active.task_id);
   expect((await f.call("port-list", {})).ports.map((port: Dict) => port.port_name)).toEqual(["ssh"]);
+});
+
+test("fails closed on a mixed native inventory before allocating a project port", async () => {
+  const f = fixture();
+  await f.call("acquire", { public_key: KEY }, "op-inventory-owner");
+  const callsBeforeInventory = f.runner.calls.length;
+  f.runner.malformedInventory = true;
+  await expectCode(f.call("port-add", { name: "web", vm_port: 8080 }, "op-malformed-inventory"), "port_inventory_unverified");
+  expect(f.store.getPort(String(f.store.getTask({ sessionId: "thread-a" })?.task_id), "web", "tcp")).toBeUndefined();
+  expect(f.runner.calls.slice(callsBeforeInventory).some(({ args }) => args[0] === "incus" && args[1] === "--project" && args[3] === "config" && args[4] === "device" && args[5] === "add")).toBe(false);
+});
+
+test("keeps durable port accounting when native device maps are unavailable", async () => {
+  const f = fixture();
+  const active = await f.call("acquire", { public_key: KEY }, "op-mapping-owner");
+  f.runner.invalidDeviceMaps = true;
+  await expectCode(f.call("release", {}, "op-mapping-release"), "cleanup_incomplete");
+  expect(f.store.getTask({ taskId: String(active.task_id) })?.state).toBe("closing");
+  expect(f.store.getPorts(String(active.task_id))).toHaveLength(1);
+  expect(Object.keys(f.runner.instances.get(active.instance_name)?.devices ?? {}).some((name) => name.endsWith("-ssh-tcp"))).toBe(true);
 });
 
 test("live memory reduction preserves lease and guest continuity", async () => {

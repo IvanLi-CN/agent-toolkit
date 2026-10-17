@@ -29,6 +29,8 @@ bin/                    repository-local index and safety checks
 
 Run the checks from the repository root with the installed Bun runtime:
 
+The repository test runner supports macOS and glibc-based Linux. It requires Bun FFI access to POSIX `getsid`/`getpgid` from `libSystem.B.dylib` (macOS) or `libc.so.6` (Linux), plus `bash`, `ps`, `mktemp`, `mkfifo`, `cat`, `tr`, `sleep`, `wc`, and `rm` on `PATH`. Native Windows and non-glibc Linux are outside the supported runner platforms.
+
 ```bash
 bun install --frozen-lockfile
 bun run typecheck
@@ -39,7 +41,7 @@ ruby -e 'require "yaml"'
 bun run test:skills
 ```
 
-The test runner discovers maintained TypeScript, Python, and Shell test files automatically. It rejects empty or non-declarative test files before execution; Shell tests must execute at least one `test` builtin, which the runner counts and reports as `TESTS_RUN=<count>`. Skill tests that exercise the XP policy require Ruby with its standard YAML library; Python-facing tests use the dependencies declared by the repository.
+The test runner discovers maintained TypeScript, Python, and Shell test files automatically. It rejects empty or non-declarative Bun/Python test files before execution. Shell assertion counting covers `test` builtins executed in the suite shell, including sourced helpers, and reports `TESTS_RUN=<count>`; zero counted assertions fail. Assert a child helper's result in the suite shell: assertions executed only in a separate helper process do not contribute to this count. Skill tests that exercise the XP policy require Ruby with its standard YAML library; Python-facing tests use the dependencies declared by the repository.
 
 During a source migration, compare the public allowlist with the source snapshot and verify that private consumer Skills remain in the private source tree:
 

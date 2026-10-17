@@ -22,11 +22,10 @@ bun run typecheck
 bun run check
 bun run test:repo
 python3 -m pip install -r requirements-dev.txt
-ruby -e 'require "yaml"'
 bun run test:skills
 ```
 
-`test:repo` discovers repository-owned Bun, Python, and Shell test files outside `skills/`. `test:skills` discovers the same test families below `skills/`. The runner rejects empty or non-declarative Bun/Python test files before execution; Shell tests must execute at least one counted `test` builtin in the suite shell or a sourced helper and report `TESTS_RUN=<count>`. Assertions confined to a separate helper process do not contribute to the count; assert that helper's result in the suite shell. See [validation prerequisites](README.md#validation) for supported runner platforms, native commands, and Bun FFI requirements. Python dependencies needed by application-facing or domain tests are declared separately in `requirements-dev.txt`; the XP policy test also requires Ruby with its standard YAML library; text-only Skills need no programming runtime.
+`test:repo` discovers repository-owned Bun, Python, and Shell test files outside `skills/`. `test:skills` discovers the same test families below `skills/`. The runner rejects empty or non-declarative Bun/Python test files before execution; Shell tests must execute at least one counted `test` builtin in the suite shell or a sourced helper and report `TESTS_RUN=<count>`. Assertions confined to a separate helper process do not contribute to the count; assert that helper's result in the suite shell. See [validation prerequisites](README.md#validation) for supported runner platforms, native commands, and Bun FFI requirements. XP local policy and audit entrypoints use the installed Bun runtime plus native `ssh` and `curl` where needed; remote observation remains in POSIX Shell and does not require Bun on an inspected node. Python dependencies needed by application-facing or domain tests are declared separately in `requirements-dev.txt`; text-only Skills need no programming runtime.
 
 The source-target inventory check is an opt-in migration check because it compares a synthetic or explicitly supplied Git source snapshot:
 

@@ -37,11 +37,10 @@ bun run typecheck
 bun run check
 bun run test:repo
 python3 -m pip install -r requirements-dev.txt
-ruby -e 'require "yaml"'
 bun run test:skills
 ```
 
-The test runner discovers maintained TypeScript, Python, and Shell test files automatically. It rejects empty or non-declarative Bun/Python test files before execution. Shell assertion counting covers `test` builtins executed in the suite shell, including sourced helpers, and reports `TESTS_RUN=<count>`; zero counted assertions fail. Assert a child helper's result in the suite shell: assertions executed only in a separate helper process do not contribute to this count. Skill tests that exercise the XP policy require Ruby with its standard YAML library; Python-facing tests use the dependencies declared by the repository.
+The test runner discovers maintained TypeScript, Python, and Shell test files automatically. It rejects empty or non-declarative Bun/Python test files before execution. Shell assertion counting covers `test` builtins executed in the suite shell, including sourced helpers, and reports `TESTS_RUN=<count>`; zero counted assertions fail. Assert a child helper's result in the suite shell: assertions executed only in a separate helper process do not contribute to this count. XP local policy and audit entrypoints use the installed Bun runtime plus native `ssh` and `curl` where needed; remote observation remains in POSIX Shell and does not require Bun on an inspected node. Python-facing tests use the dependencies declared by the repository.
 
 During a source migration, compare the public allowlist with the source snapshot and verify that private consumer Skills remain in the private source tree:
 

@@ -155,6 +155,7 @@ test("preserves baseline YAML scalar spellings without reopening unsafe construc
   expect(parseRestrictedYaml("owner_confirmed: ON\n")).toEqual({ owner_confirmed: true });
   expect(parseRestrictedYaml("owner_confirmed: off\n")).toEqual({ owner_confirmed: false });
   expect(parseRestrictedYaml("reason: 1.5\n")).toEqual({ reason: 1.5 });
+  expect(parseRestrictedYaml("reason: fixture,\n")).toEqual({ reason: "fixture," });
   expect(parseRestrictedYaml("node_overrides:\n  fixture-node:\n    reason: fixture\n")).toEqual({
     node_overrides: { "fixture-node": { reason: "fixture" } },
   });

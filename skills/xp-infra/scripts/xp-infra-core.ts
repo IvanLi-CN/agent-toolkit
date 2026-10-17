@@ -218,7 +218,7 @@ function parseYamlScalar(rawValue: string, lineNumber: number): unknown {
   if (!value) return Object.create(null) as JsonRecord;
   if (value.startsWith("{")) return parseFlowMapping(value, lineNumber);
   if (value === "[]") return [];
-  if (value.startsWith("[") || value.endsWith(",")) {
+  if (value.startsWith("[")) {
     fail(`unsupported YAML collection at line ${lineNumber}`);
   }
   if (/^(?:---|\.\.\.)$/.test(value) || /^[&*!%@`]/.test(value)) {

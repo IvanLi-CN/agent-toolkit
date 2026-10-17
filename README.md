@@ -34,6 +34,8 @@ bun install --frozen-lockfile
 bun run typecheck
 bun run check
 bun run test:repo
+python3 -m pip install -r requirements-dev.txt
+ruby -e 'require "yaml"'
 bun run test:skills
 ```
 

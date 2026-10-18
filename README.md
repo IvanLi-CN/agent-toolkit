@@ -7,7 +7,7 @@ Agent Toolkit is a public collection of reusable Skills, focused command-line he
 Clone this repository, then point a standalone consumer's Skill root at its `skills/` directory. A direct symlink is sufficient when the consumer has no private Skills:
 
 ```bash
-git clone git@github.com:IvanLi-CN/agent-toolkit.git /path/to/agent-toolkit
+git clone https://github.com/IvanLi-CN/agent-toolkit.git /path/to/agent-toolkit
 ln -sfn /path/to/agent-toolkit/skills /path/to/consumer/skills
 ```
 
@@ -23,24 +23,30 @@ bin/                    repository-local index and safety checks
 .github/workflows/      repository checks
 ```
 
-`PUBLIC_SKILLS.txt` is the public boundary and `skills/README.md` is the discoverability index; both must contain the same public Skill set exactly once. `~/.agents/skills` and other installed third-party Skill roots are external dependencies, not content maintained here. Codex-only workflow and runtime integration Skills live in the consumer configuration repository.
+`PUBLIC_SKILLS.txt` is the public boundary and `skills/README.md` is the discoverability index; both must contain the same public Skill set exactly once. Installed third-party Skill roots are external dependencies, not content maintained here.
 
 ## Validation
 
-Run the checks from the repository root:
+Run the checks from the repository root with the installed Bun runtime:
+
+The repository test runner supports macOS and glibc-based Linux. It requires Bun FFI access to POSIX `getsid`/`getpgid` from `libSystem.B.dylib` (macOS) or `libc.so.6` (Linux), plus `bash`, `ps`, `mktemp`, `mkfifo`, `cat`, `tr`, `sleep`, `wc`, and `rm` on `PATH`. Native Windows and non-glibc Linux are outside the supported runner platforms.
 
 ```bash
-python3 bin/skills_index_check.py
-python3 -m unittest discover -s bin -p 'test_*.py'
-python3 bin/public_boundary_check.py
+bun install --frozen-lockfile
+bun run typecheck
+bun run check
+bun run test:repo
 python3 -m pip install -r requirements-dev.txt
-while IFS= read -r test_file; do python3 "$test_file"; done < <(find skills -type f -name 'test_*.py' | sort)
+ruby -e 'require "yaml"'
+bun run test:skills
 ```
+
+The test runner discovers maintained TypeScript, Python, and Shell test files automatically. It rejects empty or non-declarative Bun/Python test files before execution. Shell assertion counting covers `test` builtins executed in the suite shell, including sourced helpers, and reports `TESTS_RUN=<count>`; zero counted assertions fail. Assert a child helper's result in the suite shell: assertions executed only in a separate helper process do not contribute to this count. Skill tests that exercise the XP policy require Ruby with its standard YAML library; Python-facing tests use the dependencies declared by the repository.
 
 During a source migration, compare the public allowlist with the source snapshot and verify that private consumer Skills remain in the private source tree:
 
 ```bash
-python3 bin/source_target_inventory_check.py \
+bun run bin/source_target_inventory_check.ts \
   --source-root /path/to/dot-codex \
   --source-revision <migration-source-revision>
 ```

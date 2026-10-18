@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { COMMAND_OUTPUT_LIMIT, CommandRunner, Control, ControlError, IncusClient, StateStore } from "../scripts/agent_vm_control.ts";
+import { COMMAND_OUTPUT_LIMIT, DIAGNOSTIC_LOG_TRUNCATION_MARKER, CommandRunner, Control, ControlError, IncusClient, StateStore } from "../scripts/agent_vm_control.ts";
 
 type Dict = Record<string, any>;
 
@@ -134,7 +134,8 @@ linuxTest("drains noisy stdout and stderr and reaps a real descendant", async ()
   const runner = new CommandRunner();
   const bounded = await runner.runBounded(["/bin/sh", "-c", "dd if=/dev/zero bs=1M count=8 status=none; dd if=/dev/zero bs=1M count=8 status=none >&2"], { timeout: 5, stdoutLimit: 128, stderrLimit: 128 });
   expect(bounded.stdout.length).toBe(128);
-  expect(bounded.stderr.length).toBe(128);
+  expect(bounded.stderr.length).toBeLessThanOrEqual(128);
+  expect(new TextDecoder().decode(bounded.stderr)).toBe(DIAGNOSTIC_LOG_TRUNCATION_MARKER);
   expect(bounded.stdoutTruncated).toBe(true);
 
   const probeRoot = root("agent-vm-process-tree");

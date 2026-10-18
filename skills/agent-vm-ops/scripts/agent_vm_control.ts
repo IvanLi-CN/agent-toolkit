@@ -1590,6 +1590,12 @@ export class CommandRunner {
         processTreeComplete = finalInspectionComplete;
         if (identityMismatch) processGroupCleanupError ??= "process_identity_mismatch";
         if (markerBindingFailure) processGroupCleanupError ??= "process_marker_identity_unbound";
+        const inspectionDetail = {
+          descendants_complete: finalDescendants.complete,
+          environment_complete: finalEnvironment.complete,
+          environment_scan_complete: !environmentInspectionIncomplete,
+          pipes_complete: finalPipes.complete,
+        };
         if (!processTreeComplete) processGroupCleanupError ??= "process_tree_inspection_failed";
         const knownDescendant = [...known.values()].some((member) => member.pid !== processHandle.pid);
         if (leaderExitedAfterTerm && !knownDescendant) processGroupCleanupError ??= "process_tree_root_lost";
@@ -1606,7 +1612,7 @@ export class CommandRunner {
           sleep(1000).then(() => ({ bytes: encode(DIAGNOSTIC_LOG_TRUNCATION_MARKER), truncated: true })),
         ]);
         if (!processGroupKilled && !processGroupCleanupError) processGroupCleanupError = "process_group_kill_failed";
-        throw new ControlError("command_timeout", `command timed out: ${argv[0]}`, { reaped, process_group_killed: processGroupKilled, process_group_cleanup_error: processGroupCleanupError, stderr: decode(stderr.bytes), stderr_truncated: stderr.truncated });
+        throw new ControlError("command_timeout", `command timed out: ${argv[0]}`, { reaped, process_group_killed: processGroupKilled, process_group_cleanup_error: processGroupCleanupError, process_tree_inspection: inspectionDetail, stderr: decode(stderr.bytes), stderr_truncated: stderr.truncated });
       }
       const [, stdout, stderr, returncode] = outcome.value;
       const result: CompletedProcess = { args: [...argv], returncode, stdout: stdout.bytes, stderr: stderr.bytes, stdoutTruncated: stdout.truncated };

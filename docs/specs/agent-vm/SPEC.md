@@ -12,7 +12,7 @@ The deployment topology is layered: the local Codex client reaches a configured 
 
 Every request carries a generic `session_id`. The CLI selects it from explicit `--session-id` first and `AGENT_VM_SESSION_ID` second. A missing value returns `missing_session` before any remote write. Session identity is ownership metadata and is not an authentication mechanism. The client sends one versioned JSON request over the configured SSH control path and emits one JSON response; diagnostics go to stderr.
 
-Protocol 4 is required by both client and control. Mutations include an operation ID and lease generation. The control persists requests and outcomes, rejects incompatible or conflicting retries, and never replays an uncertain native mutation automatically.
+Protocol 4 is required by both client and control. Mutations include an operation ID and lease generation, including drain entry and exit. Every successful response carries a validated non-negative generation or an explicit `null` for non-session actions and an `outcome` of `success` or `replayed`. The control persists requests and outcomes, rejects incompatible or conflicting retries, and never replays an uncertain native mutation automatically.
 
 ## Lifecycle
 

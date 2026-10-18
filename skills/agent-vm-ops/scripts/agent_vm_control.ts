@@ -9,7 +9,7 @@
 import { Database } from "bun:sqlite";
 import { dlopen } from "bun:ffi";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { closeSync, constants, existsSync, fchmodSync, fsyncSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, renameSync, rmdirSync, statfsSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fchmodSync, ftruncateSync, fsyncSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmdirSync, statfsSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { isIP } from "node:net";
 import { availableParallelism, homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -22,7 +22,9 @@ export const GUEST_READINESS_DIAGNOSTIC_SECONDS = 120;
 export const DIAGNOSTIC_COMMAND_TIMEOUT_SECONDS = 5;
 export const DIAGNOSTIC_LOG_LIMIT = 8192;
 export const DIAGNOSTIC_LOG_TRUNCATION_MARKER = "\n[TRUNCATED BY DIAGNOSTIC LIMIT]";
+export const DIAGNOSTIC_MESSAGE_LIMIT = 4096;
 export const COMMAND_OUTPUT_LIMIT = 1024 * 1024;
+const RAW_DIAGNOSTIC_CAPTURE_LIMIT = 1024 * 1024;
 export const DEFAULT_CONFIG_PATH = "/etc/agent-vm-native/config.json";
 export const DEFAULT_TIMER_DIR = "/etc/systemd/system";
 export const REQUIRED_ENVIRONMENT_FIELDS = [
@@ -127,16 +129,18 @@ export class ControlError extends Error {
   readonly rawDetail: unknown;
 
   constructor(code: string, message: string, detail: unknown = undefined) {
-    super(message);
+    const safeMessage = boundedDiagnosticText(String(message), DIAGNOSTIC_MESSAGE_LIMIT);
+    super(safeMessage);
     this.name = "ControlError";
     this.code = code;
     this.rawDetail = detail;
     Object.defineProperty(this, "rawDetail", { enumerable: false });
+    this.message = safeMessage;
     this.detail = detail === undefined ? undefined : redactDiagnosticValue(detail);
   }
 
   asDict(): Dict {
-    const value: Dict = { code: this.code, message: this.message };
+    const value: Dict = { code: this.code, message: boundedDiagnosticText(this.message, DIAGNOSTIC_MESSAGE_LIMIT) };
     if (this.detail !== undefined) value.detail = redactDiagnosticValue(this.detail);
     return value;
   }
@@ -154,22 +158,38 @@ function isDict(value: unknown): value is Dict {
 }
 
 const SENSITIVE_FIELD_RE = /(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)/i;
+const SECRET_LABEL = "(?:[A-Za-z0-9]+[_-])*(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)(?:[_-][A-Za-z0-9]+)*";
+const PRIVATE_KEY_RE = /-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 _-]*PRIVATE KEY-----/gi;
+const AUTH_SCHEME_RE = /(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?(?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]+/gi;
+const AUTH_BASIC_RE = /(\bbasic\s+)[A-Za-z0-9._~+/=-]+/gi;
+const SECRET_DOUBLE_RE = new RegExp(`(['\\\"]?\\b${SECRET_LABEL}\\b['\\\"]?\\s*[:=]\\s*)\\"[^\\"\\r\\n]*\\"`, "gi");
+const SECRET_SINGLE_RE = new RegExp(`(['\\\"]?\\b${SECRET_LABEL}\\b['\\\"]?\\s*[:=]\\s*)'[^'\\r\\n]*'`, "gi");
+const SECRET_TOKEN_RE = new RegExp(`(['\\\"]?\\b${SECRET_LABEL}\\b['\\\"]?\\s*[:=]\\s*)([^\\s,;}}\\]\\\\\\"']+)`, "gi");
+const SSHPASS_RE = /(\bsshpass\b[ \t]+-p)[^\r\n]*/gi;
+const URL_CREDENTIAL_RE = /(\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s:@]+:)([^@\s/]+)(@)/gi;
+const BEARER_RE = /(bearer\s+)[A-Za-z0-9._~+/=-]+/gi;
 
 function redactDiagnosticText(rawInput: string): string {
-  const privateKey = /-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 _-]*PRIVATE KEY-----|$)/gi;
-  let redacted = rawInput.replace(privateKey, "[REDACTED PRIVATE KEY]");
-  const secretLabel = "(?:[A-Za-z0-9]+[_-])*(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)(?:[_-][A-Za-z0-9]+)*";
-  redacted = redacted.replace(new RegExp(`(?<label>[\\\"']?\\bauthorization\\b[\\\"']?\\s*(?:[:=]\\s*)?[\\\"']?bearer\\s+)[A-Za-z0-9._~+/=-]+`, "gi"), "$<label>[REDACTED]");
-  redacted = redacted.replace(new RegExp(`(?<label>[\\\"']?${secretLabel}[\\\"']?)(?<separator>\\s*[:=]\\s*)(?<quote>[\\\"'])(?<value>.*?)(\\k<quote>)`, "gis"), "$<label>$<separator>$<quote>[REDACTED]$<quote>");
-  redacted = redacted.replace(new RegExp(`(?<label>[\\\"']?${secretLabel}[\\\"']?)(?<separator>\\s*[:=]\\s*)(?<value>[^\\s,;}}\\]\\\"']+)`, "gi"), "$<label>$<separator>[REDACTED]");
-  redacted = redacted.replace(/(\bsshpass\b[ \t]+-p)[\s\S]*/is, "$1 [REDACTED]");
-  redacted = redacted.replace(/(\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s:@]+:)([^@\s/]+)(@)/gi, "$1[REDACTED]$3");
-  return redacted.replace(/(bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1[REDACTED]");
+  let redacted = rawInput.replace(PRIVATE_KEY_RE, "[REDACTED PRIVATE KEY]");
+  redacted = redacted.replace(AUTH_SCHEME_RE, "$1[REDACTED]");
+  redacted = redacted.replace(AUTH_BASIC_RE, "$1[REDACTED]");
+  redacted = redacted.replace(SECRET_DOUBLE_RE, "$1\"[REDACTED]\"");
+  redacted = redacted.replace(SECRET_SINGLE_RE, "$1'[REDACTED]'");
+  redacted = redacted.replace(SECRET_TOKEN_RE, "$1[REDACTED]");
+  redacted = redacted.replace(SSHPASS_RE, "$1 [REDACTED]");
+  redacted = redacted.replace(URL_CREDENTIAL_RE, "$1[REDACTED]$3");
+  return redacted.replace(BEARER_RE, "$1[REDACTED]");
+}
+
+function boundedDiagnosticText(rawInput: string, limit: number): string {
+  const redacted = redactDiagnosticText(rawInput);
+  if (redacted.length <= limit) return redacted;
+  return redacted.slice(0, Math.max(0, limit - DIAGNOSTIC_LOG_TRUNCATION_MARKER.length)) + DIAGNOSTIC_LOG_TRUNCATION_MARKER;
 }
 
 function redactDiagnosticValue(value: unknown, depth = 0): unknown {
   if (depth > 8) return "[REDACTED]";
-  if (typeof value === "string") return redactDiagnosticText(value);
+  if (typeof value === "string") return boundedDiagnosticText(value, DIAGNOSTIC_LOG_LIMIT);
   if (Array.isArray(value)) return value.map((entry) => redactDiagnosticValue(entry, depth + 1));
   if (isDict(value)) {
     const result: Dict = Object.create(null);
@@ -181,6 +201,21 @@ function redactDiagnosticValue(value: unknown, depth = 0): unknown {
 
 function hasOwn(value: object, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function validateSuccessEnvelope(response: Dict, action: string, sessionId: string | undefined): Dict {
+  if (response.ok !== true || response.protocol !== PROTOCOL_VERSION || response.action !== action || response.session_id !== (sessionId ?? null) || !isDict(response.result) || typeof response.server_time !== "string") {
+    throw new ControlError("invalid_response", "control success envelope is malformed");
+  }
+  if (!hasOwn(response, "generation")) {
+    throw new ControlError("invalid_response", "control success envelope generation is invalid");
+  }
+  if (response.generation !== null) {
+    try { if (integerBigInt(response.generation, "generation") < 0n) throw new Error("negative"); }
+    catch { throw new ControlError("invalid_response", "control success envelope generation is invalid"); }
+  }
+  if (response.outcome !== "success" && response.outcome !== "replayed") throw new ControlError("invalid_response", "control success envelope outcome is invalid");
+  return response;
 }
 
 function setOwn(value: Dict, key: string, child: unknown): void {
@@ -681,9 +716,51 @@ export class CTResources {
   }
 }
 
+function currentOwnerUid(): number | undefined {
+  return typeof process.geteuid === "function" ? process.geteuid() : undefined;
+}
+
+type ProtectedStats = { isFile(): boolean; isDirectory(): boolean; mode: number | bigint; uid: number };
+
+function validateProtectedStat(path: string, stats: ProtectedStats, kind: "file" | "directory"): void {
+  const expected = kind === "file" ? stats.isFile() : stats.isDirectory();
+  const mode = Number(stats.mode);
+  if (!expected || (mode & 0o022) !== 0 || (kind === "file" && (mode & 0o111) !== 0)) throw new ControlError("config_invalid", `${kind} path has unsafe type or mode`);
+  const owner = currentOwnerUid();
+  if (owner !== undefined && stats.uid !== owner) throw new ControlError("config_invalid", `${kind} path is not owned by the control user`);
+}
+
+function validateProtectedFile(path: string): void {
+  const resolved = resolve(path);
+  const stats = lstatSync(resolved);
+  if (stats.isSymbolicLink()) throw new ControlError("config_invalid", "configuration path must be a regular file and cannot be a symlink");
+  realpathSync(resolved); // Resolve parent aliases such as macOS /tmp without following the final file.
+  validateProtectedStat(resolved, stats, "file");
+  const noFollow = (constants as any).O_NOFOLLOW ?? 0;
+  const fd = openSync(resolved, constants.O_RDONLY | noFollow);
+  try { validateProtectedStat(resolved, fstatSync(fd), "file"); } finally { closeSync(fd); }
+}
+
+export function validateProtectedDirectory(path: string): void {
+  const resolved = resolve(path);
+  const stats = lstatSync(resolved);
+  if (stats.isSymbolicLink()) throw new ControlError("config_invalid", "timer directory must be a real directory and cannot be a symlink");
+  realpathSync(resolved); // Resolve parent aliases such as macOS /tmp without following the final directory.
+  validateProtectedStat(resolved, stats, "directory");
+  const noFollow = (constants as any).O_NOFOLLOW ?? 0;
+  const directoryFlag = (constants as any).O_DIRECTORY ?? 0;
+  const fd = openSync(resolved, constants.O_RDONLY | noFollow | directoryFlag);
+  try { validateProtectedStat(resolved, fstatSync(fd), "directory"); } finally { closeSync(fd); }
+}
+
 export function readJsonFile(path: string): Dict {
   try {
-    const value = parseJson(decodeUtf8Strict(readFileSync(path)));
+    validateProtectedFile(path);
+    const noFollow = (constants as any).O_NOFOLLOW ?? 0;
+    const fd = openSync(resolve(path), constants.O_RDONLY | noFollow);
+    let bytes: Uint8Array;
+    try { validateProtectedStat(path, fstatSync(fd), "file"); bytes = readFileSync(fd); } finally { closeSync(fd); }
+    const value = parseJson(decodeUtf8Strict(bytes));
     if (!isDict(value)) throw new Error("root");
     return value;
   } catch (error) {
@@ -730,6 +807,7 @@ export function loadConfig(path = DEFAULT_CONFIG_PATH): Dict {
   config.state_db = configString(config.state_db, "state_db");
   config.timer_dir = configString(config.timer_dir, "timer_dir");
   if (!Array.isArray(config.required_guest_tools) || !config.required_guest_tools.every((item: unknown) => typeof item === "string" && item.length > 0)) throw new ControlError("config_invalid", "required_guest_tools must be a list of strings");
+  try { validateProtectedDirectory(config.timer_dir); } catch (error) { if (error instanceof ControlError) throw error; throw new ControlError("config_invalid", "timer directory cannot be verified"); }
   return config;
 }
 
@@ -737,12 +815,13 @@ type CompletedProcess = { args: string[]; returncode: number; stdout: Uint8Array
 type RunOptions = { inputData?: Uint8Array | string; timeout?: number; check?: boolean };
 type BoundedOptions = { timeout?: number; stdoutLimit?: number; stderrLimit?: number; check?: boolean };
 
-async function readBounded(stream: ReadableStream<Uint8Array>, limit: number, tail: boolean, signal?: AbortSignal): Promise<{ bytes: Uint8Array; truncated: boolean }> {
+async function readBounded(stream: ReadableStream<Uint8Array>, limit: number, tail: boolean, signal?: AbortSignal, redactTail = false): Promise<{ bytes: Uint8Array; truncated: boolean }> {
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
   let retained = 0;
   let seen = 0;
   let truncated = false;
+  let rawTruncated = false;
   const cancel = (): void => { void reader.cancel(); };
   signal?.addEventListener("abort", cancel, { once: true });
   try {
@@ -757,6 +836,11 @@ async function readBounded(stream: ReadableStream<Uint8Array>, limit: number, ta
         if (available) chunks.push(chunk.slice(0, available));
         retained += available;
         if (seen > limit) truncated = true;
+      } else if (redactTail) {
+        const available = Math.max(0, Math.min(RAW_DIAGNOSTIC_CAPTURE_LIMIT - retained, chunk.length));
+        if (available) chunks.push(chunk.slice(0, available));
+        retained += available;
+        if (seen > RAW_DIAGNOSTIC_CAPTURE_LIMIT) rawTruncated = true;
       } else if (limit > 0) {
         chunks.push(chunk.slice());
         retained += chunk.length;
@@ -775,6 +859,11 @@ async function readBounded(stream: ReadableStream<Uint8Array>, limit: number, ta
   const output = new Uint8Array(chunks.reduce((size, entry) => size + entry.length, 0));
   let offset = 0;
   for (const entry of chunks) { output.set(entry, offset); offset += entry.length; }
+  if (redactTail) {
+    if (rawTruncated) return { bytes: encode(DIAGNOSTIC_LOG_TRUNCATION_MARKER).slice(0, Math.max(0, limit)), truncated: true };
+    const redacted = encode(redactDiagnosticText(decode(output)));
+    return { bytes: redacted.slice(Math.max(0, redacted.length - limit)), truncated: redacted.length > limit };
+  }
   return { bytes: output.slice(Math.max(0, output.length - limit)), truncated: tail ? seen > limit : truncated };
 }
 
@@ -845,7 +934,7 @@ export class CommandRunner {
     }
     const readAbort = new AbortController();
     const stdoutPromise = readBounded(processHandle.stdout, options.stdoutLimit ?? DIAGNOSTIC_LOG_LIMIT, false, readAbort.signal);
-    const stderrPromise = readBounded(processHandle.stderr, options.stderrLimit ?? 4000, true, readAbort.signal);
+    const stderrPromise = readBounded(processHandle.stderr, options.stderrLimit ?? 4000, true, readAbort.signal, true);
     const timeoutMs = (options.timeout ?? 60) * 1000;
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
     const exit = processHandle.exited;
@@ -1223,7 +1312,21 @@ function acquireWriterIntent(directory: string): () => void {
   const noFollow = (constants as any).O_NOFOLLOW ?? 0;
   const path = join(directory, `native-writer-${randomUUID()}`);
   const fd = openSync(path, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | noFollow, 0o600);
-  try { flock(fd, 2); } catch (error) {
+  const token = randomUUID();
+  const writeMarker = (value: string): void => {
+    const bytes = Buffer.from(value, "utf8");
+    ftruncateSync(fd, 0);
+    writeSync(fd, bytes, 0, bytes.length, 0);
+  };
+  try {
+    // Publish a pending marker before taking the lock. Readers treat this
+    // state as active, so a marker cannot be reclaimed in the pre-flock gap.
+    writeMarker(`pending ${process.pid} ${token}\n`);
+    fsyncSync(fd);
+    flock(fd, 2);
+    writeMarker(`ready__ ${process.pid} ${token}\n`);
+    fsyncSync(fd);
+  } catch (error) {
     try { closeSync(fd); } catch { /* The descriptor is already closed. */ }
     try { unlinkSync(path); } catch { /* The marker may not have been created. */ }
     throw new ControlError("lock_failed", "native writer intent could not be acquired");
@@ -1252,7 +1355,18 @@ function hasWriterIntent(directory: string): boolean {
     let stale = false;
     try {
       fd = openSync(path, constants.O_RDWR | noFollow);
-      try { flock(fd, 2 | 4); stale = true; } catch { active = true; }
+      const marker = String(readFileSync(fd, "utf8"));
+      if (marker.startsWith("pending ")) {
+        const pid = Number(marker.split(/\s+/, 3)[1]);
+        if (Number.isSafeInteger(pid) && pid > 1) {
+          try { process.kill(pid, 0); active = true; } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ESRCH") active = true;
+            else { try { flock(fd, 2 | 4); stale = true; } catch { active = true; } }
+          }
+        } else active = true;
+      } else if (marker.startsWith("ready__ ")) {
+        try { flock(fd, 2 | 4); stale = true; } catch { active = true; }
+      } else active = true;
     } catch { active = true; }
     finally { if (fd !== undefined) closeSync(fd); }
     if (stale) try { unlinkSync(path); } catch { /* Another process may have reclaimed it. */ }
@@ -1261,7 +1375,14 @@ function hasWriterIntent(directory: string): boolean {
 }
 
 export class SystemdManager {
-  constructor(readonly runner: CommandRunner, readonly config: Dict, readonly enabled = true) {}
+  constructor(readonly runner: CommandRunner, readonly config: Dict, readonly enabled = true) {
+    if (enabled) {
+      try { validateProtectedDirectory(String(config.timer_dir)); } catch (error) {
+        if (error instanceof ControlError) throw error;
+        throw new ControlError("config_invalid", "timer directory cannot be verified");
+      }
+    }
+  }
 
   private get timerDir(): string { return String(this.config.timer_dir); }
 
@@ -1482,7 +1603,7 @@ export class Control {
           response.current_state = task ? this.stateSummary(task) : null;
           if (action === "renew" && task && this.stateSummary(task).effective_lease) await this.scheduleExpiry(task);
         }
-        return response;
+        return validateSuccessEnvelope(response, action, sessionId);
       }
       numberFromInteger(requiredOwn(request, "generation"), "generation", 0);
       if (action !== "renew") await this.globalLock(() => this.store.recordOperation(operationId, action, sessionId, request.generation, { outcome: "pending", _request_digest: digest }));
@@ -1490,11 +1611,12 @@ export class Control {
     try {
       const result = await this.dispatchAction(action, request, sessionId);
       const response: Dict = { ok: true, protocol: PROTOCOL_VERSION, server_time: isoTime(this.now()), action, session_id: sessionId ?? null, generation: request.generation ?? null, operation_id: operationId ?? null, outcome: "success", result };
+      const validated = validateSuccessEnvelope(response, action, sessionId);
       await this.globalLock(() => {
         if (operationId && Control.WRITE_ACTIONS.has(action) && action !== "renew") this.store.recordOperation(operationId, action, sessionId, request.generation, { ...response, _request_digest: digest });
         if (sessionId) this.store.audit(action, "ok", result, undefined, sessionId, request.generation);
       });
-      return response;
+      return validated;
     } catch (error) {
       if (error instanceof ControlError) {
         await this.globalLock(() => {
@@ -2232,11 +2354,17 @@ export class Control {
     if (!isDict(acl) || !isDict(acl.config) || acl.config["user.agent-vm.managed"] !== "native-v1") throw new ControlError("network_unverified", "isolation ACL ownership is not verified");
     const fields = ["action", "state", "source", "destination", "protocol", "source_port", "destination_port", "icmp_type", "icmp_code"];
     for (const [direction, rules] of Object.entries(this.isolationRules())) {
-      const normalized = dictArray(acl[direction], "network_unverified", `isolation ACL ${direction} contains an invalid rule`).map((value) => {
+      const actual = dictArray(acl[direction], "network_unverified", `isolation ACL ${direction} contains an invalid rule`);
+      const normalized = actual.map((value) => {
+        if (Object.keys(value).some((key) => !fields.includes(key))) throw new ControlError("network_unverified", `isolation ACL ${direction} contains an unsupported field`);
         for (const key of fields) if (hasOwn(value, key) && typeof value[key] !== "string") throw new ControlError("network_unverified", `isolation ACL ${direction} contains an invalid ${key} field`);
         return Object.fromEntries(fields.map((key) => [key, value[key] ?? (key === "state" ? "enabled" : "")])) as Dict;
       });
-      for (const rule of rules) { const expected = Object.fromEntries(fields.map((key) => [key, rule[key] ?? (key === "state" ? "enabled" : "")])); if (!normalized.some((item) => stableJson(item) === stableJson(expected))) throw new ControlError("network_unverified", "isolation ACL lacks required peer/host withdrawal rules"); }
+      if (normalized.length !== rules.length) throw new ControlError("network_unverified", `isolation ACL ${direction} contains extra or missing rules`);
+      (rules as Dict[]).forEach((rule: Dict, index: number) => {
+        const expected = Object.fromEntries(fields.map((key) => [key, rule[key] ?? (key === "state" ? "enabled" : "")])) as Dict;
+        if (stableJson(normalized[index]) !== stableJson(expected)) throw new ControlError("network_unverified", `isolation ACL ${direction} is not the exact managed rule set`);
+      });
     }
   }
 

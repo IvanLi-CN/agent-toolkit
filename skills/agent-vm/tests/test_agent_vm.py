@@ -7,6 +7,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -54,7 +55,7 @@ class SessionContractTests(unittest.TestCase):
         self.assertEqual(command[-2:], ["--session-id", "explicit"])
 
     def test_control_uses_bun_for_the_remote_controller(self):
-        response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "status", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "result": {}}
+        response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "status", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 1, "outcome": "success", "result": {}}
         process = CLI.subprocess.CompletedProcess([], 0, CLI.json.dumps(response).encode(), b"")
         with mock.patch.object(CLI, "run_child", return_value=process) as run:
             CLI.control_request("status", session="thread")
@@ -89,7 +90,7 @@ class SessionContractTests(unittest.TestCase):
         self.assertNotIn(b"guest-auth-01", stderr.getvalue())
 
     def test_same_operation_journal_creation_is_idempotent_across_threads(self):
-        response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "acquire", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "operation_id": "same-operation", "result": {}}
+        response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "acquire", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 0, "operation_id": "same-operation", "outcome": "success", "result": {}}
         process = CLI.subprocess.CompletedProcess([], 0, json.dumps(response).encode(), b"")
         with tempfile.TemporaryDirectory() as state:
             with mock.patch.object(CLI, "LOCAL_STATE_ROOT", Path(state)), mock.patch.object(CLI, "run_child", return_value=process):
@@ -117,6 +118,66 @@ class SessionContractTests(unittest.TestCase):
         process = CLI.run_child([CLI.sys.executable, "-c", "import sys; sys.stderr.write('Authorization: Bearer ' + 'x' * 20000)"], capture_stdout=True)
         self.assertLessEqual(len(process.stderr), CLI.DIAGNOSTIC_OUTPUT_LIMIT)
         self.assertIn(CLI.DIAGNOSTIC_TRUNCATION_MARKER, process.stderr)
+
+    def test_admin_drain_mutations_expose_a_reusable_operation_id(self):
+        args = CLI.build_parser().parse_args(["admin", "drain", "enter", "--session-id", "thread", "--operation-id", "drain-op"])
+        self.assertEqual(args.operation_id, "drain-op")
+
+    def test_non_acquire_retry_restores_journaled_generation(self):
+        response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "release", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 3, "operation_id": "release-op", "outcome": "success", "result": {}}
+        process = CLI.subprocess.CompletedProcess([], 0, json.dumps(response).encode(), b"")
+        args = CLI.build_parser().parse_args(["release", "--session-id", "thread", "--operation-id", "release-op"])
+        with tempfile.TemporaryDirectory() as state:
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", Path(state)), mock.patch.object(CLI, "run_child", return_value=process) as run:
+                CLI.write_session_state("thread", {"session_id": "thread", "generation": 7})
+                directory = CLI.local_session_dir("thread") / "operations"
+                directory.mkdir(parents=True, exist_ok=True)
+                CLI.ensure_operation_journal(directory, {"protocol": CLI.PROTOCOL_VERSION, "action": "release", "session_id": "thread", "generation": 3, "operation_id": "release-op"})
+                CLI.mutation("release", args)
+        request = json.loads(run.call_args.kwargs["input_data"])
+        self.assertEqual(request["generation"], 3)
+
+    def test_large_structured_response_is_not_diagnostic_truncated(self):
+        response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "status", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 1, "outcome": "success", "result": {"payload": "x" * (CLI.DIAGNOSTIC_OUTPUT_LIMIT * 2)}}
+        process = CLI.subprocess.CompletedProcess([], 0, json.dumps(response).encode(), b"")
+        with mock.patch.object(CLI, "run_child", return_value=process):
+            actual = CLI.control_request("status", session="thread")
+        self.assertEqual(len(actual["result"]["payload"]), CLI.DIAGNOSTIC_OUTPUT_LIMIT * 2)
+
+    def test_malformed_success_generation_and_outcome_are_rejected(self):
+        base = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "status", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "result": {}}
+        for field, value in (("generation", True), ("outcome", "pending")):
+            response = {**base, "generation": 1, "outcome": "success", field: value}
+            process = CLI.subprocess.CompletedProcess([], 0, json.dumps(response).encode(), b"")
+            with mock.patch.object(CLI, "run_child", return_value=process):
+                with self.assertRaises(CLI.CliError) as error:
+                    CLI.control_request("status", session="thread")
+            self.assertEqual(error.exception.code, "invalid_remote_response")
+
+    def test_basic_credentials_and_long_error_messages_are_redacted_before_bounds(self):
+        value = 'Authorization: Basic dXNlcjpzZWNyZXQ= url=https://user:secret@example.test sshpass -p very-secret'
+        self.assertNotIn("dXNlcjpzZWNyZXQ=", CLI.redact_diagnostic_text(value))
+        self.assertNotIn("secret", CLI.redact_diagnostic_text(value))
+        error = CLI.CliError("remote_failed", "Authorization: Basic " + "secret-value" + "x" * 10000)
+        self.assertLessEqual(len(error.message), CLI.DIAGNOSTIC_MESSAGE_LIMIT)
+        self.assertNotIn("secret-value", error.message)
+
+    def test_timeout_kills_descendant_process_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            child_pid = Path(directory) / "child.pid"
+            code = "import pathlib, subprocess, sys, time; child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); pathlib.Path(sys.argv[1]).write_text(str(child.pid)); time.sleep(30)"
+            with self.assertRaises(CLI.subprocess.TimeoutExpired):
+                CLI.run_child([CLI.sys.executable, "-c", code, str(child_pid)], timeout=0.1)
+            pid = int(child_pid.read_text())
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                try:
+                    CLI.os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("descendant survived process-group cleanup")
 
 
 if __name__ == "__main__":

@@ -367,6 +367,41 @@ linuxTest("prevents a queued cross-process drain writer from being bypassed by r
   }
 });
 
+linuxTest("does not reclaim a pending writer marker before its flock transition", async () => {
+  const probeRoot = root("agent-vm-native-marker-race");
+  const dbPath = join(probeRoot, "state.sqlite3");
+  const initial = new StateStore(dbPath);
+  initial.close();
+  const lockDirectory = join(probeRoot, "locks");
+  mkdirSync(lockDirectory, { recursive: true });
+  const marker = join(lockDirectory, "native-writer-pending");
+  writeFileSync(marker, `pending ${process.pid} marker-test\n`, { mode: 0o600 });
+  const worker = `
+    const { existsSync } = await import("node:fs");
+    const { Control, StateStore } = await import(process.env.CONTROL_PATH);
+    const root = process.env.PROBE_ROOT;
+    const store = new StateStore(root + "/state.sqlite3");
+    const control = new Control({ state_db: root + "/state.sqlite3", timer_dir: root }, { store });
+    try {
+      await control.nativeBarrier(async () => { await Bun.write(root + "/reader-entered", "1"); }, false);
+    } finally { store.close(); }
+  `;
+  const child = spawnWorker(worker, { PROBE_ROOT: probeRoot });
+  let collected = false;
+  try {
+    await Bun.sleep(250);
+    expect(existsSync(join(probeRoot, "reader-entered"))).toBe(false);
+    rmSync(marker, { force: true });
+    const result = await collect(child);
+    collected = true;
+    expect(result.exit).toBe(0);
+    expect(existsSync(join(probeRoot, "reader-entered"))).toBe(true);
+  } finally {
+    rmSync(marker, { force: true });
+    if (!collected) await collect(child).catch(() => undefined);
+  }
+});
+
 linuxTest("serializes concurrent SQLite admission and preserves the single reservation", async () => {
   const probeRoot = root("agent-vm-admission");
   const dbPath = join(probeRoot, "state.sqlite3");

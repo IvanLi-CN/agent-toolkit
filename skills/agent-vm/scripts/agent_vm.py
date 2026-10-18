@@ -18,6 +18,7 @@ from pathlib import Path
 import re
 import selectors
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,10 @@ DEFAULT_CONTROL_TIMEOUT_SECONDS = 240
 LONG_CONTROL_TIMEOUT_SECONDS = 600
 DIAGNOSTIC_OUTPUT_LIMIT = 8192
 DIAGNOSTIC_TRUNCATION_MARKER = b"\n[TRUNCATED BY DIAGNOSTIC LIMIT]"
+CONTROL_RESPONSE_LIMIT = 4 * 1024 * 1024
+CHILD_DRAIN_GRACE_SECONDS = 1.0
+DIAGNOSTIC_MESSAGE_LIMIT = 4096
+DEFAULT_CHILD_TIMEOUT_SECONDS = 600
 SESSION_ENV = "AGENT_VM_SESSION_ID"
 CONTROL_HOST_ENV = "AGENT_VM_CONTROL_HOST"
 REMOTE_CONTROL_ENV = "AGENT_VM_REMOTE_CONTROL"
@@ -43,25 +48,43 @@ LOCAL_STATE_ROOT = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".loc
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.:@/-]{1,160}$")
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
 SENSITIVE_FIELD_RE = re.compile(r"(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)", re.IGNORECASE)
+SECRET_LABELS = r"(?:[A-Za-z0-9]+[_-])*(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)(?:[_-][A-Za-z0-9]+)*"
+PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 _-]*PRIVATE KEY-----", re.IGNORECASE)
+AUTH_SCHEME_RE = re.compile(r"(?i)(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?(?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]+")
+AUTH_BASIC_RE = re.compile(r"(?i)(\bbasic\s+)[A-Za-z0-9._~+/=-]+")
+SECRET_DOUBLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)\"[^\"\r\n]*\"")
+SECRET_SINGLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)'[^'\r\n]*'")
+SECRET_TOKEN_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)([^\s,;}}\]\\\"']+)")
+SSHPASS_RE = re.compile(r"(?i)(\bsshpass\b[ \t]+-p)[^\r\n]*")
+URL_CREDENTIAL_RE = re.compile(r"(?i)(\b[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:)([^@\s/]+)(@)")
+BEARER_RE = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+")
 
 
 def redact_diagnostic_text(value: str) -> str:
-    private_key = re.compile(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 _-]*PRIVATE KEY-----|$)", re.IGNORECASE)
-    redacted = private_key.sub("[REDACTED PRIVATE KEY]", value)
-    labels = r"(?:[A-Za-z0-9]+[_-])*(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)(?:[_-][A-Za-z0-9]+)*"
-    redacted = re.sub(rf"(?i)(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[REDACTED]", redacted)
-    redacted = re.sub(rf"(?i)(['\"]?\b{labels}\b['\"]?\s*[:=]\s*)(['\"])[^\r\n]*?\2", r"\1\2[REDACTED]\2", redacted)
-    redacted = re.sub(rf"(?i)(['\"]?\b{labels}\b['\"]?\s*[:=]\s*)([^\s,;}}\]\\\"']+)", r"\1[REDACTED]", redacted)
-    redacted = re.sub(r"(?i)(\bsshpass\b[ \t]+-p)[\s\S]*", r"\1 [REDACTED]", redacted)
-    redacted = re.sub(r"(?i)(\b[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:)([^@\s/]+)(@)", r"\1[REDACTED]\3", redacted)
-    return re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[REDACTED]", redacted)
+    redacted = PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", value)
+    redacted = AUTH_SCHEME_RE.sub(r"\1[REDACTED]", redacted)
+    redacted = AUTH_BASIC_RE.sub(r"\1[REDACTED]", redacted)
+    redacted = SECRET_DOUBLE_RE.sub(r'\1"[REDACTED]"', redacted)
+    redacted = SECRET_SINGLE_RE.sub(r"\1'[REDACTED]'", redacted)
+    redacted = SECRET_TOKEN_RE.sub(r"\1[REDACTED]", redacted)
+    redacted = SSHPASS_RE.sub(r"\1 [REDACTED]", redacted)
+    redacted = URL_CREDENTIAL_RE.sub(r"\1[REDACTED]\3", redacted)
+    return BEARER_RE.sub(r"\1[REDACTED]", redacted)
+
+
+def bounded_diagnostic_text(value: str, limit: int = DIAGNOSTIC_MESSAGE_LIMIT) -> str:
+    redacted = redact_diagnostic_text(value)
+    if len(redacted) <= limit:
+        return redacted
+    marker = DIAGNOSTIC_TRUNCATION_MARKER.decode("utf-8")
+    return redacted[: max(0, limit - len(marker))] + marker
 
 
 def redact_diagnostic_value(value: Any, depth: int = 0) -> Any:
     if depth > 8:
         return "[REDACTED]"
     if isinstance(value, str):
-        return redact_diagnostic_text(value)
+        return bounded_diagnostic_text(value, DIAGNOSTIC_OUTPUT_LIMIT)
     if isinstance(value, list):
         return [redact_diagnostic_value(item, depth + 1) for item in value]
     if isinstance(value, dict):
@@ -71,9 +94,10 @@ def redact_diagnostic_value(value: Any, depth: int = 0) -> Any:
 
 class CliError(Exception):
     def __init__(self, code: str, message: str, detail: Any = None, exit_code: int = 2):
-        super().__init__(message)
+        safe_message = bounded_diagnostic_text(str(message))
+        super().__init__(safe_message)
         self.code = code
-        self.message = message
+        self.message = safe_message
         self.detail = redact_diagnostic_value(detail) if detail is not None else None
         self.exit_code = exit_code
 
@@ -168,9 +192,9 @@ class _BoundedCapture:
         elif len(self.value) < self.limit:
             self.value.extend(chunk[: self.limit - len(self.value)])
 
-    def finish(self) -> bytes:
+    def finish(self, *, marker: bool = True) -> bytes:
         value = bytes(self.value)
-        if self.seen <= self.limit:
+        if not marker or self.seen <= self.limit:
             return value
         available = max(0, self.limit - len(DIAGNOSTIC_TRUNCATION_MARKER))
         if self.tail:
@@ -178,8 +202,42 @@ class _BoundedCapture:
         return value[:available] + DIAGNOSTIC_TRUNCATION_MARKER
 
 
+def terminate_process_group(process: subprocess.Popen[Any]) -> None:
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=0.25)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    else:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+
+
 def run_child(argv: Sequence[str], *, input_data: bytes | None = None,
-              capture_stdout: bool = False, timeout: float | None = None) -> subprocess.CompletedProcess:
+              capture_stdout: bool = False, stdout_limit: int = DIAGNOSTIC_OUTPUT_LIMIT,
+              timeout: float | None = None) -> subprocess.CompletedProcess:
     try:
         process = subprocess.Popen(
             list(argv),
@@ -187,12 +245,15 @@ def run_child(argv: Sequence[str], *, input_data: bytes | None = None,
             stdout=subprocess.PIPE if capture_stdout else None,
             stderr=subprocess.PIPE,
             close_fds=True,
+            start_new_session=os.name == "posix",
         )
     except FileNotFoundError:
         raise
     selector = selectors.DefaultSelector()
-    stdout_capture = _BoundedCapture(DIAGNOSTIC_OUTPUT_LIMIT, tail=False)
-    stderr_capture = _BoundedCapture(DIAGNOSTIC_OUTPUT_LIMIT, tail=True)
+    stdout_capture = _BoundedCapture(stdout_limit, tail=False)
+    # Keep the diagnostic prefix. A bounded tail can retain an unlabeled secret
+    # suffix after truncation, even when the retained bytes are redacted later.
+    stderr_capture = _BoundedCapture(DIAGNOSTIC_OUTPUT_LIMIT, tail=False)
     input_view = memoryview(input_data or b"")
     input_offset = 0
 
@@ -216,35 +277,33 @@ def run_child(argv: Sequence[str], *, input_data: bytes | None = None,
             selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
         else:
             process.stdin.close()
-    deadline = None if timeout is None else time.monotonic() + timeout
+    effective_timeout = DEFAULT_CHILD_TIMEOUT_SECONDS if timeout is None else timeout
+    deadline = time.monotonic() + effective_timeout
+    drain_deadline: float | None = None
     try:
         while selector.get_map() or process.poll() is None:
-            remaining = None if deadline is None else deadline - time.monotonic()
+            if process.poll() is not None and drain_deadline is None:
+                drain_deadline = time.monotonic() + CHILD_DRAIN_GRACE_SECONDS
+            deadlines = [value for value in (deadline, drain_deadline) if value is not None]
+            remaining = None if not deadlines else min(deadlines) - time.monotonic()
             if remaining is not None and remaining <= 0:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-                try:
-                    process.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    pass
-                raise subprocess.TimeoutExpired(list(argv), timeout, output=stdout_capture.finish(), stderr=stderr_capture.finish())
+                if deadline is not None and (drain_deadline is None or deadline <= drain_deadline):
+                    terminate_process_group(process)
+                    raise subprocess.TimeoutExpired(list(argv), effective_timeout, output=stdout_capture.finish(marker=False), stderr=stderr_capture.finish())
+                terminate_process_group(process)
+                for stream in (process.stdout, process.stderr):
+                    if stream is not None:
+                        close_stream(stream)
+                continue
             if not selector.get_map():
                 try:
                     process.wait(timeout=remaining)
                 except subprocess.TimeoutExpired:
-                    try:
-                        process.kill()
-                    except ProcessLookupError:
-                        pass
-                    try:
-                        process.wait(timeout=1)
-                    except subprocess.TimeoutExpired:
-                        pass
-                    raise subprocess.TimeoutExpired(list(argv), timeout, output=stdout_capture.finish(), stderr=stderr_capture.finish())
+                    terminate_process_group(process)
+                    raise subprocess.TimeoutExpired(list(argv), effective_timeout, output=stdout_capture.finish(marker=False), stderr=stderr_capture.finish())
                 break
-            for key, _ in selector.select(remaining):
+            events = selector.select(remaining)
+            for key, _ in events:
                 stream = key.fileobj
                 if key.data == "stdin":
                     try:
@@ -264,13 +323,23 @@ def run_child(argv: Sequence[str], *, input_data: bytes | None = None,
                     (stdout_capture if key.data == "stdout" else stderr_capture).append(chunk)
                 else:
                     close_stream(stream)
-        return subprocess.CompletedProcess(
+        completed = subprocess.CompletedProcess(
             list(argv),
             process.wait(),
-            stdout_capture.finish() if capture_stdout else None,
+            stdout_capture.finish(marker=not capture_stdout) if capture_stdout else None,
             stderr_capture.finish(),
         )
+        completed.stdout_truncated = stdout_capture.seen > stdout_capture.limit if capture_stdout else False
+        return completed
     finally:
+        if process.poll() is None:
+            terminate_process_group(process)
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
         selector.close()
         if process.stdin is not None:
             try:
@@ -315,6 +384,17 @@ def current_generation(value: str) -> int:
     return generation
 
 
+def journal_generation(session: str, operation: str, fallback: int) -> int:
+    path = operation_journal_path(session, operation)
+    if not path.is_file():
+        return fallback
+    record = read_operation_journal(path)
+    value = record["request"].get("generation")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        fail("local_journal_invalid", "operation journal has no valid generation")
+    return value
+
+
 def control_timeout(action: str, fields: dict[str, Any] | None = None) -> int:
     if action in {"acquire", "restart"}:
         return LONG_CONTROL_TIMEOUT_SECONDS
@@ -342,6 +422,7 @@ def control_request(action: str, *, session: str | None, generation: int | None 
         process = run_child(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", control_host,
                              shlex.join(["bun", remote_control])],
                             input_data=json.dumps(request, sort_keys=True).encode(), capture_stdout=True,
+                            stdout_limit=CONTROL_RESPONSE_LIMIT,
                             timeout=control_timeout(action, fields))
     except FileNotFoundError: fail("command_missing", "ssh is not installed")
     except subprocess.TimeoutExpired:
@@ -353,10 +434,17 @@ def control_request(action: str, *, session: str | None, generation: int | None 
     if process.returncode:
         fail("remote_failed", "remote request failed; retry only with its original operation ID",
              {"operation_id": request.get("operation_id")}, process.returncode)
+    if getattr(process, "stdout_truncated", False):
+        fail("invalid_remote_response", "control response exceeds the protocol size limit", {"limit": CONTROL_RESPONSE_LIMIT})
     try: response = json.loads(process.stdout or b"")
     except (ValueError, UnicodeDecodeError): fail("invalid_remote_response", "control did not return JSON")
     if not isinstance(response, dict) or response.get("protocol") != PROTOCOL_VERSION or response.get("action") != action or response.get("session_id") != session:
         fail("protocol_mismatch", "response protocol or request identity differs")
+    generation = response.get("generation")
+    if "generation" not in response or (generation is not None and (isinstance(generation, bool) or not isinstance(generation, int) or generation < 0)):
+        fail("invalid_remote_response", "control response generation is invalid")
+    if response.get("outcome") not in {"success", "replayed"}:
+        fail("invalid_remote_response", "control response outcome is invalid")
     if not response.get("ok") or not isinstance(response.get("result"), dict) or not isinstance(response.get("server_time"), str):
         fail("invalid_remote_response", "invalid control response envelope")
     if write and response.get("operation_id") != request["operation_id"]:
@@ -370,6 +458,8 @@ def run_command(argv: Sequence[str], *, input_data: bytes | None = None, output:
         process = run_child(list(argv), input_data=input_data)
     except FileNotFoundError:
         fail("command_missing", f"command not found: {argv[0]}")
+    except subprocess.TimeoutExpired:
+        fail("command_timeout", f"command timed out: {argv[0]}")
     if process.stderr:
         sys.stderr.buffer.write(redact_diagnostic_text(process.stderr.decode("utf-8", "replace")).encode("utf-8"))
         sys.stderr.flush()
@@ -384,8 +474,10 @@ def make_ssh_key(session: str) -> tuple[Path, str]:
     if not private_key.exists() or not public_key.exists():
         try:
             process = run_child(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(private_key)], capture_stdout=True)
-        except FileNotFoundError as exc:
+        except FileNotFoundError:
             fail("command_missing", "ssh-keygen is not installed")
+        except subprocess.TimeoutExpired:
+            fail("command_timeout", "ssh-keygen timed out")
         if process.returncode != 0:
             fail("keygen_failed", "ssh-keygen failed", process.stderr.decode("utf-8", "replace"))
     os.chmod(private_key, 0o600)
@@ -586,6 +678,7 @@ def build_parser() -> argparse.ArgumentParser:
     drain = admin_sub.add_parser("drain")
     add_session_option(drain, suppress_default=True)
     drain.add_argument("drain_command", choices=("enter", "status", "exit"))
+    add_common_mutation_options(drain)
     reconcile = admin_sub.add_parser("reconcile")
     add_session_option(reconcile, suppress_default=True)
     reconcile.add_argument("--apply", action="store_true")
@@ -611,6 +704,9 @@ def mutation(
     session: str | None = None,
 ) -> dict[str, Any]:
     session = session if session is not None else session_id(getattr(args, "session_id", None))
+    requested_operation = getattr(args, "operation_id", None)
+    if requested_operation and session is not None:
+        generation = journal_generation(session, requested_operation, generation if generation is not None else 0)
     if generation is None and action not in {"acquire", "drain-enter", "drain-exit", "admin-reconcile", "admin-gc"}:
         assert session is not None
         generation = current_generation(session)
@@ -632,13 +728,7 @@ def command_acquire(args: argparse.Namespace) -> int:
     generation = control_request("status", session=session)["result"]["generation"]
     requested_op = getattr(args, "operation_id", None)
     if requested_op:
-        journal = operation_journal_path(session, requested_op)
-        if journal.is_file():
-            record = read_operation_journal(journal)
-            value = record["request"].get("generation")
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                fail("local_journal_invalid", "operation journal has no valid generation")
-            generation = value
+        generation = journal_generation(session, requested_op, generation)
     fields = {"public_key": public_key}
     if args.ssh_host_port is not None: fields["ssh_host_port"] = args.ssh_host_port
     if args.cpu is not None: fields["cpu"] = args.cpu

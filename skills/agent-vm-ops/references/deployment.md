@@ -12,7 +12,7 @@ If the control environment must be rebuilt or recovered, preserve the state and 
 | Native units | systemd assets copied atomically into the configured unit directory |
 | Local client | installed executable and protected session state under the operator's chosen XDG paths |
 
-The deployment supplies the control alias, Incus project/profile/image, network ACL, control address, guest address pool, host port range, storage path, state database and timer directory through the example configuration. Placeholder values must be replaced before installation; missing or invalid values fail closed.
+The deployment supplies the control alias, Incus project/profile/image, network ACL, control address, guest address pool, host port range, storage path, state database and timer directory through the example configuration. The configuration must be a canonical regular file opened without following a final symlink, owned by the control user, and not group- or world-writable. The timer directory must be a canonical real directory with the same ownership and write restrictions. Placeholder values must be replaced before installation; missing or invalid values fail closed.
 
 The control entrypoint and every bundled systemd unit read the same canonical path, `/etc/agent-vm-native/config.json`. Deployment selects the project, image, network, address pool, port range, storage, state database and ACL by installing a protected JSON at that path; alternate runtime config paths are intentionally unsupported so one-shot requests and expiry/reconciliation timers cannot select different state stores.
 

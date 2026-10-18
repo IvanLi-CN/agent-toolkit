@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import selectors
 import shlex
+import signal
 import stat
 import subprocess
 import sys
@@ -20,20 +21,34 @@ import uuid
 
 OWNER = ".agent-vm-sync-owner.json"
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
-SENSITIVE_FIELD_RE = r"(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)"
 DIAGNOSTIC_OUTPUT_LIMIT = 8192
 DIAGNOSTIC_TRUNCATION_MARKER = b"\n[TRUNCATED BY DIAGNOSTIC LIMIT]"
+STRUCTURED_OUTPUT_LIMIT = 16 * 1024 * 1024
+CHILD_DRAIN_GRACE_SECONDS = 1.0
+DEFAULT_CHILD_TIMEOUT_SECONDS = 600
+SECRET_LABELS = r"(?:[A-Za-z0-9]+[_-])*(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)(?:[_-][A-Za-z0-9]+)*"
+PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 _-]*PRIVATE KEY-----", re.IGNORECASE)
+AUTH_SCHEME_RE = re.compile(r"(?i)(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?(?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]+")
+AUTH_BASIC_RE = re.compile(r"(?i)(\bbasic\s+)[A-Za-z0-9._~+/=-]+")
+SECRET_DOUBLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)\"[^\"\r\n]*\"")
+SECRET_SINGLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)'[^'\r\n]*'")
+SECRET_TOKEN_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)([^\s,;}}\]\\\"']+)")
+SSHPASS_RE = re.compile(r"(?i)(\bsshpass\b[ \t]+-p)[^\r\n]*")
+URL_CREDENTIAL_RE = re.compile(r"(?i)(\b[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:)([^@\s/]+)(@)")
+BEARER_RE = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+")
 
 
 def redact_stderr(value: bytes) -> bytes:
     text = value.decode("utf-8", "replace")
-    text = re.sub(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 _-]*PRIVATE KEY-----|$)", "[REDACTED PRIVATE KEY]", text, flags=re.IGNORECASE)
-    text = re.sub(rf"(?i)(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[REDACTED]", text)
-    text = re.sub(rf"(?i)(['\"]?\b{SENSITIVE_FIELD_RE}\b['\"]?\s*[:=]\s*)(['\"])[^\r\n]*?\2", r"\1\2[REDACTED]\2", text)
-    text = re.sub(rf"(?i)(['\"]?\b{SENSITIVE_FIELD_RE}\b['\"]?\s*[:=]\s*)([^\s,;}}\]\\\"']+)", r"\1[REDACTED]", text)
-    text = re.sub(r"(?i)(\bsshpass\b[ \t]+-p)[\s\S]*", r"\1 [REDACTED]", text)
-    text = re.sub(r"(?i)(\b[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:)([^@\s/]+)(@)", r"\1[REDACTED]\3", text)
-    text = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[REDACTED]", text)
+    text = PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", text)
+    text = AUTH_SCHEME_RE.sub(r"\1[REDACTED]", text)
+    text = AUTH_BASIC_RE.sub(r"\1[REDACTED]", text)
+    text = SECRET_DOUBLE_RE.sub(r'\1"[REDACTED]"', text)
+    text = SECRET_SINGLE_RE.sub(r"\1'[REDACTED]'", text)
+    text = SECRET_TOKEN_RE.sub(r"\1[REDACTED]", text)
+    text = SSHPASS_RE.sub(r"\1 [REDACTED]", text)
+    text = URL_CREDENTIAL_RE.sub(r"\1[REDACTED]\3", text)
+    text = BEARER_RE.sub(r"\1[REDACTED]", text)
     return text.encode("utf-8")
 
 
@@ -223,9 +238,9 @@ class _BoundedCapture:
         elif len(self.value) < self.limit:
             self.value.extend(chunk[: self.limit - len(self.value)])
 
-    def finish(self) -> bytes:
+    def finish(self, *, marker: bool = True) -> bytes:
         value = bytes(self.value)
-        if self.seen <= self.limit:
+        if not marker or self.seen <= self.limit:
             return value
         available = max(0, self.limit - len(DIAGNOSTIC_TRUNCATION_MARKER))
         if self.tail:
@@ -233,17 +248,54 @@ class _BoundedCapture:
         return value[:available] + DIAGNOSTIC_TRUNCATION_MARKER
 
 
-def _run_bounded(argv: list[str], *, input_data: bytes | None = None, timeout: float | None = None) -> subprocess.CompletedProcess:
+def _terminate_process_group(process: subprocess.Popen) -> None:
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=0.25)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    else:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _run_bounded(argv: list[str], *, input_data: bytes | None = None, timeout: float | None = None,
+                 stdout_limit: int = DIAGNOSTIC_OUTPUT_LIMIT, structured_stdout: bool = False) -> subprocess.CompletedProcess:
     process = subprocess.Popen(
         argv,
         stdin=subprocess.PIPE if input_data is not None else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         close_fds=True,
+        start_new_session=os.name == "posix",
     )
     selector = selectors.DefaultSelector()
-    stdout_capture = _BoundedCapture(DIAGNOSTIC_OUTPUT_LIMIT, tail=False)
-    stderr_capture = _BoundedCapture(DIAGNOSTIC_OUTPUT_LIMIT, tail=True)
+    stdout_capture = _BoundedCapture(stdout_limit, tail=False)
+    # Retain a bounded prefix so discarded bytes cannot expose an unlabeled
+    # credential suffix after the diagnostic is redacted.
+    stderr_capture = _BoundedCapture(DIAGNOSTIC_OUTPUT_LIMIT, tail=False)
     input_view = memoryview(input_data or b"")
     input_offset = 0
 
@@ -266,30 +318,30 @@ def _run_bounded(argv: list[str], *, input_data: bytes | None = None, timeout: f
             selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
         else:
             process.stdin.close()
-    deadline = None if timeout is None else time.monotonic() + timeout
+    effective_timeout = DEFAULT_CHILD_TIMEOUT_SECONDS if timeout is None else timeout
+    deadline = time.monotonic() + effective_timeout
+    drain_deadline: float | None = None
     try:
         while selector.get_map() or process.poll() is None:
-            remaining = None if deadline is None else deadline - time.monotonic()
+            if process.poll() is not None and drain_deadline is None:
+                drain_deadline = time.monotonic() + CHILD_DRAIN_GRACE_SECONDS
+            deadlines = [value for value in (deadline, drain_deadline) if value is not None]
+            remaining = None if not deadlines else min(deadlines) - time.monotonic()
             if remaining is not None and remaining <= 0:
-                process.kill()
-                try:
-                    process.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    pass
-                raise subprocess.TimeoutExpired(argv, timeout, output=stdout_capture.finish(), stderr=stderr_capture.finish())
+                if deadline is not None and (drain_deadline is None or deadline <= drain_deadline):
+                    _terminate_process_group(process)
+                    raise subprocess.TimeoutExpired(argv, effective_timeout, output=stdout_capture.finish(marker=False), stderr=stderr_capture.finish())
+                _terminate_process_group(process)
+                for stream in (process.stdout, process.stderr):
+                    if stream is not None:
+                        close_stream(stream)
+                continue
             if not selector.get_map():
                 try:
                     process.wait(timeout=remaining)
                 except subprocess.TimeoutExpired:
-                    try:
-                        process.kill()
-                    except ProcessLookupError:
-                        pass
-                    try:
-                        process.wait(timeout=1)
-                    except subprocess.TimeoutExpired:
-                        pass
-                    raise subprocess.TimeoutExpired(argv, timeout, output=stdout_capture.finish(), stderr=stderr_capture.finish())
+                    _terminate_process_group(process)
+                    raise subprocess.TimeoutExpired(argv, effective_timeout, output=stdout_capture.finish(marker=False), stderr=stderr_capture.finish())
                 break
             for key, _ in selector.select(remaining):
                 stream = key.fileobj
@@ -311,8 +363,18 @@ def _run_bounded(argv: list[str], *, input_data: bytes | None = None, timeout: f
                     (stdout_capture if key.data == "stdout" else stderr_capture).append(chunk)
                 else:
                     close_stream(stream)
-        return subprocess.CompletedProcess(argv, process.wait(), stdout_capture.finish(), stderr_capture.finish())
+        completed = subprocess.CompletedProcess(argv, process.wait(), stdout_capture.finish(marker=not structured_stdout), stderr_capture.finish())
+        completed.stdout_truncated = stdout_capture.seen > stdout_capture.limit
+        return completed
     finally:
+        if process.poll() is None:
+            _terminate_process_group(process)
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
         selector.close()
         if process.stdin is not None:
             try:
@@ -323,9 +385,14 @@ def _run_bounded(argv: list[str], *, input_data: bytes | None = None, timeout: f
 
 def run(argv: list[str], **kwargs) -> subprocess.CompletedProcess:
     capture_output = kwargs.pop("capture_output", False)
-    if capture_output:
-        return _run_bounded(argv, input_data=kwargs.pop("input", None), timeout=kwargs.pop("timeout", None))
-    return subprocess.run(argv, check=False, **kwargs)
+    result = _run_bounded(argv, input_data=kwargs.pop("input", None), timeout=kwargs.pop("timeout", DEFAULT_CHILD_TIMEOUT_SECONDS),
+                          stdout_limit=kwargs.pop("stdout_limit", DIAGNOSTIC_OUTPUT_LIMIT),
+                          structured_stdout=kwargs.pop("structured_stdout", False))
+    if kwargs.pop("check", False) and result.returncode:
+        raise subprocess.CalledProcessError(result.returncode, argv, result.stdout, result.stderr)
+    if kwargs:
+        raise TypeError(f"unsupported run options: {', '.join(sorted(kwargs))}")
+    return result
 
 
 def file_sha256(path: Path) -> str:
@@ -337,14 +404,20 @@ def file_sha256(path: Path) -> str:
 
 
 def selected_files(root: Path) -> tuple[list[bytes], dict]:
-    modules = run(["git", "-C", str(root), "ls-files", "--stage", "-z"], capture_output=True)
+    modules = run(["git", "-C", str(root), "ls-files", "--stage", "-z"], capture_output=True,
+                  stdout_limit=STRUCTURED_OUTPUT_LIMIT, structured_stdout=True)
     if modules.returncode:
         raise SyncFailure("cannot inspect Git index", modules.returncode)
+    if getattr(modules, "stdout_truncated", False) or (modules.stdout and not modules.stdout.endswith(b"\0")):
+        raise SyncFailure("Git index inventory is truncated or malformed")
     if any(entry.startswith(b"160000 ") for entry in modules.stdout.split(b"\0")):
         raise SyncFailure("submodules are unsupported; use explicit native upload/rsync")
-    result = run(["git", "-C", str(root), "ls-files", "-co", "--exclude-standard", "-z"], capture_output=True)
+    result = run(["git", "-C", str(root), "ls-files", "-co", "--exclude-standard", "-z"], capture_output=True,
+                 stdout_limit=STRUCTURED_OUTPUT_LIMIT, structured_stdout=True)
     if result.returncode:
         raise SyncFailure("cannot select Git files", result.returncode)
+    if getattr(result, "stdout_truncated", False) or (result.stdout and not result.stdout.endswith(b"\0")):
+        raise SyncFailure("Git file inventory is truncated or malformed")
     names, manifest = [], {}
     for raw in sorted(set(result.stdout.split(b"\0")) - {b""}):
         parts = raw.split(b"/")

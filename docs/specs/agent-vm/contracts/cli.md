@@ -35,7 +35,7 @@ Unknown flags and command layouts must be rejected; callers should use `--help` 
 
 ## Request and response
 
-Requests contain `protocol`, `action`, `session_id`, and mutation fields `generation` and `operation_id`. Success envelopes contain `ok`, `protocol`, `server_time`, `action`, `session_id`, `generation`, `operation_id`, `outcome` and `result`. Error diagnostics are JSON on stderr with a nonzero exit status. A transport timeout reports the operation ID without claiming whether the mutation completed.
+Requests contain `protocol`, `action`, `session_id`, and mutation fields `generation` and `operation_id`. Every successful envelope contains `ok`, `protocol`, `server_time`, `action`, `session_id`, `generation`, `operation_id`, `outcome` and `result`; `generation` is a non-negative integer or `null` for actions without a session generation, and `outcome` is `success` or `replayed`. Drain entry and exit are mutations and accept an explicit operation ID. Error diagnostics are JSON on stderr with a nonzero exit status. A transport timeout reports the operation ID without claiming whether the mutation completed.
 
 Acquire, restart and restart-capable resize use a longer bounded transport timeout. No command implicitly renews a lease. Retry an uncertain mutation only with the original operation ID and generation after inspecting status or reconciliation.
 

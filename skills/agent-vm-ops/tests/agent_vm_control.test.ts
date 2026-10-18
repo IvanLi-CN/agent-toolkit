@@ -1,5 +1,5 @@
 import { afterEach, expect, setDefaultTimeout, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -17,6 +17,7 @@ import {
   StateStore,
   SystemdManager,
   loadConfig,
+  validateProtectedDirectory,
 } from "../scripts/agent_vm_control.ts";
 
 const GIB = 1024 ** 3;
@@ -288,6 +289,7 @@ class Fixture {
   readonly config: Dict;
 
   constructor() {
+    mkdirSync(join(this.root, "systemd"), { recursive: true, mode: 0o755 });
     this.config = {
       project: "agents", profile: "agent-vm", image_alias: "image", image_fingerprint: "a".repeat(64),
       network: "agentsbr0", network_acl: "agent-vm-isolation", pool: "agents", host_address: "198.51.100.19",
@@ -374,6 +376,7 @@ test("loads Bun and Python 3 as managed guest prerequisites", () => {
 
 test("fails closed on missing or invalid environment config before native writes", () => {
   const root = mkdtempSync("/tmp/agent-vm-config-contract-test-");
+  mkdirSync(join(root, "systemd"), { recursive: true, mode: 0o755 });
   const base: Dict = { project: "agents", profile: "agent-vm", image_alias: "image", image_fingerprint: "a".repeat(64), network: "agentsbr0", network_acl: "agent-vm-isolation", pool: "agents", host_address: "198.51.100.19", port_start: 20000, port_end: 20030, vm_ip_start: "198.51.100.20", vm_ip_end: "198.51.100.250", gateway_ip: "198.51.100.1", storage_path: root, state_db: join(root, "state.sqlite3"), timer_dir: join(root, "systemd") };
   const required = ["project", "profile", "image_alias", "image_fingerprint", "network", "network_acl", "pool", "host_address", "port_start", "port_end", "vm_ip_start", "vm_ip_end", "gateway_ip", "storage_path", "state_db", "timer_dir"];
   const runner = new NativeCommands();
@@ -403,8 +406,28 @@ test("fails closed on missing or invalid environment config before native writes
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("requires protected canonical config and timer paths", () => {
+  const root = mkdtempSync("/tmp/agent-vm-path-contract-test-");
+  const timer = join(root, "systemd");
+  mkdirSync(timer, { recursive: true, mode: 0o755 });
+  const base: Dict = { project: "agents", profile: "agent-vm", image_alias: "image", image_fingerprint: "a".repeat(64), network: "agentsbr0", network_acl: "agent-vm-isolation", pool: "agents", host_address: "198.51.100.19", port_start: 20000, port_end: 20030, vm_ip_start: "198.51.100.20", vm_ip_end: "198.51.100.250", gateway_ip: "198.51.100.1", storage_path: root, state_db: join(root, "state.sqlite3"), timer_dir: timer };
+  const configPath = join(root, "config.json");
+  try {
+    writeFileSync(configPath, JSON.stringify(base));
+    chmodSync(configPath, 0o666);
+    expectSyncCode(() => loadConfig(configPath), "config_invalid");
+    chmodSync(configPath, 0o600);
+    const link = join(root, "config-link.json");
+    symlinkSync(configPath, link);
+    expectSyncCode(() => loadConfig(link), "config_invalid");
+    chmodSync(timer, 0o777);
+    expectSyncCode(() => validateProtectedDirectory(timer), "config_invalid");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("accepts scientific ratios and preserves large integer config and request values", () => {
   const root = mkdtempSync("/tmp/agent-vm-numeric-contract-test-");
+  mkdirSync(join(root, "systemd"), { recursive: true, mode: 0o755 });
   const base: Dict = { project: "agents", profile: "agent-vm", image_alias: "image", image_fingerprint: "a".repeat(64), network: "agentsbr0", network_acl: "agent-vm-isolation", pool: "agents", host_address: "198.51.100.19", port_start: 20000, port_end: 20030, vm_ip_start: "198.51.100.20", vm_ip_end: "198.51.100.250", gateway_ip: "198.51.100.1", storage_path: root, state_db: join(root, "state.sqlite3"), timer_dir: join(root, "systemd"), cpu_overcommit_ratio: 1e21, create_cost_bytes: "9007199254740993" };
   const configPath = join(root, "config.json");
   const raw = JSON.stringify(base).replace('"create_cost_bytes":"9007199254740993"', '"create_cost_bytes":9007199254740993');
@@ -477,6 +500,7 @@ test("treats prototype-sensitive JSON keys as data and requires own envelope fie
 
 test("preserves JSON float semantics and Python canonical numeric digests", async () => {
   const root = mkdtempSync("/tmp/agent-vm-numeric-boundary-test-");
+  mkdirSync(join(root, "systemd"), { recursive: true, mode: 0o755 });
   try {
     const base: Dict = { project: "agents", profile: "agent-vm", image_alias: "image", image_fingerprint: "a".repeat(64), network: "agentsbr0", network_acl: "agent-vm-isolation", pool: "agents", host_address: "198.51.100.19", port_start: 20000, port_end: 20030, vm_ip_start: "198.51.100.20", vm_ip_end: "198.51.100.250", gateway_ip: "198.51.100.1", storage_path: root, state_db: join(root, "state.sqlite3"), timer_dir: join(root, "systemd"), cpu_overcommit_ratio: 2e4 };
     const configPath = join(root, "config.json");
@@ -684,6 +708,22 @@ test("fails closed on primitive, null, and array ACL rules before native init", 
       expect(f.runner.calls.some(({ args }) => args[0] === "incus" && args[3] === "init")).toBe(false);
     }
   }
+});
+
+test("requires the exact ordered isolation ACL without extra rules or fields", async () => {
+  const extra = fixture();
+  extra.runner.aclMalformedDirection = "egress";
+  extra.runner.aclMalformedEntries = [{ action: "allow", state: "enabled", destination: "0.0.0.0/0" }];
+  await expectCode(extra.call("acquire", { public_key: KEY }, "op-acl-extra"), "network_unverified");
+  const reordered = fixture();
+  const runner = reordered.runner as any;
+  const original = runner.acl.bind(runner);
+  runner.acl = () => {
+    const value = original();
+    [value.egress[0], value.egress[1]] = [value.egress[1], value.egress[0]];
+    return value;
+  };
+  await expectCode(reordered.call("acquire", { public_key: KEY }, "op-acl-order"), "network_unverified");
 });
 
 test("keeps bounded output and reaps a timed out process group", async () => {
@@ -936,6 +976,26 @@ test("drain protects active leases and reclaim never deletes them", async () => 
   expect(f.store.getTask({ taskId: String(cached.task_id) })?.state).toBe("deleting");
   const deletes = f.runner.calls.filter(({ args }) => args[0] === "incus" && args[3] === "delete");
   expect(deletes.every(({ args }) => !args.includes(active.instance_name))).toBe(true);
+});
+
+test("drain enter and exit retain operation identity and replay safely", async () => {
+  const f = fixture();
+  const enter = f.request("drain-enter", {}, "op-drain-replay-enter");
+  const first = await f.control.dispatch(enter);
+  const replay = await f.control.dispatch(enter);
+  expect(first.generation).toBe(0);
+  expect(first.outcome).toBe("success");
+  expect(replay.generation).toBe(0);
+  expect(replay.outcome).toBe("replayed");
+  const exit = f.request("drain-exit", {}, "op-drain-replay-exit");
+  expect((await f.control.dispatch(exit)).operation_id).toBe("op-drain-replay-exit");
+});
+
+test("bounds and redacts ControlError messages before durable use", () => {
+  const error = new ControlError("remote_failed", `Authorization: Basic dXNlcjpzZWNyZXQ= ${"x".repeat(10_000)}`);
+  expect(error.message.length).toBeLessThanOrEqual(4096);
+  expect(error.message).not.toContain("dXNlcjpzZWNyZXQ=");
+  expect(JSON.stringify(error.asDict())).not.toContain("dXNlcjpzZWNyZXQ=");
 });
 
 test("retains conservative accounting after cleanup failure and reconciles on retry", async () => {

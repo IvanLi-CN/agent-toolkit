@@ -184,6 +184,36 @@ class SessionContractTests(unittest.TestCase):
         self.assertLessEqual(len(redacted), CLI.DIAGNOSTIC_OUTPUT_LIMIT)
         self.assertNotIn(b"pem-canary", redacted)
 
+    def test_quoted_secret_redaction_handles_unterminated_and_escaped_quotes(self):
+        values = [
+            "password" + '="unterminated-secret-canary',
+            "password" + r'="escaped\"-secret-canary',
+            "token" + "='unterminated-token-canary",
+            "token" + r"='escaped\'-token-canary",
+        ]
+        for value in values:
+            self.assertNotIn("canary", CLI.redact_diagnostic_text(value))
+
+    def test_mutation_response_generation_must_match_request(self):
+        response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "release", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 4, "operation_id": "release-op", "outcome": "success", "result": {}}
+        process = CLI.subprocess.CompletedProcess([], 0, json.dumps(response).encode(), b"")
+        with tempfile.TemporaryDirectory() as state:
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", Path(state)), mock.patch.object(CLI, "run_child", return_value=process):
+                with self.assertRaises(CLI.CliError) as error:
+                    CLI.control_request("release", session="thread", generation=3, write=True, operation_id="release-op")
+        self.assertEqual(error.exception.code, "invalid_remote_response")
+
+    def test_session_state_rejects_symlinked_connection_material(self):
+        with tempfile.TemporaryDirectory() as state, tempfile.TemporaryDirectory() as outside:
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", Path(state)):
+                CLI.write_session_state("thread", {"session_id": "thread", "generation": 1})
+                path = CLI.local_session_dir("thread") / "state.json"
+                path.unlink()
+                path.symlink_to(Path(outside) / "state.json")
+                with self.assertRaises(CLI.CliError) as error:
+                    CLI.read_session_state("thread")
+        self.assertEqual(error.exception.code, "local_state_invalid")
+
     def test_timeout_kills_descendant_process_group(self):
         with tempfile.TemporaryDirectory() as directory:
             child_pid = Path(directory) / "child.pid"

@@ -19,6 +19,7 @@ import re
 import selectors
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -54,8 +55,10 @@ PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?---
 UNTERMINATED_PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*$", re.IGNORECASE)
 AUTH_SCHEME_RE = re.compile(r"(?i)(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?(?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]+")
 AUTH_BASIC_RE = re.compile(r"(?i)(\bbasic\s+)[A-Za-z0-9._~+/=-]+")
-SECRET_DOUBLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)\"[^\"\r\n]*\"")
-SECRET_SINGLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)'[^'\r\n]*'")
+SECRET_DOUBLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)\"(?:\\.|[^\"\\\r\n])*\"")
+SECRET_SINGLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)'(?:\\.|[^'\\\r\n])*'")
+UNTERMINATED_SECRET_DOUBLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)\"(?:\\.|[^\"\\\r\n])*$")
+UNTERMINATED_SECRET_SINGLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)'(?:\\.|[^'\\\r\n])*$")
 SECRET_TOKEN_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)([^\s,;}}\]\\\"']+)")
 SSHPASS_RE = re.compile(r"(?i)(\bsshpass\b[ \t]+-p)[^\r\n]*")
 URL_CREDENTIAL_RE = re.compile(r"(?i)(\b[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:)([^@\s/]+)(@)")
@@ -69,6 +72,8 @@ def redact_diagnostic_text(value: str) -> str:
     redacted = AUTH_BASIC_RE.sub(r"\1[REDACTED]", redacted)
     redacted = SECRET_DOUBLE_RE.sub(r'\1"[REDACTED]"', redacted)
     redacted = SECRET_SINGLE_RE.sub(r"\1'[REDACTED]'", redacted)
+    redacted = UNTERMINATED_SECRET_DOUBLE_RE.sub(r'\1"[REDACTED]', redacted)
+    redacted = UNTERMINATED_SECRET_SINGLE_RE.sub(r"\1'[REDACTED]", redacted)
     redacted = SECRET_TOKEN_RE.sub(r"\1[REDACTED]", redacted)
     redacted = SSHPASS_RE.sub(r"\1 [REDACTED]", redacted)
     redacted = URL_CREDENTIAL_RE.sub(r"\1[REDACTED]\3", redacted)
@@ -143,13 +148,79 @@ def local_session_dir(value: str) -> Path:
     return LOCAL_STATE_ROOT / "sessions" / digest
 
 
+def _secure_directory(path: Path, *, code: str = "local_state_invalid") -> Path:
+    path = path.absolute()
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        try:
+            path.mkdir(mode=0o700, parents=True, exist_ok=False)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            fail(code, "local directory cannot be created", str(error))
+        try:
+            current = path.lstat()
+        except OSError:
+            fail(code, "local directory cannot be inspected")
+    except OSError:
+        fail(code, "local directory cannot be inspected")
+    if stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(current.st_mode):
+        fail(code, "local directory must be a real directory")
+    owner = getattr(os, "geteuid", lambda: current.st_uid)()
+    if current.st_uid != owner or stat.S_IMODE(current.st_mode) & 0o022:
+        fail(code, "local directory must be privately owned")
+    os.chmod(path, 0o700)
+    return path
+
+
+def _secure_session_directory(session: str) -> Path:
+    root = _secure_directory(LOCAL_STATE_ROOT)
+    sessions = _secure_directory(root / "sessions")
+    return _secure_directory(sessions / hashlib.sha256(session.encode("utf-8")).hexdigest()[:24])
+
+
+def _secure_config_session_directory(session: str) -> Path:
+    root = _secure_directory(LOCAL_CONFIG_ROOT, code="local_config_invalid")
+    sessions = _secure_directory(root / "sessions", code="local_config_invalid")
+    return _secure_directory(sessions / hashlib.sha256(session.encode("utf-8")).hexdigest()[:24], code="local_config_invalid")
+
+
+def _secure_file(path: Path, *, code: str = "local_state_invalid") -> Path:
+    path = path.absolute()
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        fail(code, "local file is missing")
+    except OSError:
+        fail(code, "local file cannot be inspected")
+    if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode):
+        fail(code, "local file must be a real regular file")
+    owner = getattr(os, "geteuid", lambda: current.st_uid)()
+    if current.st_uid != owner or stat.S_IMODE(current.st_mode) & 0o077 or stat.S_IMODE(current.st_mode) & 0o111:
+        fail(code, "local file must be privately owned")
+    return path
+
+
+def _secure_fd(fd: int, *, code: str = "local_state_invalid") -> None:
+    current = os.fstat(fd)
+    if not stat.S_ISREG(current.st_mode):
+        fail(code, "local file descriptor is not a regular file")
+    owner = getattr(os, "geteuid", lambda: current.st_uid)()
+    if current.st_uid != owner or stat.S_IMODE(current.st_mode) & 0o077 or stat.S_IMODE(current.st_mode) & 0o111:
+        fail(code, "local file descriptor is not privately owned")
+
+
 def operation_journal_path(session: str, operation: str) -> Path:
-    return local_session_dir(session) / "operations" / (hashlib.sha256(operation.encode()).hexdigest() + ".json")
+    return _secure_session_directory(session) / "operations" / (hashlib.sha256(operation.encode()).hexdigest() + ".json")
 
 
 def read_operation_journal(path: Path) -> dict[str, Any]:
     try:
+        _secure_file(path, code="local_journal_invalid")
         value = json.loads(path.read_text(encoding="utf-8"))
+    except CliError:
+        raise
     except (OSError, UnicodeError, ValueError):
         fail("local_journal_invalid", "operation journal is unreadable")
     if not isinstance(value, dict) or not isinstance(value.get("request"), dict):
@@ -158,29 +229,49 @@ def read_operation_journal(path: Path) -> dict[str, Any]:
 
 
 def ensure_operation_journal(directory: Path, request: dict[str, Any]) -> None:
+    session = request.get("session_id")
+    if not isinstance(session, str):
+        fail("local_journal_invalid", "operation journal request has no session identity")
+    expected = _secure_session_directory(session) / "operations"
+    if directory.absolute() != expected.absolute():
+        fail("local_journal_invalid", "operation journal path is outside the session namespace")
+    _secure_directory(expected)
     operation = str(request["operation_id"])
     path = directory / (hashlib.sha256(operation.encode()).hexdigest() + ".json")
     lock_path = path.with_suffix(path.suffix + ".lock")
-    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="utf-8") as lock:
+    if lock_path.exists() or os.path.lexists(lock_path):
+        _secure_file(lock_path)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        lock_fd = os.open(lock_path, flags, 0o600)
+    except OSError as error:
+        fail("local_journal_invalid", "operation journal lock is unsafe", str(error))
+    with os.fdopen(lock_fd, "a+", encoding="utf-8") as lock:
+        _secure_fd(lock.fileno())
         os.fchmod(lock.fileno(), 0o600)
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
-            if path.exists():
+            if os.path.lexists(path):
+                _secure_file(path, code="local_journal_invalid")
                 old = read_operation_journal(path)
                 if old["request"] != request:
                     fail("operation_conflict", "operation ID already describes another request")
                 return
             try:
-                with path.open("x", encoding="utf-8") as handle:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    _secure_fd(handle.fileno())
                     os.fchmod(handle.fileno(), 0o600)
                     json.dump({"request": request, "outcome": "pending"}, handle, sort_keys=True)
                     handle.flush()
                     os.fsync(handle.fileno())
             except FileExistsError:
+                _secure_file(path, code="local_journal_invalid")
                 old = read_operation_journal(path)
                 if old["request"] != request:
                     fail("operation_conflict", "operation ID already describes another request")
+            except OSError as error:
+                fail("local_journal_invalid", "operation journal file is unsafe", str(error))
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
@@ -360,12 +451,17 @@ def run_child(argv: Sequence[str], *, input_data: bytes | None = None,
 
 
 def read_session_state(value: str) -> dict[str, Any]:
-    path = local_session_dir(value) / "state.json"
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            state = json.load(handle)
-    except FileNotFoundError:
+    path = _secure_session_directory(value) / "state.json"
+    if not os.path.lexists(path):
         fail("local_state_missing", "local session state is missing; run acquire first")
+    try:
+        _secure_file(path)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            _secure_fd(handle.fileno())
+            state = json.load(handle)
+    except CliError:
+        raise
     except (OSError, json.JSONDecodeError):
         fail("local_state_invalid", "local session state cannot be read")
     if not isinstance(state, dict):
@@ -374,17 +470,27 @@ def read_session_state(value: str) -> dict[str, Any]:
 
 
 def write_session_state(value: str, state: dict[str, Any]) -> None:
-    directory = local_session_dir(value)
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory = _secure_session_directory(value)
     path = directory / "state.json"
-    temp = path.with_name(f".{path.name}.{os.getpid()}")
-    with temp.open("w", encoding="utf-8") as handle:
-        json.dump(state, handle, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fchmod(handle.fileno(), 0o600)
-        os.fsync(handle.fileno())
-    os.replace(temp, path)
+    if os.path.lexists(path):
+        _secure_file(path)
+    fd, temp_name = tempfile.mkstemp(prefix=".state.json.", dir=directory)
+    temp = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            _secure_fd(handle.fileno())
+            json.dump(state, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fchmod(handle.fileno(), 0o600)
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+        _secure_file(path)
+    finally:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def current_generation(value: str) -> int:
@@ -397,8 +503,9 @@ def current_generation(value: str) -> int:
 
 def journal_generation(session: str, operation: str, fallback: int) -> int:
     path = operation_journal_path(session, operation)
-    if not path.is_file():
+    if not os.path.lexists(path):
         return fallback
+    _secure_file(path)
     record = read_operation_journal(path)
     value = record["request"].get("generation")
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -424,8 +531,7 @@ def control_request(action: str, *, session: str | None, generation: int | None 
     if write: request["operation_id"] = operation_id or str(uuid.uuid4())
     if fields: request.update(fields)
     if write:
-        directory = local_session_dir(session) / "operations"
-        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory = _secure_directory(_secure_session_directory(session) / "operations")
         ensure_operation_journal(directory, request)
     try:
         control_host = os.environ.get(CONTROL_HOST_ENV, DEFAULT_CONTROL_HOST)
@@ -454,6 +560,8 @@ def control_request(action: str, *, session: str | None, generation: int | None 
     generation = response.get("generation")
     if "generation" not in response or (generation is not None and (isinstance(generation, bool) or not isinstance(generation, int) or generation < 0)):
         fail("invalid_remote_response", "control response generation is invalid")
+    if write and request.get("generation") is not None and generation != request["generation"]:
+        fail("invalid_remote_response", "mutation response generation is inconsistent")
     if response.get("outcome") not in {"success", "replayed"}:
         fail("invalid_remote_response", "control response outcome is invalid")
     if not response.get("ok") or not isinstance(response.get("result"), dict) or not isinstance(response.get("server_time"), str):
@@ -485,11 +593,18 @@ def run_command(argv: Sequence[str], *, input_data: bytes | None = None, output:
 
 
 def make_ssh_key(session: str) -> tuple[Path, str]:
-    directory = local_session_dir(session) / "keys"
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory = _secure_directory(_secure_session_directory(session) / "keys")
     private_key = directory / "id_ed25519"
     public_key = private_key.with_suffix(".pub")
-    if not private_key.exists() or not public_key.exists():
+    private_exists = os.path.lexists(private_key)
+    public_exists = os.path.lexists(public_key)
+    if private_exists != public_exists:
+        fail("key_invalid", "SSH key pair is incomplete")
+    if private_exists:
+        _secure_file(private_key)
+        _secure_file(public_key)
+        os.chmod(public_key, 0o600)
+    else:
         try:
             process = run_child(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(private_key)], capture_stdout=True)
         except FileNotFoundError:
@@ -499,6 +614,9 @@ def make_ssh_key(session: str) -> tuple[Path, str]:
         if process.returncode != 0:
             fail("keygen_failed", "ssh-keygen failed", process.stderr.decode("utf-8", "replace"))
     os.chmod(private_key, 0o600)
+    os.chmod(public_key, 0o600)
+    _secure_file(private_key)
+    _secure_file(public_key)
     try:
         key = public_key.read_text(encoding="utf-8").strip()
     except OSError:
@@ -511,8 +629,7 @@ def make_ssh_key(session: str) -> tuple[Path, str]:
 def ssh_paths(session: str, info: dict[str, Any]) -> tuple[Path, Path]:
     task_id = str(info["task_id"])
     generation = int(info["generation"])
-    directory = LOCAL_CONFIG_ROOT / "sessions" / hashlib.sha256(session.encode("utf-8")).hexdigest()[:24]
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory = _secure_config_session_directory(session)
     return directory / f"agent-vm-{task_id}-g{generation}.ssh", directory / f"agent-vm-{task_id}-g{generation}.known_hosts"
 
 
@@ -531,6 +648,10 @@ def write_ssh_config(session: str, info: dict[str, Any], private_key: Path) -> P
     if len(fields) != 2 or fields[0] != "ssh-ed25519" or not re.fullmatch(r"[A-Za-z0-9+/=]+", fields[1]):
         fail("invalid_host_key", "control returned an invalid trusted host key")
     config_path, known_hosts_path = ssh_paths(session, info)
+    expected_key = _secure_session_directory(session) / "keys" / "id_ed25519"
+    if private_key.absolute() != expected_key.absolute():
+        fail("invalid_path", "SSH identity file is outside the session namespace")
+    _secure_file(expected_key)
     known_hosts = f"{alias} {host_key}\n"
     config = (
         "Host agent-vm\n"
@@ -546,13 +667,24 @@ def write_ssh_config(session: str, info: dict[str, Any], private_key: Path) -> P
         "  ControlPath none\n"
     )
     for path, content in ((known_hosts_path, known_hosts), (config_path, config)):
-        temp = path.with_name(f".{path.name}.{os.getpid()}")
-        with temp.open("w", encoding="utf-8") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fchmod(handle.fileno(), 0o600)
-            os.fsync(handle.fileno())
-        os.replace(temp, path)
+        if os.path.lexists(path):
+            _secure_file(path, code="local_config_invalid")
+        fd, temp_name = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
+        temp = Path(temp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                _secure_fd(handle.fileno(), code="local_config_invalid")
+                handle.write(content)
+                handle.flush()
+                os.fchmod(handle.fileno(), 0o600)
+                os.fsync(handle.fileno())
+            os.replace(temp, path)
+            _secure_file(path, code="local_config_invalid")
+        finally:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
     return config_path
 
 
@@ -572,8 +704,10 @@ def fetch_ssh_info(session: str) -> tuple[dict[str, Any], dict[str, Any], Path]:
     private_key = Path(str(state["private_key"]))
     if state.get("task_id") != info["task_id"] or state.get("generation") != info["generation"]:
         fail("generation_mismatch", "connection material belongs to another lease; acquire the current lease first")
-    if not private_key.is_file():
-        fail("key_missing", f"private key is missing: {private_key}")
+    expected_key = _secure_session_directory(session) / "keys" / "id_ed25519"
+    if private_key.absolute() != expected_key.absolute():
+        fail("invalid_path", "session state points outside the session key namespace")
+    _secure_file(expected_key)
     config_path = write_ssh_config(session, info, private_key)
     _, known_hosts = ssh_paths(session, info)
     info.update(identity_file=str(private_key), known_hosts_file=str(known_hosts), ssh_config=str(config_path))

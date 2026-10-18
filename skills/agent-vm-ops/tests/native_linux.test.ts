@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -377,6 +377,7 @@ linuxTest("does not reclaim a pending writer marker before its flock transition"
   mkdirSync(lockDirectory, { recursive: true });
   const marker = join(lockDirectory, "native-writer-pending");
   writeFileSync(marker, `pending ${process.pid} marker-test\n`, { mode: 0o600 });
+  const markerFd = openSync(marker, "r+");
   const worker = `
     const { existsSync } = await import("node:fs");
     const { Control, StateStore } = await import(process.env.CONTROL_PATH);
@@ -393,11 +394,14 @@ linuxTest("does not reclaim a pending writer marker before its flock transition"
     await Bun.sleep(250);
     expect(existsSync(join(probeRoot, "reader-entered"))).toBe(false);
     rmSync(marker, { force: true });
+    closeSync(markerFd);
+    // The marker descriptor is intentionally held across the pending window.
     const result = await collect(child);
     collected = true;
     expect(result.exit).toBe(0);
     expect(existsSync(join(probeRoot, "reader-entered"))).toBe(true);
   } finally {
+    try { closeSync(markerFd); } catch { /* The pending marker descriptor may already be closed. */ }
     rmSync(marker, { force: true });
     if (!collected) await collect(child).catch(() => undefined);
   }
@@ -426,6 +430,52 @@ linuxTest("publishes writer marker state atomically and removes it on release", 
     expect(readFileSync(join(lockDirectory, stateName), "utf8")).toMatch(/^ready__ /);
   } finally { release(); }
   expect(readdirSync(lockDirectory).filter((name) => name.startsWith("native-writer-"))).toEqual([]);
+});
+
+linuxTest("treats a cross-process ready sidecar flock as active", async () => {
+  const probeRoot = root("agent-vm-native-ready-sidecar");
+  const lockDirectory = join(probeRoot, "locks");
+  mkdirSync(lockDirectory, { recursive: true, mode: 0o700 });
+  const worker = [
+    "const { closeSync, openSync, writeFileSync, existsSync } = await import(\"node:fs\");",
+    "const { dlopen } = await import(\"bun:ffi\");",
+    "const { flock } = dlopen(process.platform === \"darwin\" ? \"/usr/lib/libSystem.B.dylib\" : \"libc.so.6\", { flock: { args: [\"int\", \"int\"], returns: \"int\" } }).symbols;",
+    "const marker = process.env.MARKER_PATH;",
+    "writeFileSync(marker, \"ready__ 99999999 unknown sidecar-token\\n\", { mode: 0o600 });",
+    "writeFileSync(marker + \".state\", \"ready__ 99999999 unknown sidecar-token\\n\", { mode: 0o600 });",
+    "const fd = openSync(marker + \".state\", \"r+\");",
+    "if (flock(fd, 2) !== 0) throw new Error(\"sidecar flock failed\");",
+    "await Bun.write(process.env.READY_FILE, \"1\");",
+    "while (!existsSync(process.env.RELEASE_FILE)) await Bun.sleep(5);",
+    "flock(fd, 8);",
+    "closeSync(fd);",
+  ].join("\n");
+  const marker = join(lockDirectory, "native-writer-ready-only");
+  const child = spawnWorker(worker, { MARKER_PATH: marker, READY_FILE: join(probeRoot, "ready"), RELEASE_FILE: join(probeRoot, "release") });
+  let collected = false;
+  try {
+    expect(await waitFor(join(probeRoot, "ready"))).toBe(true);
+    expect(hasWriterIntent(lockDirectory)).toBe(true);
+    await Bun.write(join(probeRoot, "release"), "1");
+    const result = await collect(child);
+    collected = true;
+    expect(result.exit).toBe(0);
+    expect(hasWriterIntent(lockDirectory)).toBe(false);
+  } finally {
+    await Bun.write(join(probeRoot, "release"), "1");
+    if (!collected) await collect(child).catch(() => undefined);
+    rmSync(lockDirectory, { recursive: true, force: true });
+  }
+});
+
+linuxTest("does not trust a live but unowned or reused PID in a pending marker", () => {
+  const probeRoot = root("agent-vm-native-marker-identity");
+  const lockDirectory = join(probeRoot, "locks");
+  mkdirSync(lockDirectory, { recursive: true, mode: 0o700 });
+  const unowned = join(lockDirectory, "native-writer-unowned");
+  writeFileSync(unowned, "pending " + process.pid + " wrong-identity token\n", { mode: 0o600 });
+  expect(hasWriterIntent(lockDirectory)).toBe(false);
+  expect(existsSync(unowned)).toBe(false);
 });
 
 linuxTest("serializes concurrent SQLite admission and preserves the single reservation", async () => {

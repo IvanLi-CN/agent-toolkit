@@ -69,6 +69,7 @@ def main() -> None:
         connection.commit()
     finally:
         connection.close()
+    path.chmod(0o600)
 
 
 if __name__ == "__main__":

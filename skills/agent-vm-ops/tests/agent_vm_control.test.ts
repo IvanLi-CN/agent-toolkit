@@ -1,4 +1,5 @@
 import { afterEach, expect, setDefaultTimeout, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -90,6 +91,7 @@ class NativeCommands extends CommandRunner {
   imageAvailable = true;
   imageType = "virtual-machine";
   guestToolsAvailable = true;
+  waitTimeout = false;
   missingGuestTool: string | undefined;
   onWait: ((name: string, condition: string) => void) | undefined;
   onStart: ((name: string) => void) | undefined;
@@ -108,6 +110,7 @@ class NativeCommands extends CommandRunner {
     const args = [...argv];
     this.calls.push({ args, options });
     if (this.failure?.(args)) throw new ControlError("command_failed", "injected native failure", { returncode: 1, stderr: "injected native failure" });
+    if (this.waitTimeout && args[0] === "incus" && args.includes("wait")) return result(args, "", 1, "timeout");
     if (args[0] === "ss") return result(args);
     if (args[0] === "conntrack") return result(args, args[1] === "-L" ? this.conntrackListOutput : "");
     if (args[0] === "systemctl") return result(args);
@@ -481,6 +484,39 @@ test("rejects invalid identity, protocol, action and generation before native wr
   expect(f.runner.calls).toHaveLength(0);
 });
 
+test("verifies real CT resource accounting and filesystem capacity inputs", () => {
+  const files: Record<string, string> = {
+    "/sys/fs/cgroup/cpu.max": "200000 100000\n",
+    "/sys/fs/cgroup/memory.max": String(8 * GIB),
+    "/sys/fs/cgroup/memory.current": String(5 * GIB),
+    "/sys/fs/cgroup/memory.stat": "anon 1\ninactive_file " + (1 * GIB) + "\n",
+    "/proc/self/mountinfo": "36 25 0:32 / /proc/meminfo rw,relatime - proc proc rw\n",
+  };
+  const resources = new CTResources({ readText: (path) => files[path] ?? (() => { throw new Error("missing fixture: " + path); })(), availableParallelism: () => 8 });
+  expect(resources.cpu()).toBe(2);
+  expect(resources.memory()).toMatchObject({ scope: "ct-memory", sources: ["cgroup-v2"], limit_bytes: 8 * GIB, available_bytes: 4 * GIB });
+
+  files["/sys/fs/cgroup/cpu.max"] = "max 100000\n";
+  expect(resources.cpu()).toBe(8);
+  files["/sys/fs/cgroup/memory.max"] = "max\n";
+  files["/proc/self/mountinfo"] = "36 25 0:32 / /proc/meminfo rw,relatime - fuse.lxcfs lxcfs rw\n";
+  files["/proc/meminfo"] = "MemTotal: 6144 kB\nMemAvailable: 4096 kB\n";
+  expect(resources.memory()).toMatchObject({ sources: ["lxcfs"], limit_bytes: 6144 * 1024, available_bytes: 4096 * 1024 });
+
+  files["/sys/fs/cgroup/memory.max"] = "8192";
+  files["/sys/fs/cgroup/memory.stat"] = "inactive_file 1\ninactive_file 2\n";
+  expectSyncCode(() => resources.memory(), "resource_unverified");
+  files["/sys/fs/cgroup/memory.stat"] = "inactive_file 1\n";
+  files["/sys/fs/cgroup/cpu.max"] = "broken";
+  expectSyncCode(() => resources.cpu(), "resource_unverified");
+
+  const f = fixture();
+  const valid = new Control(f.config, { store: f.store, runner: f.runner, systemd: f.systemd, resources, statfs: () => ({ blocks: 100n * BigInt(GIB), bfree: 40n * BigInt(GIB), bavail: 30n * BigInt(GIB), bsize: 1n }) });
+  expect((valid as any).ensureCapacityVerified().layers[0]).toMatchObject({ total: 100 * GIB, free: 30 * GIB });
+  const invalid = new Control(f.config, { store: f.store, runner: f.runner, systemd: f.systemd, resources, statfs: () => ({ blocks: 100n, bfree: 40n, bavail: 101n, bsize: 1024n }) });
+  expectSyncCode(() => (invalid as any).ensureCapacityVerified(), "capacity_unverified");
+});
+
 test("status envelope generation follows active and absent session state", async () => {
   const f = fixture();
   const absent = await f.control.dispatch({ protocol: PROTOCOL_VERSION, action: "status", session_id: "missing-session" });
@@ -507,6 +543,11 @@ test("success envelopes require a matching operation identity", async () => {
   await expectCode(f.control.dispatch(request), "invalid_response");
 
   cached.operation_id = "different-operation";
+  (f.store.db as any).run("UPDATE operations SET response_json = ? WHERE operation_id = ?", JSON.stringify(cached), "op-envelope-operation");
+  await expectCode(f.control.dispatch(request), "invalid_response");
+
+  cached.operation_id = "op-envelope-operation";
+  cached.generation = 1;
   (f.store.db as any).run("UPDATE operations SET response_json = ? WHERE operation_id = ?", JSON.stringify(cached), "op-envelope-operation");
   await expectCode(f.control.dispatch(request), "invalid_response");
 
@@ -596,6 +637,37 @@ test("fails closed for missing, empty, and invalid runtime state databases", () 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("rejects runtime state without canonical uniqueness and foreign-key contracts", () => {
+  const root = mkdtempSync("/tmp/agent-vm-state-contract-test-");
+  const path = join(root, "state.sqlite3");
+  const db = new Database(path);
+  db.run("CREATE TABLE meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)");
+  db.run("CREATE TABLE tasks (task_id TEXT PRIMARY KEY NOT NULL, session_id TEXT NOT NULL, generation INTEGER NOT NULL, state TEXT NOT NULL, instance_name TEXT NOT NULL, vm_ip TEXT, ssh_host_port INTEGER, lease_expires_at TEXT, inactive_since TEXT, cleanup_after TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_error TEXT, image_fingerprint TEXT NOT NULL, resources_json TEXT NOT NULL DEFAULT '{}', reservation_bytes INTEGER NOT NULL DEFAULT 0, previous_generation INTEGER, resource_reservation_json TEXT NOT NULL DEFAULT '{}')");
+  db.run("CREATE TABLE ports (task_id TEXT NOT NULL, generation INTEGER NOT NULL, port_name TEXT NOT NULL, protocol TEXT NOT NULL, host_port INTEGER NOT NULL, vm_port INTEGER NOT NULL, device_name TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (task_id, port_name, protocol))");
+  db.run("CREATE TABLE operations (operation_id TEXT PRIMARY KEY NOT NULL, action TEXT NOT NULL, session_id TEXT, generation INTEGER, response_json TEXT NOT NULL, created_at TEXT NOT NULL)");
+  db.run("CREATE TABLE audit (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, task_id TEXT, session_id TEXT, generation INTEGER, outcome TEXT NOT NULL, detail_json TEXT, created_at TEXT NOT NULL)");
+  db.close();
+  chmodSync(path, 0o600);
+  try { expectSyncCode(() => new StateStore(path), "state_invalid"); }
+  finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("rejects canonical runtime state with invalid task identity data", () => {
+  const root = mkdtempSync("/tmp/agent-vm-state-data-test-");
+  const path = join(root, "state.sqlite3");
+  const store = StateStore.bootstrap(path);
+  store.close();
+  const db = new Database(path);
+  db.run(
+    "INSERT INTO tasks (task_id,session_id,generation,state,instance_name,vm_ip,ssh_host_port,lease_expires_at,inactive_since,cleanup_after,created_at,updated_at,last_error,image_fingerprint,resources_json,reservation_bytes,previous_generation,resource_reservation_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    ["avm-invalid", "invalid session", 1, "active", "agent-vm-avm-invalid", null, null, null, null, null, "2026-10-04T00:00:00+00:00", "2026-10-04T00:00:00+00:00", null, "a".repeat(64), "{}", 0, null, "{}"],
+  );
+  db.close();
+  chmodSync(path, 0o600);
+  try { expectSyncCode(() => new StateStore(path), "state_invalid"); }
+  finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("projects untrusted result JSON before operation and audit persistence", async () => {
   const f = fixture();
   const sensitiveName = ["extra", "secret"].join("_");
@@ -618,6 +690,15 @@ test("projects untrusted result JSON before operation and audit persistence", as
   expect(audit).not.toContain(canary);
   expect(operation.length).toBeLessThan(16_384);
   expect(audit.length).toBeLessThan(16_384);
+});
+
+test("overlimit persistence keeps an explicit marker and capacity facts", async () => {
+  const f = fixture();
+  (f.control as any).dispatchAction = async () => ({ generation: 0, capacity: { total: 100, free: 40 }, payload: Array.from({ length: 128 }, () => "x".repeat(4096)) });
+  const response = await f.control.dispatch(f.request("acquire", {}, "op-persistence-capacity"));
+  expect(response.result).toMatchObject({ truncated: true, capacity: { total: 100, free: 40 } });
+  const stored = JSON.parse(String((f.store.db.query("SELECT response_json FROM operations WHERE operation_id = ?") as any).get("op-persistence-capacity").response_json));
+  expect(stored.result).toMatchObject({ truncated: true, capacity: { total: 100, free: 40 } });
 });
 
 test("preserves exact decimal native resources through cache persistence", async () => {
@@ -855,6 +936,30 @@ test("redacts command stderr before journal, audit, and diagnostic output", asyn
   expect(JSON.stringify(diagnostic)).not.toContain("quoted-auth-02");
   const pemDiagnostic = new ControlError("command_failed", "native command failed", { stderr: "-----BEGIN OPENSSH PRIVATE KEY-----\n" + "pem-canary-".repeat(2000) }).asDict();
   expect(JSON.stringify(pemDiagnostic)).not.toContain("pem-canary");
+  const values = [
+    ["password", '"unterminated-secret-canary'],
+    ["password", '"escaped\\"-secret-canary'],
+    ["token", "'unterminated-token-canary"],
+    ["token", "'escaped\\'-token-canary"],
+  ].map(([label, value]) => label + "=" + value);
+  for (const value of values) {
+    expect(JSON.stringify(new ControlError("command_failed", "native command failed", { stderr: value }).asDict())).not.toContain("canary");
+  }
+});
+
+test("real guest readiness shares one budget and emits a projected slow-start diagnostic", async () => {
+  const f = fixture();
+  const active = await f.call("acquire", { public_key: KEY }, "op-readiness-budget");
+  f.runner.waitTimeout = true;
+  let failure: ControlError | undefined;
+  try { await (f.control as any).waitGuestReady(f.store.getTask({ taskId: active.task_id })); }
+  catch (error) { failure = error as ControlError; }
+  expect(failure?.code).toBe("guest_readiness_timeout");
+  expect(failure?.detail).toMatchObject({ budget_seconds: 300, readiness: { diagnostic: { emitted: true } } });
+  const waits = f.runner.calls.filter(({ args }) => args[0] === "incus" && args.includes("wait"));
+  expect(waits.length).toBeGreaterThanOrEqual(3);
+  const diagnostic = (f.store.db.query("SELECT detail_json FROM audit WHERE action = ? ORDER BY id DESC LIMIT 1") as any).get("boot-diagnostic") as { detail_json: string };
+  expect(JSON.parse(diagnostic.detail_json)).toMatchObject({ event: "agent-vm-slow-start", readiness: { budget_seconds: 300 } });
 });
 
 test("expiry and drain fences stop preparation before a late native effect", async () => {
@@ -1432,6 +1537,17 @@ test("expiry preempts the lease and leaves the native object cached", async () =
   expect(response.result.state).toBe("cached");
   expect((await f.call("status")).effective_lease).toBe(false);
   expect(f.runner.instances.get(active.instance_name)?.status).toBe("Stopped");
+});
+
+test("lease expiry cleans durable ports before leaving the VM cached", async () => {
+  const f = fixture();
+  const active = await f.call("acquire", { public_key: KEY }, "op-expiry-port-create");
+  await f.call("port-add", { name: "web", vm_port: 8080 }, "op-expiry-port-add");
+  f.now = new Date(active.lease_expires_at);
+  const response = await f.control.dispatch({ protocol: PROTOCOL_VERSION, action: "timer-expire", task_id: active.task_id, generation: active.generation });
+  expect(response.result.state).toBe("cached");
+  expect(response.result.ports).toEqual([]);
+  expect(f.store.getPorts(String(active.task_id))).toEqual([]);
 });
 
 test("native wait distinguishes timeout from a stopped guest", async () => {

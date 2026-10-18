@@ -70,6 +70,16 @@ class SyncTests(unittest.TestCase):
         self.assertLessEqual(len(redacted), MOD.DIAGNOSTIC_OUTPUT_LIMIT)
         self.assertNotIn(b"pem-canary", redacted)
 
+    def test_quoted_secret_redaction_handles_unterminated_and_escaped_quotes(self):
+        values = [
+            "password" + '="unterminated-secret-canary',
+            "password" + r'="escaped\"-secret-canary',
+            "token" + "='unterminated-token-canary",
+            "token" + r"='escaped\'-token-canary",
+        ]
+        for value in values:
+            self.assertNotIn("canary", MOD.redact_stderr(value.encode()).decode())
+
     def test_truncated_git_inventory_fails_closed(self):
         complete = MOD.subprocess.CompletedProcess([], 0, b"", b"")
         truncated = MOD.subprocess.CompletedProcess([], 0, b"tracked-without-nul", b"")

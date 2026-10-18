@@ -1561,7 +1561,9 @@ class Control:
             "stop-unexpected-running-cache", "rearm-current-expiry",
         }
         for item in result["actions"]:
-            if not isinstance(item, Mapping) or not isinstance(item.get("task_id"), str):
+            if (not isinstance(item, Mapping) or not isinstance(item.get("task_id"), str)
+                    or isinstance(item.get("generation"), bool)
+                    or not isinstance(item.get("generation"), int)):
                 raise ControlError("operation_unverified", "reconcile journal action is invalid",
                                    {"operation_id": operation_id})
             if "error" in item:
@@ -1574,12 +1576,33 @@ class Control:
             if item.get("action") not in allowed:
                 raise ControlError("operation_unverified", "reconcile journal action is unknown",
                                    {"operation_id": operation_id})
-            if result["dry_run"] or item["action"] != "finish-delete":
-                continue
             task = self.store.get_task(task_id=item["task_id"])
-            if task is not None and task.get("state") != "absent":
-                raise ControlError("operation_unverified", "reconcile deletion is not reflected in durable state",
+            try:
+                generation = int(task["generation"]) if task is not None else None
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ControlError("operation_unverified", "reconcile task generation cannot be verified",
+                                   {"operation_id": operation_id}) from exc
+            if task is None or generation != item["generation"]:
+                raise ControlError("operation_unverified", "reconcile task generation no longer matches",
                                    {"operation_id": operation_id})
+            dry_states = {
+                "inspect": {"active", "cached", "closing", "preparing", "failed", "deleting"},
+                "finish-delete": {"deleting"},
+                "close-incomplete-or-expired": {"active", "closing", "preparing", "failed"},
+                "stop-unexpected-running-cache": {"cached"},
+                "rearm-current-expiry": {"active"},
+            }
+            applied_states = {
+                "inspect": {"active", "cached", "closing", "preparing", "failed", "deleting"},
+                "finish-delete": {"absent"},
+                "close-incomplete-or-expired": {"cached", "absent"},
+                "stop-unexpected-running-cache": {"cached", "absent"},
+                "rearm-current-expiry": {"active"},
+            }
+            expected_states = dry_states if result["dry_run"] else applied_states
+            if task.get("state") not in expected_states[item["action"]]:
+                raise ControlError("operation_unverified", "reconcile result is not reflected in durable state",
+                                   {"operation_id": operation_id, "action": item["action"]})
 
     def _dispatch_locked(self, request: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(request, Mapping):
@@ -3654,7 +3677,7 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
                 with self._object_lock("session:" + snapshot["session_id"], blocking=False):
                     task = self.store.get_task(task_id=snapshot["task_id"])
                     if task["state"] == "absent": continue
-                    item = {"task_id": task["task_id"], "action": "inspect"}
+                    item = {"task_id": task["task_id"], "generation": int(task["generation"]), "action": "inspect"}
                     if task["state"] == "deleting":
                         item["action"] = "finish-delete"
                         if apply:
@@ -3703,7 +3726,7 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
                                             self.store.remove_port(task["task_id"], port["port_name"], port["protocol"])
                     actions.append(item)
             except ControlError as exc:
-                actions.append({"task_id": snapshot["task_id"], "error": exc.as_dict()})
+                actions.append({"task_id": snapshot["task_id"], "generation": int(snapshot["generation"]), "error": exc.as_dict()})
         return {"dry_run": not apply, "actions": actions}
 
 

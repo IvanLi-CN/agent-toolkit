@@ -356,6 +356,14 @@ class AdmissionTests(Fixture):
         self.store.record_operation(request["operation_id"], "admin-gc", request["session_id"], request["generation"], record)
         self.error("operation_unverified", self.control.dispatch, request)
 
+    def test_reconcile_replay_requires_current_task_state(self):
+        self.acquire()
+        request = self.request("admin-reconcile", operation="reconcile-once", apply=True)
+        response = self.control.dispatch(request)
+        self.assertEqual(response["result"]["actions"][0]["action"], "rearm-current-expiry")
+        self.call("release")
+        self.error("operation_unverified", self.control.dispatch, request)
+
     def test_acquire_rechecks_drain_before_active_commit(self):
         def enter_drain(*_):
             self.store.set_meta("draining", "1")

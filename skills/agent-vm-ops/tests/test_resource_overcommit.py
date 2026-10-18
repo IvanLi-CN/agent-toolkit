@@ -74,6 +74,27 @@ class SQLiteStateTests(unittest.TestCase):
         self.assertIn("rollback_error", failure.exception.detail)
         self.assertTrue(store._unusable)
 
+    def test_non_sqlite_failure_with_rollback_error_is_structured(self):
+        class FailingRollback:
+            def execute(self, *_args):
+                return None
+
+            def rollback(self):
+                raise sqlite3.OperationalError("rollback failed")
+
+        store = object.__new__(CONTROL.StateStore)
+        store._lock = threading.RLock()
+        store.connection = FailingRollback()
+        store.depth = 0
+        store._unusable = False
+        with self.assertRaises(CONTROL.ControlError) as failure:
+            with store.transaction():
+                raise CONTROL.ControlError("native_failed", "native operation failed")
+        self.assertEqual(failure.exception.code, "sqlite_unavailable")
+        self.assertIsNone(failure.exception.detail["state_committed"])
+        self.assertEqual(failure.exception.detail["original_error"]["type"], "ControlError")
+        self.assertTrue(store._unusable)
+
 
 class CTObservationTests(unittest.TestCase):
     mount = "12 1 0:9 /meminfo /proc/meminfo rw - fuse.lxcfs lxcfs rw\n"
@@ -273,6 +294,11 @@ class AdmissionTests(Fixture):
         before = self.store.list_tasks()
         result = self.call("admin-metrics")
         self.assertEqual(CONTROL.parse_time(result["observed_at"]), self.now)
+        self.assertTrue({
+            "observed_at", "up", "draining", "admission_ready", "reclaim_required", "resources",
+            "capacity", "disk_admission", "ct_memory", "instances", "task_states", "operations",
+            "pending_operations", "image_unpack_failures", "warnings", "warning_counts", "doctor",
+        }.issubset(result))
         self.assertTrue(result["up"])
         self.assertTrue(result["admission_ready"])
         self.assertTrue(result["ct_memory"]["pressure"])
@@ -303,6 +329,18 @@ class AdmissionTests(Fixture):
         pending = self.call("admin-metrics")["pending_operations"]
         self.assertEqual(pending[0]["operation_id"], request["operation_id"])
         self.assertEqual(pending[0]["action"], "acquire")
+
+    def test_resource_failure_preserves_verified_memory_pressure(self):
+        self.resources.memory.return_value["available_bytes"] = 0
+        with mock.patch.object(self.control, "_disk_admission_diagnostics", return_value={
+            "verified": False,
+            "error": {"code": "resource_unverified", "message": "disk observation failed"},
+        }):
+            result = self.control._resource_diagnostics()
+        self.assertFalse(result["verified"])
+        self.assertTrue(result["memory_pressure"])
+        self.assertEqual(result["memory"]["available_bytes"], 0)
+        self.assertIsNone(result["remaining"])
 
     def test_native_resource_drift_fails_closed_for_new_admission(self):
         active = self.acquire()

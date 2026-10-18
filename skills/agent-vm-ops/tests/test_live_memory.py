@@ -111,6 +111,15 @@ class LiveMemoryTests(Fixture):
         self.assertGreaterEqual(len(self.changes(before)), 1)
         self.assertEqual(self.call("status")["resources"]["memory_mib"], 8192)
 
+    def test_restart_growth_uses_logical_allocation_guard_even_under_pressure(self):
+        self.acquire()
+        self.resources.memory.return_value["available_bytes"] = 0
+        result = self.call("resize", memory_mib=8192, allow_restart=True)
+        self.assertTrue(result["applied"])
+        self.assertTrue(self.call("status")["admission"]["memory_pressure"])
+        self.config.update(memory_budget_mib=4096, memory_overcommit_ratio=1)
+        self.error("resource_insufficient", self.call, "resize", memory_mib=12288, allow_restart=True)
+
     def test_growth_reserves_maximum_then_commits_only_after_native_ack(self):
         self.acquire()
         observed = []

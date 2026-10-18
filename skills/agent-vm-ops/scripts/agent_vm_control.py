@@ -889,8 +889,23 @@ class StateStore:
                     state_committed=None if rollback_error else False,
                     rollback_error=rollback_error,
                 ) from exc
-            except BaseException:
-                if outer: self.connection.rollback()
+            except BaseException as exc:
+                if outer:
+                    try:
+                        self.connection.rollback()
+                    except sqlite3.Error as rollback_error:
+                        self._unusable = True
+                        failure = self._sqlite_failure(
+                            rollback_error,
+                            phase="rollback",
+                            sql_operation="write",
+                            state_committed=None,
+                        )
+                        failure.detail["original_error"] = {
+                            "type": type(exc).__name__,
+                            "message": str(exc),
+                        }
+                        raise failure from exc
                 raise
             else:
                 if outer:
@@ -2413,12 +2428,13 @@ class Control:
                                    {"storage": facts, "reclaimed": reclaimed})
         return reclaimed
 
-    def _resource_policy(self) -> dict[str, Any]:
+    def _resource_policy(self, *, memory_observation: Mapping[str, Any] | None = None) -> dict[str, Any]:
         cpu_budget = require_int(self.config.get("cpu_budget", 0), "cpu_budget", 1)
         memory_budget = require_int(self.config.get("memory_budget_mib", 0), "memory_budget_mib", 512)
         ratios = {"cpu": overcommit_ratio(self.config.get("cpu_overcommit_ratio", 4), "cpu_overcommit_ratio"),
                   "memory_mib": overcommit_ratio(self.config.get("memory_overcommit_ratio", 4), "memory_overcommit_ratio")}
-        cpu_capacity, memory = self.resources.cpu(), self.resources.memory()
+        cpu_capacity = self.resources.cpu()
+        memory = self.resources.memory() if memory_observation is None else memory_observation
         base = {"cpu": cpu_budget, "memory_mib": memory_budget}
         capacity = {"cpu": cpu_capacity, "memory_mib": memory["limit_bytes"] // 1024**2}
         if any(base[key] > capacity[key] for key in base):
@@ -2465,17 +2481,32 @@ class Control:
         instances = self.incus.list_instances()
         records = {item["instance_name"]: item for item in self.store.list_tasks()}
         for instance in instances:
-            if str(instance.get("status", "")).lower() != "stopped":
-                record = records.get(instance.get("name"))
-                if record is None or record["state"] in {"absent", "cached"}:
-                    raise ControlError("resource_unverified", "unaccounted running native instance blocks admission")
-                if record["state"] != "active":
-                    raise ControlError("resource_unverified", "transitional native instance blocks admission")
-                self._verify_native_allocation(record)
+            record = records.get(instance.get("name"))
+            stopped = str(instance.get("status", "")).lower() == "stopped"
+            if stopped:
+                if record is not None and record["state"] not in {"absent", "cached"}:
+                    if record["state"] != "active":
+                        raise ControlError("resource_unverified", "transitional native instance blocks admission")
+                    self._verify_native_allocation(record)
+                continue
+            if record is None or record["state"] in {"absent", "cached"}:
+                raise ControlError("resource_unverified", "unaccounted running native instance blocks admission")
+            if record["state"] != "active":
+                raise ControlError("resource_unverified", "transitional native instance blocks admission")
+            self._verify_native_allocation(record)
 
     def _resource_diagnostics(self) -> dict[str, Any]:
+        memory = None
+        memory_error = None
         try:
-            policy = self._resource_policy()
+            memory = self.resources.memory()
+        except ControlError as exc:
+            memory_error = exc
+        policy = None
+        try:
+            if memory_error is not None:
+                raise memory_error
+            policy = self._resource_policy(memory_observation=memory)
             self._running_inventory_guard()
             with self._global_lock(), self.store.transaction():
                 breakdown = self._allocation_breakdown()
@@ -2491,7 +2522,26 @@ class Control:
                     "memory_pressure": policy["memory"]["available_bytes"] < policy["memory"]["threshold_bytes"],
                     "disk_admission": disk}
         except ControlError as exc:
-            return {"verified": False, "error": exc.as_dict()}
+            result = {
+                "verified": False,
+                "error": exc.as_dict(),
+                "base": None,
+                "ratios": None,
+                "limits": None,
+                "ct_capacity": None,
+                "memory": None if memory is None else {**memory, "observed_at": iso_time(self.now())},
+                "memory_pressure": None,
+                "allocated": None,
+                "reserved": None,
+                "allocated_and_reserved": None,
+                "remaining": None,
+                "disk_admission": None,
+            }
+            if policy is not None:
+                result.update(policy)
+            if memory is not None:
+                result["memory_pressure"] = memory["available_bytes"] < memory["threshold_bytes"]
+            return result
 
     def _disk_admission_diagnostics(self, capacity: Mapping[str, Any] | None) -> dict[str, Any]:
         if not isinstance(capacity, Mapping) or not isinstance(capacity.get("layers"), list):
@@ -2595,7 +2645,7 @@ class Control:
             reasons.append(instances["error"])
         elif not instances["policy_compliant"] and not any(reason["code"] == "project_instance_limits_conflict" for reason in reasons):
             reasons.append({"code": "project_instance_limits_conflict", "conflicting_limits": instances["limits"]})
-        reclaim_required = False
+        reclaim_required = None
         if "error" in capacity:
             reasons.append(capacity["error"])
         elif resources.get("verified"):
@@ -2605,7 +2655,7 @@ class Control:
                 reasons.append({"code": "disk_reclaim_required", "message": "default creation needs capacity reclamation"})
         return {"requested": requested, "request_cost_bytes": self.config["create_cost_bytes"],
                 "ready": not reasons, "reasons": reasons, "reclaim_required": reclaim_required,
-                "observations": {"memory_pressure": bool(resources.get("memory_pressure"))},
+                "observations": {"memory_pressure": resources.get("memory_pressure")},
                 "warnings": warnings}
 
     def _reserve_resources(self, task: Mapping[str, Any], resources: Mapping[str, int],
@@ -4245,7 +4295,7 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
         tasks = self.store.list_tasks()
         task_states = Counter(str(task["state"]) for task in tasks)
         resources = doctor.get("resources", {})
-        memory = resources.get("memory", {}) if isinstance(resources, Mapping) else {}
+        memory = resources.get("memory") or {} if isinstance(resources, Mapping) else {}
         warnings = list(doctor.get("default_admission", {}).get("warnings", []))
         audit = self.store.audit_summary()
         return {
@@ -4253,7 +4303,7 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
             "up": True,
             "draining": self.store.get_meta("draining") == "1",
             "admission_ready": bool(doctor.get("admission_ready")),
-            "reclaim_required": bool(doctor.get("default_admission", {}).get("reclaim_required")),
+            "reclaim_required": doctor.get("default_admission", {}).get("reclaim_required"),
             "resources": resources,
             "capacity": doctor.get("capacity"),
             "disk_admission": self._disk_admission_diagnostics(doctor.get("capacity")),
@@ -4262,7 +4312,7 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
                 "current_bytes": memory.get("current_bytes"),
                 "available_bytes": memory.get("available_bytes"),
                 "pressure_threshold_bytes": memory.get("threshold_bytes"),
-                "pressure": resources.get("memory_pressure") if isinstance(resources, Mapping) and resources.get("verified") else None,
+                "pressure": resources.get("memory_pressure") if isinstance(resources, Mapping) else None,
                 "oom_events": memory.get("oom_events"),
             },
             "instances": doctor.get("instances"),
@@ -4331,6 +4381,7 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
                             raise ControlError("reconciliation_required", "active task has no effective lease",
                                                {"task_id": task.get("task_id")})
                         self._ownership(task)
+                        self._network_guard()
                         self._verify_network_device(task)
                         if self.incus.instance_info(task["instance_name"])["status"].lower() != "running":
                             raise ControlError("state_mismatch", "active task guest is not running",
@@ -4410,6 +4461,7 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
                     else:
                         self._ownership(task)
                         if task["state"] == "active":
+                            self._network_guard()
                             self._verify_network_device(task)
                         status = self.incus.instance_info(task["instance_name"])["status"].lower()
                         if task["state"] == "cached" and status != "stopped":

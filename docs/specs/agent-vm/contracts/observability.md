@@ -47,6 +47,8 @@ The one-shot controller remains the source of truth for native state and must no
 
 The `admin-metrics` JSON is the bridge input contract: `observed_at` is the freshness timestamp, `up` is the controller read success flag, `resources` is the logical admission object, `ct_memory` is the CT-local runtime observation, and `pending_operations` lists journal entries whose native outcome remains uncertain. A collector must expose `agent_vm_up=0` and freshness failure when the action cannot be read or parsed; it must not emit `agent_vm_memory_pressure=0` when `ct_memory.pressure` is `null`. The bridge must preserve `null` or absent limits and observations instead of coercing them to zero.
 
+When `admin-metrics.reclaim_required` is `null`, the collector must omit `agent_vm_admission_reclaim_required` for that scrape; `null` means disk admission is unverified, not that reclamation is unnecessary.
+
 The `admin-metrics` response keeps disk domains separate: `disk_admission.guest_allocation` reports sparse guest virtual-disk sizes, while `disk_admission.physical_admission` reports CT filesystem used/reserved/headroom against its low watermark. Consumers must map native disk admission metrics from the physical domain and must not compare sparse guest allocation totals with physical capacity. VM-slot admission is under `instances.admission`; its limit and remaining values are null when Incus exposes no authoritative slot limit, including `-1`.
 
 ## Dashboard contract

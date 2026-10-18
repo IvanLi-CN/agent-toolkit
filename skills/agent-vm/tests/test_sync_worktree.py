@@ -51,6 +51,12 @@ class SyncTests(unittest.TestCase):
     def request(self, action, tx="a" * 32, name="repo", **kw):
         return self.remote(dict(action=action, name=name, tx=tx, **kw))
 
+    def test_stderr_redaction_covers_assignments_and_json_fields(self):
+        value = MOD.redact_stderr(b'{"password":"secret-value", "private_key": "private-value"} token=token-value')
+        self.assertNotIn(b"secret-value", value)
+        self.assertNotIn(b"private-value", value)
+        self.assertNotIn(b"token-value", value)
+
     def populate(self, tx, files):
         p = self.workspace / "repo" / (".agent-vm-src-stage." + tx)
         manifest = {}

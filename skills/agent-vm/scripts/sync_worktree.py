@@ -18,6 +18,24 @@ import uuid
 
 OWNER = ".agent-vm-sync-owner.json"
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+SENSITIVE_FIELD_RE = r"(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)"
+
+
+def redact_stderr(value: bytes) -> bytes:
+    text = value.decode("utf-8", "replace")
+    text = re.sub(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 _-]*PRIVATE KEY-----|$)", "[REDACTED PRIVATE KEY]", text, flags=re.IGNORECASE)
+    text = re.sub(rf"(?i)(['\"]?\b{SENSITIVE_FIELD_RE}\b['\"]?\s*[:=]\s*)(['\"])[^\r\n]*?\2", r"\1\2[REDACTED]\2", text)
+    text = re.sub(rf"(?i)(['\"]?\b{SENSITIVE_FIELD_RE}\b['\"]?\s*[:=]\s*)([^\s,;}}\]\\\"']+)", r"\1[REDACTED]", text)
+    text = re.sub(r"(?i)(\bsshpass\b[ \t]+-p)[\s\S]*", r"\1 [REDACTED]", text)
+    text = re.sub(r"(?i)(\b[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:)([^@\s/]+)(@)", r"\1[REDACTED]\3", text)
+    text = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[REDACTED]", text)
+    return text.encode("utf-8")
+
+
+def write_redacted_stderr(value: bytes) -> None:
+    if value:
+        sys.stderr.buffer.write(redact_stderr(value))
+        sys.stderr.flush()
 
 # Executed as a bounded Python action inside the guest, never installed as a service.
 REMOTE = r'''
@@ -262,7 +280,7 @@ def sync(name: str, cli: str = "agent-vm", ssh: str = "ssh", rsync: str = "rsync
         info_argv.extend(["--session-id", session_id])
     info = run(info_argv, capture_output=True)
     if info.returncode:
-        if info.stderr: sys.stderr.buffer.write(info.stderr)
+        write_redacted_stderr(info.stderr)
         raise SyncFailure("cannot obtain an active VM SSH configuration", info.returncode)
     if not info.stdout.strip():
         raise SyncFailure("CLI returned empty SSH configuration")
@@ -279,7 +297,7 @@ def sync(name: str, cli: str = "agent-vm", ssh: str = "ssh", rsync: str = "rsync
         try:
             begin = remote(ssh, config, {**base, "action": "begin"})
             if begin.returncode:
-                sys.stderr.buffer.write(begin.stderr)
+                write_redacted_stderr(begin.stderr)
                 raise SyncFailure("remote preparation failed; existing source was retained", begin.returncode)
             prepared = True
             stage = json.loads(begin.stdout)["stage"]
@@ -287,13 +305,14 @@ def sync(name: str, cli: str = "agent-vm", ssh: str = "ssh", rsync: str = "rsync
             if stage != expected: raise SyncFailure("remote returned an unexpected stage path")
             transport = shlex.join([ssh, "-F", str(config), "-o", "BatchMode=yes"])
             transfer = run([rsync, "-a", "--from0", "--files-from=" + str(listing), "--relative",
-                            "-e", transport, str(root) + "/", "agent-vm:" + stage + "/"])
+                            "-e", transport, str(root) + "/", "agent-vm:" + stage + "/"], capture_output=True)
             if transfer.returncode:
+                write_redacted_stderr(transfer.stderr)
                 raise SyncFailure("transfer failed; existing source was retained", transfer.returncode)
             committing = True
             commit = remote(ssh, config, {**base, "action": "commit", "manifest": manifest})
             if commit.returncode:
-                sys.stderr.buffer.write(commit.stderr)
+                write_redacted_stderr(commit.stderr)
                 # SSH failure or control crash can occur after rename, before acknowledgement.
                 raise SyncFailure(f"commit unverified (exit {commit.returncode}); retain recovery record "
                                   f"/workspace/worktrees/{name}/.agent-vm-sync-{tx}.json", 75)
@@ -305,7 +324,7 @@ def sync(name: str, cli: str = "agent-vm", ssh: str = "ssh", rsync: str = "rsync
                 raise SyncFailure("commit acknowledgement is invalid; recovery material retained", 75)
             finish = remote(ssh, config, {**base, "action": "finish"})
             if finish.returncode:
-                sys.stderr.buffer.write(finish.stderr)
+                write_redacted_stderr(finish.stderr)
                 print("source committed; cleanup incomplete, recovery material retained", file=sys.stderr)
             print(json.dumps({"synced": True, "target": f"/workspace/worktrees/{name}/src", "files": len(names)}))
             return 0

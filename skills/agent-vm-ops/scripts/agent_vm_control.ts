@@ -39,6 +39,53 @@ type Dict = Record<string, any>;
 type IntegerValue = number | bigint;
 const JSON_FLOAT = Symbol("json-float");
 type JsonFloat = { readonly value: number; readonly raw: string; readonly [JSON_FLOAT]: true };
+type NativeBarrierWaiter = { exclusive: boolean; grant: (release: () => void) => void };
+type NativeBarrierState = { activeReaders: number; writerActive: boolean; waiters: NativeBarrierWaiter[] };
+const nativeBarrierStates = new Map<string, NativeBarrierState>();
+
+function nativeBarrierRelease(path: string, state: NativeBarrierState, exclusive: boolean): () => void {
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    if (exclusive) state.writerActive = false;
+    else state.activeReaders -= 1;
+    if (state.writerActive || state.activeReaders > 0) return;
+    const next = state.waiters[0];
+    if (!next) {
+      if (nativeBarrierStates.get(path) === state) nativeBarrierStates.delete(path);
+      return;
+    }
+    if (next.exclusive) {
+      state.waiters.shift();
+      state.writerActive = true;
+      next.grant(nativeBarrierRelease(path, state, true));
+      return;
+    }
+    while (state.waiters[0] && !state.waiters[0].exclusive) {
+      const reader = state.waiters.shift()!;
+      state.activeReaders += 1;
+      reader.grant(nativeBarrierRelease(path, state, false));
+    }
+  };
+}
+
+async function acquireNativeBarrier(path: string, exclusive: boolean): Promise<() => void> {
+  const state = nativeBarrierStates.get(path) ?? { activeReaders: 0, writerActive: false, waiters: [] };
+  nativeBarrierStates.set(path, state);
+  return new Promise<() => void>((resolve) => {
+    const grant = (release: () => void): void => resolve(release);
+    if (exclusive) {
+      if (!state.writerActive && state.activeReaders === 0 && state.waiters.length === 0) {
+        state.writerActive = true;
+        grant(nativeBarrierRelease(path, state, true));
+      } else state.waiters.push({ exclusive: true, grant });
+    } else if (!state.writerActive && !state.waiters.some((waiter) => waiter.exclusive)) {
+      state.activeReaders += 1;
+      grant(nativeBarrierRelease(path, state, false));
+    } else state.waiters.push({ exclusive: false, grant });
+  });
+}
 
 export const GUEST_GROWTH_SCRIPT = `
 import { existsSync, readFileSync, statfsSync } from "node:fs";
@@ -76,17 +123,20 @@ console.log(JSON.stringify({ virtual_bytes: safe(size), filesystem_before: safe(
 export class ControlError extends Error {
   readonly code: string;
   readonly detail: unknown;
+  readonly rawDetail: unknown;
 
   constructor(code: string, message: string, detail: unknown = undefined) {
     super(message);
     this.name = "ControlError";
     this.code = code;
-    this.detail = detail;
+    this.rawDetail = detail;
+    Object.defineProperty(this, "rawDetail", { enumerable: false });
+    this.detail = detail === undefined ? undefined : redactDiagnosticValue(detail);
   }
 
   asDict(): Dict {
     const value: Dict = { code: this.code, message: this.message };
-    if (this.detail !== undefined) value.detail = this.detail;
+    if (this.detail !== undefined) value.detail = redactDiagnosticValue(this.detail);
     return value;
   }
 }
@@ -100,6 +150,31 @@ export class GuestWaitTimeout extends ControlError {
 
 function isDict(value: unknown): value is Dict {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const SENSITIVE_FIELD_RE = /(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)/i;
+
+function redactDiagnosticText(rawInput: string): string {
+  const privateKey = /-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 _-]*PRIVATE KEY-----|$)/gi;
+  let redacted = rawInput.replace(privateKey, "[REDACTED PRIVATE KEY]");
+  const secretLabel = "(?:[A-Za-z0-9]+[_-])*(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)(?:[_-][A-Za-z0-9]+)*";
+  redacted = redacted.replace(new RegExp(`(?<label>[\\\"']?${secretLabel}[\\\"']?)(?<separator>\\s*[:=]\\s*)(?<quote>[\\\"'])(?<value>.*?)(\\k<quote>)`, "gis"), "$<label>$<separator>$<quote>[REDACTED]$<quote>");
+  redacted = redacted.replace(new RegExp(`(?<label>[\\\"']?${secretLabel}[\\\"']?)(?<separator>\\s*[:=]\\s*)(?<value>[^\\s,;}}\\]\\\"']+)`, "gi"), "$<label>$<separator>[REDACTED]");
+  redacted = redacted.replace(/(\bsshpass\b[ \t]+-p)[\s\S]*/is, "$1 [REDACTED]");
+  redacted = redacted.replace(/(\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s:@]+:)([^@\s/]+)(@)/gi, "$1[REDACTED]$3");
+  return redacted.replace(/(bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1[REDACTED]");
+}
+
+function redactDiagnosticValue(value: unknown, depth = 0): unknown {
+  if (depth > 8) return "[REDACTED]";
+  if (typeof value === "string") return redactDiagnosticText(value);
+  if (Array.isArray(value)) return value.map((entry) => redactDiagnosticValue(entry, depth + 1));
+  if (isDict(value)) {
+    const result: Dict = Object.create(null);
+    for (const [key, child] of Object.entries(value)) setOwn(result, key, SENSITIVE_FIELD_RE.test(key) ? "[REDACTED]" : redactDiagnosticValue(child, depth + 1));
+    return result;
+  }
+  return value;
 }
 
 function hasOwn(value: object, key: string): boolean {
@@ -371,7 +446,7 @@ function requireBoolean(value: unknown, field: string): boolean {
   return value;
 }
 
-function ratio(value: unknown, name: string): { numerator: bigint; denominator: bigint; text: string } {
+function ratio(value: unknown, name: string): { numerator: bigint; denominator: bigint; text: string; diagnosticText: string } {
   if (!isJsonFloat(value) && typeof value !== "number" && typeof value !== "string" && typeof value !== "bigint") {
     throw new ControlError("config_invalid", `${name} must be a finite number at least one`);
   }
@@ -388,7 +463,9 @@ function ratio(value: unknown, name: string): { numerator: bigint; denominator: 
   const denominator = scale >= 0 ? 1n : 10n ** BigInt(-scale);
   const numerator = scale >= 0 ? mantissa * 10n ** BigInt(scale) : mantissa;
   if (numerator < denominator) throw new ControlError("config_invalid", `${name} must be a finite number at least one`);
-  return { numerator, denominator, text };
+  const result = { numerator, denominator, text } as { numerator: bigint; denominator: bigint; text: string; diagnosticText: string };
+  Object.defineProperty(result, "diagnosticText", { configurable: false, enumerable: false, writable: false, value: isJsonFloat(value) ? value.raw : String(value) });
+  return result;
 }
 
 function floorRatio(value: bigint, multiplier: { numerator: bigint; denominator: bigint }): bigint {
@@ -1111,12 +1188,12 @@ function flock(fd: number, operation: number): void {
   if (flockNative(fd, operation) !== 0) throw new Error("flock failed");
 }
 
-async function withFileLock<T>(path: string, callback: () => T | Promise<T>, blocking = true): Promise<T> {
+async function withFileLock<T>(path: string, callback: () => T | Promise<T>, blocking = true, shared = false): Promise<T> {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const noFollow = (constants as any).O_NOFOLLOW ?? 0;
   const fd = openSync(path, constants.O_RDWR | constants.O_CREAT | noFollow, 0o600);
   try {
-    try { flock(fd, 2 | (blocking ? 0 : 4)); } catch (error) {
+    try { flock(fd, (shared ? 1 : 2) | (blocking ? 0 : 4)); } catch (error) {
       if (!blocking) throw new ControlError("object_busy", "resource is being changed");
       throw new ControlError("lock_failed", "native lock could not be acquired");
     }
@@ -1226,6 +1303,16 @@ export class Control {
     return withFileLock(join(dirname(this.store.path), "locks", sha256(identity)), callback, blocking);
   }
 
+  private async nativeBarrier<T>(callback: () => T | Promise<T>, exclusive = false): Promise<T> {
+    const lockPath = join(dirname(this.store.path), "locks", sha256("native:barrier"));
+    const release = await acquireNativeBarrier(lockPath, exclusive);
+    try {
+      return await withFileLock(lockPath, callback, true, !exclusive);
+    } finally {
+      release();
+    }
+  }
+
   private async nativeLock<T>(task: Dict, callback: () => T | Promise<T>): Promise<T> {
     const identity = String(task.session_id);
     const depth = this.nativeLockState.get(identity) ?? 0;
@@ -1262,18 +1349,23 @@ export class Control {
   private async expirePreempt(request: Dict): Promise<void> {
     const taskId = requiredString(requiredOwn(request, "task_id"), "task_id", TASK_ID_RE);
     const generation = numberFromInteger(requiredOwn(request, "generation"), "generation", 1);
-    let task: Dict | undefined;
-    await this.globalLock(() => this.store.transaction(() => {
-      task = this.store.getTask({ taskId });
-      if (!task || !sameInteger(task.generation, generation)) return;
-      const expiry = parseTime(task.lease_expires_at);
-      if (!Control.ACTIVE_STATES.has(String(task.state)) || (expiry && expiry.getTime() > this.now().getTime())) return;
-      const inactive = parseTime(task.inactive_since) ?? new Date(Math.min(this.now().getTime(), expiry?.getTime() ?? this.now().getTime()));
-      task = this.store.updateTask(taskId, {
-        state: "closing", lease_expires_at: null, inactive_since: isoTime(inactive),
-        cleanup_after: isoTime(new Date(inactive.getTime() + Number(this.config.cache_seconds) * 1000)),
-      });
-    }));
+    let task = this.store.getTask({ taskId });
+    if (!task || !sameInteger(task.generation, generation)) return;
+    const expiry = parseTime(task.lease_expires_at);
+    if (!Control.ACTIVE_STATES.has(String(task.state)) || (expiry && expiry.getTime() > this.now().getTime())) return;
+    await this.nativeLock(task, async () => {
+      task = await this.nativeBarrier(() => this.globalLock(() => this.store.transaction(() => {
+          const current = this.store.getTask({ taskId });
+          if (!current || !sameInteger(current.generation, generation)) return undefined;
+          const currentExpiry = parseTime(current.lease_expires_at);
+          if (!Control.ACTIVE_STATES.has(String(current.state)) || (currentExpiry && currentExpiry.getTime() > this.now().getTime())) return undefined;
+          const inactive = parseTime(current.inactive_since) ?? new Date(Math.min(this.now().getTime(), currentExpiry?.getTime() ?? this.now().getTime()));
+          return this.store.updateTask(taskId, {
+            state: "closing", lease_expires_at: null, inactive_since: isoTime(inactive),
+            cleanup_after: isoTime(new Date(inactive.getTime() + Number(this.config.cache_seconds) * 1000)),
+          });
+        })));
+    });
     if (!task) return;
     try {
       await this.objectLock(`cleanup:${task.session_id}`, async () => {
@@ -1407,11 +1499,58 @@ export class Control {
     const current = this.store.getTask({ taskId: String(task.task_id) });
     const expiry = current ? parseTime(current.lease_expires_at) : undefined;
     if (!current || !sameInteger(current.generation, task.generation) || current.instance_name !== task.instance_name || !["preparing", "active"].includes(String(current.state)) || !expiry || expiry.getTime() <= this.now().getTime()) throw new ControlError("lease_expired", "native operation was revoked before its effect");
+    if (this.store.getMeta("draining") === "1") throw new ControlError("draining", "native effects are refused while draining");
     return current;
   }
 
-  private async startInstance(task: Dict): Promise<void> { await this.nativeLock(task, async () => { const current = await this.nativeOperationCurrent(task); await this.ownership(current); await this.incus.start(String(current.instance_name)); }); }
-  private async stopInstance(task: Dict): Promise<void> { await this.nativeLock(task, async () => { const current = await this.nativeOperationCurrent(task); await this.ownership(current); await this.incus.stop(String(current.instance_name), true); }); }
+  private async cleanupOperationCurrent(task: Dict): Promise<Dict> {
+    const current = this.store.getTask({ taskId: String(task.task_id) });
+    if (!current || !sameInteger(current.generation, task.generation) || current.instance_name !== task.instance_name || current.state !== "closing") throw new ControlError("stale_cleanup", "cleanup generation or state changed before its effect");
+    return current;
+  }
+
+  private async deletionOperationCurrent(task: Dict): Promise<Dict> {
+    const current = this.store.getTask({ taskId: String(task.task_id) });
+    if (!current || !sameInteger(current.generation, task.generation) || current.instance_name !== task.instance_name || current.state !== "deleting") throw new ControlError("stale_cleanup", "deletion generation or state changed before its effect");
+    return current;
+  }
+
+  private async nativeConfigSet(task: Dict, key: string, value: string): Promise<void> {
+    await this.nativeLock(task, async () => {
+      await this.nativeBarrier(async () => {
+        const current = await this.nativeOperationCurrent(task);
+        await this.ownership(current);
+        await this.nativeOperationCurrent(current);
+        await this.incus.configSet(String(current.instance_name), key, value);
+      });
+    });
+  }
+
+  private async nativeDeviceSet(task: Dict, device: string, key: string, value: string): Promise<void> {
+    await this.nativeLock(task, async () => {
+      await this.nativeBarrier(async () => {
+        const current = await this.nativeOperationCurrent(task);
+        await this.ownership(current);
+        await this.nativeOperationCurrent(current);
+        await this.incus.deviceSet(String(current.instance_name), device, key, value);
+      });
+    });
+  }
+
+  private async nativeGuestExec(task: Dict, argv: string[], options: RunOptions = {}, effect = true): Promise<CompletedProcess> {
+    return this.nativeLock(task, async () => {
+      const run = async (): Promise<CompletedProcess> => {
+        const current = await this.nativeOperationCurrent(task);
+        if (effect) await this.ownership(current);
+        await this.nativeOperationCurrent(current);
+        return this.incus.exec(String(current.instance_name), argv, options);
+      };
+      return effect ? this.nativeBarrier(run) : run();
+    });
+  }
+
+  private async startInstance(task: Dict): Promise<void> { await this.nativeLock(task, async () => { await this.nativeBarrier(async () => { const current = await this.nativeOperationCurrent(task); await this.ownership(current); await this.nativeOperationCurrent(current); await this.incus.start(String(current.instance_name)); }); }); }
+  private async stopInstance(task: Dict): Promise<void> { await this.nativeLock(task, async () => { await this.nativeBarrier(async () => { const current = await this.nativeOperationCurrent(task); await this.ownership(current); await this.nativeOperationCurrent(current); await this.incus.stop(String(current.instance_name), true); }); }); }
 
   private stateSummary(task: Dict): Dict {
     const result: Dict = { task_id: task.task_id, session_id: task.session_id, generation: integerForJson(task.generation), state: task.state, instance_name: task.instance_name, vm_ip: task.vm_ip, ssh_host_port: task.ssh_host_port === null ? null : Number(task.ssh_host_port), lease_expires_at: task.lease_expires_at, inactive_since: task.inactive_since, cleanup_after: task.cleanup_after };
@@ -1494,8 +1633,16 @@ export class Control {
     task = await this.eligibleCache(task);
     await this.globalLock(() => this.store.updateTask(String(task.task_id), { state: "deleting" }));
     try {
-      await this.incus.delete(String(task.instance_name));
-      if ((await this.incus.listInstances()).some((item) => item.name === task.instance_name)) throw new ControlError("cleanup_incomplete", "native deletion is not confirmed");
+      await this.nativeLock(task, async () => {
+        const current = await this.deletionOperationCurrent(task);
+        await this.ownership(current);
+        await this.nativeBarrier(async () => {
+          await this.deletionOperationCurrent(current);
+          await this.ownership(current);
+          await this.incus.delete(String(current.instance_name));
+        });
+        if ((await this.incus.listInstances()).some((item) => item.name === current.instance_name)) throw new ControlError("cleanup_incomplete", "native deletion is not confirmed");
+      });
     } catch (error) {
       this.store.updateTask(String(task.task_id), { last_error: stableJson(error instanceof ControlError ? error.asDict() : { code: "internal_error", message: (error as Error).name }) });
       throw error;
@@ -1541,7 +1688,7 @@ export class Control {
     if (Object.keys(conflicts).length) throw new ControlError("project_resource_limits_conflict", "project aggregate quotas count stopped caches; authorized deployment must remove them", { project: this.config.project, conflicting_limits: conflicts });
     const countLimits = this.instanceCountLimits(project.config);
     if (Object.keys(countLimits).length) throw new ControlError("project_instance_limits_conflict", "project instance quotas include stopped caches; authorized deployment must remove them", { project: this.config.project, conflicting_limits: countLimits, instance_count: (await this.incus.listInstances()).length });
-    return { base, ratios: { cpu: Number(cpuRatio.text), memory_mib: Number(memoryRatio.text) }, limits: { cpu: integerForJson(floorRatio(integerBigInt(base.cpu, "cpu_budget"), cpuRatio)), memory_mib: integerForJson(floorRatio(integerBigInt(base.memory_mib, "memory_budget_mib"), memoryRatio)) }, ct_capacity: capacity, memory: { ...memory, observed_at: isoTime(this.now()) } };
+    return { base, ratios: { cpu: cpuRatio.diagnosticText, memory_mib: memoryRatio.diagnosticText }, limits: { cpu: integerForJson(floorRatio(integerBigInt(base.cpu, "cpu_budget"), cpuRatio)), memory_mib: integerForJson(floorRatio(integerBigInt(base.memory_mib, "memory_budget_mib"), memoryRatio)) }, ct_capacity: capacity, memory: { ...memory, observed_at: isoTime(this.now()) } };
   }
 
   private allocationTotals(excludeTaskId?: string): Dict {
@@ -1844,7 +1991,7 @@ export class Control {
 
   private isGuestWaitTimeout(error: ControlError): boolean {
     if (error instanceof GuestWaitTimeout || error.code === "guest_wait_timeout") return true;
-    const detail = isDict(error.detail) ? error.detail : {};
+    const detail = isDict(error.rawDetail) ? error.rawDetail : {};
     return error.code === "command_failed" && detail.returncode === 1 && typeof detail.stderr === "string" && /(?:timed?\s*out|timeout)/i.test(detail.stderr);
   }
 
@@ -1881,14 +2028,7 @@ export class Control {
     let raw = rawInput;
     const collectorTruncated = raw.endsWith(DIAGNOSTIC_LOG_TRUNCATION_MARKER);
     if (collectorTruncated) raw = raw.slice(0, -DIAGNOSTIC_LOG_TRUNCATION_MARKER.length);
-    const privateKey = /-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 _-]*PRIVATE KEY-----|$)/gi;
-    let redacted = raw.replace(privateKey, "[REDACTED PRIVATE KEY]");
-    const secretLabel = "(?:[A-Za-z0-9]+[_-])*(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)(?:[_-][A-Za-z0-9]+)*";
-    redacted = redacted.replace(new RegExp(`(?<label>[\\\"']?${secretLabel}[\\\"']?)(?<separator>\\s*[:=]\\s*)(?<quote>[\\\"'])(?<value>.*?)(\\k<quote>)`, "gis"), "$<label>$<separator>$<quote>[REDACTED]$<quote>");
-    redacted = redacted.replace(new RegExp(`(?<label>[\\\"']?${secretLabel}[\\\"']?)(?<separator>\\s*[:=]\\s*)(?<value>[^\\s,;}}\\]]+)`, "gi"), "$<label>$<separator>[REDACTED]");
-    redacted = redacted.replace(/(\bsshpass\b[ \t]+-p)[\s\S]*/is, "$1 [REDACTED]");
-    redacted = redacted.replace(/(\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s:@]+:)([^@\s/]+)(@)/gi, "$1[REDACTED]$3");
-    redacted = redacted.replace(/(bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1[REDACTED]");
+    const redacted = redactDiagnosticText(raw);
     const truncated = collectorTruncated || redacted.length > DIAGNOSTIC_LOG_LIMIT;
     return { text: truncated ? redacted.slice(0, DIAGNOSTIC_LOG_LIMIT) : redacted, truncated };
   }
@@ -1967,11 +2107,11 @@ export class Control {
 
   private shellQuote(value: string): string { return `'${value.replaceAll("'", "'\\''")}'`; }
 
-  private async verifyGuestTools(instanceName: string): Promise<void> {
+  private async verifyGuestTools(task: Dict): Promise<void> {
     const configured = Array.isArray(this.config.required_guest_tools) ? this.config.required_guest_tools as string[] : [];
     const tools = [...new Set(["bun", ...configured])].map((tool) => this.shellQuote(tool)).join(" ");
     const script = `set -eu; for tool in ${tools}; do command -v "$tool" >/dev/null; done; if docker compose version >/dev/null 2>&1; then :; elif command -v docker-compose >/dev/null 2>&1; then :; else exit 1; fi`;
-    await this.incus.exec(instanceName, ["sh", "-lc", script]);
+    await this.nativeGuestExec(task, ["sh", "-lc", script], {}, false);
   }
 
   private async guestIp(instanceName: string): Promise<string> {
@@ -1985,12 +2125,12 @@ export class Control {
     return this.expectedVmIp;
   }
 
-  private async installPublicKey(instanceName: string, publicKey: unknown): Promise<void> {
+  private async installPublicKey(task: Dict, publicKey: unknown): Promise<void> {
     const key = requiredString(publicKey, "public_key");
     if (/[\r\n]/.test(key)) throw new ControlError("invalid_request", "public_key must contain one line");
     const fields = key.split(/\s+/);
     if (fields.length < 2 || !["ssh-ed25519", "ecdsa-sha2-nistp256", "rsa-sha2-512", "ssh-rsa"].includes(fields[0] ?? "")) throw new ControlError("invalid_request", "public_key is not a supported SSH public key");
-    await this.incus.exec(instanceName, ["sh", "-lc", "set -eu; umask 077; mkdir -p /root/.ssh; cat > /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys"], { inputData: `${key}\n` });
+    await this.nativeGuestExec(task, ["sh", "-lc", "set -eu; umask 077; mkdir -p /root/.ssh; cat > /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys"], { inputData: `${key}\n` });
   }
 
   private async guestHostKey(instanceName: string): Promise<string> {
@@ -2000,9 +2140,9 @@ export class Control {
     return fields.slice(0, 2).join(" ");
   }
 
-  private async configureNetwork(instanceName: string, vmIp: string): Promise<void> {
+  private async configureNetwork(task: Dict, vmIp: string): Promise<void> {
     const settings = { "ipv4.address": vmIp, "security.mac_filtering": "true", "security.ipv4_filtering": "true", "security.ipv6_filtering": "true", "security.port_isolation": "true", "security.acls": String(this.config.network_acl), "security.acls.default.ingress.action": "allow", "security.acls.default.egress.action": "allow" };
-    for (const [key, value] of Object.entries(settings)) await this.incus.deviceSet(instanceName, "eth0", key, value);
+    for (const [key, value] of Object.entries(settings)) await this.nativeDeviceSet(task, "eth0", key, value);
   }
 
   private async networkGuard(): Promise<void> {
@@ -2014,7 +2154,10 @@ export class Control {
     if (!isDict(acl) || !isDict(acl.config) || acl.config["user.agent-vm.managed"] !== "native-v1") throw new ControlError("network_unverified", "isolation ACL ownership is not verified");
     const fields = ["action", "state", "source", "destination", "protocol", "source_port", "destination_port", "icmp_type", "icmp_code"];
     for (const [direction, rules] of Object.entries(this.isolationRules())) {
-      const normalized = dictArray(acl[direction], "network_unverified", `isolation ACL ${direction} contains an invalid rule`).map((value) => Object.fromEntries(fields.map((key) => [key, value[key] ?? (key === "state" ? "enabled" : "")]))) as Dict[];
+      const normalized = dictArray(acl[direction], "network_unverified", `isolation ACL ${direction} contains an invalid rule`).map((value) => {
+        for (const key of fields) if (hasOwn(value, key) && typeof value[key] !== "string") throw new ControlError("network_unverified", `isolation ACL ${direction} contains an invalid ${key} field`);
+        return Object.fromEntries(fields.map((key) => [key, value[key] ?? (key === "state" ? "enabled" : "")])) as Dict;
+      });
       for (const rule of rules) { const expected = Object.fromEntries(fields.map((key) => [key, rule[key] ?? (key === "state" ? "enabled" : "")])); if (!normalized.some((item) => stableJson(item) === stableJson(expected))) throw new ControlError("network_unverified", "isolation ACL lacks required peer/host withdrawal rules"); }
     }
   }
@@ -2036,7 +2179,16 @@ export class Control {
       const native = devices[port.device_name];
       const expected = this.proxyProperties(current, port);
       if (native) { if (Object.entries(expected).some(([key, value]) => native[key] !== value)) throw new ControlError("ownership_mismatch", "native device does not match reservation"); return; }
-      await this.incus.deviceAdd(String(current.instance_name), String(port.device_name), "proxy", Object.fromEntries(Object.entries(expected).filter(([key]) => key !== "type")));
+      await this.nativeBarrier(async () => {
+        const fenced = await this.nativeOperationCurrent(current);
+        const fencedInfo = await this.ownership(fenced);
+        await this.nativeOperationCurrent(fenced);
+        if (!isDict(fencedInfo.devices) || !isDict(fencedInfo.expanded_devices)) throw new ControlError("mapping_unverified", "native device maps are unavailable before addition");
+        const fencedNative = fencedInfo.devices[port.device_name];
+        if (fencedNative) { if (Object.entries(expected).some(([key, value]) => fencedNative[key] !== value)) throw new ControlError("ownership_mismatch", "native device does not match reservation"); return; }
+        if (port.device_name in fencedInfo.expanded_devices) throw new ControlError("mapping_unverified", "native device maps disagree before addition");
+        await this.incus.deviceAdd(String(fenced.instance_name), String(port.device_name), "proxy", Object.fromEntries(Object.entries(expected).filter(([key]) => key !== "type")));
+      });
       const after = await this.ownership(current);
       if (!isDict(after.devices) || !isDict(after.expanded_devices)) throw new ControlError("mapping_unverified", "native device maps are unavailable after addition");
       const afterDevices = after.devices;
@@ -2044,12 +2196,18 @@ export class Control {
     });
   }
 
-  private async conntrackDelete(port: Dict, task: Dict): Promise<void> {
+  private async conntrackDelete(port: Dict, task: Dict, cleanup = false): Promise<void> {
     if (!this.which("conntrack")) throw new ControlError("conntrack_unavailable", "conntrack-tools is required for exact flow withdrawal");
     const match = ["-p", String(port.protocol), "--orig-dst", String(this.config.host_address), "--dport", String(port.host_port), "--reply-src", String(task.vm_ip), "--reply-port-src", String(port.vm_port)];
-    const result = await this.runner.run(["conntrack", "-D", ...match], { check: false, timeout: 2 });
+    const result = await this.nativeBarrier(async () => {
+      if (cleanup) await this.cleanupOperationCurrent(task); else await this.nativeOperationCurrent(task);
+      return this.runner.run(["conntrack", "-D", ...match], { check: false, timeout: 2 });
+    });
     if (result.returncode !== 0 && !(result.returncode === 1 && decode(result.stderr).includes("0 flow entries"))) throw new ControlError("conntrack_delete_failed", "exact conntrack deletion failed", { returncode: result.returncode, stderr: decode(result.stderr) });
-    const remaining = await this.runner.run(["conntrack", "-L", ...match], { check: false, timeout: 2 });
+    const remaining = await this.nativeBarrier(async () => {
+      if (cleanup) await this.cleanupOperationCurrent(task); else await this.nativeOperationCurrent(task);
+      return this.runner.run(["conntrack", "-L", ...match], { check: false, timeout: 2 });
+    });
     if (remaining.returncode !== 0 || decode(remaining.stdout).trim().length) throw new ControlError("conntrack_unverified", "matching flows remain or cannot be inspected");
   }
 
@@ -2078,11 +2236,11 @@ export class Control {
       current = await this.cleanupCurrent(task);
       if (!current) { errors.push("stale-cleanup:generation"); break; }
       task = current;
-      try { if (exists) await this.removeProxy(task, port); } catch (error) { errors.push(`remove-proxy:${port.device_name}:${error instanceof ControlError ? error.code : "error"}`); }
+      try { if (exists) await this.removeProxy(task, port, true); } catch (error) { errors.push(`remove-proxy:${port.device_name}:${error instanceof ControlError ? error.code : "error"}`); }
       current = await this.cleanupCurrent(task);
       if (!current) { errors.push("stale-cleanup:generation"); break; }
       task = current;
-      try { await this.conntrackDelete(port, task); completed.push(`withdraw:${port.device_name}`); } catch (error) { errors.push(`withdraw:${port.device_name}:${error instanceof ControlError ? error.code : "error"}`); }
+      try { await this.conntrackDelete(port, task, true); completed.push(`withdraw:${port.device_name}`); } catch (error) { errors.push(`withdraw:${port.device_name}:${error instanceof ControlError ? error.code : "error"}`); }
     }
     if (exists) {
       current = await this.cleanupCurrent(task);
@@ -2091,7 +2249,13 @@ export class Control {
         task = current;
         try {
           await this.ownership(task);
-          if (String((await this.incus.instanceInfo(String(task.instance_name))).status).toLowerCase() !== "stopped") await this.incus.stop(String(task.instance_name), true);
+          if (String((await this.incus.instanceInfo(String(task.instance_name))).status).toLowerCase() !== "stopped") {
+            await this.nativeBarrier(async () => {
+              await this.cleanupOperationCurrent(task);
+              await this.ownership(task);
+              await this.incus.stop(String(task.instance_name), true);
+            });
+          }
           if (String((await this.incus.instanceInfo(String(task.instance_name))).status).toLowerCase() !== "stopped") throw new ControlError("stop_unverified", "native instance is not stopped");
           completed.push("verify-stop");
         } catch (error) { errors.push(`stop:${error instanceof ControlError ? error.code : "error"}`); }
@@ -2106,19 +2270,32 @@ export class Control {
     return [errors, completed];
   }
 
-  private async removeProxy(task: Dict, port: Dict): Promise<void> {
-    const info = await this.ownership(task);
+  private async removeProxy(task: Dict, port: Dict, cleanup = false): Promise<void> {
+    const current = cleanup ? await this.cleanupOperationCurrent(task) : await this.nativeOperationCurrent(task);
+    const info = await this.ownership(current);
     if (!isDict(info.devices) || !isDict(info.expanded_devices)) throw new ControlError("mapping_unverified", "native device maps are unavailable");
     const devices = info.devices;
     const expandedBefore = info.expanded_devices;
     const native = devices[port.device_name];
     if (!native && port.device_name in expandedBefore) throw new ControlError("mapping_unverified", "native device maps disagree");
     if (native) {
-      const expected = this.proxyProperties(task, port);
+      const expected = this.proxyProperties(current, port);
       if (Object.entries(expected).some(([key, value]) => native[key] !== value)) throw new ControlError("ownership_mismatch", "native mapping differs from its reservation");
-      await this.incus.deviceRemove(String(task.instance_name), String(port.device_name));
+      await this.nativeBarrier(async () => {
+        const fenced = cleanup ? await this.cleanupOperationCurrent(current) : await this.nativeOperationCurrent(current);
+        const fencedInfo = await this.ownership(fenced);
+        if (!isDict(fencedInfo.devices) || !isDict(fencedInfo.expanded_devices)) throw new ControlError("mapping_unverified", "native device maps are unavailable before removal");
+        const fencedNative = fencedInfo.devices[port.device_name];
+        if (!fencedNative && port.device_name in fencedInfo.expanded_devices) throw new ControlError("mapping_unverified", "native device maps disagree before removal");
+        if (fencedNative) {
+          const fencedExpected = this.proxyProperties(fenced, port);
+          if (Object.entries(fencedExpected).some(([key, value]) => fencedNative[key] !== value)) throw new ControlError("ownership_mismatch", "native mapping differs from its reservation");
+        }
+        if (!fencedNative) return;
+        await this.incus.deviceRemove(String(fenced.instance_name), String(port.device_name));
+      });
     }
-    const after = await this.ownership(task);
+    const after = await this.ownership(current);
     if (!isDict(after.devices) || !isDict(after.expanded_devices)) throw new ControlError("mapping_unverified", "native device maps are unavailable after removal");
     if (port.device_name in after.devices || port.device_name in after.expanded_devices) throw new ControlError("mapping_unverified", "native mapping is still present");
   }
@@ -2212,37 +2389,49 @@ export class Control {
       await this.scheduleExpiry(task);
       const reclaimed = await this.reclaimCapacity(cost, String(task.task_id));
       task = await this.reserveNative(task, cost, await this.portInventory(), request.ssh_host_port);
-      if (cached) { phase = "native-generation"; await this.incus.configSet(String(task.instance_name), "user.agent-vm.generation", String(task.generation)); }
-      else {
-        phase = "native-init";
-        await this.incus.init(String(this.config.image_fingerprint), String(task.instance_name), { "user.agent-vm.managed": "native-v1", "user.agent-vm.task": task.task_id, "user.agent-vm.session": sessionId, "user.agent-vm.generation": String(task.generation) });
-        await this.configureNetwork(String(task.instance_name), String(task.vm_ip));
-      }
-      phase = "native-config";
-      for (const [key, nativeKey, suffix] of [["cpu", "limits.cpu", ""], ["memory_mib", "limits.memory", "MiB"]] as const) if (!cached || resources[key] !== old[key]) { await this.incus.configSet(String(task.instance_name), nativeKey, `${resources[key]}${suffix}`); completed.push(key); }
-      if (!cached || resources.disk_gib !== old.disk_gib) { await this.incus.deviceSet(String(task.instance_name), "root", "size", `${resources.disk_gib}GiB`); completed.push("virtual_disk"); }
-      if (stableJson(await this.nativeResources(task)) !== stableJson(resources)) throw new ControlError("resource_unverified", "native sizes differ from the session reservation");
-      phase = "native-start";
-      const nativeStarted = nowMs();
-      await this.startInstance(task);
-      stageTimings.native_start_seconds = Math.round((nowMs() - nativeStarted) / 1000 * 1000) / 1000;
-      phase = "guest-readiness";
-      readiness = await this.waitGuestReady(task, stageTimings);
-      phase = "guest-post-check";
-      const postCheckStarted = nowMs();
-      this.expectedVmIp = String(task.vm_ip);
-      await this.verifyGuestTools(String(task.instance_name));
-      await this.guestIp(String(task.instance_name));
-      const guest = await this.growGuestRoot(task, resources.disk_gib);
-      completed.push("guest_filesystem");
-      await this.installPublicKey(String(task.instance_name), publicKey);
-      stageTimings.post_check_seconds = Math.round((nowMs() - postCheckStarted) / 1000 * 1000) / 1000;
-      phase = "access-exposure";
-      if ((parseTime(task.lease_expires_at)?.getTime() ?? 0) <= this.now().getTime()) throw new ControlError("lease_expired", "lease expired during preparation");
-      const port = this.store.getPort(String(task.task_id), "ssh", "tcp");
-      if (!port) throw new ControlError("mapping_unverified", "managed SSH reservation is missing");
-      await this.addProxy(task, port);
-      if ((parseTime(task.lease_expires_at)?.getTime() ?? 0) <= this.now().getTime()) throw new ControlError("lease_expired", "lease expired while exposing SSH");
+      let guest: Dict = {};
+      await this.nativeLock(task, async () => {
+        if (cached) {
+          phase = "native-generation";
+          await this.nativeBarrier(async () => {
+            await this.nativeOperationCurrent(task);
+            await this.ownership(task);
+            await this.incus.configSet(String(task.instance_name), "user.agent-vm.generation", String(task.generation));
+          });
+        } else {
+          phase = "native-init";
+          await this.nativeBarrier(async () => {
+            await this.nativeOperationCurrent(task);
+            await this.incus.init(String(this.config.image_fingerprint), String(task.instance_name), { "user.agent-vm.managed": "native-v1", "user.agent-vm.task": task.task_id, "user.agent-vm.session": sessionId, "user.agent-vm.generation": String(task.generation) });
+          });
+          await this.configureNetwork(task, String(task.vm_ip));
+        }
+        phase = "native-config";
+        for (const [key, nativeKey, suffix] of [["cpu", "limits.cpu", ""], ["memory_mib", "limits.memory", "MiB"]] as const) if (!cached || resources[key] !== old[key]) { await this.nativeConfigSet(task, nativeKey, `${resources[key]}${suffix}`); completed.push(key); }
+        if (!cached || resources.disk_gib !== old.disk_gib) { await this.nativeDeviceSet(task, "root", "size", `${resources.disk_gib}GiB`); completed.push("virtual_disk"); }
+        if (stableJson(await this.nativeResources(task)) !== stableJson(resources)) throw new ControlError("resource_unverified", "native sizes differ from the session reservation");
+        phase = "native-start";
+        const nativeStarted = nowMs();
+        await this.startInstance(task);
+        stageTimings.native_start_seconds = Math.round((nowMs() - nativeStarted) / 1000 * 1000) / 1000;
+        phase = "guest-readiness";
+        readiness = await this.waitGuestReady(task, stageTimings);
+        phase = "guest-post-check";
+        const postCheckStarted = nowMs();
+        this.expectedVmIp = String(task.vm_ip);
+        await this.verifyGuestTools(task);
+        await this.guestIp(String(task.instance_name));
+        guest = await this.growGuestRoot(task, resources.disk_gib);
+        completed.push("guest_filesystem");
+        await this.installPublicKey(task, publicKey);
+        stageTimings.post_check_seconds = Math.round((nowMs() - postCheckStarted) / 1000 * 1000) / 1000;
+        phase = "access-exposure";
+        await this.nativeOperationCurrent(task);
+        const port = this.store.getPort(String(task.task_id), "ssh", "tcp");
+        if (!port) throw new ControlError("mapping_unverified", "managed SSH reservation is missing");
+        await this.addProxy(task, port);
+        await this.nativeOperationCurrent(task);
+      });
       task = await this.globalLock(() => this.store.transaction(() => {
         const current = this.store.getTask({ taskId: String(task.task_id) });
         if (!current || current.state !== "preparing" || (parseTime(current.lease_expires_at)?.getTime() ?? 0) <= this.now().getTime()) throw new ControlError("lease_expired", "preparation was revoked before commit");
@@ -2254,7 +2443,7 @@ export class Control {
       const controlError = error instanceof ControlError ? error : new ControlError("internal_error", (error as Error).name);
       let cleanup: Dict = { ok: false, error: { code: "not_attempted", message: "cleanup was not attempted" } };
       try { cleanup.result = await this.releaseTask(this.store.getTask({ taskId: String(task.task_id) }) ?? task); cleanup.ok = true; } catch (cleanupError) { cleanup.error = cleanupError instanceof ControlError ? cleanupError.asDict() : { code: "internal_error", message: (cleanupError as Error).name }; }
-      const detail: Dict = isDict(controlError.detail) ? { ...controlError.detail } : { cause: controlError.asDict() };
+      const detail: Dict = isDict(controlError.detail) ? redactDiagnosticValue(controlError.detail) as Dict : { cause: controlError.asDict() };
       const failurePhase = detail.phase ?? phase;
       Object.assign(detail, { phase: failurePhase, operation_phase: phase, completed, requested: resources, cleanup });
       if (readiness) detail.readiness = readiness;
@@ -2307,7 +2496,17 @@ export class Control {
       }
       await this.systemd.removeExpiry(String(task.task_id), task.generation);
       const absent = !(await this.incus.listInstances()).some((item) => item.name === task.instance_name);
-      if (!absent && task.previous_generation !== null && task.previous_generation !== undefined) { await this.ownership(task); await this.incus.configSet(String(task.instance_name), "user.agent-vm.generation", String(task.generation)); }
+      if (!absent && task.previous_generation !== null && task.previous_generation !== undefined) {
+        await this.nativeLock(task, async () => {
+          const current = await this.cleanupOperationCurrent(task);
+          await this.ownership(current);
+          await this.nativeBarrier(async () => {
+            await this.cleanupOperationCurrent(current);
+            await this.ownership(current);
+            await this.incus.configSet(String(current.instance_name), "user.agent-vm.generation", String(current.generation));
+          });
+        });
+      }
       const resources = absent ? {} : await this.nativeResources(task);
       task = await this.globalLock(() => this.store.transaction(() => {
         for (const port of this.store.getPorts(String(task.task_id))) this.store.removePort(String(task.task_id), String(port.port_name), String(port.protocol));
@@ -2350,7 +2549,7 @@ export class Control {
       const postCheckStarted = nowMs();
       this.expectedVmIp = String(task.vm_ip);
       await this.guestIp(String(task.instance_name));
-      await this.verifyGuestTools(String(task.instance_name));
+      await this.verifyGuestTools(task);
       stageTimings.post_check_seconds = Math.round((nowMs() - postCheckStarted) / 1000 * 1000) / 1000;
       task = await this.globalLock(() => this.store.transaction(() => { const current = this.store.getTask({ taskId: String(task.task_id) }); if (!current) throw new ControlError("task_missing", "task disappeared during restart"); this.checkGeneration(current, request); this.requireActive(current); return current; }));
       return { ...this.stateSummary(task), readiness, stage_timings: stageTimings };
@@ -2358,7 +2557,7 @@ export class Control {
       const controlError = error instanceof ControlError ? error : new ControlError("internal_error", (error as Error).name);
       let cleanup: Dict = { ok: false, error: { code: "not_attempted", message: "cleanup was not attempted" } };
       try { const current = this.store.getTask({ taskId: String(task.task_id) }); if (!current) throw new ControlError("task_missing", "task disappeared during restart cleanup"); cleanup.result = await this.releaseTask(current); cleanup.ok = true; } catch (cleanupError) { cleanup.error = cleanupError instanceof ControlError ? cleanupError.asDict() : { code: "internal_error", message: (cleanupError as Error).name }; }
-      const detail: Dict = isDict(controlError.detail) ? { ...controlError.detail } : { cause: controlError.asDict() };
+      const detail: Dict = isDict(controlError.detail) ? redactDiagnosticValue(controlError.detail) as Dict : { cause: controlError.asDict() };
       Object.assign(detail, { phase: detail.phase ?? phase, operation_phase: phase, cleanup });
       if (readiness) detail.readiness = readiness;
       this.store.updateTask(String(task.task_id), { last_error: stableJson({ code: "restart_partial", ...detail, error: controlError.asDict() }) });
@@ -2369,7 +2568,7 @@ export class Control {
   private async guestBootId(task: Dict): Promise<string> {
     const state = await this.incus.query(`/1.0/instances/${quotePath(String(task.instance_name))}/state`);
     if (!isDict(state) || String(state.status).toLowerCase() !== "running") throw new ControlError("guest_unavailable", "live memory adjustment requires a running guest");
-    const result = await this.incus.exec(String(task.instance_name), ["cat", "/proc/sys/kernel/random/boot_id"], { timeout: 15 });
+    const result = await this.nativeGuestExec(task, ["cat", "/proc/sys/kernel/random/boot_id"], { timeout: 15 }, false);
     const value = decode(result.stdout).trim();
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) throw new ControlError("resize_unverified", "guest boot identity is unavailable");
     return value;
@@ -2393,7 +2592,7 @@ export class Control {
     }
     const attempts: Dict[] = [];
     const applyMemory = async (): Promise<void> => {
-      try { await this.incus.configSet(String(task.instance_name), "limits.memory", `${target.memory_mib}MiB`); attempts.push({ ok: true }); }
+      try { await this.nativeLock(task, () => this.nativeConfigSet(task, "limits.memory", `${target.memory_mib}MiB`)); attempts.push({ ok: true }); }
       catch (error) { const detail = error instanceof ControlError ? error.asDict() : { code: "internal_error", message: (error as Error).name }; attempts.push({ ok: false, error: detail }); throw error; }
     };
     const completed: string[] = [];
@@ -2401,7 +2600,7 @@ export class Control {
       try { await applyMemory(); }
       catch (error) {
         const first = error instanceof ControlError ? error : new ControlError("internal_error", (error as Error).name);
-        const detail = isDict(first.detail) ? first.detail : {};
+        const detail = isDict(first.rawDetail) ? first.rawDetail : {};
         const stderr = typeof detail.stderr === "string" ? detail.stderr : "";
         const expected = new RegExp(`^Error: Failed updating memory limit: Failed setting memory to ${target.memory_mib}MiB \\(currently (?<current>\\d+)MiB\\) as it was taking too long$`).exec(stderr.trim());
         if (first.code !== "command_failed" || detail.returncode !== 1 || target.memory_mib >= old.memory_mib || !expected || Number(expected.groups?.current) <= target.memory_mib) throw first;
@@ -2436,7 +2635,7 @@ export class Control {
   }
 
   private async growGuestRoot(task: Dict, diskGib: number): Promise<Dict> {
-    const result = await this.incus.exec(String(task.instance_name), ["bun", "-e", GUEST_GROWTH_SCRIPT, String(diskGib)], { timeout: 120 });
+    const result = await this.nativeGuestExec(task, ["bun", "-e", GUEST_GROWTH_SCRIPT, String(diskGib)], { timeout: 120 });
     try {
       const value = parseJson(decodeUtf8Strict(result.stdout));
       if (!isDict(value) || typeof value.virtual_bytes !== "number" || value.virtual_bytes < diskGib * 1024 ** 3) throw new Error("report");
@@ -2484,8 +2683,10 @@ export class Control {
     try {
       if (needsRestart) await this.stopInstance(task);
       phase = "native-config";
-      for (const [key, nativeKey, suffix] of [["cpu", "limits.cpu", ""], ["memory_mib", "limits.memory", "MiB"]] as const) if (target[key] !== old[key] || recovering) { await this.incus.configSet(String(task.instance_name), nativeKey, `${target[key]}${suffix}`); completed.push(key); }
-      if (target.disk_gib > old.disk_gib) { await this.incus.deviceSet(String(task.instance_name), "root", "size", `${target.disk_gib}GiB`); const info = await this.ownership(task); const devices = nativeDeviceMaps(info, "resize_unverified").expanded_devices; if (!isDict(devices.root) || devices.root.size !== `${target.disk_gib}GiB`) throw new ControlError("resize_unverified", "native root size does not match request"); completed.push("virtual_disk"); }
+      await this.nativeLock(task, async () => {
+        for (const [key, nativeKey, suffix] of [["cpu", "limits.cpu", ""], ["memory_mib", "limits.memory", "MiB"]] as const) if (target[key] !== old[key] || recovering) { await this.nativeConfigSet(task, nativeKey, `${target[key]}${suffix}`); completed.push(key); }
+        if (target.disk_gib > old.disk_gib) { await this.nativeDeviceSet(task, "root", "size", `${target.disk_gib}GiB`); const info = await this.ownership(task); const devices = nativeDeviceMaps(info, "resize_unverified").expanded_devices; if (!isDict(devices.root) || devices.root.size !== `${target.disk_gib}GiB`) throw new ControlError("resize_unverified", "native root size does not match request"); completed.push("virtual_disk"); }
+      });
       if (needsRestart) { phase = "native-start"; const nativeStarted = nowMs(); await this.startInstance(task); stageTimings.native_start_seconds = Math.round((nowMs() - nativeStarted) / 1000 * 1000) / 1000; phase = "guest-readiness"; readiness = await this.waitGuestReady(task, stageTimings); }
       phase = "guest-post-check";
       const postCheckStarted = nowMs();
@@ -2501,7 +2702,7 @@ export class Control {
       const controlError = error instanceof ControlError ? error : new ControlError("internal_error", (error as Error).name);
       const cleanup: Dict = { performed: needsRestart, ok: true };
       if (needsRestart) try { cleanup.result = await this.releaseTask(this.store.getTask({ taskId: String(task.task_id) })!); } catch (cleanupError) { cleanup.ok = false; cleanup.error = cleanupError instanceof ControlError ? cleanupError.asDict() : { code: "internal_error", message: (cleanupError as Error).name }; }
-      const detail: Dict = isDict(controlError.detail) ? { ...controlError.detail } : { cause: controlError.asDict() };
+      const detail: Dict = isDict(controlError.detail) ? redactDiagnosticValue(controlError.detail) as Dict : { cause: controlError.asDict() };
       Object.assign(detail, { phase, completed, requested: target, cleanup });
       if (readiness) detail.readiness = readiness;
       this.store.updateTask(String(task.task_id), { last_error: stableJson({ code: "resize_partial", ...detail, error: controlError.asDict() }) });
@@ -2583,8 +2784,8 @@ export class Control {
   }
 
   async drainStatus(_request: Dict, _sessionId?: string): Promise<Dict> { return { draining: this.store.getMeta("draining") === "1" }; }
-  async drainEnter(_request: Dict, _sessionId?: string): Promise<Dict> { await this.globalLock(() => this.store.setMeta("draining", "1")); return { draining: true }; }
-  async drainExit(_request: Dict, _sessionId?: string): Promise<Dict> { await this.globalLock(() => this.store.setMeta("draining", "0")); return { draining: false }; }
+  async drainEnter(_request: Dict, _sessionId?: string): Promise<Dict> { await this.nativeBarrier(() => this.globalLock(() => this.store.setMeta("draining", "1")), true); return { draining: true }; }
+  async drainExit(_request: Dict, _sessionId?: string): Promise<Dict> { await this.nativeBarrier(() => this.globalLock(() => this.store.setMeta("draining", "0")), true); return { draining: false }; }
   async adminSessionList(_request: Dict, _sessionId?: string): Promise<Dict> { return { tasks: await Promise.all(this.store.listTasks().map((task) => this.runtimeSummary(task))) }; }
 
   async adminReconcile(request: Dict, _sessionId?: string): Promise<Dict> {
@@ -2602,7 +2803,16 @@ export class Control {
               const expiry = parseTime(task.lease_expires_at);
               if (expiry && expiry.getTime() > this.now().getTime()) throw new ControlError("cache_ineligible", "deletion retry has an effective deadline");
               const exists = (await this.incus.listInstances()).some((native) => native.name === task.instance_name);
-              if (exists) { await this.assertNoNativeProxies(task); if (String((await this.incus.instanceInfo(String(task.instance_name))).status).toLowerCase() !== "stopped" || this.store.getPorts(String(task.task_id)).length) throw new ControlError("cache_ineligible", "deletion retry is not safely stopped"); await this.incus.delete(String(task.instance_name)); }
+              if (exists) await this.nativeLock(task, async () => {
+                const current = await this.deletionOperationCurrent(task);
+                await this.assertNoNativeProxies(current);
+                if (String((await this.incus.instanceInfo(String(current.instance_name))).status).toLowerCase() !== "stopped" || this.store.getPorts(String(current.task_id)).length) throw new ControlError("cache_ineligible", "deletion retry is not safely stopped");
+                await this.nativeBarrier(async () => {
+                  await this.deletionOperationCurrent(current);
+                  await this.ownership(current);
+                  await this.incus.delete(String(current.instance_name));
+                });
+              });
               if ((await this.incus.listInstances()).some((native) => native.name === task.instance_name)) throw new ControlError("cleanup_incomplete", "deletion is not confirmed");
               await this.globalLock(() => this.store.updateTask(String(task.task_id), { state: "absent", vm_ip: null, ssh_host_port: null, lease_expires_at: null, inactive_since: null, cleanup_after: null, reservation_bytes: 0n, resource_reservation_json: "{}", last_error: null }));
             }

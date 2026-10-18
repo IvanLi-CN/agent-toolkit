@@ -672,7 +672,7 @@ test("refuses ambiguous guest roots and missing growth commands", () => {
 });
 
 test("fails closed on primitive, null, and array ACL rules before native init", async () => {
-  const invalidRules: unknown[] = [null, 7, "invalid", []];
+  const invalidRules: unknown[] = [null, 7, "invalid", [], { action: null }, { state: null }, { source: null }];
   for (const direction of ["ingress", "egress"] as const) {
     for (const [index, invalidRule] of invalidRules.entries()) {
       const f = fixture();
@@ -700,6 +700,45 @@ test("keeps bounded output and reaps a timed out process group", async () => {
     expect((error as ControlError).code).toBe("command_timeout");
     expect((error as ControlError).detail).toMatchObject({ reaped: true });
     expect(typeof ((error as ControlError).detail as Dict).process_group_killed).toBe("boolean");
+  }
+});
+
+test("redacts command stderr before journal, audit, and diagnostic output", async () => {
+  const f = fixture();
+  f.runner.failure = (args) => args[0] === "incus" && args[3] === "init";
+  const originalFailure = f.runner.failure;
+  f.runner.failure = (args) => {
+    if (!originalFailure?.(args)) return false;
+    throw new ControlError("command_failed", "native command failed", { returncode: 1, stderr: "password=secret-value bearer super-token" });
+  };
+  await expectCode(f.call("acquire", { public_key: KEY }, "op-redacted-native-error"), "command_failed");
+  const operation = JSON.stringify(f.store.operation("op-redacted-native-error"));
+  const audit = JSON.stringify(f.store.db.query("SELECT detail_json FROM audit").all());
+  const task = String(f.store.getTask({ sessionId: "thread-a" })?.last_error ?? "");
+  expect(operation).not.toContain("secret-value");
+  expect(operation).not.toContain("super-token");
+  expect(audit).not.toContain("secret-value");
+  expect(audit).not.toContain("super-token");
+  expect(task).not.toContain("secret-value");
+  const diagnostic = new ControlError("command_failed", "native command failed", { stderr: "private_key=secret-value" }).asDict();
+  expect(JSON.stringify(diagnostic)).not.toContain("secret-value");
+});
+
+test("expiry and drain fences stop preparation before a late native effect", async () => {
+  for (const mode of ["expiry", "drain"] as const) {
+    const f = fixture();
+    let triggered = false;
+    f.runner.onConfigSet = (_name, key) => {
+      if (triggered || key !== "limits.memory") return;
+      triggered = true;
+      if (mode === "expiry") f.now = new Date(f.store.getTask({ sessionId: "thread-a" })!.lease_expires_at);
+      else f.store.setMeta("draining", "1");
+    };
+    await expectCode(f.call("acquire", { public_key: KEY }, `op-fence-${mode}`), mode === "expiry" ? "lease_expired" : "draining");
+    const task = f.store.getTask({ sessionId: "thread-a" });
+    expect(task?.state).toBe("cached");
+    expect(f.runner.instances.get(task?.instance_name)?.status).toBe("Stopped");
+    expect(f.runner.calls.some(({ args }) => args[0] === "incus" && args[3] === "start")).toBe(false);
   }
 });
 
@@ -841,7 +880,7 @@ test("keeps high-ratio policy limits and admission remaining exact", async () =>
   const status = await f.call("status");
   const exactLimit = 4n * 10n ** 308n;
   expect(status.admission.limits.cpu).toBe(exactLimit);
-  expect(status.admission.ratios.cpu).toBe(1e308);
+  expect(status.admission.ratios.cpu).toBe("1e308");
   expect(status.admission.allocated_and_reserved.cpu).toBe(2);
   expect(status.admission.remaining.cpu).toBe(exactLimit - 2n);
 });

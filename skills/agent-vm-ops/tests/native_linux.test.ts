@@ -19,6 +19,7 @@ const getEuid = (process as unknown as { geteuid?: () => number }).geteuid;
 const isRoot = typeof getEuid === "function" && getEuid() === 0;
 const isLinux = process.platform === "linux";
 const hasSystemdPrerequisites = isLinux && existsSync("/usr/bin/bun") && Bun.which("systemd-analyze") !== null;
+const hasIsolatedTransportEvidence = isLinux && process.env.AGENT_VM_ISOLATED_TRANSPORT_EVIDENCE === "1";
 
 type TestCallback = () => void | Promise<void>;
 
@@ -33,7 +34,9 @@ function systemdTest(name: string, callback: TestCallback): void {
 }
 
 function transportTest(name: string, callback: TestCallback): void {
-  if (isLinux && isRoot) test(name, callback);
+  // This case only uses a temporary fake SSH transport and a non-systemd controller wrapper.
+  // The explicit CI flag does not relax the root gate for any real transport/native test.
+  if (isLinux && (isRoot || hasIsolatedTransportEvidence)) test(name, callback);
   else test.skip(name, callback);
 }
 
@@ -68,8 +71,9 @@ test("rejects a missing guest prerequisite before the guest write boundary", asy
   const store = new StateStore(dbPath);
   const control = new Control({ project: "agents", state_db: dbPath, timer_dir: probeRoot, required_guest_tools: ["bun", "sshd", "rsync", "docker", "growpart"] }, { store, runner });
   try {
+    store.putTask({ task_id: "avm-prerequisite", session_id: "prerequisite", generation: 1, state: "active", instance_name: "agent-vm-prerequisite", lease_expires_at: new Date(Date.now() + 60_000).toISOString(), created_at: new Date().toISOString(), updated_at: new Date().toISOString(), image_fingerprint: "a".repeat(64) });
     let failure: any;
-    try { await (control as any).verifyGuestTools("agent-vm-prerequisite"); }
+    try { await (control as any).verifyGuestTools(store.getTask({ taskId: "avm-prerequisite" })); }
     catch (error) { failure = error; }
     expect(failure?.code).toBe("command_failed");
     expect(runner.calls.some((args) => args.some((arg) => arg.includes("command -v")))).toBe(true);

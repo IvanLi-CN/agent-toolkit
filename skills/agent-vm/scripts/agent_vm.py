@@ -37,6 +37,30 @@ LOCAL_CONFIG_ROOT = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".c
 LOCAL_STATE_ROOT = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "agent-vm"
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.:@/-]{1,160}$")
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
+SENSITIVE_FIELD_RE = re.compile(r"(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)", re.IGNORECASE)
+
+
+def redact_diagnostic_text(value: str) -> str:
+    private_key = re.compile(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 _-]*PRIVATE KEY-----|$)", re.IGNORECASE)
+    redacted = private_key.sub("[REDACTED PRIVATE KEY]", value)
+    labels = r"(?:[A-Za-z0-9]+[_-])*(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)(?:[_-][A-Za-z0-9]+)*"
+    redacted = re.sub(rf"(?i)(['\"]?\b{labels}\b['\"]?\s*[:=]\s*)(['\"])[^\r\n]*?\2", r"\1\2[REDACTED]\2", redacted)
+    redacted = re.sub(rf"(?i)(['\"]?\b{labels}\b['\"]?\s*[:=]\s*)([^\s,;}}\]\\\"']+)", r"\1[REDACTED]", redacted)
+    redacted = re.sub(r"(?i)(\bsshpass\b[ \t]+-p)[\s\S]*", r"\1 [REDACTED]", redacted)
+    redacted = re.sub(r"(?i)(\b[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:)([^@\s/]+)(@)", r"\1[REDACTED]\3", redacted)
+    return re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[REDACTED]", redacted)
+
+
+def redact_diagnostic_value(value: Any, depth: int = 0) -> Any:
+    if depth > 8:
+        return "[REDACTED]"
+    if isinstance(value, str):
+        return redact_diagnostic_text(value)
+    if isinstance(value, list):
+        return [redact_diagnostic_value(item, depth + 1) for item in value]
+    if isinstance(value, dict):
+        return {key: "[REDACTED]" if SENSITIVE_FIELD_RE.search(str(key)) else redact_diagnostic_value(child, depth + 1) for key, child in value.items()}
+    return value
 
 
 class CliError(Exception):
@@ -44,13 +68,13 @@ class CliError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
-        self.detail = detail
+        self.detail = redact_diagnostic_value(detail) if detail is not None else None
         self.exit_code = exit_code
 
     def as_dict(self) -> dict[str, Any]:
         value = {"code": self.code, "message": self.message}
         if self.detail is not None:
-            value["detail"] = self.detail
+            value["detail"] = redact_diagnostic_value(self.detail)
         return value
 
 
@@ -151,13 +175,13 @@ def control_request(action: str, *, session: str | None, generation: int | None 
         process = subprocess.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", control_host,
                                   shlex.join(["bun", remote_control])],
                                  input=json.dumps(request, sort_keys=True).encode(), stdout=subprocess.PIPE,
-                                 stderr=None, check=False, timeout=control_timeout(action, fields))
+                                 stderr=subprocess.PIPE, check=False, timeout=control_timeout(action, fields))
     except FileNotFoundError: fail("command_missing", "ssh is not installed")
     except subprocess.TimeoutExpired:
         fail("remote_timeout", "control outcome is uncertain; retry the same operation ID",
              {"operation_id": request.get("operation_id")})
     if process.stderr:
-        sys.stderr.buffer.write(process.stderr)
+        sys.stderr.buffer.write(redact_diagnostic_text(process.stderr.decode("utf-8", "replace")).encode("utf-8"))
         sys.stderr.flush()
     if process.returncode:
         fail("remote_failed", "remote request failed; retry only with its original operation ID",
@@ -176,9 +200,12 @@ def control_request(action: str, *, session: str | None, generation: int | None 
 
 def run_command(argv: Sequence[str], *, input_data: bytes | None = None, output: bool = False) -> int:
     try:
-        process = subprocess.run(list(argv), input=input_data, check=False)
+        process = subprocess.run(list(argv), input=input_data, stderr=subprocess.PIPE, check=False)
     except FileNotFoundError:
         fail("command_missing", f"command not found: {argv[0]}")
+    if process.stderr:
+        sys.stderr.buffer.write(redact_diagnostic_text(process.stderr.decode("utf-8", "replace")).encode("utf-8"))
+        sys.stderr.flush()
     return process.returncode
 
 

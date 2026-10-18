@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 from pathlib import Path
 import unittest
 from unittest import mock
@@ -56,6 +57,30 @@ class SessionContractTests(unittest.TestCase):
             CLI.control_request("status", session="thread")
         remote = run.call_args.args[0][-1]
         self.assertEqual(remote, "bun /opt/agent-vm-native/agent_vm_control.ts")
+
+    def test_remote_stderr_is_redacted_before_cli_output(self):
+        response = CLI.subprocess.CompletedProcess([], 2, b"", b'{"password":"secret-value"} bearer super-token\n')
+        stderr = io.BytesIO()
+        stream = mock.Mock()
+        stream.buffer = stderr
+        stream.flush = mock.Mock()
+        with mock.patch.object(CLI.subprocess, "run", return_value=response), mock.patch.object(CLI.sys, "stderr", stream):
+            with self.assertRaises(CLI.CliError) as error:
+                CLI.control_request("status", session="thread")
+        self.assertNotIn(b"secret-value", stderr.getvalue())
+        self.assertNotIn(b"super-token", stderr.getvalue())
+        self.assertNotIn("secret-value", str(error.exception.as_dict()))
+
+    def test_guest_command_stderr_is_redacted_before_cli_output(self):
+        response = CLI.subprocess.CompletedProcess([], 1, b"", b'token=secret-value {"private_key":"private-value"}\n')
+        stderr = io.BytesIO()
+        stream = mock.Mock()
+        stream.buffer = stderr
+        stream.flush = mock.Mock()
+        with mock.patch.object(CLI.subprocess, "run", return_value=response), mock.patch.object(CLI.sys, "stderr", stream):
+            self.assertEqual(CLI.run_command(["ssh", "agent-vm"]), 1)
+        self.assertNotIn(b"secret-value", stderr.getvalue())
+        self.assertNotIn(b"private-value", stderr.getvalue())
 
 
 if __name__ == "__main__":

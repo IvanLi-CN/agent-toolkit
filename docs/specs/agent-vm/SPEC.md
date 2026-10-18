@@ -18,7 +18,7 @@ Protocol 4 is required by both client and control. Mutations include an operatio
 
 Each session owns at most one VM slot, including preparing, stopping, deleting and cached states. Acquire creates or reuses a stopped cache, records a new generation and waits for guest agent and IPv4 readiness within one bounded monotonic budget. Lease expiry and release revoke access, remove only owned mappings and stop the guest before making the slot reusable. A stopped disk may remain as a disposable cache; no recovery guarantee is made.
 
-Renewal is explicit and bounded. Acquire, status, SSH, execution and transfer do not renew a lease. A changed generation or expired lease rejects late readiness and native results. Durable state, locks and timers make repeated requests idempotent without hiding partial cleanup.
+Renewal is explicit and bounded. Acquire, status, SSH, execution and transfer do not renew a lease. A changed generation or expired lease rejects late readiness and native results; expiry and drain transitions coordinate with per-session native locks and the native effect barrier before permitting state changes. Durable state, locks and timers make repeated requests idempotent without hiding partial cleanup.
 
 ## Access and isolation
 
@@ -26,7 +26,7 @@ The deployment configuration supplies the control address and host port range. P
 
 ## Capacity and resizing
 
-Capacity observations are limited to the configured Incus pool filesystem and visible control-environment CPU and memory boundaries. External storage probes and infrastructure-manager inspection are unsupported. CPU and memory allocation ceilings use separately configurable overselling ratios; stopped caches consume disk only. New demand is refused when local measurements are missing, invalid or below the configured pressure threshold. Existing lease queries, retrieval, renewal and release remain available during pressure.
+Capacity observations are limited to the configured Incus pool filesystem and visible control-environment CPU and memory boundaries. External storage probes and infrastructure-manager inspection are unsupported. CPU and memory allocation ceilings use separately configurable overselling ratios; stopped caches consume disk only. Admission diagnostics serialize configured ratios as exact decimal or scientific strings so large values are not rounded or converted to non-finite JSON. New demand is refused when local measurements are missing, invalid or below the configured pressure threshold. Existing lease queries, retrieval, renewal and release remain available during pressure.
 
 Disk changes require an explicit restart allowance and grow only. Memory-only live changes require a running owned guest, unchanged boot identity and native acknowledgement. The old reservation remains until verification succeeds. The documented native balloon-timeout path settles for 45 seconds, then permits exactly one bounded convergence retry only after rereading lease, reservation, native-resource and guest-boot guards; there is no polling loop or third attempt. Partial native changes retain conservative reservations and a structured recovery state.
 

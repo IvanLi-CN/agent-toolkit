@@ -973,7 +973,37 @@ class StateStore:
         if not isinstance(value, Mapping):
             raise ControlError("operation_unverified", "operation journal record is not an object",
                                {"operation_id": operation_id})
-        return dict(value)
+        record = dict(value)
+        digest = record.get("_request_digest")
+        if not isinstance(digest, str) or not digest:
+            raise ControlError("operation_unverified", "operation journal digest is invalid",
+                               {"operation_id": operation_id})
+        outcome = record.get("outcome")
+        if outcome == "pending":
+            return record
+        if outcome == "error":
+            error = record.get("error")
+            if (not isinstance(error, Mapping)
+                    or not isinstance(error.get("code"), str)
+                    or not error["code"]
+                    or not isinstance(error.get("message"), str)
+                    or not error["message"]):
+                raise ControlError("operation_unverified", "operation journal error is invalid",
+                                   {"operation_id": operation_id})
+            return record
+        if outcome == "success":
+            if (record.get("ok") is not True
+                    or record.get("protocol") != PROTOCOL_VERSION
+                    or not isinstance(record.get("action"), str)
+                    or not record["action"]
+                    or not isinstance(record.get("operation_id"), str)
+                    or not record["operation_id"]
+                    or not isinstance(record.get("result"), Mapping)):
+                raise ControlError("operation_unverified", "operation journal success is invalid",
+                                   {"operation_id": operation_id})
+            return record
+        raise ControlError("operation_unverified", "operation journal outcome is invalid",
+                           {"operation_id": operation_id})
 
     def record_operation(
         self,
@@ -1377,6 +1407,70 @@ class Control:
                 if latest and latest["generation"] == generation and latest["state"] == "closing":
                     self.store.update_task(task_id, last_error=json.dumps(exc.as_dict()))
 
+    def _validate_cached_success(
+        self,
+        action: str,
+        operation_id: str,
+        session_id: str | None,
+        request: Mapping[str, Any],
+        cached: Mapping[str, Any],
+    ) -> None:
+        """Require a replay record to match both its request and durable state."""
+        if (cached.get("action") != action
+                or cached.get("operation_id") != operation_id
+                or cached.get("session_id") != session_id
+                or cached.get("generation") != request.get("generation")):
+            raise ControlError("operation_unverified", "operation journal identity does not match the request",
+                               {"operation_id": operation_id})
+        result = cached.get("result")
+        if not isinstance(result, Mapping):
+            raise ControlError("operation_unverified", "operation journal result is invalid",
+                               {"operation_id": operation_id})
+        if action in {"drain-enter", "drain-exit"}:
+            expected = action == "drain-enter"
+            if result.get("draining") is not expected or (self.store.get_meta("draining") == "1") is not expected:
+                raise ControlError("operation_unverified", "drain state does not match the journal result",
+                                   {"operation_id": operation_id, "expected_draining": expected})
+            return
+        if action in {"acquire", "renew", "release", "destroy", "restart", "resize"}:
+            if session_id is None:
+                raise ControlError("operation_unverified", "session-scoped operation has no session",
+                                   {"operation_id": operation_id})
+            task = self.store.get_task(session_id=session_id)
+            if (task is None
+                    or result.get("task_id") != task.get("task_id")
+                    or result.get("generation") != int(task["generation"])
+                    or result.get("state") != task.get("state")):
+                raise ControlError("operation_unverified", "task state does not match the journal result",
+                                   {"operation_id": operation_id})
+            return
+        if action == "port-add":
+            if session_id is None:
+                raise ControlError("operation_unverified", "port operation has no session",
+                                   {"operation_id": operation_id})
+            task = self.store.get_task(session_id=session_id)
+            port_name = result.get("port_name")
+            protocol = result.get("protocol")
+            port = (self.store.get_port(task["task_id"], port_name, protocol)
+                    if task and isinstance(port_name, str) and isinstance(protocol, str)
+                    and protocol in {"tcp", "udp"} else None)
+            if (port is None
+                    or port.get("state") != "active"
+                    or port.get("generation") != int(task["generation"])
+                    or any(result.get(key) != port.get(key) for key in
+                           ("task_id", "port_name", "protocol", "host_port", "vm_port", "generation"))):
+                raise ControlError("operation_unverified", "port state does not match the journal result",
+                                   {"operation_id": operation_id})
+            return
+        if action == "port-remove" and session_id is not None:
+            task = self.store.get_task(session_id=session_id)
+            name = request.get("name")
+            protocol = request.get("port_protocol", "tcp")
+            if (task and isinstance(name, str) and isinstance(protocol, str) and protocol in {"tcp", "udp"}
+                    and self.store.get_port(task["task_id"], name, protocol)):
+                raise ControlError("operation_unverified", "removed port still exists after journal success",
+                                   {"operation_id": operation_id})
+
     def _dispatch_locked(self, request: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(request, Mapping):
             raise ControlError("invalid_request", "request must be an object")
@@ -1389,7 +1483,9 @@ class Control:
             session_id = request.get("session_id")
             if session_id is not None:
                 session_id = require_nonempty_string(session_id, "session_id", SESSION_ID_RE)
-        if action == "admin-metrics" and (session_id is not None or request.get("operation_id") is not None):
+        if action == "admin-metrics" and (
+            "session_id" in request or "operation_id" in request
+        ):
             raise ControlError("invalid_request", "admin-metrics is sessionless and read-only")
         operation_id = request.get("operation_id")
         if action in self.WRITE_ACTIONS:
@@ -1405,6 +1501,7 @@ class Control:
                 if cached.get("outcome") == "error":
                     error = cached["error"]
                     raise ControlError(error["code"], error["message"], error.get("detail"))
+                self._validate_cached_success(action, operation_id, session_id, request, cached)
                 response = dict(cached)
                 response.pop("_request_digest", None)
                 response["server_time"] = iso_time(self.now())

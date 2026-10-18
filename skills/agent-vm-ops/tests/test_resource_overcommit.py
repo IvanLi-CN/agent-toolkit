@@ -269,6 +269,13 @@ class AdmissionTests(Fixture):
         self.assertEqual(failure.exception.code, "invalid_request")
         self.assertEqual(len(self.store._rows("SELECT action FROM audit")), before)
 
+    def test_admin_metrics_rejects_explicit_null_session_and_operation(self):
+        for field in ("session_id", "operation_id"):
+            with self.subTest(field=field):
+                request = self.request("admin-metrics")
+                request[field] = None
+                self.error("invalid_request", self.control.dispatch, request)
+
     def test_corrupt_operation_journal_is_structured(self):
         operation_id = "corrupt-journal"
         self.store.record_operation(operation_id, "drain-enter", None, 0, {"outcome": "success"})
@@ -278,6 +285,41 @@ class AdmissionTests(Fixture):
             )
         self.error("operation_unverified", self.control.dispatch,
                    self.request("drain-enter", operation=operation_id))
+
+    def test_success_operation_journal_must_match_durable_drain_state(self):
+        operation_id = "stale-drain-success"
+        request = self.request("drain-enter", operation=operation_id)
+        digest = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
+        record = {
+            "ok": True,
+            "protocol": CONTROL.PROTOCOL_VERSION,
+            "action": "drain-enter",
+            "session_id": request["session_id"],
+            "generation": request["generation"],
+            "operation_id": operation_id,
+            "outcome": "success",
+            "result": {"draining": True},
+            "_request_digest": digest,
+        }
+        self.store.record_operation(operation_id, "drain-enter", request["session_id"], request["generation"], record)
+        self.error("operation_unverified", self.control.dispatch, request)
+
+    def test_success_and_error_operation_journals_require_complete_shapes(self):
+        request = self.request("drain-enter", operation="incomplete-success")
+        digest = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
+        self.store.record_operation(
+            "incomplete-success", "drain-enter", request["session_id"], request["generation"],
+            {"ok": True, "protocol": CONTROL.PROTOCOL_VERSION, "outcome": "success",
+             "_request_digest": digest},
+        )
+        self.error("operation_unverified", self.control.dispatch, request)
+        request = self.request("drain-enter", operation="incomplete-error")
+        digest = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
+        self.store.record_operation(
+            "incomplete-error", "drain-enter", request["session_id"], request["generation"],
+            {"outcome": "error", "error": {"code": "draining"}, "_request_digest": digest},
+        )
+        self.error("operation_unverified", self.control.dispatch, request)
 
     def test_acquire_rechecks_drain_before_active_commit(self):
         def enter_drain(*_):

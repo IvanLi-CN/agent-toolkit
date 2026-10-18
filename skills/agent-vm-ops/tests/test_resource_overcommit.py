@@ -364,6 +364,36 @@ class AdmissionTests(Fixture):
         self.call("release")
         self.error("operation_unverified", self.control.dispatch, request)
 
+    def test_reconcile_action_error_replays_as_the_committed_result(self):
+        active = self.acquire()
+        request = self.request("admin-reconcile", operation="reconcile-error", apply=False)
+        digest = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
+        record = {
+            "ok": True,
+            "protocol": CONTROL.PROTOCOL_VERSION,
+            "action": "admin-reconcile",
+            "session_id": request["session_id"],
+            "generation": request["generation"],
+            "operation_id": request["operation_id"],
+            "outcome": "success",
+            "result": {
+                "dry_run": True,
+                "actions": [{
+                    "task_id": active["task_id"],
+                    "generation": active["generation"],
+                    "action": "inspect",
+                    "error": {"code": "object_busy", "message": "resource is being changed"},
+                }],
+            },
+            "_request_digest": digest,
+        }
+        self.store.record_operation(
+            request["operation_id"], "admin-reconcile", request["session_id"], request["generation"], record
+        )
+        replay = self.control.dispatch(request)
+        self.assertEqual(replay["outcome"], "replayed")
+        self.assertEqual(replay["result"]["actions"][0]["error"]["code"], "object_busy")
+
     def test_release_of_missing_native_instance_keeps_absent_state_readable(self):
         active = self.acquire()
         self.runner.instances.pop(active["instance_name"])

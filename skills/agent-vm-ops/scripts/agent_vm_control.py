@@ -578,7 +578,15 @@ class IncusClient:
 
     def list_instances(self) -> list[dict[str, Any]]:
         value = self.json(["list"])
-        if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        if (
+            not isinstance(value, list)
+            or any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("name"), str)
+                or not item["name"]
+                for item in value
+            )
+        ):
             raise ControlError("incus_invalid_output", "Incus list output is not an array")
         return value
 
@@ -1198,6 +1206,7 @@ class SystemdManager:
 
     def expiry_active(self, task_id: str, generation: int, expires_at: str) -> bool:
         unit = self.timer_unit(task_id, generation)
+        service_unit = f"agent-vm-native-expire@{self.instance_name(task_id, generation)}.service"
         if not self.enabled:
             return True
         path = self.timer_dir / unit
@@ -1206,6 +1215,7 @@ class SystemdManager:
         try:
             expected_calendar = "OnCalendar=" + parse_time(expires_at).strftime("%Y-%m-%d %H:%M:%S UTC")
             content = path.read_text(encoding="utf-8")
+            lines = content.splitlines()
             result = self.runner.run(
                 ["systemctl", "show", unit, "-p", "ActiveState", "-p", "FragmentPath", "-p", "UnitFileState"],
                 timeout=10,
@@ -1223,7 +1233,9 @@ class SystemdManager:
             and values.get("ActiveState") == "active"
             and values.get("FragmentPath") == str(path)
             and values.get("UnitFileState") == "enabled"
-            and content.count(expected_calendar) == 1
+            and lines.count(f"Unit={service_unit}") == 1
+            and lines.count(expected_calendar) == 1
+            and lines.count("Persistent=yes") == 1
         )
 
     def remove_expiry(self, task_id: str, generation: int) -> str:
@@ -1390,9 +1402,13 @@ class Control:
             session = task["session_id"] if task else "missing-timer"
             if request.get("protocol") != PROTOCOL_VERSION:
                 raise ControlError("protocol_mismatch", "unsupported timer protocol")
-            self._expire_preempt(request)
         identity = "session:" + str(session) if action in self.SESSION_ACTIONS or action == "timer-expire" else "admin"
         with self._object_lock(identity):
+            if action == "timer-expire":
+                # Serialize expiry with the owner operation before changing its
+                # durable state. Native cleanup must not race a slow acquire,
+                # restart, resize, or proxy mutation.
+                self._expire_preempt(request)
             if action in self.WRITE_ACTIONS:
                 op = require_nonempty_string(request.get("operation_id"), "operation_id", SESSION_ID_RE)
                 with self._object_lock("operation:" + op):
@@ -1400,9 +1416,11 @@ class Control:
             return self._dispatch_locked(request)
 
     def _expire_preempt(self, request: Mapping[str, Any]) -> None:
-        """Close the admission fence and attempt withdrawal before a slow owner
-        operation finishes. Port reuse still waits for the object lock and a
-        second confirmed cleanup; late native completion cannot reopen a lease.
+        """Close the admission fence and perform a confirmed native withdrawal.
+
+        The public timer dispatch holds the session object lock before calling
+        this method, so a slow owner operation cannot change native state while
+        expiry is withdrawing it.
         """
         task_id = require_nonempty_string(request.get("task_id"), "task_id", TASK_ID_RE)
         generation = require_int(request.get("generation"), "generation", 1)
@@ -1483,6 +1501,55 @@ class Control:
             if any(result.get(key) != current.get(key) for key in durable_fields):
                 raise ControlError("operation_unverified", "task state does not match the journal result",
                                    {"operation_id": operation_id})
+            if action in {"acquire", "restart", "resize"}:
+                try:
+                    if task.get("state") != "active":
+                        raise ControlError("operation_unverified", "replayed operation is no longer active",
+                                           {"operation_id": operation_id})
+                    self._ownership(task)
+                    if self.incus.instance_info(task["instance_name"])["status"].lower() != "running":
+                        raise ControlError("operation_unverified", "replayed guest is not running",
+                                           {"operation_id": operation_id})
+                    if self._native_resources(task) != result.get("resources"):
+                        raise ControlError("operation_unverified", "replayed native resources differ from the journal",
+                                           {"operation_id": operation_id})
+                except ControlError as exc:
+                    if exc.code == "operation_unverified":
+                        raise
+                    raise ControlError("operation_unverified", "replayed native state cannot be verified",
+                                       {"operation_id": operation_id}) from exc
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ControlError("operation_unverified", "replayed native state cannot be verified",
+                                       {"operation_id": operation_id}) from exc
+            elif action in {"release", "destroy"}:
+                try:
+                    if task.get("state") == "cached":
+                        self._ownership(task)
+                        if self.incus.instance_info(task["instance_name"])["status"].lower() != "stopped":
+                            raise ControlError("operation_unverified", "replayed cache is still running",
+                                               {"operation_id": operation_id})
+                        if self.store.get_ports(task["task_id"]):
+                            raise ControlError("operation_unverified", "replayed cache still has ports",
+                                               {"operation_id": operation_id})
+                        owned = self._ownership(task)
+                        if any(device.get("type") == "proxy" for device in owned.get("expanded_devices", {}).values()):
+                            raise ControlError("operation_unverified", "replayed cache still has native proxies",
+                                               {"operation_id": operation_id})
+                    elif task.get("state") == "absent":
+                        if any(native.get("name") == task["instance_name"] for native in self.incus.list_instances()):
+                            raise ControlError("operation_unverified", "replayed absent instance still exists",
+                                               {"operation_id": operation_id})
+                    else:
+                        raise ControlError("operation_unverified", "replayed cleanup state is invalid",
+                                           {"operation_id": operation_id})
+                except ControlError as exc:
+                    if exc.code == "operation_unverified":
+                        raise
+                    raise ControlError("operation_unverified", "replayed native cleanup state cannot be verified",
+                                       {"operation_id": operation_id}) from exc
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ControlError("operation_unverified", "replayed native cleanup state cannot be verified",
+                                       {"operation_id": operation_id}) from exc
             return
         if action == "port-add":
             if session_id is None:
@@ -1509,6 +1576,21 @@ class Control:
                            ("task_id", "port_name", "protocol", "host_port", "vm_port", "generation"))):
                 raise ControlError("operation_unverified", "port state does not match the journal result",
                                    {"operation_id": operation_id})
+            try:
+                owned = self._ownership(task)
+                native = owned.get("devices", {}).get(port["device_name"])
+                expected = self._proxy_properties(task, port)
+                if not isinstance(native, Mapping) or any(native.get(key) != value for key, value in expected.items()):
+                    raise ControlError("operation_unverified", "port mapping does not match the journal result",
+                                       {"operation_id": operation_id})
+            except ControlError as exc:
+                if exc.code == "operation_unverified":
+                    raise
+                raise ControlError("operation_unverified", "replayed port mapping cannot be verified",
+                                   {"operation_id": operation_id}) from exc
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ControlError("operation_unverified", "replayed port mapping cannot be verified",
+                                   {"operation_id": operation_id}) from exc
             return
         if action == "port-remove":
             if session_id is None:
@@ -1602,8 +1684,6 @@ class Control:
                         or not isinstance(error.get("message"), str)):
                     raise ControlError("operation_unverified", "reconcile journal error is invalid",
                                        {"operation_id": operation_id})
-                raise ControlError("operation_unverified", "reconcile journal contains an unverified action error",
-                                   {"operation_id": operation_id})
             if item.get("action") not in allowed:
                 raise ControlError("operation_unverified", "reconcile journal action is unknown",
                                    {"operation_id": operation_id})
@@ -1616,6 +1696,11 @@ class Control:
             if task is None or generation != item["generation"]:
                 raise ControlError("operation_unverified", "reconcile task generation no longer matches",
                                    {"operation_id": operation_id})
+            if "error" in item:
+                # An action-level error is already the committed outcome. A
+                # replay must return that same structured error, but it must
+                # never claim that a newer task generation was checked.
+                continue
             dry_states = {
                 "inspect": {"active", "cached", "closing", "preparing", "failed", "deleting"},
                 "finish-delete": {"deleting"},
@@ -3763,6 +3848,14 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
             raise ControlError("invalid_request", "reconcile apply must be a JSON boolean")
         actions = []
         for snapshot in self.store.list_tasks():
+            snapshot_generation = snapshot.get("generation")
+            if isinstance(snapshot_generation, bool) or not isinstance(snapshot_generation, int):
+                snapshot_generation = None
+            item = {
+                "task_id": snapshot.get("task_id"),
+                "generation": snapshot_generation,
+                "action": "inspect",
+            }
             try:
                 with self._object_lock("session:" + snapshot["session_id"], blocking=False):
                     task = self.store.get_task(task_id=snapshot["task_id"])
@@ -3818,10 +3911,8 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
                                             self.store.remove_port(task["task_id"], port["port_name"], port["protocol"])
                     actions.append(item)
             except ControlError as exc:
-                generation = snapshot.get("generation")
-                if isinstance(generation, bool) or not isinstance(generation, int):
-                    generation = None
-                actions.append({"task_id": snapshot.get("task_id"), "generation": generation, "error": exc.as_dict()})
+                item["error"] = exc.as_dict()
+                actions.append(item)
         return {"dry_run": not apply, "actions": actions}
 
 

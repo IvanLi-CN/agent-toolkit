@@ -214,6 +214,25 @@ class NativeTimerTests(unittest.TestCase):
                 self.assertIs(error.exception, self.failure)
                 self.assertEqual(self.runner.run.call_count, 2)
 
+    def test_expiry_active_requires_the_timer_to_target_its_service(self):
+        expires_at = "2026-10-04T12:34:56+00:00"
+        path = self.root / self.unit
+        content = (
+            "[Timer]\n"
+            "OnCalendar=2026-10-04 12:34:56 UTC\n"
+            "Persistent=yes\n"
+            f"Unit=agent-vm-native-expire@{self.systemd.instance_name(self.task, 1)}.service\n"
+        )
+        path.write_text(content)
+        self.runner.run.return_value = subprocess.CompletedProcess(
+            [], 0,
+            f"ActiveState=active\nFragmentPath={path}\nUnitFileState=enabled\n".encode(),
+            b"",
+        )
+        self.assertTrue(self.systemd.expiry_active(self.task, 1, expires_at))
+        path.write_text(content.replace("Unit=agent-vm-native-expire@", "Unit=other-service@"))
+        self.assertFalse(self.systemd.expiry_active(self.task, 1, expires_at))
+
 
 class Fixture(unittest.TestCase):
     def setUp(self):
@@ -1071,10 +1090,12 @@ class IncusWaitTests(unittest.TestCase):
         self.runner.run.assert_not_called()
 
     def test_instance_list_rejects_malformed_entries(self):
-        self.runner.run.return_value = subprocess.CompletedProcess([], 0, b"[null]", b"")
-        with self.assertRaises(CONTROL.ControlError) as failure:
-            self.client.list_instances()
-        self.assertEqual(failure.exception.code, "incus_invalid_output")
+        for body in (b"[null]", b"[{}]", b'[{"name":""}]'):
+            with self.subTest(body=body):
+                self.runner.run.return_value = subprocess.CompletedProcess([], 0, body, b"")
+                with self.assertRaises(CONTROL.ControlError) as failure:
+                    self.client.list_instances()
+                self.assertEqual(failure.exception.code, "incus_invalid_output")
 
 
 class ReclaimTests(Fixture):

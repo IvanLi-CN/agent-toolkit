@@ -1196,6 +1196,27 @@ class SystemdManager:
             self._systemctl("restart", unit)
         return unit
 
+    def expiry_active(self, task_id: str, generation: int) -> bool:
+        unit = self.timer_unit(task_id, generation)
+        if not self.enabled:
+            return True
+        if not (self.timer_dir / unit).is_file():
+            return False
+        try:
+            result = self.runner.run(
+                ["systemctl", "show", unit, "-p", "ActiveState", "-p", "UnitFileState"],
+                timeout=10,
+                check=False,
+            )
+        except ControlError:
+            return False
+        values = dict(
+            line.split("=", 1)
+            for line in result.stdout.decode(errors="replace").splitlines()
+            if "=" in line
+        )
+        return result.returncode == 0 and values.get("ActiveState") == "active" and values.get("UnitFileState") == "enabled"
+
     def remove_expiry(self, task_id: str, generation: int) -> str:
         unit = self.timer_unit(task_id, generation)
         path = self.timer_dir / unit
@@ -1603,6 +1624,55 @@ class Control:
             if task.get("state") not in expected_states[item["action"]]:
                 raise ControlError("operation_unverified", "reconcile result is not reflected in durable state",
                                    {"operation_id": operation_id, "action": item["action"]})
+            if not result["dry_run"]:
+                action_name = item["action"]
+                if action_name == "rearm-current-expiry":
+                    try:
+                        if not self._state_summary(task)["effective_lease"]:
+                            raise ControlError("operation_unverified", "reconciled lease is no longer effective",
+                                               {"operation_id": operation_id})
+                        self._ownership(task)
+                        if self.incus.instance_info(task["instance_name"])["status"].lower() != "running":
+                            raise ControlError("operation_unverified", "reconciled guest is not running",
+                                               {"operation_id": operation_id})
+                        if not self.systemd.expiry_active(task["task_id"], generation):
+                            raise ControlError("operation_unverified", "reconciled expiry timer is not active",
+                                               {"operation_id": operation_id})
+                    except ControlError as exc:
+                        if exc.code == "operation_unverified":
+                            raise
+                        raise ControlError("operation_unverified", "reconciled native state cannot be verified",
+                                           {"operation_id": operation_id}) from exc
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise ControlError("operation_unverified", "reconciled native state cannot be verified",
+                                           {"operation_id": operation_id}) from exc
+                elif action_name in {"close-incomplete-or-expired", "stop-unexpected-running-cache"}:
+                    if task.get("state") == "cached":
+                        try:
+                            self._ownership(task)
+                            if self.incus.instance_info(task["instance_name"])["status"].lower() != "stopped":
+                                raise ControlError("operation_unverified", "reconciled cache is still running",
+                                                   {"operation_id": operation_id})
+                            if self.store.get_ports(task["task_id"]):
+                                raise ControlError("operation_unverified", "reconciled cache still has ports",
+                                                   {"operation_id": operation_id})
+                        except ControlError as exc:
+                            if exc.code == "operation_unverified":
+                                raise
+                            raise ControlError("operation_unverified", "reconciled cache state cannot be verified",
+                                               {"operation_id": operation_id}) from exc
+                        except (KeyError, TypeError, ValueError) as exc:
+                            raise ControlError("operation_unverified", "reconciled cache state cannot be verified",
+                                               {"operation_id": operation_id}) from exc
+                elif action_name == "finish-delete" or task.get("state") == "absent":
+                    try:
+                        exists = any(native.get("name") == task.get("instance_name") for native in self.incus.list_instances())
+                    except ControlError as exc:
+                        raise ControlError("operation_unverified", "reconciled native state cannot be verified",
+                                           {"operation_id": operation_id}) from exc
+                    if exists:
+                        raise ControlError("operation_unverified", "reconciled native instance still exists",
+                                           {"operation_id": operation_id})
 
     def _dispatch_locked(self, request: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(request, Mapping):
@@ -3677,7 +3747,9 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
                 with self._object_lock("session:" + snapshot["session_id"], blocking=False):
                     task = self.store.get_task(task_id=snapshot["task_id"])
                     if task["state"] == "absent": continue
-                    item = {"task_id": task["task_id"], "generation": int(task["generation"]), "action": "inspect"}
+                    if isinstance(task.get("generation"), bool) or not isinstance(task.get("generation"), int):
+                        raise ControlError("resource_unverified", "task generation cannot be verified")
+                    item = {"task_id": task["task_id"], "generation": task["generation"], "action": "inspect"}
                     if task["state"] == "deleting":
                         item["action"] = "finish-delete"
                         if apply:
@@ -3726,7 +3798,10 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
                                             self.store.remove_port(task["task_id"], port["port_name"], port["protocol"])
                     actions.append(item)
             except ControlError as exc:
-                actions.append({"task_id": snapshot["task_id"], "generation": int(snapshot["generation"]), "error": exc.as_dict()})
+                generation = snapshot.get("generation")
+                if isinstance(generation, bool) or not isinstance(generation, int):
+                    generation = None
+                actions.append({"task_id": snapshot.get("task_id"), "generation": generation, "error": exc.as_dict()})
         return {"dry_run": not apply, "actions": actions}
 
 

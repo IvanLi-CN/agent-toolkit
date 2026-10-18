@@ -1274,6 +1274,7 @@ export class CommandRunner {
           return;
         }
       } catch { return; }
+      for (const target of processPipeTargets(processHandle.pid)) leaderPipeTargets.add(target);
       trackMembers([{ pid: processHandle.pid, starttime: leaderIdentity }]);
       const descendants = processDescendants(processHandle.pid);
       trackMembers(descendants.members);

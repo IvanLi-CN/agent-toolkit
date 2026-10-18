@@ -1553,6 +1553,19 @@ class Control:
             detail["state_committed"] = None
         return ControlError(error.code, error.message, detail)
 
+    @staticmethod
+    def _operation_outcome_uncertain(action: str, error: ControlError) -> bool:
+        """Keep a journal pending only when a native effect may have occurred."""
+        detail = error.detail if isinstance(error.detail, Mapping) else {}
+        if error.code in {"acquire_partial", "resize_partial", "restart_partial", "cleanup_incomplete", "operation_unverified"}:
+            return True
+        phases = {str(detail.get(key)) for key in ("phase", "operation_phase") if detail.get(key) is not None}
+        native_phases = {
+            "native-generation", "native-init", "native-config", "native-stop", "native-start",
+            "guest-readiness", "guest-post-check", "access-exposure",
+        }
+        return bool(phases & native_phases)
+
     def _expire_preempt(self, request: Mapping[str, Any]) -> None:
         """Close the admission fence and perform a confirmed native withdrawal.
 
@@ -2000,6 +2013,9 @@ class Control:
                     if not saved:
                         self.store.record_operation(operation_id, action, session_id, request.get("generation"),
                                                     {"outcome": "error", "error": exc.as_dict(), "_request_digest": digest})
+                    elif saved.get("outcome") == "pending" and not self._operation_outcome_uncertain(action, exc):
+                        self.store.record_operation(operation_id, action, session_id, request.get("generation"),
+                                                    {"outcome": "error", "error": exc.as_dict(), "_request_digest": digest})
                 if session_id is not None:
                     self.store.audit(
                         action,
@@ -2388,6 +2404,17 @@ class Control:
                 record = records.get(instance.get("name"))
                 if record is None or record["state"] in {"absent", "cached"}:
                     raise ControlError("resource_unverified", "unaccounted running native instance blocks admission")
+                if record["state"] != "active":
+                    raise ControlError("resource_unverified", "transitional native instance blocks admission")
+                expected = self._durable_resources(record, "resources_json", allow_empty=False)
+                reservation = self._durable_resources(record, "resource_reservation_json", allow_empty=True)
+                if reservation:
+                    expected = reservation
+                native = self._native_resources(record)
+                drifted = (any(native[key] > expected[key] for key in expected)
+                           if reservation else native != expected)
+                if drifted:
+                    raise ControlError("resource_unverified", "native resources differ from durable allocation")
 
     def _resource_diagnostics(self) -> dict[str, Any]:
         try:
@@ -4178,6 +4205,10 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
                     if not isinstance(owner, str) or not owner:
                         raise ControlError("resource_unverified", "drain state contains an invalid session owner")
                     locks.enter_context(self._object_lock("session:" + owner, blocking=False))
+                for task in snapshots:
+                    if task.get("state") in {"preparing", "closing", "deleting", "failed"}:
+                        raise ControlError("reconciliation_required", "drain exit requires all task transitions to be reconciled",
+                                           {"task_id": task.get("task_id"), "state": task.get("state")})
                 health = self.doctor(request, session_id)
                 resources = health.get("resources")
                 instances = health.get("instances")

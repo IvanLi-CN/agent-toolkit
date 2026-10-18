@@ -195,6 +195,14 @@ class AdmissionTests(Fixture):
         self.assertEqual(self.runner.instances[active["instance_name"]]["status"], "Running")
         self.assertEqual(self.store.get_task(task_id=cache["task_id"])["state"], "cached")
 
+    def test_low_memory_pressure_does_not_block_new_logical_reservation(self):
+        self.config.update(memory_budget_mib=32768, memory_overcommit_ratio=2)
+        self.resources.memory.return_value["available_bytes"] = 0
+        self.assertTrue(self.control._resource_diagnostics()["memory_pressure"])
+        result = self.acquire("new")
+        self.assertEqual(result["state"], "active")
+        self.assertEqual(self.control._resource_diagnostics()["remaining"]["memory_mib"], 61440)
+
     def test_pressure_and_failed_observation_do_not_block_existing_lease_operations(self):
         active = self.acquire()
         self.resources.memory.return_value["available_bytes"] = 0
@@ -237,6 +245,15 @@ class AdmissionTests(Fixture):
         self.assertTrue(result["up"])
         self.assertTrue(result["admission_ready"])
         self.assertTrue(result["ct_memory"]["pressure"])
+        self.assertEqual(result["ct_memory"]["capacity_bytes"], 32 * GIB)
+        self.assertIn("current_bytes", result["ct_memory"])
+        self.assertIn("available_bytes", result["ct_memory"])
+        self.assertIn("pressure_threshold_bytes", result["ct_memory"])
+        self.assertIn("oom_events", result["ct_memory"])
+        self.assertEqual(result["resources"]["allocated"]["memory_mib"], 4096)
+        self.assertEqual(result["resources"]["reserved"]["memory_mib"], 0)
+        self.assertEqual(result["resources"]["allocated_and_reserved"]["memory_mib"], 4096)
+        self.assertEqual(result["resources"]["limits"]["memory_mib"], 65536)
         self.assertEqual(result["resources"]["remaining"]["memory_mib"], 61440)
         self.assertIn("layers", result["capacity"])
         self.assertTrue(result["disk_admission"]["verified"])
@@ -244,6 +261,15 @@ class AdmissionTests(Fixture):
         self.assertIn("admission", result["instances"])
         self.assertEqual(result["task_states"]["active"], 1)
         self.assertEqual(self.store.list_tasks(), before)
+
+    def test_native_resource_drift_fails_closed_for_new_admission(self):
+        active = self.acquire()
+        instance = self.runner.instances[active["instance_name"]]
+        instance["config"]["limits.memory"] = "8192MiB"
+        doctor = self.call("doctor")
+        self.assertFalse(doctor["resources"]["verified"])
+        self.assertEqual(doctor["resources"]["error"]["code"], "resource_unverified")
+        self.error("resource_unverified", self.acquire, "new")
 
     def test_corrupt_disk_allocation_fails_closed_for_new_admission(self):
         active = self.acquire()
@@ -354,10 +380,20 @@ class AdmissionTests(Fixture):
 
     def test_pending_operation_is_not_rewritten_as_error_after_action_failure(self):
         request = self.request("acquire", operation="pending-preserved", public_key=KEY)
-        failure = CONTROL.ControlError("command_failed", "native action failed")
+        failure = CONTROL.ControlError("command_failed", "native action failed", {"phase": "native-config"})
         with mock.patch.object(self.control, "_dispatch_action", side_effect=failure):
             self.error("command_failed", self.control.dispatch, request)
         self.assertEqual(self.store.operation(request["operation_id"])["outcome"], "pending")
+
+    def test_pre_native_action_failure_is_terminal_and_replayable(self):
+        request = self.request("acquire", operation="pre-native-failure", public_key=KEY)
+        failure = CONTROL.ControlError("resource_insufficient", "logical reservation is full")
+        with mock.patch.object(self.control, "_dispatch_action", side_effect=failure):
+            self.error("resource_insufficient", self.control.dispatch, request)
+        self.assertEqual(self.store.operation(request["operation_id"])["outcome"], "error")
+        with mock.patch.object(self.control, "_dispatch_action") as dispatch:
+            self.error("resource_insufficient", self.control.dispatch, request)
+        dispatch.assert_not_called()
 
     def test_corrupt_operation_journal_is_structured(self):
         operation_id = "corrupt-journal"

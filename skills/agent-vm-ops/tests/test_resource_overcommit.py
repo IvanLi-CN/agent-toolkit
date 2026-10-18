@@ -48,6 +48,32 @@ class SQLiteStateTests(unittest.TestCase):
         self.assertEqual(failure.exception.detail["phase"], "commit")
         self.assertIsNone(failure.exception.detail["state_committed"])
 
+    def test_rollback_failure_reports_unknown_state_and_unusable_connection(self):
+        class FailingRollback:
+            def __init__(self):
+                self.calls = 0
+
+            def execute(self, *_args):
+                self.calls += 1
+                if self.calls == 2:
+                    raise sqlite3.OperationalError("database or disk is full")
+                return None
+
+            def rollback(self):
+                raise sqlite3.OperationalError("rollback failed")
+
+        store = object.__new__(CONTROL.StateStore)
+        store._lock = threading.RLock()
+        store.connection = FailingRollback()
+        store.depth = 0
+        store._unusable = False
+        with self.assertRaises(CONTROL.ControlError) as failure:
+            with store.transaction():
+                store.connection.execute("INSERT")
+        self.assertIsNone(failure.exception.detail["state_committed"])
+        self.assertIn("rollback_error", failure.exception.detail)
+        self.assertTrue(store._unusable)
+
 
 class CTObservationTests(unittest.TestCase):
     mount = "12 1 0:9 /meminfo /proc/meminfo rw - fuse.lxcfs lxcfs rw\n"
@@ -213,7 +239,10 @@ class AdmissionTests(Fixture):
         self.assertEqual(self.acquire()["lease_expires_at"], active["lease_expires_at"])
         self.resources.memory.side_effect = CONTROL.ControlError("resource_unverified", "missing metric")
         self.assertFalse(self.call("status")["admission"]["verified"])
-        self.assertIsNone(self.call("admin-metrics")["ct_memory"]["pressure"])
+        metrics = self.call("admin-metrics")
+        self.assertIsNone(metrics["ct_memory"]["pressure"])
+        self.assertFalse(metrics["resources"]["verified"])
+        self.assertEqual(metrics["resources"]["error"]["code"], "resource_unverified")
         self.call("renew")
         self.assertEqual(self.call("ssh-info")["generation"], active["generation"])
         self.assertEqual(self.call("release")["state"], "cached")
@@ -243,6 +272,7 @@ class AdmissionTests(Fixture):
         self.resources.memory.return_value["available_bytes"] = 0
         before = self.store.list_tasks()
         result = self.call("admin-metrics")
+        self.assertEqual(CONTROL.parse_time(result["observed_at"]), self.now)
         self.assertTrue(result["up"])
         self.assertTrue(result["admission_ready"])
         self.assertTrue(result["ct_memory"]["pressure"])
@@ -262,6 +292,17 @@ class AdmissionTests(Fixture):
         self.assertIn("admission", result["instances"])
         self.assertEqual(result["task_states"]["active"], 1)
         self.assertEqual(self.store.list_tasks(), before)
+
+    def test_admin_metrics_reports_pending_operation_journals(self):
+        request = self.request("acquire", operation="metrics-pending", public_key=KEY)
+        digest = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
+        self.store.record_operation(
+            request["operation_id"], "acquire", request["session_id"], request["generation"],
+            {"outcome": "pending", "_request_digest": digest},
+        )
+        pending = self.call("admin-metrics")["pending_operations"]
+        self.assertEqual(pending[0]["operation_id"], request["operation_id"])
+        self.assertEqual(pending[0]["action"], "acquire")
 
     def test_native_resource_drift_fails_closed_for_new_admission(self):
         active = self.acquire()
@@ -302,7 +343,14 @@ class AdmissionTests(Fixture):
         active = self.acquire()
         instance = self.runner.instances[active["instance_name"]]
         instance["status"] = "Stopped"
-        instance["config"]["limits.memory"] = "8192MiB"
+        for field, value in (("limits.cpu", "8"), ("limits.memory", "8192MiB")):
+            with self.subTest(field=field):
+                instance["config"][field] = value
+                before = len(self.runner.calls)
+                self.error("resource_unverified", self.call, "restart")
+                self.assertFalse(any(args[3:4] in (["stop"], ["start"]) for args, _, _ in self.runner.calls[before:]))
+                instance["config"][field] = {"limits.cpu": "2", "limits.memory": "4096MiB"}[field]
+        instance["expanded_devices"]["root"]["size"] = "40GiB"
         before = len(self.runner.calls)
         self.error("resource_unverified", self.call, "restart")
         self.assertFalse(any(args[3:4] in (["stop"], ["start"]) for args, _, _ in self.runner.calls[before:]))
@@ -315,6 +363,13 @@ class AdmissionTests(Fixture):
         before = len(self.runner.calls)
         self.error("ownership_mismatch", self.call, "restart")
         self.assertFalse(any(args[3:4] in (["stop"], ["start"]) for args, _, _ in self.runner.calls[before:]))
+
+    def test_drain_exit_rejects_active_network_isolation_drift(self):
+        active = self.acquire()
+        self.store.set_meta("draining", "1")
+        self.runner.instances[active["instance_name"]]["expanded_devices"]["eth0"]["security.acls"] = "unmanaged-acl"
+        self.error("ownership_mismatch", self.control.drain_exit, {}, None)
+        self.assertEqual(self.store.get_meta("draining"), "1")
 
     def test_corrupt_disk_allocation_fails_closed_for_new_admission(self):
         active = self.acquire()

@@ -745,6 +745,7 @@ class StateStore:
         if self.path.is_symlink(): raise ControlError("state_path_unsafe", "state database cannot be a symlink")
         self.connection: sqlite3.Connection | None = None
         self.depth = 0
+        self._unusable = False
         phase = "connect"
         try:
             self.connection = sqlite3.connect(str(path), timeout=10, check_same_thread=False)
@@ -768,6 +769,7 @@ class StateStore:
         phase: str,
         sql_operation: str,
         state_committed: bool | None,
+        rollback_error: sqlite3.Error | None = None,
     ) -> ControlError:
         detail = {
             "phase": phase,
@@ -776,7 +778,20 @@ class StateStore:
             "sql_operation": sql_operation,
             "state_committed": state_committed,
         }
+        if rollback_error is not None:
+            detail["rollback_error"] = {
+                "sqlite_code": getattr(rollback_error, "sqlite_errorcode", None),
+                "sqlite_name": getattr(rollback_error, "sqlite_errorname", type(rollback_error).__name__),
+            }
         return ControlError("sqlite_unavailable", "state database cannot be verified", detail)
+
+    def _ensure_usable(self, *, phase: str, sql_operation: str) -> None:
+        if getattr(self, "_unusable", False):
+            raise ControlError(
+                "sqlite_unavailable",
+                "state database connection is unusable and must be reopened",
+                {"phase": phase, "sql_operation": sql_operation, "state_committed": None},
+            )
 
     def _schema(self) -> None:
         with self.connection:
@@ -849,6 +864,7 @@ class StateStore:
     def transaction(self):
         """Nestable short transactions; never wrap native operations/waits."""
         with self._lock:
+            self._ensure_usable(phase="connection", sql_operation="write")
             outer = self.depth == 0
             if outer:
                 try:
@@ -859,12 +875,20 @@ class StateStore:
             try:
                 yield
             except sqlite3.Error as exc:
+                rollback_error = None
                 if outer:
                     try:
                         self.connection.rollback()
-                    except sqlite3.Error:
-                        pass
-                raise self._sqlite_failure(exc, phase="write", sql_operation="write", state_committed=False) from exc
+                    except sqlite3.Error as rollback_exc:
+                        rollback_error = rollback_exc
+                        self._unusable = True
+                raise self._sqlite_failure(
+                    exc,
+                    phase="write",
+                    sql_operation="write",
+                    state_committed=None if rollback_error else False,
+                    rollback_error=rollback_error,
+                ) from exc
             except BaseException:
                 if outer: self.connection.rollback()
                 raise
@@ -873,16 +897,25 @@ class StateStore:
                     try:
                         self.connection.commit()
                     except sqlite3.Error as exc:
+                        rollback_error = None
                         try:
                             self.connection.rollback()
-                        except sqlite3.Error:
-                            pass
-                        raise self._sqlite_failure(exc, phase="commit", sql_operation="write", state_committed=None) from exc
+                        except sqlite3.Error as rollback_exc:
+                            rollback_error = rollback_exc
+                            self._unusable = True
+                        raise self._sqlite_failure(
+                            exc,
+                            phase="commit",
+                            sql_operation="write",
+                            state_committed=None,
+                            rollback_error=rollback_error,
+                        ) from exc
             finally:
                 self.depth -= 1
 
     def _row(self, query: str, args: Sequence[Any] = ()) -> sqlite3.Row | None:
         with self._lock:
+            self._ensure_usable(phase="read", sql_operation="read")
             try:
                 return self.connection.execute(query, args).fetchone()
             except sqlite3.Error as exc:
@@ -890,6 +923,7 @@ class StateStore:
 
     def _rows(self, query: str, args: Sequence[Any] = ()) -> list[sqlite3.Row]:
         with self._lock:
+            self._ensure_usable(phase="read", sql_operation="read")
             try:
                 return list(self.connection.execute(query, args).fetchall())
             except sqlite3.Error as exc:
@@ -1182,6 +1216,27 @@ class StateStore:
                 image_unpack_failures[f"{phase}|{code}"] += 1
         return {"operations": dict(operations), "image_unpack_failures": dict(image_unpack_failures),
                 "warnings": dict(warnings)}
+
+    def pending_operations(self) -> list[dict[str, Any]]:
+        pending = []
+        for row in self._rows(
+            "SELECT operation_id, action, session_id, generation, response_json, created_at "
+            "FROM operations ORDER BY created_at, operation_id"
+        ):
+            try:
+                response = json.loads(row["response_json"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ControlError("operation_unverified", "operation journal response is malformed") from exc
+            if not isinstance(response, Mapping) or response.get("outcome") != "pending":
+                continue
+            pending.append({
+                "operation_id": row["operation_id"],
+                "action": row["action"],
+                "session_id": row["session_id"],
+                "generation": row["generation"],
+                "created_at": row["created_at"],
+            })
+        return pending
 
     def get_meta(self, key: str) -> str | None:
         row = self._row("SELECT value FROM meta WHERE key = ?", (key,))
@@ -1559,6 +1614,12 @@ class Control:
         detail = error.detail if isinstance(error.detail, Mapping) else {}
         if error.code == "sqlite_unavailable" and detail.get("state_committed") is not False:
             return True
+        cleanup = detail.get("cleanup")
+        cleanup_result = cleanup.get("result") if isinstance(cleanup, Mapping) else None
+        if (isinstance(cleanup, Mapping) and cleanup.get("ok")
+                and isinstance(cleanup_result, Mapping)
+                and cleanup_result.get("state") in {"cached", "absent"}):
+            return False
         if error.code in {"acquire_partial", "resize_partial", "restart_partial", "cleanup_incomplete", "operation_unverified"}:
             return True
         phases = {str(detail.get(key)) for key in ("phase", "operation_phase") if detail.get(key) is not None}
@@ -4207,6 +4268,7 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
             "instances": doctor.get("instances"),
             "task_states": dict(task_states),
             "operations": audit["operations"],
+            "pending_operations": self.store.pending_operations(),
             "image_unpack_failures": audit["image_unpack_failures"],
             "warnings": warnings,
             "warning_counts": audit["warnings"],
@@ -4269,6 +4331,7 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
                             raise ControlError("reconciliation_required", "active task has no effective lease",
                                                {"task_id": task.get("task_id")})
                         self._ownership(task)
+                        self._verify_network_device(task)
                         if self.incus.instance_info(task["instance_name"])["status"].lower() != "running":
                             raise ControlError("state_mismatch", "active task guest is not running",
                                                {"task_id": task.get("task_id")})
@@ -4346,6 +4409,8 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
                         if apply: self._release_task(task)
                     else:
                         self._ownership(task)
+                        if task["state"] == "active":
+                            self._verify_network_device(task)
                         status = self.incus.instance_info(task["instance_name"])["status"].lower()
                         if task["state"] == "cached" and status != "stopped":
                             item["action"] = "stop-unexpected-running-cache"

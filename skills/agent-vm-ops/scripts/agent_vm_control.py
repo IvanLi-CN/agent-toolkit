@@ -598,7 +598,7 @@ class IncusClient:
             timeout=timeout,
             bounded=bounded,
         )
-        if not isinstance(value, dict):
+        if not isinstance(value, dict) or not isinstance(value.get("status"), str) or not value["status"]:
             raise ControlError("incus_invalid_output", "Incus info output is not an object")
         return value
 
@@ -1523,6 +1523,28 @@ class Control:
                     return self._dispatch_locked(request)
             return self._dispatch_locked(request)
 
+    def _annotate_state_error(
+        self,
+        error: ControlError,
+        *,
+        action: str,
+        operation_id: str | None,
+    ) -> ControlError:
+        if error.code != "sqlite_unavailable" or not operation_id or action not in self.WRITE_ACTIONS:
+            return error
+        detail = dict(error.detail) if isinstance(error.detail, Mapping) else {}
+        try:
+            journal = self.store.operation(operation_id)
+        except ControlError:
+            journal = None
+        if journal is None:
+            detail["state_committed"] = False
+        elif journal.get("outcome") in {"success", "error"}:
+            detail["state_committed"] = True
+        else:
+            detail["state_committed"] = None
+        return ControlError(error.code, error.message, detail)
+
     def _expire_preempt(self, request: Mapping[str, Any]) -> None:
         """Close the admission fence and perform a confirmed native withdrawal.
 
@@ -1962,21 +1984,24 @@ class Control:
         try:
             result = self._dispatch_action(action, dict(request), session_id)
         except ControlError as exc:
-            if operation_id and action in self.WRITE_ACTIONS:
-                # A committed renew must remain replayable even if rearming its
-                # native timer failed after the atomic deadline/journal commit.
-                saved = self.store.operation(operation_id)
-                if not saved or saved.get("outcome") != "success":
-                    self.store.record_operation(operation_id, action, session_id, request.get("generation"),
-                                                {"outcome": "error", "error": exc.as_dict(), "_request_digest": digest})
-            if session_id is not None:
-                self.store.audit(
-                    action,
-                    "error",
-                    session_id=session_id,
-                    generation=request.get("generation"),
-                    detail=exc.as_dict(),
-                )
+            try:
+                if operation_id and action in self.WRITE_ACTIONS:
+                    # A committed renew must remain replayable even if rearming its
+                    # native timer failed after the atomic deadline/journal commit.
+                    saved = self.store.operation(operation_id)
+                    if not saved or saved.get("outcome") != "success":
+                        self.store.record_operation(operation_id, action, session_id, request.get("generation"),
+                                                    {"outcome": "error", "error": exc.as_dict(), "_request_digest": digest})
+                if session_id is not None:
+                    self.store.audit(
+                        action,
+                        "error",
+                        session_id=session_id,
+                        generation=request.get("generation"),
+                        detail=exc.as_dict(),
+                    )
+            except ControlError as state_error:
+                raise self._annotate_state_error(state_error, action=action, operation_id=operation_id) from state_error
             raise
         response = {
             "ok": True,
@@ -1989,22 +2014,25 @@ class Control:
             "outcome": "success",
             "result": result,
         }
-        if operation_id is not None and action in self.WRITE_ACTIONS and action != "renew":
-            self.store.record_operation(
-                operation_id,
-                action,
-                session_id,
-                request.get("generation"),
-                {**response, "_request_digest": digest},
-            )
-        if session_id is not None:
-            self.store.audit(
-                action,
-                "ok",
-                session_id=session_id,
-                generation=request.get("generation"),
-                detail=result,
-            )
+        try:
+            if operation_id is not None and action in self.WRITE_ACTIONS and action != "renew":
+                self.store.record_operation(
+                    operation_id,
+                    action,
+                    session_id,
+                    request.get("generation"),
+                    {**response, "_request_digest": digest},
+                )
+            if session_id is not None:
+                self.store.audit(
+                    action,
+                    "ok",
+                    session_id=session_id,
+                    generation=request.get("generation"),
+                    detail=result,
+                )
+        except ControlError as state_error:
+            raise self._annotate_state_error(state_error, action=action, operation_id=operation_id) from state_error
         return response
 
     def _dispatch_action(
@@ -2630,11 +2658,12 @@ class Control:
                 for device in devices.values():
                     if device.get("type") == "proxy":
                         listen = device.get("listen")
-                        if listen is not None and not isinstance(listen, str):
+                        if not isinstance(listen, str) or not listen:
                             raise ControlError("port_inventory_unverified", "proxy listen address is malformed")
-                        listen = listen or ""
                         if listen.startswith(("tcp:", "udp:")):
                             ports |= self._port_numbers(listen.rsplit(":", 1)[-1])
+                        elif not listen.startswith(("unix:", "vsock:")):
+                            raise ControlError("port_inventory_unverified", "proxy listen address is unrecognized")
             for network in networks:
                 network_name = require_nonempty_string(network.get("name"), "network name")
                 if not network.get("managed") or network.get("type") != "bridge": continue

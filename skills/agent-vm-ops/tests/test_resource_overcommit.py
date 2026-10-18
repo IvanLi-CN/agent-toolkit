@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -24,6 +25,25 @@ class SQLiteStateTests(unittest.TestCase):
         self.assertEqual(failure.exception.detail["phase"], "wal-init")
         self.assertIn("sqlite_name", failure.exception.detail)
         self.assertIs(failure.exception.detail["state_committed"], False)
+
+    def test_commit_failure_reports_unknown_commit_state(self):
+        class FailingCommit:
+            def execute(self, *_args):
+                return None
+
+            def commit(self):
+                raise sqlite3.OperationalError("database or disk is full")
+
+        store = object.__new__(CONTROL.StateStore)
+        store._lock = threading.RLock()
+        store.connection = FailingCommit()
+        store.depth = 0
+        with self.assertRaises(CONTROL.ControlError) as failure:
+            with store.transaction():
+                pass
+        self.assertEqual(failure.exception.code, "sqlite_unavailable")
+        self.assertEqual(failure.exception.detail["phase"], "commit")
+        self.assertIsNone(failure.exception.detail["state_committed"])
 
 
 class CTObservationTests(unittest.TestCase):
@@ -302,6 +322,20 @@ class AdmissionTests(Fixture):
                 request = self.request("admin-metrics")
                 request[field] = None
                 self.error("invalid_request", self.control.dispatch, request)
+
+    def test_audit_failure_reports_committed_operation_state(self):
+        failure = CONTROL.ControlError(
+            "sqlite_unavailable",
+            "state database cannot be verified",
+            {"phase": "commit", "state_committed": False},
+        )
+        request = self.request("drain-enter", operation="audit-commit-failure")
+        with mock.patch.object(self.store, "audit", side_effect=failure):
+            with self.assertRaises(CONTROL.ControlError) as error:
+                self.control.dispatch(request)
+        self.assertEqual(error.exception.code, "sqlite_unavailable")
+        self.assertIs(error.exception.detail["state_committed"], True)
+        self.assertEqual(self.store.operation(request["operation_id"])["outcome"], "success")
 
     def test_corrupt_operation_journal_is_structured(self):
         operation_id = "corrupt-journal"

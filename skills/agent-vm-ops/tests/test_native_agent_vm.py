@@ -1157,6 +1157,14 @@ class IncusWaitTests(unittest.TestCase):
                     self.client.list_instances()
                 self.assertEqual(failure.exception.code, "incus_invalid_output")
 
+    def test_instance_info_rejects_malformed_status(self):
+        for body in (b"{}", b'{"status":null}', b'{"status":7}'):
+            with self.subTest(body=body):
+                self.runner.run.return_value = subprocess.CompletedProcess([], 0, body, b"")
+                with self.assertRaises(CONTROL.ControlError) as failure:
+                    self.client.instance_info("vm")
+                self.assertEqual(failure.exception.code, "incus_invalid_output")
+
 
 class ReclaimTests(Fixture):
     def test_manual_gc_previews_and_deletes_all_eligible_caches(self):

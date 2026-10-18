@@ -143,6 +143,19 @@ test("refuses to kill a PID after its recorded Linux identity changes", () => {
   expect(killed).toEqual([]);
 });
 
+test("treats an identity-matched zombie as already reaped", () => {
+  const member: ProcessIdentity = { pid: 4243, starttime: "zombie-starttime" };
+  const killed: number[] = [];
+  const result = killProcessTree([member], {
+    exists: () => true,
+    readIdentity: () => member.starttime,
+    zombie: () => true,
+    kill: (pid) => { killed.push(pid); return true; },
+  });
+  expect(result).toEqual({ killed: true, error: null });
+  expect(killed).toEqual([]);
+});
+
 linuxTest("kills a TERM-ignoring descendant after the leader exits on SIGTERM", async () => {
   const runner = new CommandRunner();
   const probeRoot = root("agent-vm-term-descendant");

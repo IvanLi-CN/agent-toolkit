@@ -1316,6 +1316,7 @@ export function killProcessTree(members: readonly ProcessIdentity[], options: Pr
         identityBlocked = true;
         continue;
       }
+      if (zombie(member.pid)) continue;
       if (!kill(member.pid, 9)) cleanupError ??= "PermissionError";
     }
     const remaining = members.filter((member) => {
@@ -1349,15 +1350,20 @@ function safeProcessSignal(pid: number, expectedIdentity: string | undefined, si
     if (group) {
       if (targetPgid === undefined) return { sent: false, error: "process_group_identity_unverified" };
       try {
-        if (readProcessRecord(pid).pgrp !== targetPgid) return { sent: false, error: "process_group_identity_mismatch" };
+        const record = readProcessRecord(pid);
+        if (record.pgrp !== targetPgid) return { sent: false, error: "process_group_identity_mismatch" };
+        if (record.state === "Z") return { sent: false, error: null };
       } catch { return { sent: false, error: "process_group_identity_unverified" }; }
       target = -targetPgid;
+    } else if (processIsZombie(pid)) {
+      return { sent: false, error: null };
     }
   } else if (group) {
     target = -(targetPgid ?? pid);
   }
   const sent = nativeKill(target, signal);
-  return { sent, error: sent ? null : "PermissionError" };
+  if (sent || !processExists(pid) || processIsZombie(pid)) return { sent, error: null };
+  return { sent: false, error: "PermissionError" };
 }
 
 export class CommandRunner {

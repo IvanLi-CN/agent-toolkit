@@ -481,6 +481,40 @@ test("rejects invalid identity, protocol, action and generation before native wr
   expect(f.runner.calls).toHaveLength(0);
 });
 
+test("status envelope generation follows active and absent session state", async () => {
+  const f = fixture();
+  const absent = await f.control.dispatch({ protocol: PROTOCOL_VERSION, action: "status", session_id: "missing-session" });
+  expect(absent.generation).toBe(0);
+  expect(absent.generation).toBe(absent.result.generation);
+  expect(absent.operation_id).toBeNull();
+
+  const acquired = await f.control.dispatch(f.request("acquire", { public_key: KEY }, "op-status-generation-acquire"));
+  const active = await f.control.dispatch({ protocol: PROTOCOL_VERSION, action: "status", session_id: "thread-a" });
+  expect(active.generation).toBe(acquired.result.generation);
+  expect(active.generation).toBe(active.result.generation);
+  expect(active.operation_id).toBeNull();
+});
+
+test("success envelopes require a matching operation identity", async () => {
+  const f = fixture();
+  const request = f.request("acquire", { public_key: KEY }, "op-envelope-operation");
+  await f.control.dispatch(request);
+  const row = f.store.db.query("SELECT response_json FROM operations WHERE operation_id = ?").get("op-envelope-operation") as { response_json: string };
+  const cached = JSON.parse(row.response_json) as Dict;
+
+  delete cached.operation_id;
+  (f.store.db as any).run("UPDATE operations SET response_json = ? WHERE operation_id = ?", JSON.stringify(cached), "op-envelope-operation");
+  await expectCode(f.control.dispatch(request), "invalid_response");
+
+  cached.operation_id = "different-operation";
+  (f.store.db as any).run("UPDATE operations SET response_json = ? WHERE operation_id = ?", JSON.stringify(cached), "op-envelope-operation");
+  await expectCode(f.control.dispatch(request), "invalid_response");
+
+  const observed = await f.control.dispatch({ protocol: PROTOCOL_VERSION, action: "status", session_id: "thread-a", operation_id: "status-observation" });
+  expect(observed.operation_id).toBe("status-observation");
+  await expectCode(f.control.dispatch({ protocol: PROTOCOL_VERSION, action: "status", session_id: "thread-a", operation_id: 7 }), "invalid_request");
+});
+
 test("treats prototype-sensitive JSON keys as data and requires own envelope fields", async () => {
   const f = fixture();
   const inheritedOnly = parseRequestBytes(new TextEncoder().encode('{"__proto__":{"protocol":4,"action":"drain-enter","operation_id":"proto-op","generation":0}}'));

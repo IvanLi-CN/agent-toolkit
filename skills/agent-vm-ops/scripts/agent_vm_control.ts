@@ -203,9 +203,12 @@ function hasOwn(value: object, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(value, key);
 }
 
-function validateSuccessEnvelope(response: Dict, action: string, sessionId: string | undefined): Dict {
+function validateSuccessEnvelope(response: Dict, action: string, sessionId: string | undefined, operationId: string | undefined): Dict {
   if (response.ok !== true || response.protocol !== PROTOCOL_VERSION || response.action !== action || response.session_id !== (sessionId ?? null) || !isDict(response.result) || typeof response.server_time !== "string") {
     throw new ControlError("invalid_response", "control success envelope is malformed");
+  }
+  if (!hasOwn(response, "operation_id") || response.operation_id !== (operationId ?? null)) {
+    throw new ControlError("invalid_response", "control success envelope operation identity is invalid");
   }
   if (!hasOwn(response, "generation")) {
     throw new ControlError("invalid_response", "control success envelope generation is invalid");
@@ -213,6 +216,9 @@ function validateSuccessEnvelope(response: Dict, action: string, sessionId: stri
   if (response.generation !== null) {
     try { if (integerBigInt(response.generation, "generation") < 0n) throw new Error("negative"); }
     catch { throw new ControlError("invalid_response", "control success envelope generation is invalid"); }
+  }
+  if (action === "status" && sessionId !== undefined && (!hasOwn(response.result, "generation") || !sameInteger(response.generation, response.result.generation))) {
+    throw new ControlError("invalid_response", "status success envelope generation is inconsistent");
   }
   if (response.outcome !== "success" && response.outcome !== "replayed") throw new ControlError("invalid_response", "control success envelope outcome is invalid");
   return response;
@@ -1583,7 +1589,8 @@ export class Control {
     if (requiredOwn(request, "protocol") !== PROTOCOL_VERSION) throw new ControlError("protocol_mismatch", `protocol must be ${PROTOCOL_VERSION}`);
     const action = requiredString(requiredOwn(request, "action"), "action");
     const sessionId = Control.SESSION_ACTIONS.has(action) ? requiredString(requiredOwn(request, "session_id"), "session_id", SESSION_ID_RE) : !hasOwn(request, "session_id") || request.session_id === undefined || request.session_id === null ? undefined : requiredString(request.session_id, "session_id", SESSION_ID_RE);
-    let operationId = hasOwn(request, "operation_id") ? request.operation_id : undefined;
+    let operationId: string | undefined;
+    if (hasOwn(request, "operation_id") && request.operation_id !== null && request.operation_id !== undefined) operationId = requiredString(request.operation_id, "operation_id", SESSION_ID_RE);
     let digest: string | undefined;
     if (Control.WRITE_ACTIONS.has(action)) {
       operationId = requiredString(requiredOwn(request, "operation_id"), "operation_id", SESSION_ID_RE);
@@ -1603,15 +1610,15 @@ export class Control {
           response.current_state = task ? this.stateSummary(task) : null;
           if (action === "renew" && task && this.stateSummary(task).effective_lease) await this.scheduleExpiry(task);
         }
-        return validateSuccessEnvelope(response, action, sessionId);
+        return validateSuccessEnvelope(response, action, sessionId, operationId);
       }
       numberFromInteger(requiredOwn(request, "generation"), "generation", 0);
-      if (action !== "renew") await this.globalLock(() => this.store.recordOperation(operationId, action, sessionId, request.generation, { outcome: "pending", _request_digest: digest }));
+      if (action !== "renew") await this.globalLock(() => this.store.recordOperation(operationId!, action, sessionId, request.generation, { outcome: "pending", _request_digest: digest }));
     }
     try {
       const result = await this.dispatchAction(action, request, sessionId);
-      const response: Dict = { ok: true, protocol: PROTOCOL_VERSION, server_time: isoTime(this.now()), action, session_id: sessionId ?? null, generation: request.generation ?? null, operation_id: operationId ?? null, outcome: "success", result };
-      const validated = validateSuccessEnvelope(response, action, sessionId);
+      const response: Dict = { ok: true, protocol: PROTOCOL_VERSION, server_time: isoTime(this.now()), action, session_id: sessionId ?? null, generation: action === "status" ? result.generation ?? null : request.generation ?? null, operation_id: operationId ?? null, outcome: "success", result };
+      const validated = validateSuccessEnvelope(response, action, sessionId, operationId);
       await this.globalLock(() => {
         if (operationId && Control.WRITE_ACTIONS.has(action) && action !== "renew") this.store.recordOperation(operationId, action, sessionId, request.generation, { ...response, _request_digest: digest });
         if (sessionId) this.store.audit(action, "ok", result, undefined, sessionId, request.generation);

@@ -55,6 +55,12 @@ class CTObservationTests(unittest.TestCase):
                 with self.assertRaises(CONTROL.ControlError): CONTROL.CTResources().memory()
                 self.assertNotIn(mock.call("/proc/meminfo"), read.call_args_list)
 
+    def test_unlimited_cgroup_rejects_current_above_lxcfs_capacity(self):
+        values = {"/sys/fs/cgroup/memory.max": "max", "/sys/fs/cgroup/memory.current": str(25*GIB),
+                  "/proc/self/mountinfo": self.mount,
+                  "/proc/meminfo": f"MemTotal: {24*GIB//1024} kB\nMemAvailable: {16*GIB//1024} kB\n"}
+        with self.assertRaises(CONTROL.ControlError): self.observe(values)
+
     def test_invalid_memory_metrics_fail_closed(self):
         base = {"/sys/fs/cgroup/memory.max": str(4*GIB), "/sys/fs/cgroup/memory.current": str(3*GIB),
                 "/sys/fs/cgroup/memory.stat": "inactive_file 0\n", "/proc/self/mountinfo": ""}
@@ -178,6 +184,8 @@ class AdmissionTests(Fixture):
         self.assertTrue(result["admission_ready"])
         self.assertTrue(result["ct_memory"]["pressure"])
         self.assertEqual(result["resources"]["remaining"]["memory_mib"], 61440)
+        self.assertIn("layers", result["capacity"])
+        self.assertTrue(result["disk_admission"]["verified"])
         self.assertEqual(result["task_states"]["active"], 1)
         self.assertEqual(self.store.list_tasks(), before)
 
@@ -196,6 +204,14 @@ class AdmissionTests(Fixture):
         summary = self.store.audit_summary()
         self.assertEqual(summary["image_unpack_failures"], {"native-init|command_failed": 1})
         self.assertEqual(summary["warnings"], {"memory_pressure": 1})
+
+    def test_audit_summary_prefers_nested_error_code(self):
+        self.store.audit("acquire", "error", detail={
+            "code": "acquire_partial",
+            "detail": {"error": {"code": "command_failed", "message": "Unable to unpack image"}},
+        })
+        summary = self.store.audit_summary()
+        self.assertEqual(summary["image_unpack_failures"], {"unknown|command_failed": 1})
 
     def test_pre_native_resize_failure_releases_only_its_reservation(self):
         active = self.acquire()

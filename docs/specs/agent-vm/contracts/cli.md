@@ -27,7 +27,7 @@ The control endpoint is selected from `AGENT_VM_CONTROL_HOST` and `AGENT_VM_REMO
 | `port add NAME --guest-port N [--protocol tcp\|udp] [--host-port N]` | Create an exact native proxy mapping. |
 | `port list` / `port remove NAME` | Inspect or remove an exact mapping. |
 | `admin status` | Read-only native component and maintenance status. |
-| `admin metrics` | Read-only controller metrics snapshot for authorized scrape bridges; it does not create a session or mutate state. |
+| `admin metrics` | Read-only controller metrics snapshot for authorized scrape bridges; it includes resource allocation, CT memory, disk capacity/admission, task, warning and failure summaries; it does not create a session or mutate state. |
 | `admin drain enter\|status\|exit` | Control admission while allowing safe retrieval and release. |
 | `admin session list` | List managed session records. |
 | `admin reconcile [--apply]` / `admin gc [--apply]` | Preview by default; apply only inside an authorized operations task. |

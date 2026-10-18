@@ -191,6 +191,8 @@ class CTResources:
             raw_current = self._optional_read("/sys/fs/cgroup/memory.current")
             if raw_current is not None:
                 current = self._unsigned(raw_current, "memory.current")
+                if current > limit:
+                    raise ControlError("resource_unverified", "CT memory accounting exceeds its LXCfs capacity")
         else:
             limit = self._unsigned(raw_limit, "memory.max", positive=True)
             current = self._unsigned(self._read("/sys/fs/cgroup/memory.current"), "memory.current")
@@ -1022,9 +1024,29 @@ class StateStore:
                 except (TypeError, json.JSONDecodeError):
                     detail = {}
             nested = list(mappings(detail))
-            code = next((str(item["code"]) for item in nested if item.get("code") is not None), "unknown")
-            phase = next((str(item.get("phase") or item.get("operation_phase")) for item in nested
-                          if item.get("phase") or item.get("operation_phase")), "unknown")
+
+            def deepest(value: Any, keys: tuple[str, ...]) -> str | None:
+                if isinstance(value, Mapping):
+                    for branch in (value.get("error"), value.get("detail")):
+                        result = deepest(branch, keys)
+                        if result is not None:
+                            return result
+                    for key in keys:
+                        if value.get(key) is not None:
+                            return str(value[key])
+                    for child in value.values():
+                        result = deepest(child, keys)
+                        if result is not None:
+                            return result
+                elif isinstance(value, list):
+                    for child in value:
+                        result = deepest(child, keys)
+                        if result is not None:
+                            return result
+                return None
+
+            code = deepest(detail, ("code",)) or "unknown"
+            phase = deepest(detail, ("phase", "operation_phase")) or "unknown"
             operations[f"{row['action']}|{row['outcome']}|{phase}"] += 1
             for item in nested:
                 warning_list = item.get("warnings")
@@ -1734,6 +1756,41 @@ class Control:
                     "memory_pressure": policy["memory"]["available_bytes"] < policy["memory"]["threshold_bytes"]}
         except ControlError as exc:
             return {"verified": False, "error": exc.as_dict()}
+
+    def _disk_admission_diagnostics(self, capacity: Mapping[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(capacity, Mapping) or not isinstance(capacity.get("layers"), list):
+            return {"verified": False, "error": {"code": "capacity_unverified", "message": "disk capacity is unavailable"}}
+        try:
+            layers = capacity["layers"]
+            if not layers:
+                raise ValueError()
+            allocated = reserved = allocated_and_reserved = 0
+            durable_reserved = 0
+            for task in self.store.list_tasks():
+                if task["state"] in {"absent", "cached"}:
+                    continue
+                resources = json.loads(task["resources_json"])
+                reservation = json.loads(task["resource_reservation_json"])
+                sizes = (resources["disk_gib"], reservation.get("disk_gib", 0))
+                if any(isinstance(size, bool) or not isinstance(size, int) or size < 0 for size in sizes):
+                    raise ValueError()
+                allocated += sizes[0] * 1024**3
+                reserved += sizes[1] * 1024**3
+                allocated_and_reserved += max(sizes) * 1024**3
+                durable_reserved += int(task.get("reservation_bytes") or 0)
+            total = sum(int(layer["total"]) for layer in layers)
+            free_after_low = min(int(layer["free"]) - int(layer["low"]) for layer in layers)
+            limit = sum(int(layer["total"]) - int(layer["low"]) for layer in layers)
+            if total <= 0 or free_after_low < 0 or limit <= 0 or durable_reserved < 0:
+                raise ValueError()
+            return {"verified": True, "allocated_bytes": allocated, "reserved_bytes": reserved,
+                    "allocated_and_reserved_bytes": allocated_and_reserved,
+                    "remaining_bytes": max(0, free_after_low - durable_reserved),
+                    "limit_bytes": limit, "capacity_bytes": total,
+                    "free_bytes": sum(int(layer["free"]) for layer in layers),
+                    "durable_reserved_bytes": durable_reserved}
+        except (KeyError, TypeError, ValueError):
+            return {"verified": False, "error": {"code": "capacity_unverified", "message": "invalid disk admission capacity"}}
 
     @staticmethod
     def _instance_count_limits(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -3254,6 +3311,8 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
             "admission_ready": bool(doctor.get("admission_ready")),
             "reclaim_required": bool(doctor.get("default_admission", {}).get("reclaim_required")),
             "resources": resources,
+            "capacity": doctor.get("capacity"),
+            "disk_admission": self._disk_admission_diagnostics(doctor.get("capacity")),
             "ct_memory": {
                 "capacity_bytes": memory.get("limit_bytes"),
                 "current_bytes": memory.get("current_bytes"),

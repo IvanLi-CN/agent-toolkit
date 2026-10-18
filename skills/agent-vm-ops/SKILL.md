@@ -13,7 +13,7 @@ For a control-plane rebuild or recovery, follow the [topology and recovery runbo
 
 Begin with `agent-vm doctor`, `agent-vm admin status`, `agent-vm admin session list` and `ssh -G <configured-control-alias>`. The alias and address must come from the explicit operations configuration; daily VM SSH uses task connection information instead. Inspect exact candidate revision/checksums, component versions, native units, Incus project/pool/network/profile and CT-local filesystem capacity before mutation.
 
-For planned maintenance enter `agent-vm admin drain enter`, inspect drain status and wait for effective leases to end and cleanup to confirm NAT/flows closed and VMs stopped. Drain refuses new leases and renewals, permits online retrieval/release, and does not silently extend deadlines. Forced interruption requires explicit separate authorization naming the affected resources.
+For planned maintenance enter `agent-vm admin drain enter`, inspect drain status and wait for effective leases to end and cleanup to confirm NAT/flows closed and VMs stopped. Drain refuses new leases and restart admission, permits online retrieval/release, and does not silently extend deadlines. A restart already past the short admission fence may finish without holding the global lock. Forced interruption requires explicit separate authorization naming the affected resources.
 
 Review the complete control-environment package transaction and required native dependencies (including conntrack-tools); do not substitute a partial upgrade. Inspect native Incus/systemd/OpenSSH behavior after upgrades. This Skill does not authorize external host lifecycle changes, automatic control-environment restart or broad cleanup.
 

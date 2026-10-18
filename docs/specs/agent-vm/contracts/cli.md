@@ -74,4 +74,4 @@ CPU, memory and disk requests are parsed into canonical units before admission. 
 
 ## Output and admission
 
-Human-readable status is for operators; automation consumes the JSON envelope and checks `protocol`, `action`, `session_id`, `generation`, `operation_id`, `outcome` and `result`. Diagnostics are written to stderr and never mixed into an archive stream from `export`. Admission drain blocks new acquisition and restart work while permitting status, retrieval and release, and exits only after the control process has durably recorded the new admission state.
+Human-readable status is for operators; automation consumes the JSON envelope and checks `protocol`, `action`, `session_id`, `generation`, `operation_id`, `outcome` and `result`. Diagnostics are written to stderr and never mixed into an archive stream from `export`. Admission drain blocks new acquisition and restart admission while permitting status, retrieval and release, and exits only after the control process has durably recorded the new admission state. A restart that has crossed the short admission fence before drain may finish; the native stop/start work does not hold the global admission lock.

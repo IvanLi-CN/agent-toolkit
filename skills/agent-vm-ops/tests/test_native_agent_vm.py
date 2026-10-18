@@ -567,9 +567,10 @@ class LifecycleTests(Fixture):
             thread = threading.Thread(target=enter_drain)
             thread.start()
             self.assertTrue(attempted.wait(1))
-            original_stop(task)
             thread.join(1)
-            self.assertTrue(thread.is_alive())
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(drained.is_set())
+            original_stop(task)
             self._drain_thread = thread
 
         def start(task):
@@ -582,7 +583,7 @@ class LifecycleTests(Fixture):
 
         self._drain_thread.join(1)
         self.assertTrue(drained.is_set())
-        self.assertLess(events.index("start"), events.index("drain"))
+        self.assertLess(events.index("drain"), events.index("start"))
         self.call("drain-exit")
 
     def test_readiness_wait_cannot_extend_or_outlive_lease(self):

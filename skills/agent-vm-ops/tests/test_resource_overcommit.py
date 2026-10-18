@@ -247,6 +247,13 @@ class AdmissionTests(Fixture):
         )
         self.error("resource_unverified", self.call, "status")
 
+    def test_partial_resource_reservation_is_structured(self):
+        active = self.acquire()
+        self.store.update_task(active["task_id"], resource_reservation_json=json.dumps({"cpu": 2}))
+        doctor = self.call("doctor")
+        self.assertFalse(doctor["resources"]["verified"])
+        self.assertEqual(doctor["resources"]["error"]["code"], "resource_unverified")
+
     def test_admin_metrics_rejects_session_and_operation_without_audit(self):
         before = len(self.store._rows("SELECT action FROM audit"))
         request = self.request("admin-metrics", session="thread-a")
@@ -337,7 +344,7 @@ class AdmissionTests(Fixture):
         for thread in threads: thread.join(timeout=10); self.assertFalse(thread.is_alive())
         self.assertCountEqual(results, ["admitted", "resource_insufficient"])
         record = self.store.list_tasks()[0]
-        self.store.update_task(record["task_id"], state="closing", resources_json=json.dumps({"cpu": 2, "memory_mib": 4096}))
+        self.store.update_task(record["task_id"], state="closing", resources_json=json.dumps({"cpu": 2, "memory_mib": 4096, "disk_gib": 20}))
         self.assertEqual(self.control._allocation_totals()["cpu"], 3)
 
     def test_expiry_during_resize_cannot_commit_success_or_reopen_guest(self):

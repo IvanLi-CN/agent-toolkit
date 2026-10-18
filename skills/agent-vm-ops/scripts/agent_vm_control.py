@@ -67,6 +67,18 @@ TASK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.:@/-]{1,160}$")
 PORT_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
 TASK_TIMER_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}-g[0-9]+$")
+RESOURCE_KEYS = frozenset(("cpu", "memory_mib", "disk_gib"))
+
+
+def parse_resource_mapping(raw: str | None, label: str, *, allow_empty: bool) -> dict[str, int]:
+    value = json.loads(raw or "{}")
+    keys = frozenset(value) if isinstance(value, Mapping) else None
+    allowed = ({frozenset(), RESOURCE_KEYS} if allow_empty else {RESOURCE_KEYS})
+    if not isinstance(value, Mapping) or keys not in allowed:
+        raise ValueError(label)
+    if any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in value.values()):
+        raise ValueError(label)
+    return dict(value)
 
 
 class ControlError(Exception):
@@ -1570,19 +1582,9 @@ class Control:
         if task.get("last_error"):
             result["last_error"] = json.loads(task["last_error"])
         result["ports"] = self.store.get_ports(task["task_id"])
-        def validated(raw: str | None, label: str, *, required: bool) -> dict[str, Any]:
-            value = json.loads(raw or "{}")
-            keys = {"cpu", "memory_mib", "disk_gib"}
-            if not isinstance(value, Mapping) or (required and set(value) != keys):
-                raise ValueError(label)
-            if any(key not in keys or isinstance(item, bool) or not isinstance(item, int) or item < 0
-                   for key, item in value.items()):
-                raise ValueError(label)
-            return dict(value)
-
         try:
-            resources = validated(task.get("resources_json"), "resources", required=True)
-            resource_reservation = validated(task.get("resource_reservation_json"), "reservation", required=False)
+            resources = parse_resource_mapping(task.get("resources_json"), "resources", allow_empty=False)
+            resource_reservation = parse_resource_mapping(task.get("resource_reservation_json"), "reservation", allow_empty=True)
         except (TypeError, ValueError) as exc:
             raise ControlError("resource_unverified", "task resource state cannot be verified") from exc
         result["resources"] = resources
@@ -1748,9 +1750,8 @@ class Control:
         for other in self.store.list_tasks():
             if other["task_id"] == exclude_task_id or other["state"] in {"absent", "cached"}: continue
             try:
-                value, reservation = json.loads(other["resources_json"]), json.loads(other["resource_reservation_json"])
-                if not isinstance(value, Mapping) or not isinstance(reservation, Mapping):
-                    raise ValueError()
+                value = parse_resource_mapping(other["resources_json"], "resources", allow_empty=False)
+                reservation = parse_resource_mapping(other["resource_reservation_json"], "reservation", allow_empty=True)
                 for key in totals:
                     sizes = (value[key], reservation.get(key, 0))
                     if any(isinstance(size, bool) or not isinstance(size, int) or size < 0 for size in sizes): raise ValueError()
@@ -1805,10 +1806,8 @@ class Control:
             for task in self.store.list_tasks():
                 if task["state"] in {"absent", "cached"}:
                     continue
-                resources = json.loads(task["resources_json"])
-                reservation = json.loads(task["resource_reservation_json"])
-                if not isinstance(resources, Mapping) or not isinstance(reservation, Mapping):
-                    raise ValueError()
+                resources = parse_resource_mapping(task["resources_json"], "resources", allow_empty=False)
+                reservation = parse_resource_mapping(task["resource_reservation_json"], "reservation", allow_empty=True)
                 sizes = (resources["disk_gib"], reservation.get("disk_gib", 0))
                 if any(isinstance(size, bool) or not isinstance(size, int) or size < 0 for size in sizes):
                     raise ValueError()
@@ -2931,21 +2930,24 @@ class Control:
         phase = "native-stop"
         stage_timings: dict[str, Any] = {}
         readiness = None
+        native_admitted = False
         native_touched = False
         try:
-            # Serialize the drain check with the native stop/start boundary.
-            # A drain request must not land between the check and the restart.
+            # The short fence admits the restart atomically with the drain check.
+            # Native stop/start stays outside the global lock; a drain that lands
+            # after this fence does not interrupt an already admitted operation.
             with self._global_lock():
                 if self.store.get_meta("draining") == "1":
                     raise ControlError("draining", "restart work is refused while draining")
                 self._ownership(task)
                 self._require_window(task)
-                native_touched = True
-                self._stop_instance(task)
-                phase = "native-start"
-                native_started = time.monotonic()
-                self._start_instance(task)
-                stage_timings["native_start_seconds"] = round(max(0.0, time.monotonic() - native_started), 3)
+                native_admitted = True
+            native_touched = True
+            self._stop_instance(task)
+            phase = "native-start"
+            native_started = time.monotonic()
+            self._start_instance(task)
+            stage_timings["native_start_seconds"] = round(max(0.0, time.monotonic() - native_started), 3)
             phase = "guest-readiness"
             readiness = self._wait_guest_ready(task, stage_timings=stage_timings)
             phase = "guest-post-check"
@@ -2961,7 +2963,7 @@ class Control:
                 task = current
             return {**self._state_summary(task), "readiness": readiness, "stage_timings": stage_timings}
         except ControlError as exc:
-            if not native_touched:
+            if not native_admitted:
                 raise
             cleanup = {"ok": False, "error": {"code": "not_attempted", "message": "cleanup was not attempted"}}
             try:

@@ -116,7 +116,10 @@ class CTResources:
     def _unsigned(value: str, metric: str, *, positive: bool = False) -> int:
         if not re.fullmatch(r"[0-9]+", value.strip()):
             raise ControlError("resource_unverified", "CT resource metric is invalid", {"metric": metric})
-        number = int(value)
+        try:
+            number = int(value.strip())
+        except (ValueError, OverflowError) as exc:
+            raise ControlError("resource_unverified", "CT resource metric is invalid", {"metric": metric}) from exc
         if positive and number == 0:
             raise ControlError("resource_unverified", "CT capacity must be positive", {"metric": metric})
         return number
@@ -171,6 +174,8 @@ class CTResources:
             fields = line.split()
             if len(fields) != 2 or fields[0] not in {"oom", "oom_kill", "oom_group_kill"}:
                 continue
+            if fields[0] in values:
+                return None
             try:
                 values[fields[0]] = self._unsigned(fields[1], "memory.events." + fields[0])
             except ControlError:
@@ -1336,12 +1341,18 @@ class Control:
                     return
                 errors, completed = self._cleanup_task(current)
                 if errors:
-                    self.store.update_task(
-                        task_id,
-                        last_error=json.dumps({"errors": errors, "completed": completed}),
-                    )
+                    with self._global_lock(), self.store.transaction():
+                        latest = self.store.get_task(task_id=task_id)
+                        if latest and latest["generation"] == generation and latest["state"] == "closing":
+                            self.store.update_task(
+                                task_id,
+                                last_error=json.dumps({"errors": errors, "completed": completed}),
+                            )
         except ControlError as exc:
-            self.store.update_task(task_id, last_error=json.dumps(exc.as_dict()))
+            with self._global_lock(), self.store.transaction():
+                latest = self.store.get_task(task_id=task_id)
+                if latest and latest["generation"] == generation and latest["state"] == "closing":
+                    self.store.update_task(task_id, last_error=json.dumps(exc.as_dict()))
 
     def _dispatch_locked(self, request: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(request, Mapping):
@@ -1816,7 +1827,9 @@ class Control:
             instances = self.incus.list_instances()
             running = sum(str(item.get("status", "")).lower() == "running" for item in instances)
             stopped = sum(str(item.get("status", "")).lower() == "stopped" for item in instances)
-            preparing = sum(task["state"] == "preparing" for task in self.store.list_tasks())
+            instance_names = {str(item.get("name")) for item in instances}
+            preparing = sum(task["state"] == "preparing" and task["instance_name"] not in instance_names
+                            for task in self.store.list_tasks())
             cached_names = {task["instance_name"] for task in self.store.list_tasks() if task["state"] == "cached"}
             cached = sum(item.get("name") in cached_names and str(item.get("status", "")).lower() == "stopped" for item in instances)
             slot_limit = None

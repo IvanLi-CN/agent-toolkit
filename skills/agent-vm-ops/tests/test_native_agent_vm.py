@@ -711,6 +711,24 @@ class LifecycleTests(Fixture):
         self.control.dispatch({"protocol": CONTROL.PROTOCOL_VERSION, "action": "timer-expire", "task_id": first["task_id"], "generation": 1})
         self.assertEqual(self.call("status")["state"], "cached")
 
+    def test_stale_expiry_error_cannot_overwrite_new_generation(self):
+        first = self.acquire()
+        task = self.store.get_task(task_id=first["task_id"])
+        self.now = CONTROL.parse_time(first["lease_expires_at"])
+
+        def switch_generation_then_fail(_task):
+            self.store.update_task(task["task_id"], generation=2, state="active",
+                                   lease_expires_at=CONTROL.iso_time(self.now + dt.timedelta(minutes=10)),
+                                   last_error=None)
+            raise CONTROL.ControlError("cleanup_failed", "stale cleanup failure")
+
+        with mock.patch.object(self.control, "_cleanup_task", side_effect=switch_generation_then_fail):
+            self.control._expire_preempt({"task_id": task["task_id"], "generation": task["generation"]})
+        latest = self.store.get_task(task_id=task["task_id"])
+        self.assertEqual(latest["generation"], 2)
+        self.assertEqual(latest["state"], "active")
+        self.assertIsNone(latest["last_error"])
+
     def test_cleanup_does_not_stop_after_durable_generation_changes(self):
         first = self.acquire()
         task = self.store.get_task(task_id=first["task_id"])

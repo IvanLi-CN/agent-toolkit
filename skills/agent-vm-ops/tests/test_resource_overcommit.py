@@ -91,6 +91,17 @@ class CTObservationTests(unittest.TestCase):
         self.assertEqual(value["limit_bytes"], 4*GIB)
         self.assertIsNone(value["oom_events"])
 
+    def test_duplicate_optional_oom_events_are_unavailable(self):
+        values = {"/sys/fs/cgroup/memory.max": str(4*GIB), "/sys/fs/cgroup/memory.current": str(3*GIB),
+                  "/sys/fs/cgroup/memory.stat": "inactive_file 0\n", "/sys/fs/cgroup/memory.events": "oom 1\noom 2\n",
+                  "/proc/self/mountinfo": ""}
+        self.assertIsNone(self.observe(values)[0]["oom_events"])
+
+    def test_oversized_ct_metric_is_structured_as_unverified(self):
+        with self.assertRaises(CONTROL.ControlError) as failure:
+            CONTROL.CTResources._unsigned("9" * 5000, "memory.current")
+        self.assertEqual(failure.exception.code, "resource_unverified")
+
     def test_cpu_capacity_is_own_quota_and_visible_affinity(self):
         with mock.patch.object(CONTROL.os, "sched_getaffinity", return_value=set(range(16)), create=True), \
              mock.patch.object(CONTROL.CTResources, "_read", return_value="750000 100000") as read:
@@ -207,6 +218,19 @@ class AdmissionTests(Fixture):
         task = self.store.get_task(session_id="thread-a")
         self.assertNotEqual(task["state"], "active")
         self.store.set_meta("draining", "0")
+
+    def test_preparing_native_instance_counts_once_in_slot_admission(self):
+        observed = {}
+        original = self.control._configure_network
+
+        def configure_and_observe(*args):
+            original(*args)
+            observed.update(self.control._instance_diagnostics()["admission"])
+
+        with mock.patch.object(self.control, "_configure_network", side_effect=configure_and_observe):
+            self.acquire()
+        self.assertEqual(observed, {"allocated": 1, "reserved": 0, "allocated_and_reserved": 1,
+                                    "remaining": None, "limit": None, "capacity": None})
 
     def test_audit_summary_extracts_nested_image_failures_and_warnings(self):
         self.store.audit("acquire", "error", detail={

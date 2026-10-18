@@ -171,7 +171,7 @@ linuxTest("reaps a TERM-ignoring descendant after the leader exits before timeou
   const pidPath = join(probeRoot, "child.pid");
   let failure: any;
   try {
-    await runner.runBounded(["/bin/sh", "-c", `(setsid /bin/sh -c 'trap "" TERM; sleep 30') & echo $! > ${pidPath}; exit 0`], { timeout: 0.3, stdoutLimit: 128, stderrLimit: 128 });
+    await runner.runBounded(["/bin/sh", "-c", `(setsid /bin/sh -c 'trap "" TERM; sleep 30') & echo $! > ${pidPath}; while [ ! -s ${pidPath} ]; do sleep 0.01; done; sleep 0.05; exit 0`], { timeout: 0.3, stdoutLimit: 128, stderrLimit: 128 });
   } catch (error) { failure = error; }
   expect(failure?.code).toBe("command_timeout");
   expect(failure?.detail?.reaped).toBe(true);
@@ -187,16 +187,39 @@ linuxTest("reaps a TERM-ignoring descendant after the leader exits before timeou
   expect(state === undefined || state === "Z").toBe(true);
 });
 
+linuxTest("does not kill an unrelated process that spoofs the command marker", async () => {
+  const runner = new CommandRunner();
+  const probeRoot = root("agent-vm-marker-spoof");
+  const markerPath = join(probeRoot, "marker");
+  let unrelated: any;
+  let failure: any;
+  try {
+    const command = runner.runBounded(["/bin/sh", "-c", `printf '%s' "$AGENT_VM_COMMAND_ID" > ${markerPath}; sleep 30`], { timeout: 0.2, stdoutLimit: 128, stderrLimit: 128 });
+    expect(await waitFor(markerPath)).toBe(true);
+    const marker = readFileSync(markerPath, "utf8");
+    unrelated = Bun.spawn(["sleep", "30"], { detached: true, stdin: "ignore", stdout: "ignore", stderr: "ignore", env: { ...process.env, AGENT_VM_COMMAND_ID: marker } });
+    try { await command; }
+    catch (error) { failure = error; }
+    expect(failure?.code).toBe("command_timeout");
+    expect(failure?.detail?.process_group_killed).toBe(false);
+    expect(String(failure?.detail?.process_group_cleanup_error)).toContain("marker");
+    expect(procState(unrelated.pid)).not.toBe("Z");
+  } finally {
+    try { unrelated?.kill?.("SIGKILL"); } catch { /* The unrelated probe may already have exited. */ }
+  }
+});
+
 linuxTest("retains bounded redacted stderr in timeout diagnostics", async () => {
   const runner = new CommandRunner();
   let failure: any;
   try {
-    await runner.runBounded(["/bin/sh", "-c", "printf 'password=\"timeout-secret-canary\\ncontinued-secret-canary\"\\n' >&2; sleep 30"], { timeout: 0.05, stderrLimit: 256 });
+    await runner.runBounded(["/bin/sh", "-c", "printf 'password=\"timeout-secret-canary\\ncontinued-secret-canary\" AGENT_VM_COMMAND_ID=marker-timeout-canary\\n' >&2; sleep 30"], { timeout: 0.05, stderrLimit: 256 });
   } catch (error) { failure = error; }
   expect(failure?.code).toBe("command_timeout");
   expect(failure?.detail?.stderr).toContain("[REDACTED]");
   expect(failure?.detail?.stderr).not.toContain("timeout-secret-canary");
   expect(failure?.detail?.stderr).not.toContain("continued-secret-canary");
+  expect(failure?.detail?.stderr).not.toContain("marker-timeout-canary");
   expect(failure?.detail?.stderr.length).toBeLessThanOrEqual(256);
 });
 

@@ -196,6 +196,19 @@ class SessionContractTests(unittest.TestCase):
         self.assertLessEqual(len(error.message), CLI.DIAGNOSTIC_MESSAGE_LIMIT)
         self.assertNotIn("secret-value", error.message)
 
+    def test_redaction_covers_cookie_digest_session_and_jwt(self):
+        jwt = ".".join(("eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiJhZ2VudCJ9", "jwt-signature"))
+        value = (
+            "Cookie: sessionid=cookie-secret; theme=dark\n"
+            "Set-Cookie: sessionid=set-cookie-secret; Path=/\n"
+            "sessionid=session-secret Authorization: Digest username=agent, response=digest-secret\n"
+            + "jwt=" + jwt
+        )
+        redacted = CLI.redact_diagnostic_text(value)
+        for secret in ("cookie-secret", "set-cookie-secret", "session-secret", "digest-secret", "jwt-signature"):
+            self.assertNotIn(secret, redacted)
+        self.assertLessEqual(len(CLI.bounded_diagnostic_text(value, 128)), 128)
+
     def test_error_details_are_projected_and_document_bounded(self):
         detail = {"message": "x" * 10000, "errors": [{"stderr": "password=\"secret-value\""}] * 256, "untrusted": "drop-me"}
         error = CLI.CliError("remote_failed", "failed", detail)
@@ -246,7 +259,9 @@ class SessionContractTests(unittest.TestCase):
 
     def test_ssh_info_uses_remote_status_generation(self):
         status = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "status", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 3, "operation_id": None, "outcome": "success", "result": {"generation": 3}}
-        info = {"task_id": "avm-task", "generation": 3, "host": "198.51.100.20", "port": 2200, "user": "root", "host_key_alias": "agent-vm-avm-task-g3", "host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestfixture"}
+        wire = b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20" + bytes(range(32))
+        host_key = "ssh-ed25519 " + CLI.base64.b64encode(wire).decode("ascii")
+        info = {"task_id": "avm-task", "generation": 3, "host": "198.51.100.20", "port": 2200, "user": "root", "host_key_alias": "agent-vm-avm-task-g3", "host_key": host_key}
         ssh = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "ssh-info", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 3, "operation_id": None, "outcome": "success", "result": info}
         processes = [CLI.subprocess.CompletedProcess([], 0, json.dumps(item).encode(), b"") for item in (status, ssh)]
         with tempfile.TemporaryDirectory() as state, tempfile.TemporaryDirectory() as config:
@@ -287,6 +302,23 @@ class SessionContractTests(unittest.TestCase):
         with self.assertRaises(CLI.CliError) as error:
             CLI.write_ssh_config("thread", info, Path("/tmp/id_ed25519"))
         self.assertEqual(error.exception.code, "invalid_remote_response")
+
+    def test_ssh_config_rejects_malformed_ed25519_wire_payload(self):
+        wire = b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20" + bytes(range(32))
+        valid = "ssh-ed25519 " + CLI.base64.b64encode(wire).decode("ascii")
+        with tempfile.TemporaryDirectory() as state, tempfile.TemporaryDirectory() as config:
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", Path(state)), mock.patch.object(CLI, "LOCAL_CONFIG_ROOT", Path(config)):
+                keys = CLI._secure_directory(CLI._secure_session_directory("thread") / "keys")
+                private_key = keys / "id_ed25519"
+                private_key.write_text("fixture", encoding="utf-8")
+                private_key.chmod(0o600)
+                info = {"task_id": "avm-task", "generation": 3, "host": "198.51.100.20", "port": 2200, "user": "root", "host_key_alias": "agent-vm-avm-task-g3", "host_key": valid}
+                CLI.write_ssh_config("thread", info, private_key)
+                for payload in (wire[:-1], wire + b"\x00", wire.replace(b"ssh-ed25519", b"ssh-rsa   ", 1)):
+                    malformed = {**info, "host_key": "ssh-ed25519 " + CLI.base64.b64encode(payload).decode("ascii")}
+                    with self.assertRaises(CLI.CliError) as error:
+                        CLI.write_ssh_config("thread", malformed, private_key)
+                    self.assertEqual(error.exception.code, "invalid_host_key")
 
     def test_mutation_response_generation_must_match_request(self):
         response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "release", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 4, "operation_id": "release-op", "outcome": "success", "result": {}}
@@ -347,6 +379,71 @@ class SessionContractTests(unittest.TestCase):
                 time.sleep(0.01)
             else:
                 self.fail("descendant survived process-group cleanup")
+
+    def test_terminate_process_group_kills_descendant_after_leader_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            child_pid = Path(directory) / "child.pid"
+            child_code = "import pathlib, signal, sys, time; pathlib.Path(sys.argv[1]).write_text(str(__import__('os').getpid())); signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"
+            wrapper_code = f"import signal, subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {child_code!r}, sys.argv[1]]); signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); time.sleep(30)"
+            process = CLI.subprocess.Popen([CLI.sys.executable, "-c", wrapper_code, str(child_pid)], start_new_session=True)
+            deadline = time.monotonic() + 1.0
+            while not child_pid.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(child_pid.exists())
+            child = int(child_pid.read_text())
+            CLI.terminate_process_group(process)
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                try:
+                    CLI.os.kill(child, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("TERM-ignoring descendant survived leader-exit cleanup")
+
+    def test_run_child_timeout_closes_stdin_after_leader_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            child_pid = root / "child.pid"
+            driver = root / "driver.py"
+            driver.write_text(
+                "import importlib.util, pathlib, subprocess, sys\n"
+                "module_path, pid_path = sys.argv[1:3]\n"
+                "spec = importlib.util.spec_from_file_location('agent_vm_client_probe', module_path)\n"
+                "module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)\n"
+                "child_code = \"import pathlib, signal, sys, time; pathlib.Path(sys.argv[1]).write_text(str(__import__('os').getpid())); signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)\"\n"
+                "wrapper_code = f\"import signal, subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {child_code!r}, sys.argv[1]]); signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); time.sleep(30)\"\n"
+                "try:\n"
+                "    module.run_child([sys.executable, '-c', wrapper_code, pid_path], input_data=b'x' * (4 * 1024 * 1024), timeout=0.1)\n"
+                "except subprocess.TimeoutExpired:\n"
+                "    raise SystemExit(0)\n"
+                "raise SystemExit(9)\n",
+                encoding="utf-8",
+            )
+            probe = CLI.subprocess.Popen([CLI.sys.executable, str(driver), str(CLI.__file__), str(child_pid)], start_new_session=True)
+            try:
+                result = probe.wait(timeout=3)
+            except CLI.subprocess.TimeoutExpired:
+                if child_pid.exists():
+                    try:
+                        CLI.os.kill(int(child_pid.read_text()), CLI.signal.SIGKILL)
+                    except (ProcessLookupError, ValueError):
+                        pass
+                try:
+                    CLI.os.killpg(probe.pid, CLI.signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                probe.wait(timeout=1)
+                self.fail("run_child retained a closed leader's stdin registration")
+            self.assertEqual(result, 0)
+
+    def test_main_redacts_unexpected_exception_text(self):
+        with mock.patch.object(CLI, "dispatch", side_effect=RuntimeError("password" + '="unexpected-secret"')), mock.patch.object(CLI.sys, "stderr", new_callable=io.StringIO) as stderr:
+            self.assertEqual(CLI.main(["status"]), 3)
+        output = stderr.getvalue()
+        self.assertNotIn("unexpected-secret", output)
+        self.assertIn('"code": "internal_error"', output)
 
 
 if __name__ == "__main__":

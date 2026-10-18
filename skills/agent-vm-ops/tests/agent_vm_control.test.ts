@@ -425,6 +425,20 @@ test("requires protected canonical config and timer paths", () => {
     expectSyncCode(() => loadConfig(link), "config_invalid");
     chmodSync(timer, 0o777);
     expectSyncCode(() => validateProtectedDirectory(timer), "config_invalid");
+    chmodSync(timer, 0o755);
+    for (const field of ["storage_path", "state_db", "timer_dir"]) {
+      const relative = { ...base, [field]: field === "state_db" ? "state.sqlite3" : "." };
+      const relativePath = join(root, `relative-${field}.json`);
+      writeFileSync(relativePath, JSON.stringify(relative));
+      expectSyncCode(() => loadConfig(relativePath), "config_invalid");
+    }
+    const alias = join(root, "alias");
+    symlinkSync(root, alias);
+    const aliased = { ...base, storage_path: alias, state_db: join(alias, "state.sqlite3"), timer_dir: join(alias, "systemd") };
+    const aliasedPath = join(root, "aliased.json");
+    writeFileSync(aliasedPath, JSON.stringify(aliased));
+    expectSyncCode(() => loadConfig(aliasedPath), "config_invalid");
+    expectSyncCode(() => StateStore.bootstrap(join(alias, "aliased-state.sqlite3")), "state_path_unsafe");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -680,6 +694,18 @@ test("rejects runtime state without canonical uniqueness and foreign-key contrac
   finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("rejects runtime state with unexpected SQLite triggers and views", () => {
+  for (const [suffix, ddl] of [["trigger", "CREATE TRIGGER rogue AFTER INSERT ON meta BEGIN SELECT 1; END"], ["view", "CREATE VIEW rogue AS SELECT 1"]] as const) {
+    const root = mkdtempSync(`/tmp/agent-vm-state-schema-${suffix}-`);
+    const path = join(root, "state.sqlite3");
+    const store = StateStore.bootstrap(path);
+    store.db.run(ddl);
+    store.close();
+    try { expectSyncCode(() => new StateStore(path), "state_invalid"); }
+    finally { rmSync(root, { recursive: true, force: true }); }
+  }
+});
+
 test("rejects canonical runtime state with invalid task identity data", () => {
   const root = mkdtempSync("/tmp/agent-vm-state-data-test-");
   const path = join(root, "state.sqlite3");
@@ -792,17 +818,42 @@ test("fails closed on unknown draining and preserves legal active resize reserva
   rmSync(root, { recursive: true, force: true });
 });
 
+test("keeps cached reacquire pre-native state restartable", async () => {
+  const f = fixture();
+  const task = (f.control as any).baseTask("cached-reopen", 2) as Dict;
+  Object.assign(task, {
+    vm_ip: "198.51.100.20",
+    lease_expires_at: new Date(f.now.getTime() + 1_800_000).toISOString(),
+    resources_json: JSON.stringify({ cpu: 2, memory_mib: 4096, disk_gib: 20 }),
+  });
+  (f.control as any).resourcePolicy = async () => ({ limits: { cpu: 64, memory_mib: 65536 }, memory: { available_bytes: 24 * GIB, threshold_bytes: 4 * GIB } });
+  (f.control as any).runningInventoryGuard = async () => undefined;
+  await (f.control as any).reserveResources(task, { cpu: 2, memory_mib: 4096, disk_gib: 20 });
+  const persisted = f.store.getTask({ taskId: task.task_id }) as Dict;
+  expect(persisted.vm_ip).toBeNull();
+  expect(persisted.ssh_host_port).toBeNull();
+  expect(persisted.reservation_bytes).toBe(0n);
+  f.store.close();
+  f.storeClosed = true;
+  const reopened = new StateStore(f.config.state_db);
+  try { reopened.verifyRuntimeState(); }
+  finally { reopened.close(); }
+});
+
 test("projects untrusted result JSON before operation and audit persistence", async () => {
   const f = fixture();
   const sensitiveName = ["extra", "secret"].join("_");
   const nestedSensitiveName = ["nested", "secret", "value"].join("_");
   const canary = "persist-" + "canary";
+  const jwt = ["eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiJhZ2VudCJ9", "jwt-persist-canary"].join(".");
   (f.control as any).dispatchAction = async () => ({
     generation: 0,
     state: "active",
     [sensitiveName]: canary,
     nested: { [nestedSensitiveName]: canary },
     payload: "x".repeat(20_000),
+    stderr: "Cookie: sessionid=cookie-persist-canary\nSet-Cookie: sessionid=set-cookie-persist-canary\nAuthorization: Digest response=digest-persist-canary\njwt=" + jwt + " AGENT_VM_COMMAND_ID=marker-persist-canary",
+    message: "sessionid=session-persist-canary",
   });
   const response = await f.control.dispatch(f.request("acquire", {}, "op-persistence-boundary"));
   expect(response.result[sensitiveName]).toBeUndefined();
@@ -812,6 +863,10 @@ test("projects untrusted result JSON before operation and audit persistence", as
   const audit = String((f.store.db.query("SELECT detail_json FROM audit WHERE action = ?") as any).get("acquire").detail_json);
   expect(operation).not.toContain(canary);
   expect(audit).not.toContain(canary);
+  for (const secret of ["cookie-persist-canary", "set-cookie-persist-canary", "digest-persist-canary", "jwt-persist-canary", "marker-persist-canary", "session-persist-canary"]) {
+    expect(operation).not.toContain(secret);
+    expect(audit).not.toContain(secret);
+  }
   expect(operation.length).toBeLessThan(16_384);
   expect(audit.length).toBeLessThan(16_384);
 });
@@ -896,6 +951,25 @@ test("replays an accepted persisted operation without changing its digest or nat
     store.close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("serializes concurrent legacy-state startup and records one migration", async () => {
+  const root = mkdtempSync("/tmp/agent-vm-concurrent-migration-test-");
+  const dbPath = join(root, "state.sqlite3");
+  writeLegacyOperation(dbPath, {
+    ok: true, protocol: PROTOCOL_VERSION, server_time: "2026-10-04T00:00:00+00:00", action: "acquire", session_id: "legacy-concurrent",
+    generation: 0, operation_id: "legacy-concurrent-op", outcome: "success", result: { state: "active" }, _request_digest: "c3dccc911349ced563eb9615fb6db8ffa5801d121c9542c29c5a3fc0575a768a",
+  });
+  const source = `const { StateStore } = await import(process.env.CONTROL_PATH); const store = new StateStore(process.env.DB_PATH); store.close();`;
+  try {
+    const children = [0, 1].map(() => Bun.spawn([process.execPath, "-e", source], { env: { ...process.env, CONTROL_PATH, DB_PATH: dbPath }, stdout: "pipe", stderr: "pipe" }));
+    const results = await Promise.all(children.map(collect));
+    expect(results.every((result) => result.exit === 0)).toBe(true);
+    for (const result of results) expect(result.stderr).toBe("");
+    const store = new StateStore(dbPath);
+    try { expect(Number((store.db.query("SELECT COUNT(*) AS count FROM audit WHERE action = 'schema-migration'") as any).get().count)).toBe(1); }
+    finally { store.close(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("rejects a pending legacy operation without rewriting its journal", async () => {

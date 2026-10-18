@@ -27,11 +27,17 @@ RAW_DIAGNOSTIC_CAPTURE_LIMIT = 1024 * 1024
 STRUCTURED_OUTPUT_LIMIT = 16 * 1024 * 1024
 CHILD_DRAIN_GRACE_SECONDS = 1.0
 DEFAULT_CHILD_TIMEOUT_SECONDS = 600
-SECRET_LABELS = r"(?:[A-Za-z0-9]+[_-])*(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)(?:[_-][A-Za-z0-9]+)*"
+SECRET_LABELS = r"(?:[A-Za-z0-9]+[_-])*(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?|cookie|set[-_]?cookie)(?:[_-][A-Za-z0-9]+)*"
 PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 _-]*PRIVATE KEY-----", re.IGNORECASE)
 UNTERMINATED_PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*$", re.IGNORECASE)
 AUTH_SCHEME_RE = re.compile(r"(?i)(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?(?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]+")
+AUTH_DIGEST_RE = re.compile(r"(?i)(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?digest\s+)[^\r\n]+")
 AUTH_BASIC_RE = re.compile(r"(?i)(\bbasic\s+)[A-Za-z0-9._~+/=-]+")
+COOKIE_HEADER_RE = re.compile(r"(?i)(\b(?:set-cookie|cookie)\s*:\s*)[^\r\n]+")
+SESSION_VALUE_RE = re.compile(r"(?i)(\b(?:session[_-]?id)\b\s*[:=]\s*)[^\s,;}\]\r\n]+")
+DIGEST_FIELD_RE = re.compile(r"(?i)(\b(?:response|nonce|cnonce|opaque|nc|qop)\s*[:=]\s*)[^\s,;}\]\r\n]+")
+JWT_RE = re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?![A-Za-z0-9_-])")
+COMMAND_MARKER_RE = re.compile(r"(?i)(\bAGENT_VM_COMMAND_ID\s*[:=]\s*)[^\s,;}\]\r\n]+")
 SECRET_DOUBLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)\"(?:\\.|[^\"\\])*\"")
 SECRET_SINGLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)'(?:\\.|[^'\\])*'")
 UNTERMINATED_SECRET_DOUBLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)\"(?:\\.|[^\"\\])*\\?$")
@@ -46,8 +52,13 @@ def redact_stderr(value: bytes) -> bytes:
     text = value.decode("utf-8", "replace")
     text = PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", text)
     text = UNTERMINATED_PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", text)
+    text = COOKIE_HEADER_RE.sub(r"\1[REDACTED]", text)
+    text = AUTH_DIGEST_RE.sub(r"\1[REDACTED]", text)
     text = AUTH_SCHEME_RE.sub(r"\1[REDACTED]", text)
     text = AUTH_BASIC_RE.sub(r"\1[REDACTED]", text)
+    text = SESSION_VALUE_RE.sub(r"\1[REDACTED]", text)
+    text = DIGEST_FIELD_RE.sub(r"\1[REDACTED]", text)
+    text = COMMAND_MARKER_RE.sub(r"\1[REDACTED]", text)
     text = SECRET_DOUBLE_RE.sub(r'\1"[REDACTED]"', text)
     text = SECRET_SINGLE_RE.sub(r"\1'[REDACTED]'", text)
     text = UNTERMINATED_SECRET_DOUBLE_RE.sub(r'\1"[REDACTED]', text)
@@ -56,7 +67,7 @@ def redact_stderr(value: bytes) -> bytes:
     text = SSHPASS_RE.sub(r"\1 [REDACTED]", text)
     text = URL_CREDENTIAL_RE.sub(r"\1[REDACTED]\3", text)
     text = BEARER_RE.sub(r"\1[REDACTED]", text)
-    return text.encode("utf-8")
+    return JWT_RE.sub("[REDACTED JWT]", text).encode("utf-8")
 
 
 def redact_and_bound_stderr(value: bytes, *, truncated: bool = False, limit: int = DIAGNOSTIC_OUTPUT_LIMIT) -> bytes:
@@ -271,7 +282,6 @@ def _terminate_process_group(process: subprocess.Popen) -> None:
             pass
         try:
             process.wait(timeout=0.25)
-            return
         except subprocess.TimeoutExpired:
             pass
         try:
@@ -317,7 +327,7 @@ def _run_bounded(argv: list[str], *, input_data: bytes | None = None, timeout: f
     def close_stream(stream):
         try:
             selector.unregister(stream)
-        except KeyError:
+        except (KeyError, ValueError):
             pass
         try:
             stream.close()
@@ -339,6 +349,8 @@ def _run_bounded(argv: list[str], *, input_data: bytes | None = None, timeout: f
     try:
         while selector.get_map() or process.poll() is None:
             if process.poll() is not None and drain_deadline is None:
+                if process.stdin is not None:
+                    close_stream(process.stdin)
                 drain_deadline = time.monotonic() + CHILD_DRAIN_GRACE_SECONDS
             deadlines = [value for value in (deadline, drain_deadline) if value is not None]
             remaining = None if not deadlines else min(deadlines) - time.monotonic()
@@ -347,7 +359,7 @@ def _run_bounded(argv: list[str], *, input_data: bytes | None = None, timeout: f
                     _terminate_process_group(process)
                     raise subprocess.TimeoutExpired(argv, effective_timeout, output=stdout_capture.finish(marker=False), stderr=redact_and_bound_stderr(stderr_capture.finish(marker=False), truncated=stderr_capture.seen > stderr_capture.limit))
                 _terminate_process_group(process)
-                for stream in (process.stdout, process.stderr):
+                for stream in (process.stdin, process.stdout, process.stderr):
                     if stream is not None:
                         close_stream(stream)
                 continue
@@ -563,7 +575,10 @@ def main() -> int:
         print(str(e), file=sys.stderr)
         return e.code
     except (OSError, ValueError, KeyError) as e:
-        print("sync failed: " + str(e), file=sys.stderr)
+        print("sync failed: " + redact_stderr(str(e).encode()).decode("utf-8", "replace")[:DIAGNOSTIC_OUTPUT_LIMIT], file=sys.stderr)
+        return 1
+    except Exception as e:
+        print("sync failed: " + redact_stderr(str(e).encode()).decode("utf-8", "replace")[:DIAGNOSTIC_OUTPUT_LIMIT], file=sys.stderr)
         return 1
 
 

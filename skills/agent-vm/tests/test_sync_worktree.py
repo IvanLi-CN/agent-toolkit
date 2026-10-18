@@ -52,12 +52,15 @@ class SyncTests(unittest.TestCase):
         return self.remote(dict(action=action, name=name, tx=tx, **kw))
 
     def test_stderr_redaction_covers_assignments_and_json_fields(self):
-        value = MOD.redact_stderr(b'{"password":"secret-value", "private_key": "private-value"} token=token-value Authorization: Bearer auth-canary-01 Authorization: Basic dXNlcjpzZWNyZXQ=')
+        jwt = b".".join((b"eyJhbGciOiJIUzI1NiJ9", b"eyJzdWIiOiJhZ2VudCJ9", b"jwt-signature"))
+        value = MOD.redact_stderr(b'{"password":"secret-value", "private_key": "private-value"} token=token-value Authorization: Bearer auth-canary-01 Authorization: Basic dXNlcjpzZWNyZXQ= Cookie: sessionid=cookie-secret Set-Cookie: sessionid=set-cookie-secret Authorization: Digest response=digest-secret jwt=' + jwt)
         self.assertNotIn(b"secret-value", value)
         self.assertNotIn(b"private-value", value)
         self.assertNotIn(b"token-value", value)
         self.assertNotIn(b"auth-canary-01", value)
         self.assertNotIn(b"dXNlcjpzZWNyZXQ=", value)
+        for secret in (b"cookie-secret", b"set-cookie-secret", b"digest-secret", b"jwt-signature"):
+            self.assertNotIn(secret, value)
 
     def test_child_diagnostics_are_redacted_before_bounding(self):
         result = MOD.run([sys.executable, "-c", "import sys; sys.stderr.write('Authorization: Bearer ' + 'x' * 20000)"], capture_output=True)
@@ -271,6 +274,70 @@ class SyncTests(unittest.TestCase):
         self.assertFalse(self.config_seen.exists())
         self.assertTrue(list((self.workspace / "repo").glob(".agent-vm-sync-*.json")))
         self.assertEqual((self.workspace / "repo/src/file").read_text(), "data")
+
+    def test_terminate_process_group_kills_descendant_after_leader_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            child_pid = Path(directory) / "child.pid"
+            child_code = "import pathlib, signal, sys, time; pathlib.Path(sys.argv[1]).write_text(str(__import__('os').getpid())); signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"
+            wrapper_code = f"import signal, subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {child_code!r}, sys.argv[1]]); signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); time.sleep(30)"
+            process = MOD.subprocess.Popen([sys.executable, "-c", wrapper_code, str(child_pid)], start_new_session=True)
+            deadline = MOD.time.monotonic() + 1.0
+            while not child_pid.exists() and MOD.time.monotonic() < deadline:
+                MOD.time.sleep(0.01)
+            self.assertTrue(child_pid.exists())
+            child = int(child_pid.read_text())
+            MOD._terminate_process_group(process)
+            deadline = MOD.time.monotonic() + 1.0
+            while MOD.time.monotonic() < deadline:
+                try:
+                    MOD.os.kill(child, 0)
+                except ProcessLookupError:
+                    break
+                MOD.time.sleep(0.01)
+            else:
+                self.fail("TERM-ignoring descendant survived leader-exit cleanup")
+
+    def test_run_bounded_timeout_closes_stdin_after_leader_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            child_pid = root / "child.pid"
+            driver = root / "driver.py"
+            driver.write_text(
+                "import importlib.util, pathlib, subprocess, sys\n"
+                "module_path, pid_path = sys.argv[1:3]\n"
+                "spec = importlib.util.spec_from_file_location('sync_worktree_probe', module_path)\n"
+                "module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)\n"
+                "child_code = \"import pathlib, signal, sys, time; pathlib.Path(sys.argv[1]).write_text(str(__import__('os').getpid())); signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)\"\n"
+                "wrapper_code = f\"import signal, subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {child_code!r}, sys.argv[1]]); signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); time.sleep(30)\"\n"
+                "try:\n"
+                "    module._run_bounded([sys.executable, '-c', wrapper_code, pid_path], input_data=b'x' * (4 * 1024 * 1024), timeout=0.1)\n"
+                "except subprocess.TimeoutExpired:\n"
+                "    raise SystemExit(0)\n"
+                "raise SystemExit(9)\n",
+                encoding="utf-8",
+            )
+            probe = MOD.subprocess.Popen([sys.executable, str(driver), str(MOD.__file__), str(child_pid)], start_new_session=True)
+            try:
+                result = probe.wait(timeout=3)
+            except MOD.subprocess.TimeoutExpired:
+                if child_pid.exists():
+                    try:
+                        MOD.os.kill(int(child_pid.read_text()), MOD.signal.SIGKILL)
+                    except (ProcessLookupError, ValueError):
+                        pass
+                try:
+                    MOD.os.killpg(probe.pid, MOD.signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                probe.wait(timeout=1)
+                self.fail("_run_bounded retained a closed leader's stdin registration")
+            self.assertEqual(result, 0)
+
+    def test_main_redacts_unexpected_exception_text(self):
+        with patch.object(MOD, "sync", side_effect=RuntimeError("password" + '="unexpected-secret"')):
+            with patch.object(MOD.sys, "argv", ["sync_worktree", "--name", "repo"]), patch.object(MOD.sys, "stderr", new_callable=io.StringIO) as stderr:
+                self.assertEqual(MOD.main(), 1)
+        self.assertNotIn("unexpected-secret", stderr.getvalue())
 
     def test_invalid_name_fails_before_remote_and_missing_cli_preserves_exit(self):
         with patch.object(MOD, "run") as runner:

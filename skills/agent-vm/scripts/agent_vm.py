@@ -55,12 +55,18 @@ LOCAL_CONFIG_ROOT = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".c
 LOCAL_STATE_ROOT = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "agent-vm"
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.:@/-]{1,160}$")
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
-SENSITIVE_FIELD_RE = re.compile(r"(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)", re.IGNORECASE)
-SECRET_LABELS = r"(?:[A-Za-z0-9]+[_-])*(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)(?:[_-][A-Za-z0-9]+)*"
+SENSITIVE_FIELD_RE = re.compile(r"(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?|cookie|set[-_]?cookie|sessionid|session-id)", re.IGNORECASE)
+SECRET_LABELS = r"(?:[A-Za-z0-9]+[_-])*(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?|cookie|set[-_]?cookie)(?:[_-][A-Za-z0-9]+)*"
 PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 _-]*PRIVATE KEY-----", re.IGNORECASE)
 UNTERMINATED_PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*$", re.IGNORECASE)
 AUTH_SCHEME_RE = re.compile(r"(?i)(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?(?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]+")
+AUTH_DIGEST_RE = re.compile(r"(?i)(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?digest\s+)[^\r\n]+")
 AUTH_BASIC_RE = re.compile(r"(?i)(\bbasic\s+)[A-Za-z0-9._~+/=-]+")
+COOKIE_HEADER_RE = re.compile(r"(?i)(\b(?:set-cookie|cookie)\s*:\s*)[^\r\n]+")
+SESSION_VALUE_RE = re.compile(r"(?i)(\b(?:session[_-]?id)\b\s*[:=]\s*)[^\s,;}\]\r\n]+")
+DIGEST_FIELD_RE = re.compile(r"(?i)(\b(?:response|nonce|cnonce|opaque|nc|qop)\s*[:=]\s*)[^\s,;}\]\r\n]+")
+JWT_RE = re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?![A-Za-z0-9_-])")
+COMMAND_MARKER_RE = re.compile(r"(?i)(\bAGENT_VM_COMMAND_ID\s*[:=]\s*)[^\s,;}\]\r\n]+")
 SECRET_DOUBLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)\"(?:\\.|[^\"\\])*\"")
 SECRET_SINGLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)'(?:\\.|[^'\\])*'")
 UNTERMINATED_SECRET_DOUBLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)\"(?:\\.|[^\"\\])*\\?$")
@@ -74,8 +80,13 @@ BEARER_RE = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+")
 def redact_diagnostic_text(value: str) -> str:
     redacted = PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", value)
     redacted = UNTERMINATED_PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", redacted)
+    redacted = COOKIE_HEADER_RE.sub(r"\1[REDACTED]", redacted)
+    redacted = AUTH_DIGEST_RE.sub(r"\1[REDACTED]", redacted)
     redacted = AUTH_SCHEME_RE.sub(r"\1[REDACTED]", redacted)
     redacted = AUTH_BASIC_RE.sub(r"\1[REDACTED]", redacted)
+    redacted = SESSION_VALUE_RE.sub(r"\1[REDACTED]", redacted)
+    redacted = DIGEST_FIELD_RE.sub(r"\1[REDACTED]", redacted)
+    redacted = COMMAND_MARKER_RE.sub(r"\1[REDACTED]", redacted)
     redacted = SECRET_DOUBLE_RE.sub(r'\1"[REDACTED]"', redacted)
     redacted = SECRET_SINGLE_RE.sub(r"\1'[REDACTED]'", redacted)
     redacted = UNTERMINATED_SECRET_DOUBLE_RE.sub(r'\1"[REDACTED]', redacted)
@@ -83,7 +94,8 @@ def redact_diagnostic_text(value: str) -> str:
     redacted = SECRET_TOKEN_RE.sub(r"\1[REDACTED]", redacted)
     redacted = SSHPASS_RE.sub(r"\1 [REDACTED]", redacted)
     redacted = URL_CREDENTIAL_RE.sub(r"\1[REDACTED]\3", redacted)
-    return BEARER_RE.sub(r"\1[REDACTED]", redacted)
+    redacted = BEARER_RE.sub(r"\1[REDACTED]", redacted)
+    return JWT_RE.sub("[REDACTED JWT]", redacted)
 
 
 def bounded_diagnostic_text(value: str, limit: int = DIAGNOSTIC_MESSAGE_LIMIT) -> str:
@@ -394,7 +406,6 @@ def terminate_process_group(process: subprocess.Popen[Any]) -> None:
             pass
         try:
             process.wait(timeout=0.25)
-            return
         except subprocess.TimeoutExpired:
             pass
         try:
@@ -444,7 +455,7 @@ def run_child(argv: Sequence[str], *, input_data: bytes | None = None,
     def close_stream(stream: Any) -> None:
         try:
             selector.unregister(stream)
-        except KeyError:
+        except (KeyError, ValueError):
             pass
         try:
             stream.close()
@@ -467,6 +478,8 @@ def run_child(argv: Sequence[str], *, input_data: bytes | None = None,
     try:
         while selector.get_map() or process.poll() is None:
             if process.poll() is not None and drain_deadline is None:
+                if process.stdin is not None:
+                    close_stream(process.stdin)
                 drain_deadline = time.monotonic() + CHILD_DRAIN_GRACE_SECONDS
             deadlines = [value for value in (deadline, drain_deadline) if value is not None]
             remaining = None if not deadlines else min(deadlines) - time.monotonic()
@@ -475,7 +488,7 @@ def run_child(argv: Sequence[str], *, input_data: bytes | None = None,
                     terminate_process_group(process)
                     raise subprocess.TimeoutExpired(list(argv), effective_timeout, output=stdout_capture.finish(marker=False), stderr=redact_and_bound_diagnostic(stderr_capture.finish(marker=False), truncated=stderr_capture.seen > stderr_capture.limit))
                 terminate_process_group(process)
-                for stream in (process.stdout, process.stderr):
+                for stream in (process.stdin, process.stdout, process.stderr):
                     if stream is not None:
                         close_stream(stream)
                 continue
@@ -518,6 +531,10 @@ def run_child(argv: Sequence[str], *, input_data: bytes | None = None,
     finally:
         if process.poll() is None:
             terminate_process_group(process)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                close_stream(stream)
+        selector.close()
         for stream in (process.stdout, process.stderr):
             if stream is not None:
                 try:
@@ -773,7 +790,30 @@ def write_ssh_config(session: str, info: dict[str, Any], private_key: Path) -> P
         decoded_key = base64.b64decode(fields[1], validate=True) if len(fields) == 2 else b""
     except (ValueError, TypeError):
         decoded_key = b""
-    if len(fields) != 2 or fields[0] != "ssh-ed25519" or not decoded_key or base64.b64encode(decoded_key).decode("ascii") != fields[1]:
+    def ssh_string(payload: bytes, offset: int) -> tuple[bytes, int] | None:
+        if offset + 4 > len(payload):
+            return None
+        length = int.from_bytes(payload[offset:offset + 4], "big")
+        start = offset + 4
+        end = start + length
+        if end > len(payload):
+            return None
+        return payload[start:end], end
+
+    algorithm_field = ssh_string(decoded_key, 0) if decoded_key else None
+    key_field = ssh_string(decoded_key, algorithm_field[1]) if algorithm_field else None
+    valid_wire_key = (
+        len(fields) == 2
+        and fields[0] == "ssh-ed25519"
+        and bool(decoded_key)
+        and base64.b64encode(decoded_key).decode("ascii") == fields[1]
+        and algorithm_field is not None
+        and algorithm_field[0] == b"ssh-ed25519"
+        and key_field is not None
+        and len(key_field[0]) == 32
+        and key_field[1] == len(decoded_key)
+    )
+    if not valid_wire_key:
         fail("invalid_host_key", "control returned an invalid trusted host key")
     config_path, known_hosts_path = ssh_paths(session, info)
     expected_key = _secure_session_directory(session) / "keys" / "id_ed25519"
@@ -1245,6 +1285,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return exc.exit_code
     except KeyboardInterrupt:
         return 130
+    except Exception as exc:
+        message = bounded_diagnostic_text(str(exc), DIAGNOSTIC_MESSAGE_LIMIT)
+        sys.stderr.write(json.dumps({"ok": False, "error": {"code": "internal_error", "message": message}}, sort_keys=True) + "\n")
+        return 3
 
 
 if __name__ == "__main__":

@@ -157,12 +157,18 @@ function isDict(value: unknown): value is Dict {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-const SENSITIVE_FIELD_RE = /(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)/i;
-const SECRET_LABEL = "(?:[A-Za-z0-9]+[_-])*(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)(?:[_-][A-Za-z0-9]+)*";
+const SENSITIVE_FIELD_RE = /(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?|cookie|set[-_]?cookie|sessionid|session-id)/i;
+const SECRET_LABEL = "(?:[A-Za-z0-9]+[_-])*(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?|cookie|set[-_]?cookie)(?:[_-][A-Za-z0-9]+)*";
 const PRIVATE_KEY_RE = /-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 _-]*PRIVATE KEY-----/gi;
 const UNTERMINATED_PRIVATE_KEY_RE = /-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*$/gi;
 const AUTH_SCHEME_RE = /(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?(?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]+/gi;
+const AUTH_DIGEST_RE = /(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?digest\s+)[^\r\n]+/gi;
 const AUTH_BASIC_RE = /(\bbasic\s+)[A-Za-z0-9._~+/=-]+/gi;
+const COOKIE_HEADER_RE = /(\b(?:set-cookie|cookie)\s*:\s*)[^\r\n]+/gi;
+const SESSION_VALUE_RE = /(\b(?:session[_-]?id)\b\s*[:=]\s*)[^\s,;}\]\r\n]+/gi;
+const DIGEST_FIELD_RE = /(\b(?:response|nonce|cnonce|opaque|nc|qop)\s*[:=]\s*)[^\s,;}\]\r\n]+/gi;
+const JWT_RE = /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?![A-Za-z0-9_-])/g;
+const COMMAND_MARKER_RE = /(\bAGENT_VM_COMMAND_ID\s*[:=]\s*)[^\s,;}\]\r\n]+/gi;
 const SECRET_DOUBLE_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)\"(?:\\\\.|[^\"\\\\])*\"", "gi");
 const SECRET_SINGLE_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)'(?:\\\\.|[^'\\\\])*'", "gi");
 const UNTERMINATED_SECRET_DOUBLE_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)\"(?:\\\\.|[^\"\\\\])*\\\\?$", "gi");
@@ -175,8 +181,13 @@ const BEARER_RE = /(bearer\s+)[A-Za-z0-9._~+/=-]+/gi;
 function redactDiagnosticText(rawInput: string): string {
   let redacted = rawInput.replace(PRIVATE_KEY_RE, "[REDACTED PRIVATE KEY]");
   redacted = redacted.replace(UNTERMINATED_PRIVATE_KEY_RE, "[REDACTED PRIVATE KEY]");
+  redacted = redacted.replace(COOKIE_HEADER_RE, "$1[REDACTED]");
+  redacted = redacted.replace(AUTH_DIGEST_RE, "$1[REDACTED]");
   redacted = redacted.replace(AUTH_SCHEME_RE, "$1[REDACTED]");
   redacted = redacted.replace(AUTH_BASIC_RE, "$1[REDACTED]");
+  redacted = redacted.replace(SESSION_VALUE_RE, "$1[REDACTED]");
+  redacted = redacted.replace(DIGEST_FIELD_RE, "$1[REDACTED]");
+  redacted = redacted.replace(COMMAND_MARKER_RE, "$1[REDACTED]");
   redacted = redacted.replace(SECRET_DOUBLE_RE, "$1\"[REDACTED]\"");
   redacted = redacted.replace(SECRET_SINGLE_RE, "$1'[REDACTED]'");
   redacted = redacted.replace(UNTERMINATED_SECRET_DOUBLE_RE, "$1\"[REDACTED]");
@@ -184,7 +195,8 @@ function redactDiagnosticText(rawInput: string): string {
   redacted = redacted.replace(SECRET_TOKEN_RE, "$1[REDACTED]");
   redacted = redacted.replace(SSHPASS_RE, "$1 [REDACTED]");
   redacted = redacted.replace(URL_CREDENTIAL_RE, "$1[REDACTED]$3");
-  return redacted.replace(BEARER_RE, "$1[REDACTED]");
+  redacted = redacted.replace(BEARER_RE, "$1[REDACTED]");
+  return redacted.replace(JWT_RE, "[REDACTED JWT]");
 }
 
 function boundedDiagnosticText(rawInput: string, limit: number): string {
@@ -823,6 +835,57 @@ function currentOwnerUid(): number | undefined {
 
 type ProtectedStats = { isFile(): boolean; isDirectory(): boolean; mode: number | bigint; uid: number };
 
+const TRUSTED_SHARED_ROOTS = new Set(["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp"]);
+
+function requireAbsoluteProtectedPath(path: string): string {
+  if (typeof path !== "string" || path.length === 0 || !path.startsWith("/")) throw new ControlError("config_invalid", "protected paths must be absolute");
+  return resolve(path);
+}
+
+function isTrustedSharedRoot(path: string, stats: ProtectedStats): boolean {
+  if (!TRUSTED_SHARED_ROOTS.has(path)) return false;
+  let target = stats;
+  if (!stats.isDirectory()) {
+    try { target = lstatSync(realpathSync(path)) as ProtectedStats; } catch { return false; }
+  }
+  const mode = Number(target.mode);
+  return target.isDirectory() && (mode & 0o1000) !== 0 && (mode & 0o077) === 0o077 && target.uid === 0;
+}
+
+function validateProtectedAncestor(path: string, stats: ProtectedStats): void {
+  if (!stats.isDirectory()) throw new ControlError("config_invalid", "protected path has a non-directory ancestor");
+  if (isTrustedSharedRoot(path, stats)) return;
+  if ((Number(stats.mode) & 0o022) !== 0) throw new ControlError("config_invalid", "protected path has a writable ancestor");
+}
+
+function protectedPath(path: string, allowMissingLeaf: boolean): string {
+  const resolved = requireAbsoluteProtectedPath(path);
+  let existing = resolved;
+  while (true) {
+    try { lstatSync(existing); break; }
+    catch (error) {
+      if (!allowMissingLeaf || (error as NodeJS.ErrnoException).code !== "ENOENT" || existing === "/") throw error;
+      existing = dirname(existing);
+    }
+  }
+  const existingStats = lstatSync(existing) as ProtectedStats & { isSymbolicLink?: () => boolean };
+  if (existing === resolved && existingStats.isSymbolicLink?.()) throw new ControlError("config_invalid", "protected paths cannot be symbolic links");
+  let current = existing === resolved ? dirname(existing) : existing;
+  while (true) {
+    const stats = lstatSync(current) as ProtectedStats & { isSymbolicLink?: () => boolean };
+    if (stats.isSymbolicLink?.()) {
+      if (!isTrustedSharedRoot(current, stats)) throw new ControlError("config_invalid", "protected paths cannot contain symbolic-link ancestors");
+    } else {
+      validateProtectedAncestor(current, stats);
+    }
+    if (current === "/") break;
+    current = dirname(current);
+  }
+  const canonicalExisting = realpathSync(existing);
+  const suffix = existing === resolved ? "" : resolved.slice(existing.length);
+  return suffix ? canonicalExisting.replace(/\/$/, "") + suffix : canonicalExisting;
+}
+
 function validateProtectedStat(path: string, stats: ProtectedStats, kind: "file" | "directory"): void {
   const expected = kind === "file" ? stats.isFile() : stats.isDirectory();
   const mode = Number(stats.mode);
@@ -832,35 +895,56 @@ function validateProtectedStat(path: string, stats: ProtectedStats, kind: "file"
 }
 
 function validateProtectedFile(path: string): void {
-  const resolved = resolve(path);
+  const resolved = protectedPath(path, false);
   const stats = lstatSync(resolved);
   if (stats.isSymbolicLink()) throw new ControlError("config_invalid", "configuration path must be a regular file and cannot be a symlink");
-  realpathSync(resolved); // Resolve parent aliases such as macOS /tmp without following the final file.
   validateProtectedStat(resolved, stats, "file");
   const noFollow = (constants as any).O_NOFOLLOW ?? 0;
   const fd = openSync(resolved, constants.O_RDONLY | noFollow);
   try { validateProtectedStat(resolved, fstatSync(fd), "file"); } finally { closeSync(fd); }
 }
 
-export function validateProtectedDirectory(path: string): void {
-  const resolved = resolve(path);
+export function validateProtectedDirectory(path: string): string {
+  const resolved = protectedPath(path, false);
   const stats = lstatSync(resolved);
   if (stats.isSymbolicLink()) throw new ControlError("config_invalid", "timer directory must be a real directory and cannot be a symlink");
-  realpathSync(resolved); // Resolve parent aliases such as macOS /tmp without following the final directory.
   validateProtectedStat(resolved, stats, "directory");
   const noFollow = (constants as any).O_NOFOLLOW ?? 0;
   const directoryFlag = (constants as any).O_DIRECTORY ?? 0;
   const fd = openSync(resolved, constants.O_RDONLY | noFollow | directoryFlag);
   try { validateProtectedStat(resolved, fstatSync(fd), "directory"); } finally { closeSync(fd); }
+  return resolved;
+}
+
+function validateProtectedStatePath(path: string): string {
+  const resolved = protectedPath(path, true);
+  try {
+    const stats = lstatSync(resolved);
+    if (stats.isSymbolicLink()) throw new ControlError("state_path_unsafe", "state database cannot be a symlink");
+    validateProtectedStat(resolved, stats, "file");
+  } catch (error) {
+    if (error instanceof ControlError) throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  return resolved;
+}
+
+function statePathBoundary(path: string): string {
+  try { return validateProtectedStatePath(path); }
+  catch (error) {
+    if (error instanceof ControlError && error.code === "config_invalid") throw new ControlError("state_path_unsafe", error.message);
+    throw error;
+  }
 }
 
 export function readJsonFile(path: string): Dict {
   try {
-    validateProtectedFile(path);
+    const resolved = protectedPath(path, false);
+    validateProtectedFile(resolved);
     const noFollow = (constants as any).O_NOFOLLOW ?? 0;
-    const fd = openSync(resolve(path), constants.O_RDONLY | noFollow);
+    const fd = openSync(resolved, constants.O_RDONLY | noFollow);
     let bytes: Uint8Array;
-    try { validateProtectedStat(path, fstatSync(fd), "file"); bytes = readFileSync(fd); } finally { closeSync(fd); }
+    try { validateProtectedStat(resolved, fstatSync(fd), "file"); bytes = readFileSync(fd); } finally { closeSync(fd); }
     const value = parseJson(decodeUtf8Strict(bytes));
     if (!isDict(value)) throw new Error("root");
     return value;
@@ -908,7 +992,11 @@ export function loadConfig(path = DEFAULT_CONFIG_PATH): Dict {
   config.state_db = configString(config.state_db, "state_db");
   config.timer_dir = configString(config.timer_dir, "timer_dir");
   if (!Array.isArray(config.required_guest_tools) || !config.required_guest_tools.every((item: unknown) => typeof item === "string" && item.length > 0)) throw new ControlError("config_invalid", "required_guest_tools must be a list of strings");
-  try { validateProtectedDirectory(config.timer_dir); } catch (error) { if (error instanceof ControlError) throw error; throw new ControlError("config_invalid", "timer directory cannot be verified"); }
+  try {
+    config.storage_path = validateProtectedDirectory(config.storage_path);
+    config.state_db = validateProtectedStatePath(config.state_db);
+    config.timer_dir = validateProtectedDirectory(config.timer_dir);
+  } catch (error) { if (error instanceof ControlError) throw error; throw new ControlError("config_invalid", "protected configuration paths cannot be verified"); }
   return config;
 }
 
@@ -1223,15 +1311,25 @@ export function killProcessTree(members: readonly ProcessIdentity[], options: Pr
   return { killed: false, error: cleanupError ?? "process_tree_members_remain" };
 }
 
-function safeProcessSignal(pid: number, expectedIdentity: string | undefined, signal: number, group: boolean): { sent: boolean; error: string | null } {
+function safeProcessSignal(pid: number, expectedIdentity: string | undefined, signal: number, group: boolean, targetPgid?: number): { sent: boolean; error: string | null } {
+  let target = pid;
   if (process.platform === "linux") {
     if (!processExists(pid)) return { sent: false, error: null };
     if (!expectedIdentity) return { sent: false, error: "process_identity_unverified" };
     const current = processStartIdentity(pid);
     if (!current) return { sent: false, error: "process_identity_unverified" };
     if (current !== expectedIdentity) return { sent: false, error: "process_identity_mismatch" };
+    if (group) {
+      if (targetPgid === undefined) return { sent: false, error: "process_group_identity_unverified" };
+      try {
+        if (readProcessRecord(pid).pgrp !== targetPgid) return { sent: false, error: "process_group_identity_mismatch" };
+      } catch { return { sent: false, error: "process_group_identity_unverified" }; }
+      target = -targetPgid;
+    }
+  } else if (group) {
+    target = -(targetPgid ?? pid);
   }
-  const sent = nativeKill(group ? -pid : pid, signal);
+  const sent = nativeKill(target, signal);
   return { sent, error: sent ? null : "PermissionError" };
 }
 
@@ -1348,6 +1446,8 @@ export class CommandRunner {
         const groupAnchors = new Map<number, ProcessIdentity[]>();
         for (const [pgid, anchors] of trackedGroups) groupAnchors.set(pgid, [...anchors]);
         let identityMismatch = processTrackingIdentityMismatch;
+        let markerBindingFailure = false;
+        let environmentInspectionIncomplete = false;
         const addKnown = (members: readonly ProcessIdentity[]): void => {
           for (const member of members) {
             const previous = known.get(member.pid);
@@ -1362,11 +1462,28 @@ export class CommandRunner {
             } catch { /* Identity checks below will fail closed if this process remains. */ }
           }
         };
+        const addBoundEnvironmentMembers = (): { complete: boolean } => {
+          if (process.platform !== "linux") return { complete: true };
+          const environment = processEnvironmentMembers(commandMarker);
+          const reachable = processDescendantsFromRoots([...known.values()]);
+          if (!environment.complete || !reachable.complete) environmentInspectionIncomplete = true;
+          const bound = new Map<number, ProcessIdentity>(known);
+          for (const member of reachable.members) bound.set(member.pid, member);
+          for (const member of environment.members) {
+            const trusted = bound.get(member.pid);
+            if (!trusted || trusted.starttime !== member.starttime) {
+              markerBindingFailure = true;
+              continue;
+            }
+            addKnown([member]);
+          }
+          return { complete: environment.complete && reachable.complete };
+        };
         addKnown([...trackedMembers.values()]);
         addKnown(descendants.members);
-        addKnown(processEnvironmentMembers(commandMarker).members);
+        addBoundEnvironmentMembers();
         addKnown(processPipeMembers(leaderPipeTargets).members);
-        const term = safeProcessSignal(processHandle.pid, leaderIdentity, 15, true);
+        const term = safeProcessSignal(processHandle.pid, leaderIdentity, 15, true, leaderPgid);
         const leaderExitedAfterTerm = await Promise.race([exit.then(() => true), sleep(250).then(() => false)]);
         let processGroupCleanupError: string | null = identityMismatch ? "process_identity_mismatch" : term.error;
         let processTreeComplete = true;
@@ -1376,7 +1493,7 @@ export class CommandRunner {
         for (let attempt = 0; attempt < 4; attempt += 1) {
           const discovered = processDescendantsFromRoots([...known.values()]);
           addKnown(discovered.members);
-          addKnown(processEnvironmentMembers(commandMarker).members);
+          addBoundEnvironmentMembers();
           addKnown(processPipeMembers(leaderPipeTargets).members);
           for (const [pgid, anchors] of groupAnchors) {
             const liveAnchor = anchors.some((anchor) => {
@@ -1399,7 +1516,7 @@ export class CommandRunner {
             const leaderGroup = anchoredProcessGroupMembers(processHandle.pid, leaderIdentity ? [{ pid: processHandle.pid, starttime: leaderIdentity }] : []);
             processTreeComplete &&= leaderGroup.complete;
             addKnown(leaderGroup.members);
-            groupKill = safeProcessSignal(processHandle.pid, leaderIdentity, 9, true);
+            groupKill = safeProcessSignal(processHandle.pid, leaderIdentity, 9, true, leaderPgid);
             directKill = safeProcessSignal(processHandle.pid, leaderIdentity, 9, false);
             processGroupCleanupError ??= groupKill.error ?? directKill.error;
           }
@@ -1413,13 +1530,12 @@ export class CommandRunner {
           if (!remaining.length && (leaderExitedAfterTerm || !processExists(processHandle.pid))) break;
           await sleep(50);
         }
-        addKnown(processEnvironmentMembers(commandMarker).members);
+        const finalEnvironment = addBoundEnvironmentMembers();
         addKnown(processPipeMembers(leaderPipeTargets).members);
         const finalDescendants = processDescendantsFromRoots([...known.values()]);
         let finalInspectionComplete = finalDescendants.complete;
         addKnown(finalDescendants.members);
-        const finalEnvironment = processEnvironmentMembers(commandMarker);
-        addKnown(finalEnvironment.members);
+        finalInspectionComplete &&= finalEnvironment.complete && !environmentInspectionIncomplete;
         const finalPipes = processPipeMembers(leaderPipeTargets);
         finalInspectionComplete &&= finalPipes.complete;
         addKnown(finalPipes.members);
@@ -1437,6 +1553,9 @@ export class CommandRunner {
         processTreeComplete = finalInspectionComplete;
         if (identityMismatch) processGroupCleanupError ??= "process_identity_mismatch";
         if (!processTreeComplete) processGroupCleanupError ??= "process_tree_inspection_failed";
+        if (markerBindingFailure) processGroupCleanupError ??= "process_marker_identity_unbound";
+        const knownDescendant = [...known.values()].some((member) => member.pid !== processHandle.pid);
+        if (leaderExitedAfterTerm && !knownDescendant) processGroupCleanupError ??= "process_tree_root_lost";
         const leaderStillAlive = Boolean(leaderIdentity && processExists(processHandle.pid) && processStartIdentity(processHandle.pid) === leaderIdentity && !processIsZombie(processHandle.pid));
         const remainingKnown = [...known.values()].some((member) => processExists(member.pid) && processStartIdentity(member.pid) === member.starttime && !processIsZombie(member.pid));
         const processGroupKilled = !leaderStillAlive && !remainingKnown && !processGroupCleanupError;
@@ -1675,10 +1794,16 @@ export class StateStore {
   static bootstrap(path: string): StateStore { return new StateStore(path, { bootstrap: true }); }
 
   constructor(path: string, options: StateStoreOptions = {}) {
-    this.path = path;
     const bootstrap = options.bootstrap === true;
-    const parentPath = dirname(path);
-    if (bootstrap) mkdirSync(parentPath, { recursive: true, mode: 0o700 });
+    if (typeof path !== "string" || path.length === 0 || !path.startsWith("/")) throw new ControlError("state_path_unsafe", "state database path must be absolute");
+    const requestedPath = resolve(path);
+    if (bootstrap) {
+      statePathBoundary(requestedPath);
+      mkdirSync(dirname(requestedPath), { recursive: true, mode: 0o700 });
+    }
+    const canonicalPath = statePathBoundary(requestedPath);
+    this.path = canonicalPath;
+    const parentPath = dirname(canonicalPath);
     let parent: ReturnType<typeof lstatSync>;
     try { parent = lstatSync(parentPath); }
     catch (error) {
@@ -1688,7 +1813,7 @@ export class StateStore {
     if (!parent.isDirectory() || (typeof process.geteuid === "function" && parent.uid !== process.geteuid()) || (parent.mode & 0o77) !== 0) throw new ControlError("state_path_unsafe", "state parent must be a private owned directory");
     let file: ReturnType<typeof lstatSync> | undefined;
     try {
-      file = lstatSync(path);
+      file = lstatSync(canonicalPath);
       if (file.isSymbolicLink()) throw new ControlError("state_path_unsafe", "state database cannot be a symlink");
     } catch (error) {
       if (error instanceof ControlError) throw error;
@@ -1700,17 +1825,22 @@ export class StateStore {
     if (file && file.size === 0) throw new ControlError("state_invalid", "state database is empty");
     let opened: Database | undefined;
     try {
-      opened = new Database(path, { safeIntegers: true });
+      opened = new Database(canonicalPath, { safeIntegers: true });
       opened.run("PRAGMA foreign_keys=ON");
       opened.run("PRAGMA busy_timeout=10000");
       if (!bootstrap) {
-        StateStore.migratePythonBaseline(opened);
-        StateStore.verifyDurableState(opened);
+        const stateLock = acquireFileLock(join(parentPath, "control.lock"), true);
+        try {
+          StateStore.migratePythonBaseline(opened);
+          StateStore.verifyDurableState(opened);
+        } finally {
+          stateLock();
+        }
       }
       opened.run("PRAGMA journal_mode=WAL");
       opened.run("PRAGMA synchronous=FULL");
       if (bootstrap) StateStore.schemaOn(opened);
-      try { chmodPrivate(path); } catch { throw new ControlError("state_path_unsafe", "state database permissions cannot be secured"); }
+      try { chmodPrivate(canonicalPath); } catch { throw new ControlError("state_path_unsafe", "state database permissions cannot be secured"); }
       this.db = opened;
     } catch (error) {
       try { opened?.close(); } catch { /* Preserve the durable-state failure. */ }
@@ -1747,7 +1877,14 @@ export class StateStore {
   }
 
   private static isPythonBaseline(db: Database): boolean {
-    const names = new Set(((db.query("SELECT name FROM sqlite_master WHERE type = 'table'") as any).all() as Dict[]).map((row) => String(row.name)));
+    const schemaObjects = (db.query("SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' OR name = 'sqlite_sequence'") as any).all() as Dict[];
+    for (const object of schemaObjects) {
+      const type = String(object.type);
+      const name = String(object.name);
+      const allowed = (type === "table" && (STATE_TABLES.has(name) || name === "sqlite_sequence")) || (type === "index" && name.startsWith("sqlite_autoindex_"));
+      if (!allowed) throw new ControlError("state_invalid", "durable state database contains an unexpected SQLite schema object: " + name);
+    }
+    const names = new Set(schemaObjects.filter((object) => String(object.type) === "table").map((row) => String(row.name)));
     for (const name of names) if (!STATE_TABLES.has(name) && name !== "sqlite_sequence") return false;
     for (const name of STATE_TABLES) if (!names.has(name)) return false;
     const legacyPrimaryKeys = new Set(["meta.key", "tasks.task_id", "operations.operation_id"]);
@@ -1788,7 +1925,6 @@ export class StateStore {
   }
 
   private static migratePythonBaseline(db: Database): void {
-    if (!StateStore.isPythonBaseline(db)) return;
     const legacyNames = {
       meta: "__agent_vm_legacy_meta",
       tasks: "__agent_vm_legacy_tasks",
@@ -1796,13 +1932,17 @@ export class StateStore {
       operations: "__agent_vm_legacy_operations",
       audit: "__agent_vm_legacy_audit",
     } as const;
-    const existingNames = new Set(((db.query("SELECT name FROM sqlite_master WHERE type = 'table'") as any).all() as Dict[]).map((row) => String(row.name)));
-    for (const name of Object.values(legacyNames)) if (existingNames.has(name)) throw new ControlError("state_invalid", "durable state contains a schema migration residue");
     const count = (table: string): number => Number((db.query(`SELECT COUNT(*) AS count FROM ${table}`) as any).get().count);
     const copiedCounts = new Map<string, number>();
     try {
       db.run("PRAGMA foreign_keys=OFF");
       db.run("BEGIN IMMEDIATE");
+      if (!StateStore.isPythonBaseline(db)) {
+        db.run("COMMIT");
+        return;
+      }
+      const existingNames = new Set(((db.query("SELECT name FROM sqlite_master WHERE type = 'table'") as any).all() as Dict[]).map((row) => String(row.name)));
+      for (const name of Object.values(legacyNames)) if (existingNames.has(name)) throw new ControlError("state_invalid", "durable state contains a schema migration residue");
       for (const table of ["meta", "tasks", "ports", "operations", "audit"] as const) db.run(`ALTER TABLE ${table} RENAME TO ${legacyNames[table]}`);
       StateStore.schemaOn(db);
       for (const table of ["meta", "tasks", "ports", "operations", "audit"] as const) {
@@ -1814,7 +1954,7 @@ export class StateStore {
       db.run("INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_migration', 'python-baseline-v1->bun-canonical-v1')");
       db.run("INSERT INTO audit(action, task_id, session_id, generation, outcome, detail_json, created_at) VALUES (?, NULL, NULL, 0, ?, ?, ?)", ["schema-migration", "ok", stableJson({ from: "python-baseline-v1", to: "bun-canonical-v1", tables: [...STATE_TABLES].sort(compareUnicodeCodePoints) }), isoTime()]);
       for (const table of Object.values(legacyNames)) db.run(`DROP TABLE ${table}`);
-      StateStore.verifyDurableState(db);
+      StateStore.verifyDurableStateInTransaction(db);
       db.run("COMMIT");
     } catch (error) {
       try { db.run("ROLLBACK"); } catch { /* Preserve the migration failure. */ }
@@ -1854,9 +1994,27 @@ export class StateStore {
   }
 
   private static verifyDurableState(db: Database): void {
+    db.run("BEGIN IMMEDIATE");
+    try {
+      StateStore.verifyDurableStateInTransaction(db);
+      db.run("COMMIT");
+    } catch (error) {
+      try { db.run("ROLLBACK"); } catch { /* Preserve the durable-state failure. */ }
+      throw error;
+    }
+  }
+
+  private static verifyDurableStateInTransaction(db: Database): void {
     const quickCheck = (db.query("PRAGMA quick_check") as any).get() as Dict | null;
     if (!quickCheck || String(quickCheck.quick_check) !== "ok") throw new ControlError("state_invalid", "durable state database failed SQLite integrity check");
-    const names = new Set(((db.query("SELECT name FROM sqlite_master WHERE type = 'table'") as any).all() as Dict[]).map((row) => String(row.name)));
+    const schemaObjects = (db.query("SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' OR name = 'sqlite_sequence'") as any).all() as Dict[];
+    for (const object of schemaObjects) {
+      const type = String(object.type);
+      const name = String(object.name);
+      const allowed = (type === "table" && (STATE_TABLES.has(name) || name === "sqlite_sequence")) || (type === "index" && name.startsWith("sqlite_autoindex_"));
+      if (!allowed) throw new ControlError("state_invalid", "durable state database contains an unexpected SQLite schema object: " + name);
+    }
+    const names = new Set(schemaObjects.filter((object) => String(object.type) === "table").map((row) => String(row.name)));
     for (const name of names) if (!STATE_TABLES.has(name) && name !== "sqlite_sequence") throw new ControlError("state_invalid", "durable state database contains an unexpected table: " + name);
     for (const name of STATE_TABLES) {
       if (!names.has(name)) throw new ControlError("state_invalid", "durable state database is missing table: " + name);
@@ -2169,7 +2327,7 @@ export class StateStore {
     this.transaction(() => (this.db as any).run("INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", key, value));
   }
 
-  verifyRuntimeState(): void { StateStore.verifyDurableState(this.db); }
+  verifyRuntimeState(): void { this.transaction(() => StateStore.verifyDurableStateInTransaction(this.db)); }
 }
 
 function chmodPrivate(path: string): void {
@@ -3016,7 +3174,15 @@ export class Control {
       const exceeded = policy ? ["cpu", "memory_mib"].filter((key) => (projectedBig as Dict)[key] > integerBigInt((policy.limits as Dict)[key], `${key} limit`)) : [];
       if (exceeded.length) throw new ControlError("resource_insufficient", `allocation ceiling exceeded: ${exceeded.join(", ")}`, { dimensions: exceeded, requested: resources, other_allocated: totals, projected, base: policy?.base, limits: policy?.limits });
       const record = { ...task, resource_reservation_json: stableJson(resources), resources_json: task.resources_json || stableJson(resources) };
-      this.store.putTask(record);
+      const persisted: Dict = { ...record };
+      const preNative = String(task.state) === "preparing" && integerBigInt(task.reservation_bytes ?? 0, "reservation_bytes") === 0n;
+      if (preNative) {
+        // A cached reacquire keeps the old address in memory for reserveNative,
+        // but does not publish native identity until its disk reservation exists.
+        persisted.vm_ip = null;
+        persisted.ssh_host_port = null;
+      }
+      this.store.putTask(persisted);
       return record;
     }));
   }

@@ -2406,15 +2406,7 @@ class Control:
                     raise ControlError("resource_unverified", "unaccounted running native instance blocks admission")
                 if record["state"] != "active":
                     raise ControlError("resource_unverified", "transitional native instance blocks admission")
-                expected = self._durable_resources(record, "resources_json", allow_empty=False)
-                reservation = self._durable_resources(record, "resource_reservation_json", allow_empty=True)
-                if reservation:
-                    expected = reservation
-                native = self._native_resources(record)
-                drifted = (any(native[key] > expected[key] for key in expected)
-                           if reservation else native != expected)
-                if drifted:
-                    raise ControlError("resource_unverified", "native resources differ from durable allocation")
+                self._verify_native_allocation(record)
 
     def _resource_diagnostics(self) -> dict[str, Any]:
         try:
@@ -2661,6 +2653,36 @@ class Control:
             return {"cpu": cpu, "memory_mib": int(memory[1]) * (1024 if memory[2] == "GiB" else 1), "disk_gib": int(disk[1])}
         except (ValueError, KeyError, TypeError) as exc:
             raise ControlError("resource_unverified", "native CPU, memory or root size cannot be verified") from exc
+
+    def _verify_native_allocation(self, task: Mapping[str, Any]) -> None:
+        expected = self._durable_resources(task, "resources_json", allow_empty=False)
+        reservation = self._durable_resources(task, "resource_reservation_json", allow_empty=True)
+        if reservation:
+            expected = reservation
+            native = self._native_resources(task)
+            if any(native[key] > expected[key] for key in expected):
+                raise ControlError("resource_unverified", "native resources exceed the durable reservation")
+        elif self._native_resources(task) != expected:
+            raise ControlError("resource_unverified", "native resources differ from durable allocation")
+
+    def _verify_network_device(self, task: Mapping[str, Any]) -> None:
+        info = self._ownership(task)
+        devices = info.get("expanded_devices")
+        eth0 = devices.get("eth0") if isinstance(devices, Mapping) else None
+        expected = {
+            "type": "nic",
+            "network": self.config["network"],
+            "ipv4.address": task["vm_ip"],
+            "security.mac_filtering": "true",
+            "security.ipv4_filtering": "true",
+            "security.ipv6_filtering": "true",
+            "security.port_isolation": "true",
+            "security.acls": self.config["network_acl"],
+            "security.acls.default.ingress.action": "allow",
+            "security.acls.default.egress.action": "allow",
+        }
+        if not isinstance(eth0, Mapping) or any(eth0.get(key) != value for key, value in expected.items()):
+            raise ControlError("ownership_mismatch", "native network isolation differs from the managed configuration")
 
     def _host_ports(self) -> set[int]:
         result = self.runner.run(["ss", "-Hlnptu"], timeout=5)
@@ -3519,7 +3541,7 @@ class Control:
         if not cached:
             self._image_guard()
         if cached:
-            self._ownership(existing)
+            self._verify_network_device(existing)
             if self.incus.instance_info(existing["instance_name"])["status"].lower() != "stopped" or self.store.get_ports(existing["task_id"]):
                 raise ControlError("cache_ineligible", "cached instance is not safely stopped")
         old = self._durable_resources(existing, "resources_json", allow_empty=False) if cached else {"cpu": 2, "memory_mib": 4096, "disk_gib": 20}
@@ -3719,6 +3741,7 @@ class Control:
                 if self.store.get_meta("draining") == "1":
                     raise ControlError("draining", "restart work is refused while draining")
                 self._ownership(task)
+                self._verify_native_allocation(task)
                 self._require_window(task)
                 native_admitted = True
             native_touched = True
@@ -4172,7 +4195,7 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
                 "current_bytes": memory.get("current_bytes"),
                 "available_bytes": memory.get("available_bytes"),
                 "pressure_threshold_bytes": memory.get("threshold_bytes"),
-                "pressure": bool(resources.get("memory_pressure")) if isinstance(resources, Mapping) else None,
+                "pressure": resources.get("memory_pressure") if isinstance(resources, Mapping) and resources.get("verified") else None,
                 "oom_events": memory.get("oom_events"),
             },
             "instances": doctor.get("instances"),

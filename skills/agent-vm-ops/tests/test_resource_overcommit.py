@@ -213,6 +213,7 @@ class AdmissionTests(Fixture):
         self.assertEqual(self.acquire()["lease_expires_at"], active["lease_expires_at"])
         self.resources.memory.side_effect = CONTROL.ControlError("resource_unverified", "missing metric")
         self.assertFalse(self.call("status")["admission"]["verified"])
+        self.assertIsNone(self.call("admin-metrics")["ct_memory"]["pressure"])
         self.call("renew")
         self.assertEqual(self.call("ssh-info")["generation"], active["generation"])
         self.assertEqual(self.call("release")["state"], "cached")
@@ -265,11 +266,34 @@ class AdmissionTests(Fixture):
     def test_native_resource_drift_fails_closed_for_new_admission(self):
         active = self.acquire()
         instance = self.runner.instances[active["instance_name"]]
-        instance["config"]["limits.memory"] = "8192MiB"
+        for field, value in (("limits.cpu", "8"), ("limits.memory", "8192MiB")):
+            with self.subTest(field=field):
+                instance["config"][field] = value
+                doctor = self.call("doctor")
+                self.assertFalse(doctor["resources"]["verified"])
+                self.assertEqual(doctor["resources"]["error"]["code"], "resource_unverified")
+                self.error("resource_unverified", self.acquire, "new")
+                instance["config"][field] = {"limits.cpu": "2", "limits.memory": "4096MiB"}[field]
+        instance["expanded_devices"]["root"]["size"] = "40GiB"
         doctor = self.call("doctor")
         self.assertFalse(doctor["resources"]["verified"])
         self.assertEqual(doctor["resources"]["error"]["code"], "resource_unverified")
         self.error("resource_unverified", self.acquire, "new")
+
+    def test_cached_resume_rejects_network_isolation_drift(self):
+        cached = self.acquire("cache")
+        self.call("release", "cache")
+        instance = self.runner.instances[cached["instance_name"]]
+        instance["expanded_devices"]["eth0"]["security.acls"] = "unmanaged-acl"
+        self.error("ownership_mismatch", self.acquire, "cache")
+        self.assertEqual(instance["status"], "Stopped")
+
+    def test_restart_rejects_stopped_native_resource_drift(self):
+        active = self.acquire()
+        instance = self.runner.instances[active["instance_name"]]
+        instance["status"] = "Stopped"
+        instance["config"]["limits.memory"] = "8192MiB"
+        self.error("resource_unverified", self.call, "restart")
 
     def test_corrupt_disk_allocation_fails_closed_for_new_admission(self):
         active = self.acquire()

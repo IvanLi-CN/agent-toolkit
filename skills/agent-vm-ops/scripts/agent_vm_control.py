@@ -1437,10 +1437,20 @@ class Control:
                 raise ControlError("operation_unverified", "session-scoped operation has no session",
                                    {"operation_id": operation_id})
             task = self.store.get_task(session_id=session_id)
-            if (task is None
-                    or result.get("task_id") != task.get("task_id")
-                    or result.get("generation") != int(task["generation"])
-                    or result.get("state") != task.get("state")):
+            if task is None:
+                raise ControlError("operation_unverified", "task state is unavailable for journal replay",
+                                   {"operation_id": operation_id})
+            try:
+                current = self._state_summary(task)
+            except (ControlError, KeyError, TypeError, ValueError) as exc:
+                raise ControlError("operation_unverified", "task state cannot be verified for journal replay",
+                                   {"operation_id": operation_id}) from exc
+            durable_fields = (
+                "task_id", "session_id", "generation", "state", "instance_name", "vm_ip",
+                "ssh_host_port", "lease_expires_at", "inactive_since", "cleanup_after",
+                "ports", "resources", "resource_reservation", "last_error",
+            )
+            if any(result.get(key) != current.get(key) for key in durable_fields):
                 raise ControlError("operation_unverified", "task state does not match the journal result",
                                    {"operation_id": operation_id})
             return
@@ -1449,26 +1459,126 @@ class Control:
                 raise ControlError("operation_unverified", "port operation has no session",
                                    {"operation_id": operation_id})
             task = self.store.get_task(session_id=session_id)
+            if task is None:
+                raise ControlError("operation_unverified", "task state is unavailable for journal replay",
+                                   {"operation_id": operation_id})
+            try:
+                generation = int(task["generation"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ControlError("operation_unverified", "task generation cannot be verified for journal replay",
+                                   {"operation_id": operation_id}) from exc
             port_name = result.get("port_name")
             protocol = result.get("protocol")
             port = (self.store.get_port(task["task_id"], port_name, protocol)
-                    if task and isinstance(port_name, str) and isinstance(protocol, str)
+                    if isinstance(port_name, str) and isinstance(protocol, str)
                     and protocol in {"tcp", "udp"} else None)
             if (port is None
                     or port.get("state") != "active"
-                    or port.get("generation") != int(task["generation"])
+                    or port.get("generation") != generation
                     or any(result.get(key) != port.get(key) for key in
                            ("task_id", "port_name", "protocol", "host_port", "vm_port", "generation"))):
                 raise ControlError("operation_unverified", "port state does not match the journal result",
                                    {"operation_id": operation_id})
             return
-        if action == "port-remove" and session_id is not None:
+        if action == "port-remove":
+            if session_id is None:
+                raise ControlError("operation_unverified", "port operation has no session",
+                                   {"operation_id": operation_id})
             task = self.store.get_task(session_id=session_id)
             name = request.get("name")
             protocol = request.get("port_protocol", "tcp")
-            if (task and isinstance(name, str) and isinstance(protocol, str) and protocol in {"tcp", "udp"}
-                    and self.store.get_port(task["task_id"], name, protocol)):
+            try:
+                generation = int(task["generation"]) if task is not None else None
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ControlError("operation_unverified", "task generation cannot be verified for journal replay",
+                                   {"operation_id": operation_id}) from exc
+            if (task is None or generation != request.get("generation") or task.get("state") != "active"
+                    or result.get("task_id") != task.get("task_id")
+                    or result.get("name") != name or result.get("protocol") != protocol
+                    or result.get("removed") is not True
+                    or not isinstance(name, str) or not isinstance(protocol, str)
+                    or protocol not in {"tcp", "udp"}
+                    or self.store.get_port(task["task_id"], name, protocol)):
                 raise ControlError("operation_unverified", "removed port still exists after journal success",
+                                   {"operation_id": operation_id})
+            return
+        if action in {"admin-gc", "timer-age-gc"}:
+            self._validate_cached_gc_result(operation_id, result)
+            return
+        if action in {"admin-reconcile", "timer-reconcile"}:
+            self._validate_cached_reconcile_result(operation_id, result)
+
+    def _validate_cached_gc_result(self, operation_id: str, result: Mapping[str, Any]) -> None:
+        if (not isinstance(result.get("dry_run"), bool)
+                or result.get("selection") not in {"eligible", "age"}
+                or isinstance(result.get("minimum_idle_seconds"), bool)
+                or not isinstance(result.get("minimum_idle_seconds"), int)
+                or not isinstance(result.get("candidates"), list)):
+            raise ControlError("operation_unverified", "GC journal result is invalid",
+                               {"operation_id": operation_id})
+        for candidate in result["candidates"]:
+            if not isinstance(candidate, Mapping) or not isinstance(candidate.get("task_id"), str):
+                raise ControlError("operation_unverified", "GC journal candidate is invalid",
+                                   {"operation_id": operation_id})
+            if "error" in candidate:
+                error = candidate["error"]
+                if (not isinstance(error, Mapping) or not isinstance(error.get("code"), str)
+                        or not isinstance(error.get("message"), str)):
+                    raise ControlError("operation_unverified", "GC journal error is invalid",
+                                       {"operation_id": operation_id})
+                continue
+            if (not isinstance(candidate.get("instance_name"), str)
+                    or isinstance(candidate.get("generation"), bool)
+                    or not isinstance(candidate.get("generation"), int)
+                    or not isinstance(candidate.get("inactive_since"), str)):
+                raise ControlError("operation_unverified", "GC journal candidate is incomplete",
+                                   {"operation_id": operation_id})
+            task = self.store.get_task(task_id=candidate["task_id"])
+            if result["dry_run"]:
+                if (task is None or task.get("state") != "cached"
+                        or any(candidate.get(key) != task.get(key) for key in
+                               ("task_id", "instance_name", "generation", "inactive_since"))):
+                    raise ControlError("operation_unverified", "GC preview no longer matches durable state",
+                                       {"operation_id": operation_id})
+            elif task is not None:
+                try:
+                    current_generation = int(task["generation"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ControlError("operation_unverified", "GC task generation cannot be verified",
+                                       {"operation_id": operation_id}) from exc
+                if (task.get("state") != "absent"
+                        and current_generation <= candidate["generation"]):
+                    raise ControlError("operation_unverified", "GC deletion is not reflected in durable state",
+                                       {"operation_id": operation_id})
+
+    def _validate_cached_reconcile_result(self, operation_id: str, result: Mapping[str, Any]) -> None:
+        if (not isinstance(result.get("dry_run"), bool)
+                or not isinstance(result.get("actions"), list)):
+            raise ControlError("operation_unverified", "reconcile journal result is invalid",
+                               {"operation_id": operation_id})
+        allowed = {
+            "inspect", "finish-delete", "close-incomplete-or-expired",
+            "stop-unexpected-running-cache", "rearm-current-expiry",
+        }
+        for item in result["actions"]:
+            if not isinstance(item, Mapping) or not isinstance(item.get("task_id"), str):
+                raise ControlError("operation_unverified", "reconcile journal action is invalid",
+                                   {"operation_id": operation_id})
+            if "error" in item:
+                error = item["error"]
+                if (not isinstance(error, Mapping) or not isinstance(error.get("code"), str)
+                        or not isinstance(error.get("message"), str)):
+                    raise ControlError("operation_unverified", "reconcile journal error is invalid",
+                                       {"operation_id": operation_id})
+                continue
+            if item.get("action") not in allowed:
+                raise ControlError("operation_unverified", "reconcile journal action is unknown",
+                                   {"operation_id": operation_id})
+            if result["dry_run"] or item["action"] != "finish-delete":
+                continue
+            task = self.store.get_task(task_id=item["task_id"])
+            if task is not None and task.get("state") != "absent":
+                raise ControlError("operation_unverified", "reconcile deletion is not reflected in durable state",
                                    {"operation_id": operation_id})
 
     def _dispatch_locked(self, request: Mapping[str, Any]) -> dict[str, Any]:

@@ -321,6 +321,41 @@ class AdmissionTests(Fixture):
         )
         self.error("operation_unverified", self.control.dispatch, request)
 
+    def test_success_replay_rejects_stale_resize_state(self):
+        self.acquire()
+        first = self.request("resize", operation="resize-old", cpu=3, allow_restart=True)
+        self.control.dispatch(first)
+        current = self.request("resize", operation="resize-new", cpu=2, allow_restart=True)
+        self.control.dispatch(current)
+        self.error("operation_unverified", self.control.dispatch, first)
+
+    def test_port_remove_replay_requires_current_lease_generation(self):
+        self.acquire()
+        add = self.request("port-add", operation="port-add-once", name="app", vm_port=8080)
+        self.control.dispatch(add)
+        remove = self.request("port-remove", operation="port-remove-once", name="app")
+        self.control.dispatch(remove)
+        self.call("release")
+        self.acquire()
+        self.error("operation_unverified", self.control.dispatch, remove)
+
+    def test_gc_replay_requires_candidate_shape_and_postcondition(self):
+        request = self.request("admin-gc", operation="gc-corrupt", apply=True)
+        digest = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
+        record = {
+            "ok": True,
+            "protocol": CONTROL.PROTOCOL_VERSION,
+            "action": "admin-gc",
+            "session_id": request["session_id"],
+            "generation": request["generation"],
+            "operation_id": request["operation_id"],
+            "outcome": "success",
+            "result": {"dry_run": False, "selection": "eligible", "minimum_idle_seconds": 0, "candidates": [{}]},
+            "_request_digest": digest,
+        }
+        self.store.record_operation(request["operation_id"], "admin-gc", request["session_id"], request["generation"], record)
+        self.error("operation_unverified", self.control.dispatch, request)
+
     def test_acquire_rechecks_drain_before_active_commit(self):
         def enter_drain(*_):
             self.store.set_meta("draining", "1")

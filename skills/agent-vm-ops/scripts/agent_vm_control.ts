@@ -141,7 +141,7 @@ export class ControlError extends Error {
 
   asDict(): Dict {
     const value: Dict = { code: this.code, message: boundedDiagnosticText(this.message, DIAGNOSTIC_MESSAGE_LIMIT) };
-    if (this.detail !== undefined) value.detail = redactDiagnosticValue(this.detail);
+    if (this.rawDetail !== undefined) value.detail = persistedDocument(this.rawDetail);
     return value;
   }
 }
@@ -165,8 +165,8 @@ const AUTH_SCHEME_RE = /(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?(?:be
 const AUTH_BASIC_RE = /(\bbasic\s+)[A-Za-z0-9._~+/=-]+/gi;
 const SECRET_DOUBLE_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)\"(?:\\\\.|[^\"\\\\])*\"", "gi");
 const SECRET_SINGLE_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)'(?:\\\\.|[^'\\\\])*'", "gi");
-const UNTERMINATED_SECRET_DOUBLE_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)\"(?:\\\\.|[^\"\\\\])*$", "gi");
-const UNTERMINATED_SECRET_SINGLE_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)'(?:\\\\.|[^'\\\\])*$", "gi");
+const UNTERMINATED_SECRET_DOUBLE_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)\"(?:\\\\.|[^\"\\\\])*\\\\?$", "gi");
+const UNTERMINATED_SECRET_SINGLE_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)'(?:\\\\.|[^'\\\\])*\\\\?$", "gi");
 const SECRET_TOKEN_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)([^\\s,;}}\\]\\\\\"']+)", "gi");
 const SSHPASS_RE = /(\bsshpass\b[ \t]+-p)[^\r\n]*/gi;
 const URL_CREDENTIAL_RE = /(\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s:@]+:)([^@\s/]+)(@)/gi;
@@ -1058,6 +1058,56 @@ export function processDescendants(rootPid: number): { members: ProcessIdentity[
   return { members, complete };
 }
 
+function processDescendantsFromRoots(roots: readonly ProcessIdentity[]): { members: ProcessIdentity[]; complete: boolean } {
+  const children = new Map<number, ProcessRecord[]>();
+  const records = new Map<number, ProcessRecord>();
+  let complete = true;
+  if (process.platform !== "linux") return { members: [], complete: false };
+  try {
+    for (const entry of readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      try {
+        const record = readProcessRecord(Number(entry));
+        if (record.state !== "Z") {
+          records.set(record.pid, record);
+          children.set(record.ppid, [...(children.get(record.ppid) ?? []), record]);
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        complete = false;
+      }
+    }
+  } catch { return { members: [], complete: false }; }
+  const members: ProcessIdentity[] = [];
+  const pending: ProcessRecord[] = [];
+  for (const root of roots) {
+    const current = records.get(root.pid);
+    if (!current || current.starttime !== root.starttime) continue;
+    pending.push(...(children.get(root.pid) ?? []));
+  }
+  const visited = new Set<number>();
+  while (pending.length) {
+    const record = pending.shift()!;
+    if (visited.has(record.pid)) continue;
+    visited.add(record.pid);
+    members.push({ pid: record.pid, starttime: record.starttime });
+    pending.push(...(children.get(record.pid) ?? []));
+  }
+  return { members, complete };
+}
+
+function anchoredProcessGroupMembers(pgid: number, anchors: readonly ProcessIdentity[]): { members: ProcessIdentity[]; complete: boolean } {
+  if (!anchors.length) return { members: [], complete: false };
+  let verified = false;
+  for (const anchor of anchors) {
+    try {
+      const record = readProcessRecord(anchor.pid);
+      if (record.starttime === anchor.starttime && record.pgrp === pgid) { verified = true; break; }
+    } catch { /* The anchor may have exited; another known member can still anchor the group. */ }
+  }
+  return verified ? processGroupMembers(pgid) : { members: [], complete: false };
+}
+
 export function killProcessTree(members: readonly ProcessIdentity[], options: ProcessCleanupOptions = {}): { killed: boolean; error: string | null } {
   const readIdentity = options.readIdentity ?? processStartIdentity;
   const exists = options.exists ?? processExists;
@@ -1102,12 +1152,6 @@ export function killProcessTree(members: readonly ProcessIdentity[], options: Pr
   return { killed: false, error: cleanupError ?? "process_tree_members_remain" };
 }
 
-function killProcessGroupMembers(pgid: number): { killed: boolean; error: string | null } {
-  const snapshot = processGroupMembers(pgid);
-  if (!snapshot.complete) return { killed: false, error: "process_group_inspection_failed" };
-  return killProcessTree(snapshot.members);
-}
-
 function safeProcessSignal(pid: number, expectedIdentity: string | undefined, signal: number, group: boolean): { sent: boolean; error: string | null } {
   if (process.platform === "linux") {
     if (!processExists(pid)) return { sent: false, error: null };
@@ -1142,6 +1186,54 @@ export class CommandRunner {
     const stderrPromise = readBounded(processHandle.stderr, options.stderrLimit ?? 4000, true, readAbort.signal, true);
     const timeoutMs = (options.timeout ?? 60) * 1000;
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    let processMonitorHandle: ReturnType<typeof setInterval> | undefined;
+    const trackedMembers = new Map<number, ProcessIdentity>();
+    const trackedGroups = new Map<number, ProcessIdentity[]>();
+    let processTrackingComplete = true;
+    let processTrackingIdentityMismatch = false;
+    const trackMembers = (members: readonly ProcessIdentity[]): void => {
+      for (const member of members) {
+        const previous = trackedMembers.get(member.pid);
+        if (previous && previous.starttime !== member.starttime) {
+          processTrackingIdentityMismatch = true;
+          continue;
+        }
+        trackedMembers.set(member.pid, member);
+        try {
+          const record = readProcessRecord(member.pid);
+          if (record.starttime === member.starttime) {
+            const anchors = trackedGroups.get(record.pgrp) ?? [];
+            if (!anchors.some((anchor) => anchor.pid === member.pid && anchor.starttime === member.starttime)) trackedGroups.set(record.pgrp, [...anchors, member]);
+          }
+        } catch { /* Identity checks during cleanup fail closed if this process remains. */ }
+      }
+    };
+    const trackProcesses = (): void => {
+      if (process.platform !== "linux" || !leaderIdentity || !processExists(processHandle.pid)) return;
+      let leaderRecord: ProcessRecord;
+      try {
+        leaderRecord = readProcessRecord(processHandle.pid);
+        if (leaderRecord.starttime !== leaderIdentity) {
+          processTrackingIdentityMismatch = true;
+          return;
+        }
+      } catch { return; }
+      trackMembers([{ pid: processHandle.pid, starttime: leaderIdentity }]);
+      const descendants = processDescendants(processHandle.pid);
+      processTrackingComplete &&= descendants.complete;
+      trackMembers(descendants.members);
+      for (const [pgid, anchors] of trackedGroups) {
+        const liveAnchor = anchors.some((anchor) => {
+          try { return processStartIdentity(anchor.pid) === anchor.starttime && readProcessRecord(anchor.pid).pgrp === pgid; } catch { return false; }
+        });
+        if (!liveAnchor) continue;
+        const group = processGroupMembers(pgid);
+        processTrackingComplete &&= group.complete;
+        trackMembers(group.members);
+      }
+    };
+    trackProcesses();
+    if (process.platform === "linux") processMonitorHandle = setInterval(trackProcesses, 100);
     const exit = processHandle.exited;
     const timeout = new Promise<"timeout">((resolveTimeout) => { timeoutHandle = setTimeout(() => { resolveTimeout("timeout"); }, timeoutMs); });
     const inputPromise = (async (): Promise<unknown> => {
@@ -1161,15 +1253,70 @@ export class CommandRunner {
       const outcome = await Promise.race([communication.then((value) => ({ kind: "complete" as const, value })), timeout.then(() => ({ kind: "timeout" as const }))]);
       if (outcome.kind === "timeout") {
         const descendants = processDescendants(processHandle.pid);
+        const known = new Map<number, ProcessIdentity>();
+        const groupAnchors = new Map<number, ProcessIdentity[]>();
+        for (const [pgid, anchors] of trackedGroups) groupAnchors.set(pgid, [...anchors]);
+        let identityMismatch = processTrackingIdentityMismatch;
+        const addKnown = (members: readonly ProcessIdentity[]): void => {
+          for (const member of members) {
+            const previous = known.get(member.pid);
+            if (previous && previous.starttime !== member.starttime) {
+              identityMismatch = true;
+              continue;
+            }
+            known.set(member.pid, member);
+            try {
+              const record = readProcessRecord(member.pid);
+              if (record.starttime === member.starttime) groupAnchors.set(record.pgrp, [...(groupAnchors.get(record.pgrp) ?? []), member]);
+            } catch { /* Identity checks below will fail closed if this process remains. */ }
+          }
+        };
+        addKnown([...trackedMembers.values()]);
+        addKnown(descendants.members);
         const term = safeProcessSignal(processHandle.pid, leaderIdentity, 15, true);
         const leaderExitedAfterTerm = await Promise.race([exit.then(() => true), sleep(250).then(() => false)]);
-        const tree = killProcessTree(descendants.members);
-        if (!descendants.complete && !tree.error) tree.error = "process_tree_inspection_failed";
-        const fallback = leaderExitedAfterTerm ? { killed: false, error: null } : killProcessGroupMembers(processHandle.pid);
-        const groupKill = leaderExitedAfterTerm ? { sent: false, error: null } : safeProcessSignal(processHandle.pid, leaderIdentity, 9, true);
-        const directKill = leaderExitedAfterTerm ? { sent: false, error: null } : safeProcessSignal(processHandle.pid, leaderIdentity, 9, false);
-        let processGroupKilled = term.sent || groupKill.sent || directKill.sent || fallback.killed || tree.killed;
-        let processGroupCleanupError = term.error ?? groupKill.error ?? directKill.error ?? fallback.error ?? tree.error;
+        let processGroupCleanupError: string | null = identityMismatch ? "process_identity_mismatch" : term.error;
+        let processTreeComplete = descendants.complete && processTrackingComplete;
+        let tree = { killed: true, error: null as string | null };
+        let groupKill = { sent: false, error: null as string | null };
+        let directKill = { sent: false, error: null as string | null };
+        for (let attempt = 0; attempt < 4; attempt += 1) {
+          const discovered = processDescendantsFromRoots([...known.values()]);
+          processTreeComplete &&= discovered.complete;
+          addKnown(discovered.members);
+          for (const [pgid, anchors] of groupAnchors) {
+            const liveAnchor = anchors.some((anchor) => {
+              try { return processStartIdentity(anchor.pid) === anchor.starttime; } catch { return false; }
+            });
+            if (!liveAnchor) continue;
+            const group = anchoredProcessGroupMembers(pgid, anchors);
+            processTreeComplete &&= group.complete;
+            addKnown(group.members);
+          }
+          if (!leaderExitedAfterTerm) {
+            const leaderGroup = anchoredProcessGroupMembers(processHandle.pid, leaderIdentity ? [{ pid: processHandle.pid, starttime: leaderIdentity }] : []);
+            processTreeComplete &&= leaderGroup.complete;
+            addKnown(leaderGroup.members);
+            groupKill = safeProcessSignal(processHandle.pid, leaderIdentity, 9, true);
+            directKill = safeProcessSignal(processHandle.pid, leaderIdentity, 9, false);
+            processGroupCleanupError ??= groupKill.error ?? directKill.error;
+          }
+          tree = killProcessTree([...known.values()]);
+          processGroupCleanupError ??= tree.error;
+          const remaining = [...known.values()].filter((member) => {
+            if (!processExists(member.pid)) return false;
+            const current = processStartIdentity(member.pid);
+            return current === member.starttime && !processIsZombie(member.pid);
+          });
+          if (!remaining.length && (leaderExitedAfterTerm || !processExists(processHandle.pid))) break;
+          await sleep(50);
+        }
+        if (identityMismatch) processGroupCleanupError ??= "process_identity_mismatch";
+        if (!descendants.complete || !processTreeComplete) processGroupCleanupError ??= "process_tree_inspection_failed";
+        const leaderStillAlive = Boolean(leaderIdentity && processExists(processHandle.pid) && processStartIdentity(processHandle.pid) === leaderIdentity && !processIsZombie(processHandle.pid));
+        const remainingKnown = [...known.values()].some((member) => processExists(member.pid) && processStartIdentity(member.pid) === member.starttime && !processIsZombie(member.pid));
+        const processGroupKilled = !leaderStillAlive && !remainingKnown && !processGroupCleanupError;
+        processGroupCleanupError ??= processGroupKilled ? null : "process_group_members_remain";
         const reaped = await Promise.race([exit.then(() => true), sleep(1000).then(() => false)]);
         readAbort.abort();
         try { processHandle.stdin?.end(); } catch { /* The pipe may already be closed. */ }
@@ -1187,12 +1334,13 @@ export class CommandRunner {
       return result;
     } finally {
       if (timeoutHandle) clearTimeout(timeoutHandle);
+      if (processMonitorHandle) clearInterval(processMonitorHandle);
     }
   }
 }
 
 function quotePath(value: string): string {
-  return encodeURIComponent(value);
+  return encodeURIComponent(value).replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
 }
 
 export class IncusClient {
@@ -1428,11 +1576,14 @@ export class StateStore {
     try {
       opened = new Database(path, { safeIntegers: true });
       opened.run("PRAGMA foreign_keys=ON");
-      if (!bootstrap) StateStore.verifyDurableState(opened);
       opened.run("PRAGMA busy_timeout=10000");
+      if (!bootstrap) {
+        StateStore.migratePythonBaseline(opened);
+        StateStore.verifyDurableState(opened);
+      }
       opened.run("PRAGMA journal_mode=WAL");
       opened.run("PRAGMA synchronous=FULL");
-      if (bootstrap) this.schemaOn(opened);
+      if (bootstrap) StateStore.schemaOn(opened);
       try { chmodPrivate(path); } catch { throw new ControlError("state_path_unsafe", "state database permissions cannot be secured"); }
       this.db = opened;
     } catch (error) {
@@ -1442,7 +1593,7 @@ export class StateStore {
     }
   }
 
-  private schemaOn(db: Database): void {
+  private static schemaOn(db: Database): void {
     db.run(`
       CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS tasks (
@@ -1467,6 +1618,85 @@ export class StateStore {
         outcome TEXT NOT NULL, detail_json TEXT, created_at TEXT NOT NULL
       );
     `);
+  }
+
+  private static isPythonBaseline(db: Database): boolean {
+    const names = new Set(((db.query("SELECT name FROM sqlite_master WHERE type = 'table'") as any).all() as Dict[]).map((row) => String(row.name)));
+    for (const name of names) if (!STATE_TABLES.has(name) && name !== "sqlite_sequence") return false;
+    for (const name of STATE_TABLES) if (!names.has(name)) return false;
+    const legacyPrimaryKeys = new Set(["meta.key", "tasks.task_id", "operations.operation_id"]);
+    const missingPrimaryKeys: string[] = [];
+    for (const name of STATE_TABLES) {
+      const actualColumns = (db.query("PRAGMA table_info(" + name + ")") as any).all() as Dict[];
+      const contract = STATE_SCHEMA[name] ?? [];
+      if (actualColumns.length !== contract.length) return false;
+      for (let index = 0; index < contract.length; index += 1) {
+        const actual = actualColumns[index]!;
+        const expected = contract[index]!;
+        const identity = `${name}.${expected.name}`;
+        const sameExceptNotNull = String(actual.name) === expected.name
+          && String(actual.type).toUpperCase() === expected.type
+          && Number(actual.pk) === expected.pk
+          && (actual.dflt_value === null ? null : String(actual.dflt_value)) === expected.defaultValue;
+        if (!sameExceptNotNull) return false;
+        if (Number(actual.notnull) !== expected.notnull) {
+          if (expected.notnull !== 1 || Number(actual.notnull) !== 0 || !legacyPrimaryKeys.has(identity)) return false;
+          missingPrimaryKeys.push(identity);
+        }
+      }
+    }
+    if (stableJson([...missingPrimaryKeys].sort(compareUnicodeCodePoints)) !== stableJson([...legacyPrimaryKeys].sort(compareUnicodeCodePoints))) return false;
+    const requiredIndexes: Record<string, readonly (readonly string[])[]> = { tasks: [["session_id"], ["instance_name"]], ports: [["host_port", "protocol"]] };
+    for (const [table, required] of Object.entries(requiredIndexes)) {
+      const indexes = (db.query("PRAGMA index_list(" + table + ")") as any).all() as Dict[];
+      const actual = indexes.map((index) => {
+        const columns = (db.query("PRAGMA index_info(" + JSON.stringify(String(index.name)) + ")") as any).all() as Dict[];
+        columns.sort((left, right) => Number(left.seq) - Number(right.seq));
+        return { unique: Number(index.unique) === 1, partial: Number(index.partial ?? 0) === 1, columns: columns.map((row) => String(row.name)) };
+      });
+      for (const expected of required) if (!actual.some((index) => index.unique && !index.partial && stableJson(index.columns) === stableJson(expected))) return false;
+    }
+    const foreignKeys = (db.query("PRAGMA foreign_key_list(ports)") as any).all() as Dict[];
+    if (foreignKeys.length !== 1 || String(foreignKeys[0]?.table) !== "tasks" || String(foreignKeys[0]?.from) !== "task_id" || String(foreignKeys[0]?.to) !== "task_id" || String(foreignKeys[0]?.on_update).toUpperCase() !== "NO ACTION" || String(foreignKeys[0]?.on_delete).toUpperCase() !== "NO ACTION" || String(foreignKeys[0]?.match).toUpperCase() !== "NONE") return false;
+    return true;
+  }
+
+  private static migratePythonBaseline(db: Database): void {
+    if (!StateStore.isPythonBaseline(db)) return;
+    const legacyNames = {
+      meta: "__agent_vm_legacy_meta",
+      tasks: "__agent_vm_legacy_tasks",
+      ports: "__agent_vm_legacy_ports",
+      operations: "__agent_vm_legacy_operations",
+      audit: "__agent_vm_legacy_audit",
+    } as const;
+    const existingNames = new Set(((db.query("SELECT name FROM sqlite_master WHERE type = 'table'") as any).all() as Dict[]).map((row) => String(row.name)));
+    for (const name of Object.values(legacyNames)) if (existingNames.has(name)) throw new ControlError("state_invalid", "durable state contains a schema migration residue");
+    const count = (table: string): number => Number((db.query(`SELECT COUNT(*) AS count FROM ${table}`) as any).get().count);
+    const copiedCounts = new Map<string, number>();
+    try {
+      db.run("PRAGMA foreign_keys=OFF");
+      db.run("BEGIN IMMEDIATE");
+      for (const table of ["meta", "tasks", "ports", "operations", "audit"] as const) db.run(`ALTER TABLE ${table} RENAME TO ${legacyNames[table]}`);
+      StateStore.schemaOn(db);
+      for (const table of ["meta", "tasks", "ports", "operations", "audit"] as const) {
+        const columns = (STATE_SCHEMA[table] ?? []).map((column) => column.name).join(", ");
+        db.run(`INSERT INTO ${table} (${columns}) SELECT ${columns} FROM ${legacyNames[table]}`);
+        copiedCounts.set(table, count(table));
+        if (copiedCounts.get(table) !== count(legacyNames[table])) throw new Error(`row count mismatch: ${table}`);
+      }
+      db.run("INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_migration', 'python-baseline-v1->bun-canonical-v1')");
+      db.run("INSERT INTO audit(action, task_id, session_id, generation, outcome, detail_json, created_at) VALUES (?, NULL, NULL, 0, ?, ?, ?)", ["schema-migration", "ok", stableJson({ from: "python-baseline-v1", to: "bun-canonical-v1", tables: [...STATE_TABLES].sort(compareUnicodeCodePoints) }), isoTime()]);
+      for (const table of Object.values(legacyNames)) db.run(`DROP TABLE ${table}`);
+      StateStore.verifyDurableState(db);
+      db.run("COMMIT");
+    } catch (error) {
+      try { db.run("ROLLBACK"); } catch { /* Preserve the migration failure. */ }
+      if (error instanceof ControlError) throw error;
+      throw new ControlError("state_invalid", "durable state schema migration failed");
+    } finally {
+      try { db.run("PRAGMA foreign_keys=ON"); } catch { /* The outer constructor will reject unusable state. */ }
+    }
   }
 
   private static validateOperationRow(row: Dict, value: unknown): void {
@@ -1527,6 +1757,8 @@ export class StateStore {
     const foreignKeys = (db.query("PRAGMA foreign_key_list(ports)") as any).all() as Dict[];
     if (foreignKeys.length !== 1 || String(foreignKeys[0]?.table) !== "tasks" || String(foreignKeys[0]?.from) !== "task_id" || String(foreignKeys[0]?.to) !== "task_id" || String(foreignKeys[0]?.on_update).toUpperCase() !== "NO ACTION" || String(foreignKeys[0]?.on_delete).toUpperCase() !== "NO ACTION" || String(foreignKeys[0]?.match).toUpperCase() !== "NONE") throw new ControlError("state_invalid", "durable state database foreign-key contract differs");
     if ((db.query("PRAGMA foreign_key_check") as any).all().length) throw new ControlError("state_invalid", "durable state database contains dangling foreign keys");
+    const draining = (db.query("SELECT value FROM meta WHERE key = 'draining'") as any).get() as Dict | null;
+    if (draining && !["0", "1"].includes(String(draining.value))) throw new ControlError("state_invalid", "durable state contains an invalid draining flag");
     const duplicateGroups = [["tasks", "session_id"], ["tasks", "instance_name"], ["operations", "operation_id"]] as const;
     for (const [table, column] of duplicateGroups) {
       const duplicates = (db.query("SELECT " + column + " FROM " + table + " GROUP BY " + column + " HAVING COUNT(*) > 1") as any).all() as Dict[];
@@ -1567,6 +1799,23 @@ export class StateStore {
       }
       return object;
     };
+    const resourceKeys = ["cpu", "memory_mib", "disk_gib"] as const;
+    const exactResources = (value: Dict, field: string, positive: boolean): void => {
+      if (stableJson(Object.keys(value).sort(compareUnicodeCodePoints)) !== stableJson([...resourceKeys].sort(compareUnicodeCodePoints))) invalid("durable state contains incomplete resources: " + field);
+      for (const key of resourceKeys) {
+        try {
+          const number = integerBigInt(value[key], field + "." + key);
+          if (number < (positive ? 1n : 0n)) throw new Error("range");
+        } catch { invalid("durable state contains an invalid resource value: " + field + "." + key); }
+      }
+    };
+    const validateReservation = (value: Dict, field: string, resources: Dict): void => {
+      if (!Object.keys(value).length) return;
+      exactResources(value, field, true);
+      if (Object.keys(resources).length === resourceKeys.length) for (const key of resourceKeys) {
+        if (integerBigInt(value[key], field + "." + key) < integerBigInt(resources[key], "resources." + key)) invalid("durable state contains a reservation below committed resources: " + field);
+      }
+    };
     for (const task of tasks) {
       const taskId = String(task.task_id);
       const sessionId = String(task.session_id);
@@ -1595,15 +1844,42 @@ export class StateStore {
       const cleanupAfter = task.cleanup_after === null || task.cleanup_after === undefined ? undefined : parseTime(String(task.cleanup_after));
       if (inactive && cleanupAfter && cleanupAfter.getTime() < inactive.getTime()) invalid("durable state contains an invalid cleanup timestamp order");
       const state = String(task.state);
+      const reservationBytes = integerBigInt(task.reservation_bytes, "reservation_bytes");
       if (["preparing", "active"].includes(state) && (task.lease_expires_at === null || task.lease_expires_at === undefined)) invalid("durable state contains an active task without a lease");
       if (["cached", "absent", "closing", "deleting", "failed"].includes(state) && task.lease_expires_at !== null && task.lease_expires_at !== undefined) invalid("durable state contains a terminal task with a lease");
-      if (["active", "cached"].includes(state) && Object.keys(resources).length !== 3) invalid("durable state contains incomplete committed resources");
       if (["cached", "absent"].includes(state)) {
         if (task.ssh_host_port !== null && task.ssh_host_port !== undefined) invalid("durable state contains a cached or absent SSH port");
-        if (integerBigInt(task.reservation_bytes, "reservation_bytes") !== 0n || Object.keys(reservation).length) invalid("durable state contains a cached or absent reservation");
+        if (reservationBytes !== 0n || Object.keys(reservation).length) invalid("durable state contains a cached or absent reservation");
       }
-      if (state === "absent" && task.vm_ip !== null && task.vm_ip !== undefined) invalid("durable state contains an absent VM address");
-      if (state === "active" && (integerBigInt(task.reservation_bytes, "reservation_bytes") !== 0n || Object.keys(reservation).length)) invalid("durable state contains an active reservation");
+      if (state === "absent") {
+        if (task.vm_ip !== null && task.vm_ip !== undefined) invalid("durable state contains an absent VM address");
+        if (Object.keys(resources).length || Object.keys(reservation).length || reservationBytes !== 0n) invalid("durable state contains residual absent resources");
+      }
+      if (state === "cached") {
+        if (task.vm_ip === null || task.vm_ip === undefined || isIP(String(task.vm_ip)) !== 4) invalid("durable state contains a cached task without a VM address");
+        exactResources(resources, "tasks.resources_json", true);
+        if (task.ssh_host_port !== null && task.ssh_host_port !== undefined) invalid("durable state contains a cached SSH port");
+      }
+      if (state === "preparing") {
+        exactResources(resources, "tasks.resources_json", true);
+        validateReservation(reservation, "tasks.resource_reservation_json", resources);
+        if (reservationBytes === 0n && (task.vm_ip !== null && task.vm_ip !== undefined || task.ssh_host_port !== null && task.ssh_host_port !== undefined)) invalid("durable state contains a preparing native reservation without reservation bytes");
+        if (reservationBytes > 0n && (task.vm_ip === null || task.vm_ip === undefined || task.ssh_host_port === null || task.ssh_host_port === undefined)) invalid("durable state contains an incomplete preparing native reservation");
+      }
+      if (state === "active") {
+        if (task.vm_ip === null || task.vm_ip === undefined || isIP(String(task.vm_ip)) !== 4) invalid("durable state contains an active task without a VM address");
+        if (task.ssh_host_port === null || task.ssh_host_port === undefined) invalid("durable state contains an active task without an SSH port");
+        exactResources(resources, "tasks.resources_json", true);
+        validateReservation(reservation, "tasks.resource_reservation_json", resources);
+      }
+      if (state === "closing") {
+        if (task.vm_ip !== null && task.vm_ip !== undefined) exactResources(resources, "tasks.resources_json", true);
+        else if (Object.keys(resources).length) exactResources(resources, "tasks.resources_json", true);
+        validateReservation(reservation, "tasks.resource_reservation_json", resources);
+        if (task.vm_ip === null || task.vm_ip === undefined) {
+          if (task.ssh_host_port !== null && task.ssh_host_port !== undefined || reservationBytes !== 0n) invalid("durable state contains a closing task without a native identity");
+        } else if (task.ssh_host_port === null || task.ssh_host_port === undefined) invalid("durable state contains a closing VM without an SSH identity");
+      }
       taskGenerations.set(taskId, generation);
       taskRows.set(taskId, task);
     }
@@ -1628,6 +1904,13 @@ export class StateStore {
         if (sshPorts.length !== 1 || !sameInteger(sshPorts[0]!.host_port, task.ssh_host_port) || sshPorts[0]!.state === "removed") invalid("durable state contains an SSH port identity mismatch");
       }
       if (state === "active" && (sshPorts.length !== 1 || sshPorts[0]!.state !== "active" || !sameInteger(sshPorts[0]!.host_port, task.ssh_host_port))) invalid("durable state contains an active task without an active SSH reservation");
+      if (state === "preparing") {
+        const reservationBytes = integerBigInt(task.reservation_bytes, "reservation_bytes");
+        if (reservationBytes === 0n && ports.length) invalid("durable state contains preparing ports without native reservation bytes");
+        if (reservationBytes > 0n && (ports.length !== 1 || sshPorts.length !== 1 || !["preparing", "active"].includes(String(sshPorts[0]!.state)))) invalid("durable state contains an incomplete preparing SSH reservation");
+      }
+      if (state === "closing" && ports.length && (task.vm_ip === null || task.vm_ip === undefined || task.ssh_host_port === null || task.ssh_host_port === undefined || sshPorts.length !== 1)) invalid("durable state contains closing ports without a native identity");
+      if (state === "active" && ports.some((port) => port.state === "removed")) invalid("durable state contains removed ports for an active task");
       if (["cached", "absent"].includes(state) && ports.length) invalid("durable state contains ports for a cached or absent task");
     }
     for (const operation of (db.query("SELECT * FROM operations") as any).all() as Dict[]) {
@@ -1748,9 +2031,19 @@ export class StateStore {
     this.transaction(() => (this.db as any).run("INSERT INTO audit(action,task_id,session_id,generation,outcome,detail_json,created_at) VALUES (?,?,?,?,?,?,?)", action, taskId ?? null, sessionId ?? null, generation ?? null, outcome, detail === undefined ? null : stableJson(persistedDocument(detail)), isoTime()));
   }
 
-  getMeta(key: string): string | undefined { const row = this.row("SELECT value FROM meta WHERE key = ?", [key]); return row ? String(row.value) : undefined; }
+  getMeta(key: string): string | undefined {
+    const row = this.row("SELECT value FROM meta WHERE key = ?", [key]);
+    const value = row ? String(row.value) : undefined;
+    if (key === "draining" && value !== undefined && value !== "0" && value !== "1") throw new ControlError("state_invalid", "durable state contains an invalid draining flag");
+    return value;
+  }
 
-  setMeta(key: string, value: string): void { this.transaction(() => (this.db as any).run("INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", key, value)); }
+  setMeta(key: string, value: string): void {
+    if (key === "draining" && value !== "0" && value !== "1") throw new ControlError("state_invalid", "draining must be exactly 0 or 1");
+    this.transaction(() => (this.db as any).run("INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", key, value));
+  }
+
+  verifyRuntimeState(): void { StateStore.verifyDurableState(this.db); }
 }
 
 function chmodPrivate(path: string): void {
@@ -3148,8 +3441,13 @@ export class Control {
     return { ready: issues.length === 0, issues, incus_version: version, capacity, resources, instances, default_admission: admission, admission_ready: issues.length === 0 && admission.ready, config: Object.fromEntries(["project", "profile", "image_fingerprint", "network", "pool", "host_address"].map((key) => [key, this.config[key]])) };
   }
 
-  async status(_request: Dict, sessionId: string): Promise<Dict> {
+  async status(request: Dict, sessionId: string): Promise<Dict> {
     const task = this.store.getTask({ sessionId });
+    if (hasOwn(request, "generation")) {
+      const generation = numberFromInteger(request.generation, "generation", 0);
+      if (task && !sameInteger(task.generation, generation)) throw new ControlError("generation_mismatch", "request generation does not match current task generation", { current_generation: integerForJson(task.generation) });
+      if (!task && !sameInteger(generation, 0)) throw new ControlError("generation_mismatch", "request generation does not match the absent session");
+    }
     const result = task ? await this.runtimeSummary(task) : { state: "absent", generation: 0, effective_lease: false, native_status: "absent", guest_available: false };
     const admission = await this.resourceDiagnostics();
     admission.instances = await this.instanceDiagnostics();

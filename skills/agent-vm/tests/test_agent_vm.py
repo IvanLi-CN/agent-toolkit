@@ -123,19 +123,37 @@ class SessionContractTests(unittest.TestCase):
         args = CLI.build_parser().parse_args(["admin", "drain", "enter", "--session-id", "thread", "--operation-id", "drain-op"])
         self.assertEqual(args.operation_id, "drain-op")
 
-    def test_non_acquire_retry_restores_journaled_generation(self):
-        response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "release", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 3, "operation_id": "release-op", "outcome": "success", "result": {}}
-        process = CLI.subprocess.CompletedProcess([], 0, json.dumps(response).encode(), b"")
+    def test_non_acquire_retry_without_state_uses_remote_generation(self):
+        status = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "status", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 7, "operation_id": None, "outcome": "success", "result": {"generation": 7}}
+        response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "release", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 7, "operation_id": "release-op", "outcome": "success", "result": {}}
+        processes = [CLI.subprocess.CompletedProcess([], 0, json.dumps(item).encode(), b"") for item in (status, response)]
         args = CLI.build_parser().parse_args(["release", "--session-id", "thread", "--operation-id", "release-op"])
         with tempfile.TemporaryDirectory() as state:
-            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", Path(state)), mock.patch.object(CLI, "run_child", return_value=process) as run:
-                CLI.write_session_state("thread", {"session_id": "thread", "generation": 7})
-                directory = CLI.local_session_dir("thread") / "operations"
-                directory.mkdir(parents=True, exist_ok=True)
-                CLI.ensure_operation_journal(directory, {"protocol": CLI.PROTOCOL_VERSION, "action": "release", "session_id": "thread", "generation": 3, "operation_id": "release-op"})
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", Path(state)), mock.patch.object(CLI, "run_child", side_effect=processes) as run:
                 CLI.mutation("release", args)
+        request = json.loads(run.call_args_list[-1].kwargs["input_data"])
+        self.assertEqual(request["generation"], 7)
+
+    def test_explicit_acquire_without_state_uses_remote_status_generation(self):
+        status = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "status", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 0, "operation_id": None, "outcome": "success", "result": {"generation": 0}}
+        response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "acquire", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 0, "operation_id": "acquire-op", "outcome": "success", "result": {}}
+        processes = [CLI.subprocess.CompletedProcess([], 0, json.dumps(item).encode(), b"") for item in (status, response)]
+        args = CLI.build_parser().parse_args(["acquire", "--session-id", "thread", "--operation-id", "acquire-op"])
+        with tempfile.TemporaryDirectory() as state:
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", Path(state)), mock.patch.object(CLI, "run_child", side_effect=processes) as run:
+                CLI.mutation("acquire", args, session="thread")
+        request = json.loads(run.call_args_list[-1].kwargs["input_data"])
+        self.assertEqual(request["generation"], 0)
+
+    def test_zero_generation_admin_retry_does_not_read_local_state(self):
+        response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "admin-reconcile", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 0, "operation_id": "admin-op", "outcome": "success", "result": {}}
+        process = CLI.subprocess.CompletedProcess([], 0, json.dumps(response).encode(), b"")
+        args = CLI.build_parser().parse_args(["admin", "reconcile", "--session-id", "thread", "--operation-id", "admin-op"])
+        with tempfile.TemporaryDirectory() as state:
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", Path(state)), mock.patch.object(CLI, "run_child", return_value=process) as run:
+                CLI.mutation("admin-reconcile", args, generation=0, session="thread")
         request = json.loads(run.call_args.kwargs["input_data"])
-        self.assertEqual(request["generation"], 3)
+        self.assertEqual(request["generation"], 0)
 
     def test_large_structured_response_is_not_diagnostic_truncated(self):
         response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "status", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 1, "operation_id": None, "outcome": "success", "result": {"generation": 1, "payload": "x" * (CLI.DIAGNOSTIC_OUTPUT_LIMIT * 2)}}
@@ -178,6 +196,14 @@ class SessionContractTests(unittest.TestCase):
         self.assertLessEqual(len(error.message), CLI.DIAGNOSTIC_MESSAGE_LIMIT)
         self.assertNotIn("secret-value", error.message)
 
+    def test_error_details_are_projected_and_document_bounded(self):
+        detail = {"message": "x" * 10000, "errors": [{"stderr": "password=\"secret-value\""}] * 256, "untrusted": "drop-me"}
+        error = CLI.CliError("remote_failed", "failed", detail)
+        encoded = json.dumps(error.as_dict(), sort_keys=True)
+        self.assertLessEqual(len(encoded), CLI.PERSISTED_DOCUMENT_LIMIT + 256)
+        self.assertNotIn("drop-me", encoded)
+        self.assertNotIn("secret-value", encoded)
+
     def test_unterminated_pem_is_redacted_before_bounding(self):
         value = b"-----BEGIN OPENSSH PRIVATE KEY-----\n" + (b"pem-canary-" * 2000)
         redacted = CLI.redact_and_bound_diagnostic(value)
@@ -190,6 +216,8 @@ class SessionContractTests(unittest.TestCase):
             "password" + r'="escaped\"-secret-canary',
             "token" + "='unterminated-token-canary",
             "token" + r"='escaped\'-token-canary",
+            "password" + "=" + "\"terminal-secret-canary\\",
+            "token" + "=" + "'terminal-token-canary\\",
             "password" + "=" + '"line-one-secret-canary\nline-two-secret-canary"',
             "token" + r'="escaped\"-multiline-token-canary',
         ]
@@ -216,15 +244,32 @@ class SessionContractTests(unittest.TestCase):
                 CLI.control_request("ssh-info", session="thread", generation=3)
         self.assertEqual(error.exception.code, "invalid_remote_response")
 
-    def test_explicit_operation_without_a_journal_uses_current_generation(self):
+    def test_ssh_info_uses_remote_status_generation(self):
+        status = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "status", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 3, "operation_id": None, "outcome": "success", "result": {"generation": 3}}
+        info = {"task_id": "avm-task", "generation": 3, "host": "198.51.100.20", "port": 2200, "user": "root", "host_key_alias": "agent-vm-avm-task-g3", "host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestfixture"}
+        ssh = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "ssh-info", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 3, "operation_id": None, "outcome": "success", "result": info}
+        processes = [CLI.subprocess.CompletedProcess([], 0, json.dumps(item).encode(), b"") for item in (status, ssh)]
+        with tempfile.TemporaryDirectory() as state, tempfile.TemporaryDirectory() as config:
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", Path(state)), mock.patch.object(CLI, "LOCAL_CONFIG_ROOT", Path(config)), mock.patch.object(CLI, "run_child", side_effect=processes) as run:
+                keys = CLI._secure_directory(CLI._secure_session_directory("thread") / "keys")
+                key = keys / "id_ed25519"
+                key.write_text("fixture", encoding="utf-8")
+                key.chmod(0o600)
+                CLI.write_session_state("thread", {"task_id": "avm-task", "generation": 3, "private_key": str(key)})
+                _, result, _ = CLI.fetch_ssh_info("thread")
+        self.assertEqual(result["generation"], 3)
+        self.assertEqual([json.loads(call.kwargs["input_data"])["action"] for call in run.call_args_list], ["status", "ssh-info"])
+        self.assertEqual(json.loads(run.call_args_list[1].kwargs["input_data"])["generation"], 3)
+
+    def test_explicit_operation_without_a_journal_uses_remote_generation(self):
+        status = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "status", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 7, "operation_id": None, "outcome": "success", "result": {"generation": 7}}
         response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "release", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 7, "operation_id": "release-op", "outcome": "success", "result": {}}
-        process = CLI.subprocess.CompletedProcess([], 0, json.dumps(response).encode(), b"")
+        processes = [CLI.subprocess.CompletedProcess([], 0, json.dumps(item).encode(), b"") for item in (status, response)]
         args = CLI.build_parser().parse_args(["release", "--session-id", "thread", "--operation-id", "release-op"])
         with tempfile.TemporaryDirectory() as state:
-            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", Path(state)), mock.patch.object(CLI, "run_child", return_value=process) as run:
-                CLI.write_session_state("thread", {"session_id": "thread", "generation": 7})
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", Path(state)), mock.patch.object(CLI, "run_child", side_effect=processes) as run:
                 CLI.mutation("release", args)
-        self.assertEqual(json.loads(run.call_args.kwargs["input_data"])["generation"], 7)
+        self.assertEqual(json.loads(run.call_args_list[-1].kwargs["input_data"])["generation"], 7)
 
     def test_timeout_diagnostics_preserve_bounded_redacted_stderr(self):
         error = CLI.subprocess.TimeoutExpired(["ssh"], 1, stderr=b"password" + b"=" + b'"timeout-secret-canary\ncontinued-secret-canary"')
@@ -262,6 +307,29 @@ class SessionContractTests(unittest.TestCase):
                 with self.assertRaises(CLI.CliError) as error:
                     CLI.read_session_state("thread")
         self.assertEqual(error.exception.code, "local_state_invalid")
+
+    def test_local_state_rejects_relative_and_symlinked_roots(self):
+        with mock.patch.object(CLI, "LOCAL_STATE_ROOT", Path("relative-state")):
+            with self.assertRaises(CLI.CliError) as error:
+                CLI.write_session_state("thread", {"session_id": "thread", "generation": 1})
+        self.assertEqual(error.exception.code, "local_state_invalid")
+
+        with tempfile.TemporaryDirectory() as state, tempfile.TemporaryDirectory() as outside:
+            link = Path(state) / "link"
+            link.symlink_to(Path(outside), target_is_directory=True)
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", link):
+                with self.assertRaises(CLI.CliError) as error:
+                    CLI.write_session_state("thread", {"session_id": "thread", "generation": 1})
+            self.assertEqual(error.exception.code, "local_state_invalid")
+
+        with tempfile.TemporaryDirectory() as state:
+            unsafe = Path(state) / "unsafe"
+            unsafe.mkdir()
+            unsafe.chmod(0o777)
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", unsafe / "agent-vm"):
+                with self.assertRaises(CLI.CliError) as error:
+                    CLI.write_session_state("thread", {"session_id": "thread", "generation": 1})
+            self.assertEqual(error.exception.code, "local_state_invalid")
 
     def test_timeout_kills_descendant_process_group(self):
         with tempfile.TemporaryDirectory() as directory:

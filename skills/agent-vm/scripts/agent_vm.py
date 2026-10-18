@@ -40,6 +40,11 @@ RAW_DIAGNOSTIC_CAPTURE_LIMIT = 1024 * 1024
 CONTROL_RESPONSE_LIMIT = 4 * 1024 * 1024
 CHILD_DRAIN_GRACE_SECONDS = 1.0
 DIAGNOSTIC_MESSAGE_LIMIT = 4096
+PERSISTED_DEPTH_LIMIT = 8
+PERSISTED_STRING_LIMIT = 4096
+PERSISTED_COLLECTION_LIMIT = 128
+PERSISTED_DOCUMENT_LIMIT = 64 * 1024
+PERSISTENCE_TRUNCATION_MARKER = "[TRUNCATED BY PERSISTENCE LIMIT]"
 DEFAULT_CHILD_TIMEOUT_SECONDS = 600
 SESSION_ENV = "AGENT_VM_SESSION_ID"
 CONTROL_HOST_ENV = "AGENT_VM_CONTROL_HOST"
@@ -58,8 +63,8 @@ AUTH_SCHEME_RE = re.compile(r"(?i)(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?[
 AUTH_BASIC_RE = re.compile(r"(?i)(\bbasic\s+)[A-Za-z0-9._~+/=-]+")
 SECRET_DOUBLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)\"(?:\\.|[^\"\\])*\"")
 SECRET_SINGLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)'(?:\\.|[^'\\])*'")
-UNTERMINATED_SECRET_DOUBLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)\"(?:\\.|[^\"\\])*$")
-UNTERMINATED_SECRET_SINGLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)'(?:\\.|[^'\\])*$")
+UNTERMINATED_SECRET_DOUBLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)\"(?:\\.|[^\"\\])*\\?$")
+UNTERMINATED_SECRET_SINGLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)'(?:\\.|[^'\\])*\\?$")
 SECRET_TOKEN_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)([^\s,;}}\]\\\"']+)")
 SSHPASS_RE = re.compile(r"(?i)(\bsshpass\b[ \t]+-p)[^\r\n]*")
 URL_CREDENTIAL_RE = re.compile(r"(?i)(\b[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:)([^@\s/]+)(@)")
@@ -109,19 +114,63 @@ def redact_diagnostic_value(value: Any, depth: int = 0) -> Any:
     return value
 
 
+PERSISTED_PAYLOAD_FIELDS = {
+    "action", "active", "admission", "available", "available_bytes", "capacity", "cause", "cleanup", "code", "completed",
+    "current_generation", "current_state", "detail", "differences", "draining", "error", "errors", "expected", "free",
+    "generation", "guest_error", "host", "host_port", "message", "native_status", "operation_id", "operation_phase", "outcome",
+    "phase", "port", "port_name", "ports", "protocol", "reason", "readiness", "reported", "requested", "resource_reservation",
+    "resource_reservation_json", "resources", "resources_json", "reservation_bytes", "result", "returncode", "session_id", "ssh_host_port",
+    "state", "status", "stderr", "stderr_truncated", "task_id", "target", "total", "truncated", "vm_ip", "vm_port",
+}
+
+
+def persisted_value(value: Any, depth: int = 0) -> Any:
+    if depth > PERSISTED_DEPTH_LIMIT:
+        return PERSISTENCE_TRUNCATION_MARKER
+    if isinstance(value, str):
+        return bounded_diagnostic_text(value, PERSISTED_STRING_LIMIT)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, list):
+        return [persisted_value(item, depth + 1) for item in value[:PERSISTED_COLLECTION_LIMIT]]
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, child in list(value.items())[:PERSISTED_COLLECTION_LIMIT]:
+            key_text = str(key)
+            if key_text not in PERSISTED_PAYLOAD_FIELDS or SENSITIVE_FIELD_RE.search(key_text):
+                continue
+            result[key_text] = persisted_value(child, depth + 1)
+        return result
+    return PERSISTENCE_TRUNCATION_MARKER
+
+
+def persisted_document(value: Any) -> Any:
+    projected = persisted_value(value)
+    try:
+        encoded = json.dumps(projected, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    except (TypeError, ValueError, OverflowError):
+        return {"truncated": True}
+    if len(encoded) <= PERSISTED_DOCUMENT_LIMIT:
+        return projected
+    result: dict[str, Any] = {"truncated": True}
+    if isinstance(projected, dict) and "capacity" in projected:
+        result["capacity"] = projected["capacity"]
+    return result
+
+
 class CliError(Exception):
     def __init__(self, code: str, message: str, detail: Any = None, exit_code: int = 2):
         safe_message = bounded_diagnostic_text(str(message))
         super().__init__(safe_message)
         self.code = code
         self.message = safe_message
-        self.detail = redact_diagnostic_value(detail) if detail is not None else None
+        self.detail = persisted_document(detail) if detail is not None else None
         self.exit_code = exit_code
 
     def as_dict(self) -> dict[str, Any]:
         value = {"code": self.code, "message": self.message}
         if self.detail is not None:
-            value["detail"] = redact_diagnostic_value(self.detail)
+            value["detail"] = persisted_document(self.detail)
         return value
 
 
@@ -149,8 +198,36 @@ def local_session_dir(value: str) -> Path:
     return LOCAL_STATE_ROOT / "sessions" / digest
 
 
+def _assert_absolute_no_symlink_ancestors(path: Path, *, code: str) -> None:
+    if not path.is_absolute():
+        fail(code, "local path root must be absolute")
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        try:
+            entry = current.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            fail(code, "local path ancestor cannot be inspected")
+        # macOS exposes /var and /tmp as stable system aliases; the selected
+        # XDG/session path itself and every user-controlled ancestor remain
+        # symlink-free.
+        if stat.S_ISLNK(entry.st_mode):
+            if current not in {Path("/var"), Path("/tmp")}:
+                fail(code, "local path ancestor cannot be a symlink")
+            continue
+        if current == path:
+            continue
+        if not stat.S_ISDIR(entry.st_mode):
+            fail(code, "local path ancestor must be a directory")
+        owner = getattr(os, "geteuid", lambda: entry.st_uid)()
+        if entry.st_uid not in {0, owner} or stat.S_IMODE(entry.st_mode) & 0o022:
+            fail(code, "local path ancestor must be privately owned")
+
+
 def _secure_directory(path: Path, *, code: str = "local_state_invalid") -> Path:
-    path = path.absolute()
+    _assert_absolute_no_symlink_ancestors(path, code=code)
     try:
         current = path.lstat()
     except FileNotFoundError:
@@ -166,6 +243,7 @@ def _secure_directory(path: Path, *, code: str = "local_state_invalid") -> Path:
             fail(code, "local directory cannot be inspected")
     except OSError:
         fail(code, "local directory cannot be inspected")
+    _assert_absolute_no_symlink_ancestors(path, code=code)
     if stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(current.st_mode):
         fail(code, "local directory must be a real directory")
     owner = getattr(os, "geteuid", lambda: current.st_uid)()
@@ -188,7 +266,7 @@ def _secure_config_session_directory(session: str) -> Path:
 
 
 def _secure_file(path: Path, *, code: str = "local_state_invalid") -> Path:
-    path = path.absolute()
+    _assert_absolute_no_symlink_ancestors(path, code=code)
     try:
         current = path.lstat()
     except FileNotFoundError:
@@ -529,6 +607,14 @@ def journal_generation(session: str, operation: str, fallback: int) -> int:
     return value
 
 
+def remote_generation(session: str) -> int:
+    response = control_request("status", session=session)
+    value = response.get("result", {}).get("generation")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        fail("invalid_remote_response", "status response has no valid generation")
+    return value
+
+
 def control_timeout(action: str, fields: dict[str, Any] | None = None) -> int:
     if action in {"acquire", "restart"}:
         return LONG_CONTROL_TIMEOUT_SECONDS
@@ -736,7 +822,9 @@ def ssh_config_path(path: Path) -> str:
 
 def fetch_ssh_info(session: str) -> tuple[dict[str, Any], dict[str, Any], Path]:
     state = read_session_state(session)
-    generation = current_generation(session)
+    generation = remote_generation(session)
+    if generation < 1:
+        fail("generation_mismatch", "the remote session has no active lease; acquire the current lease first")
     response = control_request("ssh-info", session=session, generation=generation)
     info = response["result"]
     if not isinstance(info, dict):
@@ -903,8 +991,13 @@ def mutation(
     session = session if session is not None else session_id(getattr(args, "session_id", None))
     requested_operation = getattr(args, "operation_id", None)
     if requested_operation and session is not None:
-        current = current_generation(session)
-        generation = journal_generation(session, requested_operation, generation if generation is not None else current)
+        journal_path = operation_journal_path(session, requested_operation)
+        fallback = generation
+        if fallback is None and not os.path.lexists(journal_path):
+            fallback = remote_generation(session)
+        if fallback is None:
+            fallback = 0
+        generation = journal_generation(session, requested_operation, fallback)
     if generation is None and action not in {"acquire", "drain-enter", "drain-exit", "admin-reconcile", "admin-gc"}:
         assert session is not None
         generation = current_generation(session)

@@ -538,12 +538,14 @@ test("status envelope generation follows active and absent session state", async
   expect(absent.generation).toBe(0);
   expect(absent.generation).toBe(absent.result.generation);
   expect(absent.operation_id).toBeNull();
+  await expectCode(f.control.dispatch({ protocol: PROTOCOL_VERSION, action: "status", session_id: "missing-session", generation: 1 }), "generation_mismatch");
 
   const acquired = await f.control.dispatch(f.request("acquire", { public_key: KEY }, "op-status-generation-acquire"));
   const active = await f.control.dispatch({ protocol: PROTOCOL_VERSION, action: "status", session_id: "thread-a" });
   expect(active.generation).toBe(acquired.result.generation);
   expect(active.generation).toBe(active.result.generation);
   expect(active.operation_id).toBeNull();
+  await expectCode(f.control.dispatch({ protocol: PROTOCOL_VERSION, action: "status", session_id: "thread-a", generation: Number(active.generation) + 1 }), "generation_mismatch");
 });
 
 test("ssh-info binds the request, envelope, port and alias to one generation", async () => {
@@ -724,6 +726,7 @@ test("verifies state-dependent task, port, and operation invariants at runtime",
   valid.close();
   try {
     const reopened = new StateStore(validPath);
+    reopened.verifyRuntimeState();
     reopened.close();
 
     const invalidPath = join(root, "invalid.sqlite3");
@@ -742,6 +745,51 @@ test("verifies state-dependent task, port, and operation invariants at runtime",
     chmodSync(operationPath, 0o600);
     expectSyncCode(() => new StateStore(operationPath), "state_invalid");
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("fails closed on unknown draining and preserves legal active resize reservations", () => {
+  const root = mkdtempSync("/tmp/agent-vm-state-runtime-contract-test-");
+  const timestamp = "2026-10-04T00:00:00+00:00";
+  const base = {
+    task_id: "avm-resize", session_id: "resize-session", generation: 3, state: "active", instance_name: "agent-vm-avm-resize",
+    vm_ip: "198.51.100.20", ssh_host_port: 20000, lease_expires_at: "2026-10-04T01:00:00+00:00", inactive_since: null,
+    cleanup_after: null, created_at: timestamp, updated_at: timestamp, last_error: null, image_fingerprint: "a".repeat(64),
+    resources_json: JSON.stringify({ cpu: 2, memory_mib: 4096, disk_gib: 20 }), reservation_bytes: 1024,
+    previous_generation: null, resource_reservation_json: JSON.stringify({ cpu: 2, memory_mib: 8192, disk_gib: 20 }),
+  };
+  const validPath = join(root, "valid.sqlite3");
+  const valid = StateStore.bootstrap(validPath);
+  valid.putTask(base);
+  valid.putPort({ task_id: base.task_id, generation: base.generation, port_name: "ssh", protocol: "tcp", host_port: 20000, vm_port: 22, device_name: "agent-vm-avm-resize-ssh-tcp", state: "active", created_at: timestamp });
+  valid.verifyRuntimeState();
+  valid.db.run("INSERT INTO meta(key, value) VALUES ('draining', 'maybe')");
+  expectSyncCode(() => valid.verifyRuntimeState(), "state_invalid");
+  valid.close();
+
+  const residualPath = join(root, "residual.sqlite3");
+  const residual = StateStore.bootstrap(residualPath);
+  residual.putTask({ ...base, task_id: "avm-cached-residual", session_id: "cached-residual", instance_name: "agent-vm-avm-cached-residual", state: "cached", lease_expires_at: null, reservation_bytes: 1, resource_reservation_json: "{}", ssh_host_port: null });
+  expectSyncCode(() => residual.verifyRuntimeState(), "state_invalid");
+  residual.close();
+
+  const missingActivePath = join(root, "missing-active.sqlite3");
+  const missingActive = StateStore.bootstrap(missingActivePath);
+  missingActive.putTask({ ...base, task_id: "avm-missing-active", session_id: "missing-active", instance_name: "agent-vm-avm-missing-active", vm_ip: null, ssh_host_port: null, resource_reservation_json: "{}" });
+  expectSyncCode(() => missingActive.verifyRuntimeState(), "state_invalid");
+  missingActive.close();
+
+  const incompletePreparingPath = join(root, "incomplete-preparing.sqlite3");
+  const incompletePreparing = StateStore.bootstrap(incompletePreparingPath);
+  incompletePreparing.putTask({ ...base, task_id: "avm-incomplete-preparing", session_id: "incomplete-preparing", instance_name: "agent-vm-avm-incomplete-preparing", state: "preparing", vm_ip: null, ssh_host_port: null, reservation_bytes: 1, resource_reservation_json: JSON.stringify({ cpu: 2, memory_mib: 4096, disk_gib: 20 }) });
+  expectSyncCode(() => incompletePreparing.verifyRuntimeState(), "state_invalid");
+  incompletePreparing.close();
+
+  const incompleteClosingPath = join(root, "incomplete-closing.sqlite3");
+  const incompleteClosing = StateStore.bootstrap(incompleteClosingPath);
+  incompleteClosing.putTask({ ...base, task_id: "avm-incomplete-closing", session_id: "incomplete-closing", instance_name: "agent-vm-avm-incomplete-closing", state: "closing", lease_expires_at: null, ssh_host_port: null, resource_reservation_json: "{}" });
+  expectSyncCode(() => incompleteClosing.verifyRuntimeState(), "state_invalid");
+  incompleteClosing.close();
+  rmSync(root, { recursive: true, force: true });
 });
 
 test("projects untrusted result JSON before operation and audit persistence", async () => {
@@ -832,7 +880,9 @@ test("replays an accepted persisted operation without changing its digest or nat
     generation: 0, operation_id: "legacy-op", outcome: "success", result: { state: "active" }, _request_digest: digest,
   };
   writeLegacyOperation(dbPath, response);
-  const store = StateStore.bootstrap(dbPath);
+  const store = new StateStore(dbPath);
+  expect(store.getMeta("schema_migration")).toBe("python-baseline-v1->bun-canonical-v1");
+  expect(Number((store.db.query("SELECT COUNT(*) AS count FROM audit WHERE action = 'schema-migration'") as any).get().count)).toBe(1);
   const runner = new NativeCommands();
   const control = new Control({ state_db: dbPath, timer_dir: root }, { store, runner });
   try {
@@ -854,7 +904,7 @@ test("rejects a pending legacy operation without rewriting its journal", async (
   const digest = "c3dccc911349ced563eb9615fb6db8ffa5801d121c9542c29c5a3fc0575a768a";
   const response = { protocol: PROTOCOL_VERSION, action: "acquire", session_id: "legacy", generation: 0, operation_id: "legacy-op", outcome: "pending", _request_digest: digest };
   writeLegacyOperation(dbPath, response);
-  const store = StateStore.bootstrap(dbPath);
+  const store = new StateStore(dbPath);
   const runner = new NativeCommands();
   const control = new Control({ state_db: dbPath, timer_dir: root }, { store, runner });
   try {
@@ -1020,6 +1070,8 @@ test("redacts command stderr before journal, audit, and diagnostic output", asyn
     ["password", '"escaped\\"-secret-canary'],
     ["token", "'unterminated-token-canary"],
     ["token", "'escaped\\'-token-canary"],
+    ["password", '"terminal-secret-canary\\'],
+    ["token", "'terminal-token-canary\\"],
   ].map(([label, value]) => label + "=" + value);
   for (const value of values) {
     expect(JSON.stringify(new ControlError("command_failed", "native command failed", { stderr: value }).asDict())).not.toContain("canary");

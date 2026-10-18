@@ -76,6 +76,8 @@ class SyncTests(unittest.TestCase):
             "password" + r'="escaped\"-secret-canary',
             "token" + "='unterminated-token-canary",
             "token" + r"='escaped\'-token-canary",
+            "password" + "=" + "\"terminal-secret-canary\\",
+            "token" + "=" + "'terminal-token-canary\\",
             "password" + "=" + '"line-one-secret-canary\nline-two-secret-canary"',
             "token" + r'="escaped\"-multiline-token-canary',
         ]

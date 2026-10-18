@@ -149,7 +149,29 @@ linuxTest("kills a TERM-ignoring descendant after the leader exits on SIGTERM", 
   const pidPath = join(probeRoot, "child.pid");
   let failure: any;
   try {
-    await runner.runBounded(["/bin/sh", "-c", `(trap '' TERM; sleep 30) & echo $! > ${pidPath}; trap 'exit 0' TERM; while :; do printf xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done`], { timeout: 0.2, stdoutLimit: 128, stderrLimit: 128 });
+    await runner.runBounded(["/bin/sh", "-c", `(setsid /bin/sh -c 'trap "" TERM; sleep 30') & echo $! > ${pidPath}; trap 'exit 0' TERM; while :; do printf xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done`], { timeout: 0.2, stdoutLimit: 128, stderrLimit: 128 });
+  } catch (error) { failure = error; }
+  expect(failure?.code).toBe("command_timeout");
+  expect(failure?.detail?.reaped).toBe(true);
+  expect(failure?.detail?.process_group_killed).toBe(true);
+  expect(await waitFor(pidPath)).toBe(true);
+  const pid = Number(readFileSync(pidPath, "utf8"));
+  let state: string | undefined;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    state = procState(pid);
+    if (state === undefined || state === "Z") break;
+    await Bun.sleep(10);
+  }
+  expect(state === undefined || state === "Z").toBe(true);
+});
+
+linuxTest("reaps a TERM-ignoring descendant after the leader exits before timeout", async () => {
+  const runner = new CommandRunner();
+  const probeRoot = root("agent-vm-early-leader");
+  const pidPath = join(probeRoot, "child.pid");
+  let failure: any;
+  try {
+    await runner.runBounded(["/bin/sh", "-c", `(setsid /bin/sh -c 'trap "" TERM; sleep 30') & echo $! > ${pidPath}; exit 0`], { timeout: 0.3, stdoutLimit: 128, stderrLimit: 128 });
   } catch (error) { failure = error; }
   expect(failure?.code).toBe("command_timeout");
   expect(failure?.detail?.reaped).toBe(true);

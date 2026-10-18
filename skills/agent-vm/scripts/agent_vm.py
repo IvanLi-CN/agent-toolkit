@@ -9,16 +9,19 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fcntl
 import hashlib
 import ipaddress
 import json
 import os
 from pathlib import Path
 import re
+import selectors
 import shlex
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any, Sequence
 import uuid
 
@@ -28,6 +31,8 @@ VERSION = "0.4.0-native"
 REMOTE_CONTROL = "/opt/agent-vm-native/agent_vm_control.ts"
 DEFAULT_CONTROL_TIMEOUT_SECONDS = 240
 LONG_CONTROL_TIMEOUT_SECONDS = 600
+DIAGNOSTIC_OUTPUT_LIMIT = 8192
+DIAGNOSTIC_TRUNCATION_MARKER = b"\n[TRUNCATED BY DIAGNOSTIC LIMIT]"
 SESSION_ENV = "AGENT_VM_SESSION_ID"
 CONTROL_HOST_ENV = "AGENT_VM_CONTROL_HOST"
 REMOTE_CONTROL_ENV = "AGENT_VM_REMOTE_CONTROL"
@@ -44,6 +49,7 @@ def redact_diagnostic_text(value: str) -> str:
     private_key = re.compile(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 _-]*PRIVATE KEY-----|$)", re.IGNORECASE)
     redacted = private_key.sub("[REDACTED PRIVATE KEY]", value)
     labels = r"(?:[A-Za-z0-9]+[_-])*(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)(?:[_-][A-Za-z0-9]+)*"
+    redacted = re.sub(rf"(?i)(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[REDACTED]", redacted)
     redacted = re.sub(rf"(?i)(['\"]?\b{labels}\b['\"]?\s*[:=]\s*)(['\"])[^\r\n]*?\2", r"\1\2[REDACTED]\2", redacted)
     redacted = re.sub(rf"(?i)(['\"]?\b{labels}\b['\"]?\s*[:=]\s*)([^\s,;}}\]\\\"']+)", r"\1[REDACTED]", redacted)
     redacted = re.sub(r"(?i)(\bsshpass\b[ \t]+-p)[\s\S]*", r"\1 [REDACTED]", redacted)
@@ -102,6 +108,177 @@ def local_session_dir(value: str) -> Path:
     return LOCAL_STATE_ROOT / "sessions" / digest
 
 
+def operation_journal_path(session: str, operation: str) -> Path:
+    return local_session_dir(session) / "operations" / (hashlib.sha256(operation.encode()).hexdigest() + ".json")
+
+
+def read_operation_journal(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        fail("local_journal_invalid", "operation journal is unreadable")
+    if not isinstance(value, dict) or not isinstance(value.get("request"), dict):
+        fail("local_journal_invalid", "operation journal is malformed")
+    return value
+
+
+def ensure_operation_journal(directory: Path, request: dict[str, Any]) -> None:
+    operation = str(request["operation_id"])
+    path = directory / (hashlib.sha256(operation.encode()).hexdigest() + ".json")
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        os.fchmod(lock.fileno(), 0o600)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            if path.exists():
+                old = read_operation_journal(path)
+                if old["request"] != request:
+                    fail("operation_conflict", "operation ID already describes another request")
+                return
+            try:
+                with path.open("x", encoding="utf-8") as handle:
+                    os.fchmod(handle.fileno(), 0o600)
+                    json.dump({"request": request, "outcome": "pending"}, handle, sort_keys=True)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except FileExistsError:
+                old = read_operation_journal(path)
+                if old["request"] != request:
+                    fail("operation_conflict", "operation ID already describes another request")
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+class _BoundedCapture:
+    def __init__(self, limit: int, *, tail: bool) -> None:
+        self.limit = limit
+        self.tail = tail
+        self.value = bytearray()
+        self.seen = 0
+
+    def append(self, chunk: bytes) -> None:
+        self.seen += len(chunk)
+        if self.limit <= 0:
+            return
+        if self.tail:
+            self.value.extend(chunk)
+            if len(self.value) > self.limit:
+                del self.value[:-self.limit]
+        elif len(self.value) < self.limit:
+            self.value.extend(chunk[: self.limit - len(self.value)])
+
+    def finish(self) -> bytes:
+        value = bytes(self.value)
+        if self.seen <= self.limit:
+            return value
+        available = max(0, self.limit - len(DIAGNOSTIC_TRUNCATION_MARKER))
+        if self.tail:
+            return DIAGNOSTIC_TRUNCATION_MARKER + value[-available:] if available else DIAGNOSTIC_TRUNCATION_MARKER
+        return value[:available] + DIAGNOSTIC_TRUNCATION_MARKER
+
+
+def run_child(argv: Sequence[str], *, input_data: bytes | None = None,
+              capture_stdout: bool = False, timeout: float | None = None) -> subprocess.CompletedProcess:
+    try:
+        process = subprocess.Popen(
+            list(argv),
+            stdin=subprocess.PIPE if input_data is not None else None,
+            stdout=subprocess.PIPE if capture_stdout else None,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+        )
+    except FileNotFoundError:
+        raise
+    selector = selectors.DefaultSelector()
+    stdout_capture = _BoundedCapture(DIAGNOSTIC_OUTPUT_LIMIT, tail=False)
+    stderr_capture = _BoundedCapture(DIAGNOSTIC_OUTPUT_LIMIT, tail=True)
+    input_view = memoryview(input_data or b"")
+    input_offset = 0
+
+    def close_stream(stream: Any) -> None:
+        try:
+            selector.unregister(stream)
+        except KeyError:
+            pass
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+    for stream, kind in ((process.stdout, "stdout"), (process.stderr, "stderr")):
+        if stream is not None:
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, kind)
+    if process.stdin is not None:
+        os.set_blocking(process.stdin.fileno(), False)
+        if input_view:
+            selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
+        else:
+            process.stdin.close()
+    deadline = None if timeout is None else time.monotonic() + timeout
+    try:
+        while selector.get_map() or process.poll() is None:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
+                raise subprocess.TimeoutExpired(list(argv), timeout, output=stdout_capture.finish(), stderr=stderr_capture.finish())
+            if not selector.get_map():
+                try:
+                    process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    raise subprocess.TimeoutExpired(list(argv), timeout, output=stdout_capture.finish(), stderr=stderr_capture.finish())
+                break
+            for key, _ in selector.select(remaining):
+                stream = key.fileobj
+                if key.data == "stdin":
+                    try:
+                        written = os.write(stream.fileno(), input_view[input_offset:])
+                    except (BrokenPipeError, OSError):
+                        close_stream(stream)
+                    else:
+                        input_offset += written
+                        if input_offset >= len(input_view):
+                            close_stream(stream)
+                    continue
+                try:
+                    chunk = os.read(stream.fileno(), 64 * 1024)
+                except BlockingIOError:
+                    continue
+                if chunk:
+                    (stdout_capture if key.data == "stdout" else stderr_capture).append(chunk)
+                else:
+                    close_stream(stream)
+        return subprocess.CompletedProcess(
+            list(argv),
+            process.wait(),
+            stdout_capture.finish() if capture_stdout else None,
+            stderr_capture.finish(),
+        )
+    finally:
+        selector.close()
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+
+
 def read_session_state(value: str) -> dict[str, Any]:
     path = local_session_dir(value) / "state.json"
     try:
@@ -158,24 +335,14 @@ def control_request(action: str, *, session: str | None, generation: int | None 
     if write:
         directory = local_session_dir(session) / "operations"
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        op_path = directory / (hashlib.sha256(request["operation_id"].encode()).hexdigest() + ".json")
-        if op_path.exists():
-            try: old = json.loads(op_path.read_text())
-            except (ValueError, OSError): fail("local_journal_invalid", "operation journal is unreadable")
-            if old["request"] != request: fail("operation_conflict", "operation ID already describes another request")
-        else:
-            with op_path.open("x", encoding="utf-8") as handle:
-                os.fchmod(handle.fileno(), 0o600)
-                json.dump({"request": request, "outcome": "pending"}, handle, sort_keys=True)
-                handle.flush()
-                os.fsync(handle.fileno())
+        ensure_operation_journal(directory, request)
     try:
         control_host = os.environ.get(CONTROL_HOST_ENV, DEFAULT_CONTROL_HOST)
         remote_control = os.environ.get(REMOTE_CONTROL_ENV, DEFAULT_REMOTE_CONTROL)
-        process = subprocess.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", control_host,
-                                  shlex.join(["bun", remote_control])],
-                                 input=json.dumps(request, sort_keys=True).encode(), stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE, check=False, timeout=control_timeout(action, fields))
+        process = run_child(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", control_host,
+                             shlex.join(["bun", remote_control])],
+                            input_data=json.dumps(request, sort_keys=True).encode(), capture_stdout=True,
+                            timeout=control_timeout(action, fields))
     except FileNotFoundError: fail("command_missing", "ssh is not installed")
     except subprocess.TimeoutExpired:
         fail("remote_timeout", "control outcome is uncertain; retry the same operation ID",
@@ -186,7 +353,7 @@ def control_request(action: str, *, session: str | None, generation: int | None 
     if process.returncode:
         fail("remote_failed", "remote request failed; retry only with its original operation ID",
              {"operation_id": request.get("operation_id")}, process.returncode)
-    try: response = json.loads(process.stdout)
+    try: response = json.loads(process.stdout or b"")
     except (ValueError, UnicodeDecodeError): fail("invalid_remote_response", "control did not return JSON")
     if not isinstance(response, dict) or response.get("protocol") != PROTOCOL_VERSION or response.get("action") != action or response.get("session_id") != session:
         fail("protocol_mismatch", "response protocol or request identity differs")
@@ -200,7 +367,7 @@ def control_request(action: str, *, session: str | None, generation: int | None 
 
 def run_command(argv: Sequence[str], *, input_data: bytes | None = None, output: bool = False) -> int:
     try:
-        process = subprocess.run(list(argv), input=input_data, stderr=subprocess.PIPE, check=False)
+        process = run_child(list(argv), input_data=input_data)
     except FileNotFoundError:
         fail("command_missing", f"command not found: {argv[0]}")
     if process.stderr:
@@ -216,12 +383,7 @@ def make_ssh_key(session: str) -> tuple[Path, str]:
     public_key = private_key.with_suffix(".pub")
     if not private_key.exists() or not public_key.exists():
         try:
-            process = subprocess.run(
-                ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(private_key)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
+            process = run_child(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(private_key)], capture_stdout=True)
         except FileNotFoundError as exc:
             fail("command_missing", "ssh-keygen is not installed")
         if process.returncode != 0:
@@ -470,8 +632,13 @@ def command_acquire(args: argparse.Namespace) -> int:
     generation = control_request("status", session=session)["result"]["generation"]
     requested_op = getattr(args, "operation_id", None)
     if requested_op:
-        journal = local_session_dir(session) / "operations" / (hashlib.sha256(requested_op.encode()).hexdigest() + ".json")
-        if journal.is_file(): generation = json.loads(journal.read_text())["request"]["generation"]
+        journal = operation_journal_path(session, requested_op)
+        if journal.is_file():
+            record = read_operation_journal(journal)
+            value = record["request"].get("generation")
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                fail("local_journal_invalid", "operation journal has no valid generation")
+            generation = value
     fields = {"public_key": public_key}
     if args.ssh_host_port is not None: fields["ssh_host_port"] = args.ssh_host_port
     if args.cpu is not None: fields["cpu"] = args.cpu

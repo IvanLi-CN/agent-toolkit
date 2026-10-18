@@ -52,10 +52,17 @@ class SyncTests(unittest.TestCase):
         return self.remote(dict(action=action, name=name, tx=tx, **kw))
 
     def test_stderr_redaction_covers_assignments_and_json_fields(self):
-        value = MOD.redact_stderr(b'{"password":"secret-value", "private_key": "private-value"} token=token-value')
+        value = MOD.redact_stderr(b'{"password":"secret-value", "private_key": "private-value"} token=token-value Authorization: Bearer auth-canary-01 "Authorization": "Bearer quoted-auth-01"')
         self.assertNotIn(b"secret-value", value)
         self.assertNotIn(b"private-value", value)
         self.assertNotIn(b"token-value", value)
+        self.assertNotIn(b"auth-canary-01", value)
+        self.assertNotIn(b"quoted-auth-01", value)
+
+    def test_child_diagnostics_are_bounded_before_redaction(self):
+        result = MOD.run([sys.executable, "-c", "import sys; sys.stderr.write('Authorization: Bearer ' + 'x' * 20000)"], capture_output=True)
+        self.assertLessEqual(len(result.stderr), MOD.DIAGNOSTIC_OUTPUT_LIMIT)
+        self.assertIn(MOD.DIAGNOSTIC_TRUNCATION_MARKER, result.stderr)
 
     def populate(self, tx, files):
         p = self.workspace / "repo" / (".agent-vm-src-stage." + tx)

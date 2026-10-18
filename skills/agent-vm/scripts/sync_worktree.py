@@ -9,21 +9,26 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import shlex
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 
 OWNER = ".agent-vm-sync-owner.json"
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 SENSITIVE_FIELD_RE = r"(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)"
+DIAGNOSTIC_OUTPUT_LIMIT = 8192
+DIAGNOSTIC_TRUNCATION_MARKER = b"\n[TRUNCATED BY DIAGNOSTIC LIMIT]"
 
 
 def redact_stderr(value: bytes) -> bytes:
     text = value.decode("utf-8", "replace")
     text = re.sub(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 _-]*PRIVATE KEY-----|$)", "[REDACTED PRIVATE KEY]", text, flags=re.IGNORECASE)
+    text = re.sub(rf"(?i)(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[REDACTED]", text)
     text = re.sub(rf"(?i)(['\"]?\b{SENSITIVE_FIELD_RE}\b['\"]?\s*[:=]\s*)(['\"])[^\r\n]*?\2", r"\1\2[REDACTED]\2", text)
     text = re.sub(rf"(?i)(['\"]?\b{SENSITIVE_FIELD_RE}\b['\"]?\s*[:=]\s*)([^\s,;}}\]\\\"']+)", r"\1[REDACTED]", text)
     text = re.sub(r"(?i)(\bsshpass\b[ \t]+-p)[\s\S]*", r"\1 [REDACTED]", text)
@@ -200,7 +205,126 @@ class SyncFailure(Exception):
         self.code = code
 
 
+class _BoundedCapture:
+    def __init__(self, limit: int, *, tail: bool) -> None:
+        self.limit = limit
+        self.tail = tail
+        self.value = bytearray()
+        self.seen = 0
+
+    def append(self, chunk: bytes) -> None:
+        self.seen += len(chunk)
+        if self.limit <= 0:
+            return
+        if self.tail:
+            self.value.extend(chunk)
+            if len(self.value) > self.limit:
+                del self.value[:-self.limit]
+        elif len(self.value) < self.limit:
+            self.value.extend(chunk[: self.limit - len(self.value)])
+
+    def finish(self) -> bytes:
+        value = bytes(self.value)
+        if self.seen <= self.limit:
+            return value
+        available = max(0, self.limit - len(DIAGNOSTIC_TRUNCATION_MARKER))
+        if self.tail:
+            return DIAGNOSTIC_TRUNCATION_MARKER + value[-available:] if available else DIAGNOSTIC_TRUNCATION_MARKER
+        return value[:available] + DIAGNOSTIC_TRUNCATION_MARKER
+
+
+def _run_bounded(argv: list[str], *, input_data: bytes | None = None, timeout: float | None = None) -> subprocess.CompletedProcess:
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE if input_data is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+    )
+    selector = selectors.DefaultSelector()
+    stdout_capture = _BoundedCapture(DIAGNOSTIC_OUTPUT_LIMIT, tail=False)
+    stderr_capture = _BoundedCapture(DIAGNOSTIC_OUTPUT_LIMIT, tail=True)
+    input_view = memoryview(input_data or b"")
+    input_offset = 0
+
+    def close_stream(stream):
+        try:
+            selector.unregister(stream)
+        except KeyError:
+            pass
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+    for stream, kind in ((process.stdout, "stdout"), (process.stderr, "stderr")):
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream, selectors.EVENT_READ, kind)
+    if process.stdin is not None:
+        os.set_blocking(process.stdin.fileno(), False)
+        if input_view:
+            selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
+        else:
+            process.stdin.close()
+    deadline = None if timeout is None else time.monotonic() + timeout
+    try:
+        while selector.get_map() or process.poll() is None:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                process.kill()
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
+                raise subprocess.TimeoutExpired(argv, timeout, output=stdout_capture.finish(), stderr=stderr_capture.finish())
+            if not selector.get_map():
+                try:
+                    process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    raise subprocess.TimeoutExpired(argv, timeout, output=stdout_capture.finish(), stderr=stderr_capture.finish())
+                break
+            for key, _ in selector.select(remaining):
+                stream = key.fileobj
+                if key.data == "stdin":
+                    try:
+                        written = os.write(stream.fileno(), input_view[input_offset:])
+                    except (BrokenPipeError, OSError):
+                        close_stream(stream)
+                    else:
+                        input_offset += written
+                        if input_offset >= len(input_view):
+                            close_stream(stream)
+                    continue
+                try:
+                    chunk = os.read(stream.fileno(), 64 * 1024)
+                except BlockingIOError:
+                    continue
+                if chunk:
+                    (stdout_capture if key.data == "stdout" else stderr_capture).append(chunk)
+                else:
+                    close_stream(stream)
+        return subprocess.CompletedProcess(argv, process.wait(), stdout_capture.finish(), stderr_capture.finish())
+    finally:
+        selector.close()
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+
+
 def run(argv: list[str], **kwargs) -> subprocess.CompletedProcess:
+    capture_output = kwargs.pop("capture_output", False)
+    if capture_output:
+        return _run_bounded(argv, input_data=kwargs.pop("input", None), timeout=kwargs.pop("timeout", None))
     return subprocess.run(argv, check=False, **kwargs)
 
 

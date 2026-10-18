@@ -158,6 +158,7 @@ function redactDiagnosticText(rawInput: string): string {
   const privateKey = /-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 _-]*PRIVATE KEY-----|$)/gi;
   let redacted = rawInput.replace(privateKey, "[REDACTED PRIVATE KEY]");
   const secretLabel = "(?:[A-Za-z0-9]+[_-])*(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)(?:[_-][A-Za-z0-9]+)*";
+  redacted = redacted.replace(new RegExp(`(?<label>[\\\"']?\\bauthorization\\b[\\\"']?\\s*(?:[:=]\\s*)?[\\\"']?bearer\\s+)[A-Za-z0-9._~+/=-]+`, "gi"), "$<label>[REDACTED]");
   redacted = redacted.replace(new RegExp(`(?<label>[\\\"']?${secretLabel}[\\\"']?)(?<separator>\\s*[:=]\\s*)(?<quote>[\\\"'])(?<value>.*?)(\\k<quote>)`, "gis"), "$<label>$<separator>$<quote>[REDACTED]$<quote>");
   redacted = redacted.replace(new RegExp(`(?<label>[\\\"']?${secretLabel}[\\\"']?)(?<separator>\\s*[:=]\\s*)(?<value>[^\\s,;}}\\]\\\"']+)`, "gi"), "$<label>$<separator>[REDACTED]");
   redacted = redacted.replace(/(\bsshpass\b[ \t]+-p)[\s\S]*/is, "$1 [REDACTED]");
@@ -1305,9 +1306,10 @@ export class Control {
 
   private async nativeBarrier<T>(callback: () => T | Promise<T>, exclusive = false): Promise<T> {
     const lockPath = join(dirname(this.store.path), "locks", sha256("native:barrier"));
+    const turnstilePath = join(dirname(this.store.path), "locks", sha256("native:barrier:turnstile"));
     const release = await acquireNativeBarrier(lockPath, exclusive);
     try {
-      return await withFileLock(lockPath, callback, true, !exclusive);
+      return await withFileLock(turnstilePath, () => withFileLock(lockPath, callback, true, !exclusive), true, !exclusive);
     } finally {
       release();
     }
@@ -1503,9 +1505,10 @@ export class Control {
     return current;
   }
 
-  private async cleanupOperationCurrent(task: Dict): Promise<Dict> {
+  private async cleanupOperationCurrent(task: Dict, allowActive = false): Promise<Dict> {
     const current = this.store.getTask({ taskId: String(task.task_id) });
-    if (!current || !sameInteger(current.generation, task.generation) || current.instance_name !== task.instance_name || current.state !== "closing") throw new ControlError("stale_cleanup", "cleanup generation or state changed before its effect");
+    const validState = current?.state === "closing" || (allowActive && current?.state === "active");
+    if (!current || !sameInteger(current.generation, task.generation) || current.instance_name !== task.instance_name || !validState) throw new ControlError("stale_cleanup", "cleanup generation or state changed before its effect");
     return current;
   }
 
@@ -2196,16 +2199,16 @@ export class Control {
     });
   }
 
-  private async conntrackDelete(port: Dict, task: Dict, cleanup = false): Promise<void> {
+  private async conntrackDelete(port: Dict, task: Dict, cleanup = false, allowActiveCleanup = false): Promise<void> {
     if (!this.which("conntrack")) throw new ControlError("conntrack_unavailable", "conntrack-tools is required for exact flow withdrawal");
     const match = ["-p", String(port.protocol), "--orig-dst", String(this.config.host_address), "--dport", String(port.host_port), "--reply-src", String(task.vm_ip), "--reply-port-src", String(port.vm_port)];
     const result = await this.nativeBarrier(async () => {
-      if (cleanup) await this.cleanupOperationCurrent(task); else await this.nativeOperationCurrent(task);
+      if (cleanup) await this.cleanupOperationCurrent(task, allowActiveCleanup); else await this.nativeOperationCurrent(task);
       return this.runner.run(["conntrack", "-D", ...match], { check: false, timeout: 2 });
     });
     if (result.returncode !== 0 && !(result.returncode === 1 && decode(result.stderr).includes("0 flow entries"))) throw new ControlError("conntrack_delete_failed", "exact conntrack deletion failed", { returncode: result.returncode, stderr: decode(result.stderr) });
     const remaining = await this.nativeBarrier(async () => {
-      if (cleanup) await this.cleanupOperationCurrent(task); else await this.nativeOperationCurrent(task);
+      if (cleanup) await this.cleanupOperationCurrent(task, allowActiveCleanup); else await this.nativeOperationCurrent(task);
       return this.runner.run(["conntrack", "-L", ...match], { check: false, timeout: 2 });
     });
     if (remaining.returncode !== 0 || decode(remaining.stdout).trim().length) throw new ControlError("conntrack_unverified", "matching flows remain or cannot be inspected");
@@ -2270,8 +2273,8 @@ export class Control {
     return [errors, completed];
   }
 
-  private async removeProxy(task: Dict, port: Dict, cleanup = false): Promise<void> {
-    const current = cleanup ? await this.cleanupOperationCurrent(task) : await this.nativeOperationCurrent(task);
+  private async removeProxy(task: Dict, port: Dict, cleanup = false, allowActiveCleanup = false): Promise<void> {
+    const current = cleanup ? await this.cleanupOperationCurrent(task, allowActiveCleanup) : await this.nativeOperationCurrent(task);
     const info = await this.ownership(current);
     if (!isDict(info.devices) || !isDict(info.expanded_devices)) throw new ControlError("mapping_unverified", "native device maps are unavailable");
     const devices = info.devices;
@@ -2282,7 +2285,7 @@ export class Control {
       const expected = this.proxyProperties(current, port);
       if (Object.entries(expected).some(([key, value]) => native[key] !== value)) throw new ControlError("ownership_mismatch", "native mapping differs from its reservation");
       await this.nativeBarrier(async () => {
-        const fenced = cleanup ? await this.cleanupOperationCurrent(current) : await this.nativeOperationCurrent(current);
+        const fenced = cleanup ? await this.cleanupOperationCurrent(current, allowActiveCleanup) : await this.nativeOperationCurrent(current);
         const fencedInfo = await this.ownership(fenced);
         if (!isDict(fencedInfo.devices) || !isDict(fencedInfo.expanded_devices)) throw new ControlError("mapping_unverified", "native device maps are unavailable before removal");
         const fencedNative = fencedInfo.devices[port.device_name];
@@ -2485,9 +2488,14 @@ export class Control {
       if (!current || !sameInteger(current.generation, inputTask.generation)) throw new ControlError("generation_mismatch", "cleanup generation changed");
       let task = current;
       if (["cached", "absent"].includes(String(task.state)) && requestedState !== "closing") return this.stateSummary(task);
-      const expiry = parseTime(task.lease_expires_at);
-      const inactive = parseTime(task.inactive_since) ?? new Date(Math.min(this.now().getTime(), expiry?.getTime() ?? this.now().getTime()));
-      task = this.store.updateTask(String(task.task_id), { state: "closing", lease_expires_at: null, inactive_since: isoTime(inactive), cleanup_after: isoTime(new Date(inactive.getTime() + Number(this.config.cache_seconds) * 1000)) });
+      task = await this.nativeLock(task, () => this.nativeBarrier(() => this.globalLock(() => this.store.transaction(() => {
+        const latest = this.store.getTask({ taskId: String(task.task_id) });
+        if (!latest || !sameInteger(latest.generation, task.generation)) throw new ControlError("generation_mismatch", "cleanup generation changed");
+        if (["cached", "absent"].includes(String(latest.state)) && requestedState !== "closing") return latest;
+        const expiry = parseTime(latest.lease_expires_at);
+        const inactive = parseTime(latest.inactive_since) ?? new Date(Math.min(this.now().getTime(), expiry?.getTime() ?? this.now().getTime()));
+        return this.store.updateTask(String(latest.task_id), { state: "closing", lease_expires_at: null, inactive_since: isoTime(inactive), cleanup_after: isoTime(new Date(inactive.getTime() + Number(this.config.cache_seconds) * 1000)) });
+      })), true));
       const [errors, completed] = await this.cleanupTask(task);
       if (errors.length) {
         this.store.updateTask(String(task.task_id), { last_error: stableJson({ errors, completed }) });
@@ -2774,7 +2782,7 @@ export class Control {
     const name = requiredString(request.name, "name", PORT_NAME_RE);
     if (name === "ssh") throw new ControlError("invalid_request", "invalid project mapping");
     const port = this.store.getPort(String(task.task_id), name, String(protocol));
-    if (port) { this.store.updatePort(String(task.task_id), name, String(protocol), { state: "closing" }); await this.nativeLock(task, async () => { await this.removeProxy(task, port); await this.conntrackDelete(port, task); this.store.removePort(String(task.task_id), name, String(protocol)); }); }
+    if (port) { this.store.updatePort(String(task.task_id), name, String(protocol), { state: "closing" }); await this.nativeLock(task, async () => { await this.removeProxy(task, port, true, true); await this.conntrackDelete(port, task, true, true); this.store.removePort(String(task.task_id), name, String(protocol)); }); }
     return { task_id: task.task_id, name, protocol, removed: true };
   }
 
@@ -2826,7 +2834,7 @@ export class Control {
             else if (task.state === "active") {
               item.action = "rearm-current-expiry";
               if (status !== "running") throw new ControlError("state_mismatch", "active guest is not running");
-              if (apply) { await this.scheduleExpiry(task); for (const port of this.store.getPorts(String(task.task_id))) if (["closing", "preparing"].includes(String(port.state))) { await this.nativeLock(task, async () => { await this.removeProxy(task, port); await this.conntrackDelete(port, task); this.store.removePort(String(task.task_id), String(port.port_name), String(port.protocol)); }); } }
+              if (apply) { await this.scheduleExpiry(task); for (const port of this.store.getPorts(String(task.task_id))) if (["closing", "preparing"].includes(String(port.state))) { await this.nativeLock(task, async () => { await this.removeProxy(task, port, true, true); await this.conntrackDelete(port, task, true, true); this.store.removePort(String(task.task_id), String(port.port_name), String(port.protocol)); }); } }
             }
           }
           actions.push(item);

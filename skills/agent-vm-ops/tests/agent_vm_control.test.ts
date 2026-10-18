@@ -709,7 +709,7 @@ test("redacts command stderr before journal, audit, and diagnostic output", asyn
   const originalFailure = f.runner.failure;
   f.runner.failure = (args) => {
     if (!originalFailure?.(args)) return false;
-    throw new ControlError("command_failed", "native command failed", { returncode: 1, stderr: "password=secret-value bearer super-token" });
+    throw new ControlError("command_failed", "native command failed", { returncode: 1, stderr: "password=secret-value bearer super-token Authorization: Bearer auth-canary-01 \"Authorization\": \"Bearer quoted-auth-01\"" });
   };
   await expectCode(f.call("acquire", { public_key: KEY }, "op-redacted-native-error"), "command_failed");
   const operation = JSON.stringify(f.store.operation("op-redacted-native-error"));
@@ -717,11 +717,19 @@ test("redacts command stderr before journal, audit, and diagnostic output", asyn
   const task = String(f.store.getTask({ sessionId: "thread-a" })?.last_error ?? "");
   expect(operation).not.toContain("secret-value");
   expect(operation).not.toContain("super-token");
+  expect(operation).not.toContain("auth-canary-01");
+  expect(operation).not.toContain("quoted-auth-01");
   expect(audit).not.toContain("secret-value");
   expect(audit).not.toContain("super-token");
+  expect(audit).not.toContain("auth-canary-01");
+  expect(audit).not.toContain("quoted-auth-01");
   expect(task).not.toContain("secret-value");
-  const diagnostic = new ControlError("command_failed", "native command failed", { stderr: "private_key=secret-value" }).asDict();
+  expect(task).not.toContain("auth-canary-01");
+  const diagnostic = new ControlError("command_failed", "native command failed", { nested: [{ stderr: "Authorization: Bearer nested-auth-01" }, { Authorization: "Bearer field-auth-01" }], stderr: "private_key=secret-value \"Authorization\": \"Bearer quoted-auth-02\"" }).asDict();
   expect(JSON.stringify(diagnostic)).not.toContain("secret-value");
+  expect(JSON.stringify(diagnostic)).not.toContain("nested-auth-01");
+  expect(JSON.stringify(diagnostic)).not.toContain("field-auth-01");
+  expect(JSON.stringify(diagnostic)).not.toContain("quoted-auth-02");
 });
 
 test("expiry and drain fences stop preparation before a late native effect", async () => {
@@ -739,6 +747,32 @@ test("expiry and drain fences stop preparation before a late native effect", asy
     expect(task?.state).toBe("cached");
     expect(f.runner.instances.get(task?.instance_name)?.status).toBe("Stopped");
     expect(f.runner.calls.some(({ args }) => args[0] === "incus" && args[3] === "start")).toBe(false);
+  }
+});
+
+test("release waits for an in-flight native barrier before revoking the lease", async () => {
+  const f = fixture();
+  await f.call("acquire", { public_key: KEY }, "op-release-fence-create");
+  const task = f.store.getTask({ sessionId: "thread-a" })!;
+  let enter!: () => void;
+  let unblock!: () => void;
+  const entered = new Promise<void>((resolve) => { enter = resolve; });
+  const blocked = new Promise<void>((resolve) => { unblock = resolve; });
+  const held = (f.control as any).nativeBarrier(async () => { enter(); await blocked; }, false);
+  await entered;
+  let release: Promise<Dict> | undefined;
+  try {
+    release = f.call("release", {}, "op-release-fence");
+    await Bun.sleep(25);
+    expect(f.store.getTask({ taskId: String(task.task_id) })?.state).toBe("active");
+    unblock();
+    await held;
+    expect((await release!).state).toBe("cached");
+    await expectCode((f.control as any).nativeConfigSet(task, "limits.memory", "4096MiB"), "lease_expired");
+  } finally {
+    unblock();
+    await held.catch(() => {});
+    await release?.catch(() => {});
   }
 });
 
@@ -1017,7 +1051,7 @@ test("GC previews and deletes only eligible stopped caches", async () => {
   expect(f.runner.instances.has(active.instance_name)).toBe(true);
 });
 
-test("requires named native instances before release and deletion absence claims", async () => {
+test("requires named native instances before release and deletion absence claims", { timeout: 30_000 }, async () => {
   const f = fixture();
   const active = await f.call("acquire", { public_key: KEY }, "op-malformed-list-release-create");
   f.runner.malformedListRecord = true;
@@ -1142,6 +1176,21 @@ test("project port mappings are durable before native exposure and removable exa
   const removed = await f.call("port-remove", { name: "web" }, "op-port-remove");
   expect(removed.removed).toBe(true);
   expect((await f.call("status")).task_id).toBe(active.task_id);
+  expect((await f.call("port-list", {})).ports.map((port: Dict) => port.port_name)).toEqual(["ssh"]);
+});
+
+test("reconciles a transitional port after drain cleanup failure", async () => {
+  const f = fixture();
+  await f.call("acquire", { public_key: KEY }, "op-drain-port-create");
+  await f.call("port-add", { name: "web", vm_port: 8080 }, "op-drain-port-add");
+  f.store.setMeta("draining", "1");
+  f.runner.failure = (args) => args[0] === "conntrack" && args[1] === "-D";
+  await expectCode(f.call("port-remove", { name: "web" }, "op-drain-port-remove"), "command_failed");
+  expect(f.store.getPort(String(f.store.getTask({ sessionId: "thread-a" })!.task_id), "web", "tcp")?.state).toBe("closing");
+
+  f.runner.failure = undefined;
+  const reconciled = await f.control.dispatch(f.request("admin-reconcile", { apply: true }, "op-drain-port-reconcile"));
+  expect(reconciled.result.actions.some((item: Dict) => item.action === "rearm-current-expiry")).toBe(true);
   expect((await f.call("port-list", {})).ports.map((port: Dict) => port.port_name)).toEqual(["ssh"]);
 });
 

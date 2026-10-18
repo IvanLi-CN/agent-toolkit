@@ -306,6 +306,67 @@ linuxTest("serializes object locks across real control processes", async () => {
   expect(freeResult.stdout.trim()).toBe("probe-acquired");
 });
 
+linuxTest("prevents a queued cross-process drain writer from being bypassed by readers", async () => {
+  const probeRoot = root("agent-vm-native-barrier-fairness");
+  const dbPath = join(probeRoot, "state.sqlite3");
+  const initial = new StateStore(dbPath);
+  initial.close();
+  const worker = `
+    const { existsSync } = await import("node:fs");
+    const { Control, StateStore } = await import(process.env.CONTROL_PATH);
+    const root = process.env.PROBE_ROOT;
+    const store = new StateStore(root + "/state.sqlite3");
+    const control = new Control({ state_db: root + "/state.sqlite3", timer_dir: root }, { store });
+    const barrier = (callback, exclusive) => control.nativeBarrier(callback, exclusive);
+    try {
+      if (process.env.PROBE_MODE === "hold") {
+        await barrier(async () => {
+          await Bun.write(root + "/reader-held", "1");
+          while (!existsSync(root + "/release")) await Bun.sleep(10);
+        }, false);
+      } else if (process.env.PROBE_MODE === "writer") {
+        await Bun.write(root + "/writer-waiting", "1");
+        await barrier(async () => {
+          await Bun.write(root + "/writer-entered", "1");
+          await Bun.sleep(150);
+        }, true);
+        await Bun.write(root + "/writer-done", "1");
+      } else {
+        await barrier(async () => {
+          await Bun.write(root + "/reader-entered", "1");
+          await Bun.sleep(100);
+        }, false);
+      }
+    } finally { store.close(); }
+  `;
+  const processes: any[] = [];
+  let collected = false;
+  try {
+    const env = (mode: string): Dict => ({ PROBE_ROOT: probeRoot, PROBE_MODE: mode });
+    const holder = spawnWorker(worker, env("hold"));
+    processes.push(holder);
+    expect(await waitFor(join(probeRoot, "reader-held"))).toBe(true);
+    const writer = spawnWorker(worker, env("writer"));
+    processes.push(writer);
+    expect(await waitFor(join(probeRoot, "writer-waiting"))).toBe(true);
+    await Bun.sleep(150);
+    const reader = spawnWorker(worker, env("reader"));
+    processes.push(reader);
+    await Bun.sleep(250);
+    expect(existsSync(join(probeRoot, "reader-entered"))).toBe(false);
+    expect(existsSync(join(probeRoot, "writer-entered"))).toBe(false);
+    await Bun.write(join(probeRoot, "release"), "1");
+    const results = await Promise.all(processes.map(collect));
+    collected = true;
+    expect(results.every((result) => result.exit === 0)).toBe(true);
+    expect(existsSync(join(probeRoot, "writer-done"))).toBe(true);
+    expect(existsSync(join(probeRoot, "reader-entered"))).toBe(true);
+  } finally {
+    await Bun.write(join(probeRoot, "release"), "1");
+    if (!collected) await Promise.all(processes.map((child) => collect(child).catch(() => undefined)));
+  }
+});
+
 linuxTest("serializes concurrent SQLite admission and preserves the single reservation", async () => {
   const probeRoot = root("agent-vm-admission");
   const dbPath = join(probeRoot, "state.sqlite3");

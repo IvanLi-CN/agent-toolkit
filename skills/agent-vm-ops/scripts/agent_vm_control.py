@@ -1557,6 +1557,8 @@ class Control:
     def _operation_outcome_uncertain(action: str, error: ControlError) -> bool:
         """Keep a journal pending only when a native effect may have occurred."""
         detail = error.detail if isinstance(error.detail, Mapping) else {}
+        if error.code == "sqlite_unavailable" and detail.get("state_committed") is not False:
+            return True
         if error.code in {"acquire_partial", "resize_partial", "restart_partial", "cleanup_incomplete", "operation_unverified"}:
             return True
         phases = {str(detail.get(key)) for key in ("phase", "operation_phase") if detail.get(key) is not None}
@@ -2016,7 +2018,7 @@ class Control:
                     elif saved.get("outcome") == "pending" and not self._operation_outcome_uncertain(action, exc):
                         self.store.record_operation(operation_id, action, session_id, request.get("generation"),
                                                     {"outcome": "error", "error": exc.as_dict(), "_request_digest": digest})
-                if session_id is not None:
+                if session_id is not None or action in self.WRITE_ACTIONS:
                     self.store.audit(
                         action,
                         "error",
@@ -2047,7 +2049,7 @@ class Control:
                     request.get("generation"),
                     {**response, "_request_digest": digest},
                 )
-            if session_id is not None:
+            if session_id is not None or action in self.WRITE_ACTIONS:
                 self.store.audit(
                     action,
                     "ok",
@@ -2169,6 +2171,8 @@ class Control:
         with self._native_lock(task):
             current = self._native_operation_current(task)
             self._ownership(current)
+            self._network_guard()
+            self._verify_network_device(current)
             self.incus.start(current["instance_name"])
 
     def _stop_instance(self, task: Mapping[str, Any]) -> None:
@@ -3742,6 +3746,8 @@ class Control:
                     raise ControlError("draining", "restart work is refused while draining")
                 self._ownership(task)
                 self._verify_native_allocation(task)
+                self._network_guard()
+                self._verify_network_device(task)
                 self._require_window(task)
                 native_admitted = True
             native_touched = True

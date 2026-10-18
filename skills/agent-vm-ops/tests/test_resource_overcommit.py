@@ -272,13 +272,23 @@ class AdmissionTests(Fixture):
                 doctor = self.call("doctor")
                 self.assertFalse(doctor["resources"]["verified"])
                 self.assertEqual(doctor["resources"]["error"]["code"], "resource_unverified")
+                before = len(self.runner.calls)
+                names = set(self.runner.instances)
                 self.error("resource_unverified", self.acquire, "new")
+                self.assertEqual(set(self.runner.instances), names)
+                self.assertFalse(any(args[3:4] in (["init"], ["start"], ["config"], ["device"])
+                                     for args, _, _ in self.runner.calls[before:]))
                 instance["config"][field] = {"limits.cpu": "2", "limits.memory": "4096MiB"}[field]
         instance["expanded_devices"]["root"]["size"] = "40GiB"
         doctor = self.call("doctor")
         self.assertFalse(doctor["resources"]["verified"])
         self.assertEqual(doctor["resources"]["error"]["code"], "resource_unverified")
+        before = len(self.runner.calls)
+        names = set(self.runner.instances)
         self.error("resource_unverified", self.acquire, "new")
+        self.assertEqual(set(self.runner.instances), names)
+        self.assertFalse(any(args[3:4] in (["init"], ["start"], ["config"], ["device"])
+                             for args, _, _ in self.runner.calls[before:]))
 
     def test_cached_resume_rejects_network_isolation_drift(self):
         cached = self.acquire("cache")
@@ -293,7 +303,18 @@ class AdmissionTests(Fixture):
         instance = self.runner.instances[active["instance_name"]]
         instance["status"] = "Stopped"
         instance["config"]["limits.memory"] = "8192MiB"
+        before = len(self.runner.calls)
         self.error("resource_unverified", self.call, "restart")
+        self.assertFalse(any(args[3:4] in (["stop"], ["start"]) for args, _, _ in self.runner.calls[before:]))
+
+    def test_restart_rejects_network_isolation_drift_before_native_effect(self):
+        active = self.acquire()
+        instance = self.runner.instances[active["instance_name"]]
+        instance["status"] = "Stopped"
+        instance["expanded_devices"]["eth0"]["security.acls"] = "unmanaged-acl"
+        before = len(self.runner.calls)
+        self.error("ownership_mismatch", self.call, "restart")
+        self.assertFalse(any(args[3:4] in (["stop"], ["start"]) for args, _, _ in self.runner.calls[before:]))
 
     def test_corrupt_disk_allocation_fails_closed_for_new_admission(self):
         active = self.acquire()
@@ -408,6 +429,38 @@ class AdmissionTests(Fixture):
         with mock.patch.object(self.control, "_dispatch_action", side_effect=failure):
             self.error("command_failed", self.control.dispatch, request)
         self.assertEqual(self.store.operation(request["operation_id"])["outcome"], "pending")
+
+    def test_unknown_state_commit_preserves_pending_operation(self):
+        request = {
+            "protocol": CONTROL.PROTOCOL_VERSION,
+            "action": "drain-enter",
+            "operation_id": "unknown-drain-commit",
+            "generation": 0,
+        }
+        failure = CONTROL.ControlError(
+            "sqlite_unavailable", "state commit outcome is unknown",
+            {"phase": "commit", "state_committed": None},
+        )
+        with mock.patch.object(self.store, "set_meta", side_effect=failure):
+            self.error("sqlite_unavailable", self.control.dispatch, request)
+        self.assertEqual(self.store.operation(request["operation_id"])["outcome"], "pending")
+
+    def test_sessionless_admin_write_is_visible_in_metrics_operations(self):
+        request = {
+            "protocol": CONTROL.PROTOCOL_VERSION,
+            "action": "drain-enter",
+            "operation_id": "admin-audit-visible",
+            "generation": 0,
+        }
+        self.control.dispatch(request)
+        metrics = self.call("admin-metrics")
+        self.assertTrue(any(key.startswith("drain-enter|ok|") for key in metrics["operations"]))
+        self.control.dispatch({
+            "protocol": CONTROL.PROTOCOL_VERSION,
+            "action": "drain-exit",
+            "operation_id": "admin-audit-visible-exit",
+            "generation": 0,
+        })
 
     def test_pre_native_action_failure_is_terminal_and_replayable(self):
         request = self.request("acquire", operation="pre-native-failure", public_key=KEY)

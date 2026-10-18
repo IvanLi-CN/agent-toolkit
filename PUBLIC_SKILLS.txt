@@ -3,7 +3,6 @@
 # Every entry below is expected to work from a standalone agent-toolkit
 # checkout. Codex-specific workflow and runtime integration Skills are kept in
 # the consumer configuration repository instead of this public source.
-agent-requirements
 agent-vm
 agent-vm-ops
 buzzer-audio-preview

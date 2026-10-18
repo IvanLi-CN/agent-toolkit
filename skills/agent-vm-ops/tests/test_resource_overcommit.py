@@ -13,6 +13,19 @@ from unittest import mock
 from test_native_agent_vm import CONTROL, CLI, Fixture, GIB, KEY
 
 
+class SQLiteStateTests(unittest.TestCase):
+    def test_corrupt_database_initialization_is_structured(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            path.write_bytes(b"not a sqlite database")
+            with self.assertRaises(CONTROL.ControlError) as failure:
+                CONTROL.StateStore(path)
+        self.assertEqual(failure.exception.code, "sqlite_unavailable")
+        self.assertEqual(failure.exception.detail["phase"], "wal-init")
+        self.assertIn("sqlite_name", failure.exception.detail)
+        self.assertIs(failure.exception.detail["state_committed"], False)
+
+
 class CTObservationTests(unittest.TestCase):
     mount = "12 1 0:9 /meminfo /proc/meminfo rw - fuse.lxcfs lxcfs rw\n"
 
@@ -589,6 +602,14 @@ class AdmissionTests(Fixture):
 
 
 class CreationTests(Fixture):
+    def test_memory_pressure_does_not_block_cached_resume_with_logical_headroom(self):
+        first = self.acquire("cache")
+        self.call("release", "cache")
+        self.resources.memory.return_value["available_bytes"] = 0
+        resumed = self.acquire("cache")
+        self.assertEqual(resumed["task_id"], first["task_id"])
+        self.assertEqual(resumed["state"], "active")
+
     def test_custom_creation_active_reuse_and_mismatch_without_side_effects(self):
         first = self.call("acquire", public_key=KEY, cpu=8, memory_mib=12288, disk_gib=40)
         self.assertEqual(first["resources"], {"cpu": 8, "memory_mib": 12288, "disk_gib": 40})

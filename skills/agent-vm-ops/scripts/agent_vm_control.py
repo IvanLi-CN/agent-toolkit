@@ -743,14 +743,40 @@ class StateStore:
         if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.geteuid() or parent.st_mode & 0o077:
             raise ControlError("state_path_unsafe", "state parent must be a private owned directory")
         if self.path.is_symlink(): raise ControlError("state_path_unsafe", "state database cannot be a symlink")
-        self.connection = sqlite3.connect(str(path), timeout=10, check_same_thread=False)
-        self.path.chmod(0o600)
+        self.connection: sqlite3.Connection | None = None
         self.depth = 0
-        self.connection.row_factory = sqlite3.Row
-        self.connection.execute("PRAGMA journal_mode=WAL")
-        self.connection.execute("PRAGMA synchronous=FULL")
-        self.connection.execute("PRAGMA foreign_keys=ON")
-        self._schema()
+        phase = "connect"
+        try:
+            self.connection = sqlite3.connect(str(path), timeout=10, check_same_thread=False)
+            self.path.chmod(0o600)
+            self.connection.row_factory = sqlite3.Row
+            phase = "wal-init"
+            self.connection.execute("PRAGMA journal_mode=WAL")
+            self.connection.execute("PRAGMA synchronous=FULL")
+            self.connection.execute("PRAGMA foreign_keys=ON")
+            phase = "schema-init"
+            self._schema()
+        except sqlite3.Error as exc:
+            if self.connection is not None:
+                self.connection.close()
+            raise self._sqlite_failure(exc, phase=phase, sql_operation="initialize", state_committed=False) from exc
+
+    @staticmethod
+    def _sqlite_failure(
+        error: sqlite3.Error,
+        *,
+        phase: str,
+        sql_operation: str,
+        state_committed: bool | None,
+    ) -> ControlError:
+        detail = {
+            "phase": phase,
+            "sqlite_code": getattr(error, "sqlite_errorcode", None),
+            "sqlite_name": getattr(error, "sqlite_errorname", type(error).__name__),
+            "sql_operation": sql_operation,
+            "state_committed": state_committed,
+        }
+        return ControlError("sqlite_unavailable", "state database cannot be verified", detail)
 
     def _schema(self) -> None:
         with self.connection:
@@ -824,25 +850,46 @@ class StateStore:
         """Nestable short transactions; never wrap native operations/waits."""
         with self._lock:
             outer = self.depth == 0
-            if outer: self.connection.execute("BEGIN IMMEDIATE")
+            if outer:
+                try:
+                    self.connection.execute("BEGIN IMMEDIATE")
+                except sqlite3.Error as exc:
+                    raise self._sqlite_failure(exc, phase="begin", sql_operation="write", state_committed=False) from exc
             self.depth += 1
             try:
                 yield
+            except sqlite3.Error as exc:
+                if outer:
+                    try:
+                        self.connection.rollback()
+                    except sqlite3.Error:
+                        pass
+                raise self._sqlite_failure(exc, phase="write", sql_operation="write", state_committed=False) from exc
             except BaseException:
                 if outer: self.connection.rollback()
                 raise
             else:
-                if outer: self.connection.commit()
+                if outer:
+                    try:
+                        self.connection.commit()
+                    except sqlite3.Error as exc:
+                        raise self._sqlite_failure(exc, phase="commit", sql_operation="write", state_committed=None) from exc
             finally:
                 self.depth -= 1
 
     def _row(self, query: str, args: Sequence[Any] = ()) -> sqlite3.Row | None:
         with self._lock:
-            return self.connection.execute(query, args).fetchone()
+            try:
+                return self.connection.execute(query, args).fetchone()
+            except sqlite3.Error as exc:
+                raise self._sqlite_failure(exc, phase="read", sql_operation="read", state_committed=None) from exc
 
     def _rows(self, query: str, args: Sequence[Any] = ()) -> list[sqlite3.Row]:
         with self._lock:
-            return list(self.connection.execute(query, args).fetchall())
+            try:
+                return list(self.connection.execute(query, args).fetchall())
+            except sqlite3.Error as exc:
+                raise self._sqlite_failure(exc, phase="read", sql_operation="read", state_committed=None) from exc
 
     def get_task(self, *, session_id: str | None = None, task_id: str | None = None) -> dict[str, Any] | None:
         if (session_id is None) == (task_id is None):
@@ -2443,7 +2490,7 @@ class Control:
 
     def _reserve_resources(self, task: Mapping[str, Any], resources: Mapping[str, int],
                            *, memory_reduction: bool = False,
-                           admission_token: str | None = None) -> dict[str, Any]:
+                           admission_epoch: str | None = None) -> dict[str, Any]:
         # Only a verified, memory-only reduction may bypass new-demand gates.
         # Its old allocation stays reserved until native completion is verified.
         if memory_reduction:
@@ -2461,8 +2508,8 @@ class Control:
         with self._admission_lock(), self._global_lock(), self.store.transaction():
             if self.store.get_meta("draining") == "1":
                 raise ControlError("draining", "new leases and capacity changes are refused while draining")
-            current_token = self.store.get_meta("admission_token") or "initial"
-            if admission_token is not None and current_token != admission_token:
+            current_epoch = self.store.get_meta("admission_epoch") or "initial"
+            if admission_epoch is not None and current_epoch != admission_epoch:
                 raise ControlError("draining", "admission state changed while the request was preparing")
             current = self.store.get_task(task_id=task["task_id"])
             if task["state"] == "active":
@@ -3399,7 +3446,7 @@ class Control:
         with self._admission_lock():
             if self.store.get_meta("draining") == "1":
                 raise ControlError("draining", "new leases are refused")
-            admission_token = self.store.get_meta("admission_token") or "initial"
+            admission_epoch = self.store.get_meta("admission_epoch") or "initial"
         self._network_guard()
         public_key = require_nonempty_string(request.get("public_key"), "public_key")
         if not re.fullmatch(r"ssh-ed25519 [A-Za-z0-9+/=]+(?: [^\r\n]*)?", public_key):
@@ -3427,7 +3474,7 @@ class Control:
         # The deadline/timer exists before either starting the guest or exposing NAT.
         task["lease_expires_at"] = iso_time(self.now() + dt.timedelta(seconds=self.config["initial_lease_seconds"]))
         reserved = {key: max(old[key], resources[key]) for key in old} if cached else resources
-        task = self._reserve_resources(task, reserved, admission_token=admission_token)
+        task = self._reserve_resources(task, reserved, admission_epoch=admission_epoch)
         completed = []
         phase = "reservation"
         stage_timings: dict[str, Any] = {}
@@ -4149,7 +4196,7 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
                                        {"task_id": task.get("task_id"), "state": state})
                 with self._global_lock():
                     if self.store.get_meta("draining") == "1":
-                        self.store.set_meta("admission_token", uuid.uuid4().hex)
+                        self.store.set_meta("admission_epoch", uuid.uuid4().hex)
                         self.store.set_meta("draining", "0")
         return {"draining": False}
 

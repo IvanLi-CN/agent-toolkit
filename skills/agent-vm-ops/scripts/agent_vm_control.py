@@ -1747,13 +1747,17 @@ class Control:
             self._running_inventory_guard()
             with self._global_lock(), self.store.transaction():
                 breakdown = self._allocation_breakdown()
+                disk = self._disk_admission_diagnostics(self._storage_headroom(0))
+            if not disk.get("verified"):
+                raise ControlError("resource_unverified", "disk admission state is not verified", disk.get("error"))
             allocated = {key: value["allocated"] for key, value in breakdown.items()}
             reserved = {key: value["reserved"] for key, value in breakdown.items()}
             allocated_and_reserved = {key: value["allocated_and_reserved"] for key, value in breakdown.items()}
             return {"verified": True, **policy, "allocated": allocated, "reserved": reserved,
                     "allocated_and_reserved": allocated_and_reserved,
                     "remaining": {key: policy["limits"][key] - allocated_and_reserved[key] for key in allocated_and_reserved},
-                    "memory_pressure": policy["memory"]["available_bytes"] < policy["memory"]["threshold_bytes"]}
+                    "memory_pressure": policy["memory"]["available_bytes"] < policy["memory"]["threshold_bytes"],
+                    "disk_admission": disk}
         except ControlError as exc:
             return {"verified": False, "error": exc.as_dict()}
 
@@ -1781,14 +1785,19 @@ class Control:
             total = sum(int(layer["total"]) for layer in layers)
             free_after_low = min(int(layer["free"]) - int(layer["low"]) for layer in layers)
             limit = sum(int(layer["total"]) - int(layer["low"]) for layer in layers)
-            if total <= 0 or free_after_low < 0 or limit <= 0 or durable_reserved < 0:
+            if total <= 0 or limit <= 0 or durable_reserved < 0:
                 raise ValueError()
-            return {"verified": True, "allocated_bytes": allocated, "reserved_bytes": reserved,
-                    "allocated_and_reserved_bytes": allocated_and_reserved,
-                    "remaining_bytes": max(0, free_after_low - durable_reserved),
-                    "limit_bytes": limit, "capacity_bytes": total,
-                    "free_bytes": sum(int(layer["free"]) for layer in layers),
-                    "durable_reserved_bytes": durable_reserved}
+            used = total - sum(int(layer["free"]) for layer in layers)
+            physical_limit = limit
+            physical_remaining = max(0, free_after_low - durable_reserved)
+            return {"verified": True,
+                    "guest_allocation": {"allocated_bytes": allocated, "reserved_bytes": reserved,
+                                         "allocated_and_reserved_bytes": allocated_and_reserved},
+                    "physical_admission": {"allocated_bytes": used, "reserved_bytes": durable_reserved,
+                                           "allocated_and_reserved_bytes": used + durable_reserved,
+                                           "remaining_bytes": physical_remaining, "limit_bytes": physical_limit,
+                                           "capacity_bytes": total, "free_bytes": sum(int(layer["free"]) for layer in layers),
+                                           "durable_reserved_bytes": durable_reserved}}
         except (KeyError, TypeError, ValueError):
             return {"verified": False, "error": {"code": "capacity_unverified", "message": "invalid disk admission capacity"}}
 
@@ -1796,7 +1805,7 @@ class Control:
     def _instance_count_limits(config: Mapping[str, Any]) -> dict[str, Any]:
         # Container-only restrictions do not limit this VM backend.
         return {key: config[key] for key in ("limits.instances", "limits.virtual-machines")
-                if config.get(key) not in (None, "")}
+                if config.get(key) not in (None, "", -1, "-1")}
 
     def _instance_diagnostics(self) -> dict[str, Any]:
         try:
@@ -1807,11 +1816,27 @@ class Control:
             instances = self.incus.list_instances()
             running = sum(str(item.get("status", "")).lower() == "running" for item in instances)
             stopped = sum(str(item.get("status", "")).lower() == "stopped" for item in instances)
+            preparing = sum(task["state"] == "preparing" for task in self.store.list_tasks())
             cached_names = {task["instance_name"] for task in self.store.list_tasks() if task["state"] == "cached"}
             cached = sum(item.get("name") in cached_names and str(item.get("status", "")).lower() == "stopped" for item in instances)
+            slot_limit = None
+            for value in limits.values():
+                try:
+                    candidate = int(value)
+                except (TypeError, ValueError) as exc:
+                    raise ControlError("resource_unverified", "instance slot limit is not numeric") from exc
+                if candidate >= 0:
+                    if slot_limit is not None and slot_limit != candidate:
+                        raise ControlError("resource_unverified", "instance slot limits disagree")
+                    slot_limit = candidate
+            allocated_and_reserved = len(instances) + preparing
             return {"verified": True, "total": len(instances), "running": running,
                     "stopped": stopped, "cached": cached, "other": len(instances) - running - stopped, "limits": limits,
-                    "policy_compliant": not limits}
+                    "policy_compliant": not limits,
+                    "admission": {"allocated": len(instances), "reserved": preparing,
+                                   "allocated_and_reserved": allocated_and_reserved,
+                                   "remaining": None if slot_limit is None else max(0, slot_limit - allocated_and_reserved),
+                                   "limit": slot_limit, "capacity": None}}
         except ControlError as exc:
             return {"verified": False, "error": exc.as_dict()}
 
@@ -1861,6 +1886,9 @@ class Control:
         else:
             policy = self._resource_policy()
             self._running_inventory_guard()
+            disk = self._disk_admission_diagnostics(self._storage_headroom(0))
+            if not disk.get("verified"):
+                raise ControlError("resource_unverified", "disk admission state is not verified", disk.get("error"))
         with self._global_lock(), self.store.transaction():
             if self.store.get_meta("draining") == "1":
                 raise ControlError("draining", "new leases and capacity changes are refused while draining")
@@ -2754,6 +2782,8 @@ class Control:
             if parse_time(task["lease_expires_at"]) <= self.now(): raise ControlError("lease_expired", "lease expired while exposing SSH")
             with self._global_lock(), self.store.transaction():
                 current = self.store.get_task(task_id=task["task_id"])
+                if self.store.get_meta("draining") == "1":
+                    raise ControlError("draining", "new lease entered drain before commit")
                 if current["state"] != "preparing" or parse_time(current["lease_expires_at"]) <= self.now():
                     raise ControlError("lease_expired", "preparation was revoked before commit")
                 self.store.update_port(task["task_id"], "ssh", "tcp", state="active")

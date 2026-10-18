@@ -186,8 +186,27 @@ class AdmissionTests(Fixture):
         self.assertEqual(result["resources"]["remaining"]["memory_mib"], 61440)
         self.assertIn("layers", result["capacity"])
         self.assertTrue(result["disk_admission"]["verified"])
+        self.assertIn("physical_admission", result["disk_admission"])
+        self.assertIn("admission", result["instances"])
         self.assertEqual(result["task_states"]["active"], 1)
         self.assertEqual(self.store.list_tasks(), before)
+
+    def test_corrupt_disk_allocation_fails_closed_for_new_admission(self):
+        active = self.acquire()
+        self.store.update_task(active["task_id"], resources_json=json.dumps({"cpu": 2, "memory_mib": 4096, "disk_gib": "invalid"}))
+        doctor = self.call("doctor")
+        self.assertFalse(doctor["resources"]["verified"])
+        self.error("resource_unverified", self.acquire, "new")
+
+    def test_acquire_rechecks_drain_before_active_commit(self):
+        def enter_drain(*_):
+            self.store.set_meta("draining", "1")
+
+        with mock.patch.object(self.control, "_install_public_key", side_effect=enter_drain):
+            self.error("draining", self.acquire)
+        task = self.store.get_task(session_id="thread-a")
+        self.assertNotEqual(task["state"], "active")
+        self.store.set_meta("draining", "0")
 
     def test_audit_summary_extracts_nested_image_failures_and_warnings(self):
         self.store.audit("acquire", "error", detail={

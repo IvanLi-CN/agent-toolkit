@@ -45,6 +45,8 @@ The deployment-facing collector must expose the following stable metric families
 
 The one-shot controller remains the source of truth for native state and must not be replaced with a resident HTTP broker solely to serve these metrics. The deployment must provide an authorized, read-only scrape bridge or textfile collector that preserves the controller's failure and freshness semantics. `agent_vm_admission_limit{resource="memory"}` is the logical reservation ceiling (for the deployment, 65536 MiB), while `agent_vm_admission_capacity{resource="memory"}` is the CT-visible capacity (32768 MiB). `agent_vm_memory_pressure` is a runtime observation and must not be used to reduce `agent_vm_admission_remaining`. Until that bridge exists, a Grafana query for these families is not a working panel.
 
+The `admin-metrics` response keeps disk domains separate: `disk_admission.guest_allocation` reports sparse guest virtual-disk sizes, while `disk_admission.physical_admission` reports CT filesystem used/reserved/headroom against its low watermark. Consumers must map native disk admission metrics from the physical domain and must not compare sparse guest allocation totals with physical capacity. VM-slot admission is under `instances.admission`; its limit and remaining values are null when Incus exposes no authoritative slot limit, including `-1`.
+
 ## Dashboard contract
 
 The provisioned dashboard enables automatic refresh by default with `refresh: "auto"`, while retaining explicit user-selectable intervals. Grafana may choose an interval based on the current time range; the rendered control must show `Auto selected` after a reload.

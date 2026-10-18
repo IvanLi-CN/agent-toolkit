@@ -13,7 +13,6 @@ python3 bin/public_skill_boundary_check.py
 
 | Skill | Description | Path |
 |---|---|---|
-| `agent-requirements` | Draft a self-contained requirements brief for another agent. | `skills/agent-requirements/` |
 | `agent-vm` | Use a session-owned Incus Linux VM for isolated execution, Docker/Compose, heavy validation, and source transfer. | `skills/agent-vm/` |
 | `agent-vm-ops` | Maintain a configured native Incus Agent VM installation under an explicit infrastructure task. | `skills/agent-vm-ops/` |
 | `buzzer-audio-preview` | Render editable buzzer scores as MIDI and WAV previews. | `skills/buzzer-audio-preview/` |

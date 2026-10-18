@@ -218,12 +218,15 @@ class AdmissionTests(Fixture):
 
     def test_corrupt_disk_reservation_keeps_doctor_structured(self):
         active = self.acquire()
-        self.store.update_task(active["task_id"], reservation_bytes="invalid")
-        doctor = self.call("doctor")
-        self.assertFalse(doctor["resources"]["verified"])
-        self.assertEqual(doctor["resources"]["error"]["code"], "resource_unverified")
-        metrics = self.call("admin-metrics")
-        self.assertFalse(metrics["disk_admission"]["verified"])
+        for value in ("invalid", 1.5):
+            with self.subTest(value=value):
+                self.store.update_task(active["task_id"], reservation_bytes=value)
+                doctor = self.call("doctor")
+                self.assertFalse(doctor["resources"]["verified"])
+                self.assertEqual(doctor["resources"]["error"]["code"], "resource_unverified")
+                metrics = self.call("admin-metrics")
+                self.assertFalse(metrics["disk_admission"]["verified"])
+        self.store.update_task(active["task_id"], reservation_bytes=0)
 
     def test_non_object_resource_reservation_keeps_diagnostics_structured(self):
         active = self.acquire()
@@ -402,6 +405,29 @@ class AdmissionTests(Fixture):
         second = self.acquire()
         self.assertGreater(second["generation"], first["generation"])
         self.error("operation_unverified", self.control.dispatch, request)
+
+    def test_port_replay_is_fenced_after_lease_expiry(self):
+        self.acquire()
+        request = self.request("port-add", operation="port-expired-replay", name="app", vm_port=8080)
+        self.control.dispatch(request)
+        task = self.store.get_task(session_id="thread-a")
+        self.now = CONTROL.parse_time(task["lease_expires_at"])
+        self.error("operation_unverified", self.control.dispatch, request)
+
+    def test_recursive_inventory_scalar_corruption_is_structured(self):
+        def query(path, **_):
+            if path == "/1.0/projects?recursion=1":
+                return [{"name": "agents"}]
+            if path == "/1.0/instances?recursion=1":
+                return [{"name": "foreign", "expanded_devices": {}}]
+            if path.endswith("/leases"):
+                return [{"address": "198.51.100.77", "hwaddr": 7}]
+            raise AssertionError(path)
+
+        with mock.patch.object(self.control.incus, "query", side_effect=query):
+            with self.assertRaises(CONTROL.ControlError) as failure:
+                self.control._native_ips("agent-vm-new")
+        self.assertEqual(failure.exception.code, "vm_ip_unverified")
 
     def test_drain_exit_keeps_admission_closed_for_unreconciled_tasks(self):
         active = self.acquire()

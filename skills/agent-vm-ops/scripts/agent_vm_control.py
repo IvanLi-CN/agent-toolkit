@@ -1210,7 +1210,7 @@ class SystemdManager:
         if not self.enabled:
             return True
         path = self.timer_dir / unit
-        if not path.is_file():
+        if path.is_symlink() or not path.is_file():
             return False
         try:
             expected_calendar = "OnCalendar=" + parse_time(expires_at).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -1236,6 +1236,33 @@ class SystemdManager:
             and lines.count(f"Unit={service_unit}") == 1
             and lines.count(expected_calendar) == 1
             and lines.count("Persistent=yes") == 1
+        )
+
+    def service_asset_active(self, unit: str, required_lines: Sequence[str]) -> bool:
+        if not self.enabled:
+            return True
+        path = self.timer_dir / unit
+        if path.is_symlink() or not path.is_file():
+            return False
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+            result = self.runner.run(
+                ["systemctl", "show", unit, "-p", "LoadState", "-p", "FragmentPath"],
+                timeout=10,
+                check=False,
+            )
+        except (ControlError, OSError, TypeError, ValueError):
+            return False
+        values = dict(
+            line.split("=", 1)
+            for line in result.stdout.decode(errors="replace").splitlines()
+            if "=" in line
+        )
+        return (
+            result.returncode == 0
+            and values.get("LoadState") == "loaded"
+            and values.get("FragmentPath") == str(path)
+            and all(line in lines for line in required_lines)
         )
 
     def remove_expiry(self, task_id: str, generation: int) -> str:
@@ -1563,6 +1590,15 @@ class Control:
                 raise ControlError("operation_unverified", "task state is unavailable for journal replay",
                                    {"operation_id": operation_id})
             try:
+                if task.get("state") != "active" or not self._state_summary(task)["effective_lease"]:
+                    raise ControlError("operation_unverified", "port replay lease is no longer effective",
+                                       {"operation_id": operation_id})
+            except ControlError:
+                raise
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ControlError("operation_unverified", "port replay lease cannot be verified",
+                                   {"operation_id": operation_id}) from exc
+            try:
                 generation = int(task["generation"])
             except (KeyError, TypeError, ValueError) as exc:
                 raise ControlError("operation_unverified", "task generation cannot be verified for journal replay",
@@ -1604,10 +1640,12 @@ class Control:
             protocol = request.get("port_protocol", "tcp")
             try:
                 generation = int(task["generation"]) if task is not None else None
+                effective_lease = bool(task and task.get("state") == "active" and self._state_summary(task)["effective_lease"])
             except (KeyError, TypeError, ValueError) as exc:
                 raise ControlError("operation_unverified", "task generation cannot be verified for journal replay",
                                    {"operation_id": operation_id}) from exc
             if (task is None or generation != request.get("generation") or task.get("state") != "active"
+                    or not effective_lease
                     or result.get("task_id") != task.get("task_id")
                     or result.get("name") != name or result.get("protocol") != protocol
                     or result.get("removed") is not True
@@ -2078,10 +2116,21 @@ class Control:
         facts["request_cost"] = request_cost
         return facts
 
+    @staticmethod
+    def _durable_reservation_bytes(value: Any) -> int:
+        if value is None or (isinstance(value, int) and not isinstance(value, bool) and value == 0):
+            return 0
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("reservation_bytes must be a non-negative integer")
+        return value
+
     def _space_sufficient(self, facts: Mapping[str, Any], cost: int, threshold: str,
                           exclude_task_id: str | None = None) -> bool:
-        reserved = sum(int(task.get("reservation_bytes") or 0) for task in self.store.list_tasks()
-                       if task["task_id"] != exclude_task_id)
+        reserved = sum(
+            self._durable_reservation_bytes(task.get("reservation_bytes"))
+            for task in self.store.list_tasks()
+            if task["task_id"] != exclude_task_id
+        )
         for layer in facts["layers"]:
             demand = cost + reserved
             if layer["free"] - demand < layer[threshold]: return False
@@ -2248,7 +2297,7 @@ class Control:
                 allocated += sizes[0] * 1024**3
                 reserved += sizes[1] * 1024**3
                 allocated_and_reserved += max(sizes) * 1024**3
-                durable_reserved += int(task.get("reservation_bytes") or 0)
+                durable_reserved += self._durable_reservation_bytes(task.get("reservation_bytes"))
             total = sum(int(layer["total"]) for layer in layers)
             free_after_low = min(int(layer["free"]) - int(layer["low"]) for layer in layers)
             limit = sum(int(layer["total"]) - int(layer["low"]) for layer in layers)
@@ -2461,7 +2510,13 @@ class Control:
             instances = self._inventory_mappings(instances, "port_inventory_unverified", "instance")
             networks = self._inventory_mappings(networks, "port_inventory_unverified", "network")
             for instance in instances:
-                devices = instance.get("expanded_devices", {})
+                try:
+                    require_nonempty_string(instance.get("name"), "instance name")
+                except ControlError as exc:
+                    raise ControlError("port_inventory_unverified", "instance inventory contains an invalid name") from exc
+                if "expanded_devices" not in instance:
+                    raise ControlError("port_inventory_unverified", "instance devices are unavailable")
+                devices = instance.get("expanded_devices")
                 if not isinstance(devices, Mapping) or any(not isinstance(device, Mapping) for device in devices.values()):
                     raise ControlError("port_inventory_unverified", "instance devices are malformed")
                 for device in devices.values():
@@ -2475,12 +2530,14 @@ class Control:
                 forwards = self.incus.query("/1.0/networks/" + quote(network_name, safe="") + "/forwards?recursion=1", project=name)
                 forwards = self._inventory_mappings(forwards, "port_inventory_unverified", "forward")
                 for forward in forwards:
-                    config = forward.get("config", {})
+                    if "config" not in forward or "ports" not in forward:
+                        raise ControlError("port_inventory_unverified", "network forward fields are unavailable")
+                    config = forward.get("config")
                     if not isinstance(config, Mapping):
                         raise ControlError("port_inventory_unverified", "network forward config is malformed")
                     if config.get("target_address"):
                         ports.update(range(self.config["port_start"], self.config["port_end"] + 1))
-                    forward_ports = forward.get("ports", [])
+                    forward_ports = forward.get("ports")
                     if not isinstance(forward_ports, list) or any(not isinstance(item, Mapping) for item in forward_ports):
                         raise ControlError("port_inventory_unverified", "network forward ports are malformed")
                     for item in forward_ports:
@@ -2546,7 +2603,13 @@ class Control:
                 "instance",
             )
             for instance in instances:
-                devices = instance.get("expanded_devices", {})
+                try:
+                    require_nonempty_string(instance.get("name"), "instance name")
+                except ControlError as exc:
+                    raise ControlError("vm_ip_unverified", "instance inventory contains an invalid name") from exc
+                if "expanded_devices" not in instance:
+                    raise ControlError("vm_ip_unverified", "instance devices are unavailable")
+                devices = instance.get("expanded_devices")
                 if not isinstance(devices, Mapping) or any(not isinstance(device, Mapping) for device in devices.values()):
                     raise ControlError("vm_ip_unverified", "instance devices are malformed")
                 if name == self.config["project"] and instance.get("name") == own_name:
@@ -2556,15 +2619,33 @@ class Control:
                         raise ControlError("vm_ip_unverified", "instance config is malformed")
                     own_mac = nic.get("hwaddr") or instance_config.get("volatile.eth0.hwaddr")
                     own_ip = nic.get("ipv4.address")
+                    if own_mac is not None and not isinstance(own_mac, str):
+                        raise ControlError("vm_ip_unverified", "instance MAC address is malformed")
+                    if own_ip is not None and not isinstance(own_ip, str):
+                        raise ControlError("vm_ip_unverified", "instance IP address is malformed")
                     continue
                 for device in devices.values():
-                    if self.config["network"] in {device.get("network"), device.get("parent")} and device.get("ipv4.address"):
-                        used.add(device["ipv4.address"])
+                    network = device.get("network")
+                    parent = device.get("parent")
+                    address = device.get("ipv4.address")
+                    if network is not None and not isinstance(network, str) or parent is not None and not isinstance(parent, str):
+                        raise ControlError("vm_ip_unverified", "instance network identity is malformed")
+                    if address is not None and not isinstance(address, str):
+                        raise ControlError("vm_ip_unverified", "instance IP address is malformed")
+                    if self.config["network"] in {network, parent} and address:
+                        used.add(address)
         leases = self.incus.query("/1.0/networks/" + quote(self.config["network"], safe="") + "/leases", project="default")
         leases = self._inventory_mappings(leases, "vm_ip_unverified", "network lease")
         for lease in leases:
-            if own_mac and lease.get("hwaddr", "").lower() == own_mac.lower() and lease.get("address") == own_ip: continue
-            if lease.get("address"): used.add(lease["address"])
+            address = lease.get("address")
+            hwaddr = lease.get("hwaddr")
+            if not isinstance(address, str) or not address:
+                raise ControlError("vm_ip_unverified", "network lease address is malformed")
+            if hwaddr is not None and not isinstance(hwaddr, str):
+                raise ControlError("vm_ip_unverified", "network lease MAC address is malformed")
+            if own_mac and hwaddr and hwaddr.lower() == own_mac.lower() and address == own_ip:
+                continue
+            used.add(address)
         return used
 
     def _allocate_vm_ip(self, native_ips: set[str]) -> str:
@@ -3156,7 +3237,21 @@ class Control:
                 result = self.runner.run(["systemctl", "is-active", "--quiet", unit], timeout=5, check=False)
                 if result.returncode: issues.append("unit_inactive:" + unit)
             for unit in ("agent-vm-native-expire@.service", "agent-vm-native-reconcile.service"):
-                if not (self.systemd.timer_dir / unit).is_file(): issues.append("unit_missing:" + unit)
+                required = {
+                    "agent-vm-native-expire@.service": (
+                        "ExecStart=/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py --timer-expire %i",
+                    ),
+                    "agent-vm-native-reconcile.service": (
+                        "ExecStart=/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py --timer-reconcile",
+                    ),
+                }[unit]
+                if not self.systemd.service_asset_active(unit, required):
+                    issues.append("unit_unverified:" + unit)
+            if not self.systemd.service_asset_active(
+                "agent-vm-native-age-gc.service",
+                ("ExecStart=/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py --timer-age-gc",),
+            ):
+                issues.append("unit_unverified:agent-vm-native-age-gc.service")
             for task in self.store.list_tasks():
                 if task.get("state") != "active":
                     continue

@@ -233,6 +233,26 @@ class NativeTimerTests(unittest.TestCase):
         path.write_text(content.replace("Unit=agent-vm-native-expire@", "Unit=other-service@"))
         self.assertFalse(self.systemd.expiry_active(self.task, 1, expires_at))
 
+    def test_service_asset_requires_loaded_fragment_and_exec_contract(self):
+        unit = "agent-vm-native-reconcile.service"
+        path = self.root / unit
+        path.write_text(
+            "[Service]\n"
+            "ExecStart=/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py --timer-reconcile\n"
+        )
+        self.runner.run.return_value = subprocess.CompletedProcess(
+            [], 0, f"LoadState=loaded\nFragmentPath={path}\n".encode(), b""
+        )
+        self.assertTrue(self.systemd.service_asset_active(
+            unit,
+            ("ExecStart=/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py --timer-reconcile",),
+        ))
+        path.write_text("[Service]\n")
+        self.assertFalse(self.systemd.service_asset_active(
+            unit,
+            ("ExecStart=/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py --timer-reconcile",),
+        ))
+
 
 class Fixture(unittest.TestCase):
     def setUp(self):
@@ -858,8 +878,8 @@ class LifecycleTests(Fixture):
 
     def test_port_range_inventory_and_exact_collision(self):
         self.acquire()
-        self.runner.proxy_inventory = [{"expanded_devices": {"proxy": {"type": "proxy", "listen": "tcp:0.0.0.0:20001-20003"}}}]
-        self.runner.forwards = [{"ports": [{"listen_port": "20004,20005-20006"}]}]
+        self.runner.proxy_inventory = [{"name": "foreign-proxy", "expanded_devices": {"proxy": {"type": "proxy", "listen": "tcp:0.0.0.0:20001-20003"}}}]
+        self.runner.forwards = [{"config": {}, "ports": [{"listen_port": "20004,20005-20006"}]}]
         mapping = self.call("port-add", name="web", vm_port=8080)
         self.assertEqual(mapping["host_port"], 20007)
         self.error("port_busy", self.call, "port-add", name="other", vm_port=9000, host_port=20002)

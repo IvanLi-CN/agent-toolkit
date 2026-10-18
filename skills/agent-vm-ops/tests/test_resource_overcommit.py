@@ -228,6 +228,12 @@ class AdmissionTests(Fixture):
                 self.assertFalse(metrics["disk_admission"]["verified"])
         self.store.update_task(active["task_id"], reservation_bytes=0)
 
+    def test_corrupt_cached_disk_reservation_fails_closed_for_new_admission(self):
+        cached = self.acquire("cache")
+        self.call("release", "cache")
+        self.store.update_task(cached["task_id"], reservation_bytes=1.5)
+        self.error("resource_unverified", self.acquire, "new")
+
     def test_non_object_resource_reservation_keeps_diagnostics_structured(self):
         active = self.acquire()
         self.store.update_task(active["task_id"], resource_reservation_json="null")

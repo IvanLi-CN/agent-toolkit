@@ -1265,6 +1265,28 @@ class SystemdManager:
             and all(line in lines for line in required_lines)
         )
 
+    def enabled_unit_active(self, unit: str) -> bool:
+        if not self.enabled:
+            return True
+        try:
+            result = self.runner.run(
+                ["systemctl", "show", unit, "-p", "ActiveState", "-p", "UnitFileState"],
+                timeout=10,
+                check=False,
+            )
+        except (ControlError, OSError, TypeError, ValueError):
+            return False
+        values = dict(
+            line.split("=", 1)
+            for line in result.stdout.decode(errors="replace").splitlines()
+            if "=" in line
+        )
+        return (
+            result.returncode == 0
+            and values.get("ActiveState") == "active"
+            and values.get("UnitFileState") == "enabled"
+        )
+
     def remove_expiry(self, task_id: str, generation: int) -> str:
         unit = self.timer_unit(task_id, generation)
         path = self.timer_dir / unit
@@ -1996,13 +2018,25 @@ class Control:
 
     def _ownership(self, task: Mapping[str, Any]) -> Mapping[str, Any]:
         info = self.incus.config_show(str(task["instance_name"]))
-        config = info.get("config", {})
+        if not isinstance(info, Mapping):
+            raise ControlError("ownership_mismatch", "native instance inventory is not an object; refusing mutation")
+        config = info.get("config")
+        devices = info.get("devices")
+        expanded_devices = info.get("expanded_devices")
         expected = {"user.agent-vm.managed": "native-v1", "user.agent-vm.task": task["task_id"],
                     "user.agent-vm.session": task["session_id"], "user.agent-vm.generation": str(task["generation"])}
         generations = {str(task["generation"])}
         if task["state"] in {"preparing", "closing"} and task.get("previous_generation") is not None:
             generations.add(str(task["previous_generation"]))
-        if not isinstance(config, Mapping) or any(config.get(key) != value for key, value in expected.items() if key != "user.agent-vm.generation") or config.get("user.agent-vm.generation") not in generations:
+        if (
+            not isinstance(config, Mapping)
+            or not isinstance(devices, Mapping)
+            or not isinstance(expanded_devices, Mapping)
+            or any(not isinstance(device, Mapping) for device in devices.values())
+            or any(not isinstance(device, Mapping) for device in expanded_devices.values())
+            or any(config.get(key) != value for key, value in expected.items() if key != "user.agent-vm.generation")
+            or config.get("user.agent-vm.generation") not in generations
+        ):
             raise ControlError("ownership_mismatch", "native instance identity differs from durable ownership; refusing mutation")
         return info
 
@@ -2126,11 +2160,14 @@ class Control:
 
     def _space_sufficient(self, facts: Mapping[str, Any], cost: int, threshold: str,
                           exclude_task_id: str | None = None) -> bool:
-        reserved = sum(
-            self._durable_reservation_bytes(task.get("reservation_bytes"))
-            for task in self.store.list_tasks()
-            if task["task_id"] != exclude_task_id
-        )
+        try:
+            reserved = sum(
+                self._durable_reservation_bytes(task.get("reservation_bytes"))
+                for task in self.store.list_tasks()
+                if task["task_id"] != exclude_task_id
+            )
+        except (TypeError, ValueError) as exc:
+            raise ControlError("resource_unverified", "durable disk reservation is malformed") from exc
         for layer in facts["layers"]:
             demand = cost + reserved
             if layer["free"] - demand < layer[threshold]: return False
@@ -3059,13 +3096,18 @@ class Control:
         if project_config.get("restricted.devices.proxy") != "allow":
             raise ControlError("network_unverified", "Incus project does not allow managed proxy NAT devices")
         acl = self.incus.query("/1.0/network-acls/" + quote(name, safe=""), project="default")
-        if acl.get("config", {}).get("user.agent-vm.managed") != "native-v1":
+        if not isinstance(acl, Mapping) or not isinstance(acl.get("config"), Mapping):
+            raise ControlError("network_unverified", "isolation ACL response is not an object")
+        if acl["config"].get("user.agent-vm.managed") != "native-v1":
             raise ControlError("network_unverified", "isolation ACL ownership is not verified")
         required = self._isolation_rules()
         fields = ("action", "state", "source", "destination", "protocol", "source_port", "destination_port", "icmp_type", "icmp_code")
         for direction, rules in required.items():
+            actual = acl.get(direction)
+            if not isinstance(actual, list) or any(not isinstance(value, Mapping) for value in actual):
+                raise ControlError("network_unverified", "isolation ACL rules are malformed")
             normalized = [{key: value.get(key, "enabled" if key == "state" else "") for key in fields}
-                          for value in acl.get(direction, [])]
+                          for value in actual]
             for rule in rules:
                 expected = {key: rule.get(key, "enabled" if key == "state" else "") for key in fields}
                 if expected not in normalized:
@@ -3236,6 +3278,8 @@ class Control:
             for unit in ("incus.service", "agent-vm-native-age-gc.timer"):
                 result = self.runner.run(["systemctl", "is-active", "--quiet", unit], timeout=5, check=False)
                 if result.returncode: issues.append("unit_inactive:" + unit)
+            if not self.systemd.enabled_unit_active("agent-vm-native-age-gc.timer"):
+                issues.append("unit_disabled:agent-vm-native-age-gc.timer")
             for unit in ("agent-vm-native-expire@.service", "agent-vm-native-reconcile.service"):
                 required = {
                     "agent-vm-native-expire@.service": (
@@ -3247,6 +3291,8 @@ class Control:
                 }[unit]
                 if not self.systemd.service_asset_active(unit, required):
                     issues.append("unit_unverified:" + unit)
+                if unit == "agent-vm-native-reconcile.service" and not self.systemd.enabled_unit_active(unit):
+                    issues.append("unit_disabled:" + unit)
             if not self.systemd.service_asset_active(
                 "agent-vm-native-age-gc.service",
                 ("ExecStart=/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py --timer-age-gc",),

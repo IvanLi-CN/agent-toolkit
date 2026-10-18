@@ -253,6 +253,16 @@ class NativeTimerTests(unittest.TestCase):
             ("ExecStart=/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py --timer-reconcile",),
         ))
 
+    def test_enabled_unit_active_requires_active_enabled_unit(self):
+        self.runner.run.return_value = subprocess.CompletedProcess(
+            [], 0, b"ActiveState=active\nUnitFileState=disabled\n", b""
+        )
+        self.assertFalse(self.systemd.enabled_unit_active("agent-vm-native-reconcile.service"))
+        self.runner.run.return_value = subprocess.CompletedProcess(
+            [], 0, b"ActiveState=active\nUnitFileState=enabled\n", b""
+        )
+        self.assertTrue(self.systemd.enabled_unit_active("agent-vm-native-reconcile.service"))
+
 
 class Fixture(unittest.TestCase):
     def setUp(self):
@@ -670,6 +680,27 @@ class LifecycleTests(Fixture):
         with mock.patch.object(self.control.incus, 'query', side_effect=drift):
             self.error('network_unverified', self.acquire)
         self.assertEqual(self.runner.instances, {})
+
+    def test_malformed_isolation_acl_is_structured(self):
+        query = self.control.incus.query
+
+        def malformed(path, **kwargs):
+            value = query(path, **kwargs)
+            if path.startswith('/1.0/network-acls/'):
+                value['egress'] = ["malformed"]
+            return value
+
+        with mock.patch.object(self.control.incus, 'query', side_effect=malformed):
+            self.error('network_unverified', self.acquire)
+        self.assertEqual(self.runner.instances, {})
+
+    def test_malformed_native_device_inventory_is_structured(self):
+        active = self.acquire()
+        self.runner.instances[active["instance_name"]]["devices"]["eth0"] = "malformed"
+        task = self.store.get_task(task_id=active["task_id"])
+        with self.assertRaises(CONTROL.ControlError) as failure:
+            self.control._ownership(task)
+        self.assertEqual(failure.exception.code, "ownership_mismatch")
 
     def test_early_old_timer_rearms_recorded_deadline(self):
         first = self.acquire()

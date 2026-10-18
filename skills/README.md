@@ -24,7 +24,6 @@ python3 bin/public_skill_boundary_check.py
 | `git-sync` | Synchronize local Git branches and confirmed baselines safely. | `skills/git-sync/` |
 | `linux-server-init` | Initialize and harden a Linux server through explicit configuration. | `skills/linux-server-init/` |
 | `mcu-agentd-project-integration` | Integrate the configuration-driven `mcu-agentd` workflow into a project. | `skills/mcu-agentd-project-integration/` |
-| `requirements-analysis` | Clarify goals, scope, constraints, and acceptance criteria before implementation. | `skills/requirements-analysis/` |
 | `step-stl-print-repair` | Repair and regenerate print-ready STL files from STEP/CAD sources. | `skills/step-stl-print-repair/` |
 | `tavily-hikari-infra` | Inspect a configured Tavily Hikari primary/standby deployment read-only. | `skills/tavily-hikari-infra/` |
 | `xp-infra` | Validate configured XP self-hosted nodes using explicit private configuration. | `skills/xp-infra/` |

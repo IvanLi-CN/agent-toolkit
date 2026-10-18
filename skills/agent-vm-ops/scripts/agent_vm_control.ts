@@ -1061,6 +1061,7 @@ function processEnvironmentMembers(marker: string): { members: ProcessIdentity[]
   const members: ProcessIdentity[] = [];
   let complete = true;
   if (process.platform !== "linux") return { members, complete };
+  const ownerUid = typeof process.getuid === "function" ? process.getuid() : undefined;
   const markerBytes = Buffer.from(`AGENT_VM_COMMAND_ID=${marker}\0`, "utf8");
   try {
     for (const entry of readdirSync("/proc")) {
@@ -1069,6 +1070,7 @@ function processEnvironmentMembers(marker: string): { members: ProcessIdentity[]
       try {
         const record = readProcessRecord(pid);
         if (record.state === "Z") continue;
+        if (ownerUid !== undefined && statSync(`/proc/${pid}`).uid !== ownerUid) continue;
         if (readFileSync(`/proc/${pid}/environ`).includes(markerBytes)) members.push({ pid, starttime: record.starttime });
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;

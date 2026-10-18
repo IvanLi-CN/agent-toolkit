@@ -1010,6 +1010,53 @@ function processIsZombie(pid: number): boolean {
   try { return readProcessRecord(pid).state === "Z"; } catch { return false; }
 }
 
+function processPipeTargets(pid: number): Set<string> {
+  const targets = new Set<string>();
+  if (process.platform !== "linux") return targets;
+  for (const fd of ["1", "2"]) {
+    try {
+      const target = readlinkSync(`/proc/${pid}/fd/${fd}`);
+      if (target.startsWith("pipe:[")) targets.add(target);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
+    }
+  }
+  return targets;
+}
+
+function processPipeMembers(targets: ReadonlySet<string>): { members: ProcessIdentity[]; complete: boolean } {
+  const members: ProcessIdentity[] = [];
+  let complete = true;
+  if (process.platform !== "linux" || !targets.size) return { members, complete };
+  try {
+    for (const entry of readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry) || Number(entry) === process.pid) continue;
+      const pid = Number(entry);
+      try {
+        const record = readProcessRecord(pid);
+        if (record.state === "Z") continue;
+        let inherited = false;
+        for (const fd of readdirSync(`/proc/${pid}/fd`)) {
+          try {
+            if (targets.has(readlinkSync(`/proc/${pid}/fd/${fd}`))) {
+              inherited = true;
+              break;
+            }
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+            complete = false;
+          }
+        }
+        if (inherited) members.push({ pid, starttime: record.starttime });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        complete = false;
+      }
+    }
+  } catch { return { members: [], complete: false }; }
+  return { members, complete };
+}
+
 function processGroupMembers(pgid: number): { members: ProcessIdentity[]; complete: boolean } {
   const members: ProcessIdentity[] = [];
   let complete = true;
@@ -1188,6 +1235,7 @@ export class CommandRunner {
         if (record.starttime === leaderIdentity) leaderPgid = record.pgrp;
       } catch { /* Cleanup will fail closed if the leader identity cannot be anchored. */ }
     }
+    const leaderPipeTargets = processPipeTargets(processHandle.pid);
     const readAbort = new AbortController();
     const stdoutPromise = readBounded(processHandle.stdout, options.stdoutLimit ?? DIAGNOSTIC_LOG_LIMIT, false, readAbort.signal);
     const stderrPromise = readBounded(processHandle.stderr, options.stderrLimit ?? 4000, true, readAbort.signal, true);
@@ -1266,6 +1314,7 @@ export class CommandRunner {
       const outcome = await Promise.race([communication.then((value) => ({ kind: "complete" as const, value })), timeout.then(() => ({ kind: "timeout" as const }))]);
       if (outcome.kind === "timeout") {
         const descendants = processDescendants(processHandle.pid);
+        for (const target of processPipeTargets(processHandle.pid)) leaderPipeTargets.add(target);
         const known = new Map<number, ProcessIdentity>();
         const groupAnchors = new Map<number, ProcessIdentity[]>();
         for (const [pgid, anchors] of trackedGroups) groupAnchors.set(pgid, [...anchors]);
@@ -1286,24 +1335,24 @@ export class CommandRunner {
         };
         addKnown([...trackedMembers.values()]);
         addKnown(descendants.members);
+        addKnown(processPipeMembers(leaderPipeTargets).members);
         const term = safeProcessSignal(processHandle.pid, leaderIdentity, 15, true);
         const leaderExitedAfterTerm = await Promise.race([exit.then(() => true), sleep(250).then(() => false)]);
         let processGroupCleanupError: string | null = identityMismatch ? "process_identity_mismatch" : term.error;
-        let processTreeComplete = descendants.complete;
+        let processTreeComplete = true;
         let tree = { killed: true, error: null as string | null };
         let groupKill = { sent: false, error: null as string | null };
         let directKill = { sent: false, error: null as string | null };
         for (let attempt = 0; attempt < 4; attempt += 1) {
           const discovered = processDescendantsFromRoots([...known.values()]);
-          processTreeComplete &&= discovered.complete;
           addKnown(discovered.members);
+          addKnown(processPipeMembers(leaderPipeTargets).members);
           for (const [pgid, anchors] of groupAnchors) {
             const liveAnchor = anchors.some((anchor) => {
               try { return processStartIdentity(anchor.pid) === anchor.starttime; } catch { return false; }
             });
             if (!liveAnchor) continue;
             const group = anchoredProcessGroupMembers(pgid, anchors);
-            processTreeComplete &&= group.complete;
             addKnown(group.members);
           }
           if (leaderExitedAfterTerm && leaderPgid !== undefined) {
@@ -1333,22 +1382,27 @@ export class CommandRunner {
           if (!remaining.length && (leaderExitedAfterTerm || !processExists(processHandle.pid))) break;
           await sleep(50);
         }
+        addKnown(processPipeMembers(leaderPipeTargets).members);
         const finalDescendants = processDescendantsFromRoots([...known.values()]);
-        processTreeComplete &&= finalDescendants.complete;
+        let finalInspectionComplete = finalDescendants.complete;
         addKnown(finalDescendants.members);
+        const finalPipes = processPipeMembers(leaderPipeTargets);
+        finalInspectionComplete &&= finalPipes.complete;
+        addKnown(finalPipes.members);
         for (const [pgid, anchors] of groupAnchors) {
           const liveAnchor = anchors.some((anchor) => {
             try { return processStartIdentity(anchor.pid) === anchor.starttime; } catch { return false; }
           });
           if (!liveAnchor) continue;
           const group = anchoredProcessGroupMembers(pgid, anchors);
-          processTreeComplete &&= group.complete;
+          finalInspectionComplete &&= group.complete;
           addKnown(group.members);
         }
         tree = killProcessTree([...known.values()]);
         if (tree.error && tree.error !== "process_tree_members_remain") processGroupCleanupError ??= tree.error;
+        processTreeComplete = finalInspectionComplete;
         if (identityMismatch) processGroupCleanupError ??= "process_identity_mismatch";
-        if (!descendants.complete || !processTreeComplete) processGroupCleanupError ??= "process_tree_inspection_failed";
+        if (!processTreeComplete) processGroupCleanupError ??= "process_tree_inspection_failed";
         const leaderStillAlive = Boolean(leaderIdentity && processExists(processHandle.pid) && processStartIdentity(processHandle.pid) === leaderIdentity && !processIsZombie(processHandle.pid));
         const remainingKnown = [...known.values()].some((member) => processExists(member.pid) && processStartIdentity(member.pid) === member.starttime && !processIsZombie(member.pid));
         const processGroupKilled = !leaderStillAlive && !remainingKnown && !processGroupCleanupError;

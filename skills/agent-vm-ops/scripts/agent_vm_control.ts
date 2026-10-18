@@ -42,6 +42,7 @@ type JsonFloat = { readonly value: number; readonly raw: string; readonly [JSON_
 type NativeBarrierWaiter = { exclusive: boolean; grant: (release: () => void) => void };
 type NativeBarrierState = { activeReaders: number; writerActive: boolean; waiters: NativeBarrierWaiter[] };
 const nativeBarrierStates = new Map<string, NativeBarrierState>();
+const nativeWriterIntentPaths = new Set<string>();
 
 function nativeBarrierRelease(path: string, state: NativeBarrierState, exclusive: boolean): () => void {
   let released = false;
@@ -1190,19 +1191,73 @@ function flock(fd: number, operation: number): void {
 }
 
 async function withFileLock<T>(path: string, callback: () => T | Promise<T>, blocking = true, shared = false): Promise<T> {
+  const release = acquireFileLock(path, blocking, shared);
+  try { return await callback(); } finally { release(); }
+}
+
+function acquireFileLock(path: string, blocking = true, shared = false): () => void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const noFollow = (constants as any).O_NOFOLLOW ?? 0;
   const fd = openSync(path, constants.O_RDWR | constants.O_CREAT | noFollow, 0o600);
   try {
     try { flock(fd, (shared ? 1 : 2) | (blocking ? 0 : 4)); } catch (error) {
+      closeSync(fd);
       if (!blocking) throw new ControlError("object_busy", "resource is being changed");
       throw new ControlError("lock_failed", "native lock could not be acquired");
     }
-    return await callback();
-  } finally {
+  } catch (error) {
+    try { closeSync(fd); } catch { /* The descriptor is already closed. */ }
+    throw error;
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
     try { flock(fd, 8); } catch { /* The descriptor is being closed. */ }
     closeSync(fd);
+  };
+}
+
+function acquireWriterIntent(directory: string): () => void {
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const noFollow = (constants as any).O_NOFOLLOW ?? 0;
+  const path = join(directory, `native-writer-${randomUUID()}`);
+  const fd = openSync(path, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | noFollow, 0o600);
+  try { flock(fd, 2); } catch (error) {
+    try { closeSync(fd); } catch { /* The descriptor is already closed. */ }
+    try { unlinkSync(path); } catch { /* The marker may not have been created. */ }
+    throw new ControlError("lock_failed", "native writer intent could not be acquired");
   }
+  nativeWriterIntentPaths.add(path);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    nativeWriterIntentPaths.delete(path);
+    try { flock(fd, 8); } catch { /* The descriptor is being closed. */ }
+    closeSync(fd);
+    try { unlinkSync(path); } catch { /* Marker cleanup is best effort. */ }
+  };
+}
+
+function hasWriterIntent(directory: string): boolean {
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  let active = false;
+  for (const name of readdirSync(directory)) {
+    if (!name.startsWith("native-writer-")) continue;
+    const path = join(directory, name);
+    if (nativeWriterIntentPaths.has(path)) { active = true; continue; }
+    const noFollow = (constants as any).O_NOFOLLOW ?? 0;
+    let fd: number | undefined;
+    let stale = false;
+    try {
+      fd = openSync(path, constants.O_RDWR | noFollow);
+      try { flock(fd, 2 | 4); stale = true; } catch { active = true; }
+    } catch { active = true; }
+    finally { if (fd !== undefined) closeSync(fd); }
+    if (stale) try { unlinkSync(path); } catch { /* Another process may have reclaimed it. */ }
+  }
+  return active;
 }
 
 export class SystemdManager {
@@ -1307,11 +1362,31 @@ export class Control {
   private async nativeBarrier<T>(callback: () => T | Promise<T>, exclusive = false): Promise<T> {
     const lockPath = join(dirname(this.store.path), "locks", sha256("native:barrier"));
     const turnstilePath = join(dirname(this.store.path), "locks", sha256("native:barrier:turnstile"));
-    const release = await acquireNativeBarrier(lockPath, exclusive);
+    const lockDirectory = dirname(turnstilePath);
+    const releaseWriter = exclusive ? acquireWriterIntent(lockDirectory) : undefined;
     try {
-      return await withFileLock(turnstilePath, () => withFileLock(lockPath, callback, true, !exclusive), true, !exclusive);
+      while (true) {
+        const releaseGate = acquireFileLock(turnstilePath, true, false);
+        let releaseLocal: (() => void) | undefined;
+        let releaseNative: (() => void) | undefined;
+        let blockedByWriter = false;
+        try {
+          blockedByWriter = !exclusive && hasWriterIntent(lockDirectory);
+          if (!blockedByWriter) {
+            releaseLocal = await acquireNativeBarrier(lockPath, exclusive);
+            releaseNative = acquireFileLock(lockPath, true, !exclusive);
+            releaseGate();
+            return await callback();
+          }
+        } finally {
+          releaseNative?.();
+          releaseLocal?.();
+          releaseGate();
+        }
+        if (blockedByWriter) await Bun.sleep(5);
+      }
     } finally {
-      release();
+      releaseWriter?.();
     }
   }
 

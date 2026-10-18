@@ -1123,9 +1123,9 @@ function processPipeTargets(pid: number): Set<string> {
   return targets;
 }
 
-type ProcessPipeScope = { pids: ReadonlySet<number>; pgids: ReadonlySet<number> };
+type ProcessScanScope = { pids: ReadonlySet<number>; pgids: ReadonlySet<number> };
 
-function processPipeMembers(targets: ReadonlySet<string>, scope?: ProcessPipeScope): { members: ProcessIdentity[]; complete: boolean } {
+function processPipeMembers(targets: ReadonlySet<string>, scope?: ProcessScanScope): { members: ProcessIdentity[]; complete: boolean } {
   const members: ProcessIdentity[] = [];
   let complete = true;
   if (process.platform !== "linux" || !targets.size) return { members, complete };
@@ -1162,7 +1162,7 @@ function processPipeMembers(targets: ReadonlySet<string>, scope?: ProcessPipeSco
   return { members, complete };
 }
 
-function processEnvironmentMembers(marker: string): { members: ProcessIdentity[]; complete: boolean } {
+function processEnvironmentMembers(marker: string, scope?: ProcessScanScope): { members: ProcessIdentity[]; complete: boolean } {
   const members: ProcessIdentity[] = [];
   let complete = true;
   if (process.platform !== "linux") return { members, complete };
@@ -1177,6 +1177,7 @@ function processEnvironmentMembers(marker: string): { members: ProcessIdentity[]
         if (owned === undefined) { complete = false; continue; }
         const record = readProcessRecord(pid);
         if (record.state === "Z") continue;
+        if (scope && !scope.pids.has(pid) && !scope.pids.has(record.ppid) && !scope.pgids.has(record.pgrp) && record.ppid !== process.pid) continue;
         if (readFileSync(`/proc/${pid}/environ`).includes(markerBytes)) members.push({ pid, starttime: record.starttime });
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
@@ -1498,10 +1499,10 @@ export class CommandRunner {
             } catch { /* Identity checks below will fail closed if this process remains. */ }
           }
         };
-        const pipeScope = (): ProcessPipeScope => ({ pids: new Set(known.keys()), pgids: new Set(groupAnchors.keys()) });
+        const pipeScope = (): ProcessScanScope => ({ pids: new Set(known.keys()), pgids: new Set(groupAnchors.keys()) });
         const addBoundEnvironmentMembers = (): { complete: boolean } => {
           if (process.platform !== "linux") return { complete: true };
-          const environment = processEnvironmentMembers(commandMarker);
+          const environment = processEnvironmentMembers(commandMarker, pipeScope());
           const reachable = processDescendantsFromRoots([...known.values()]);
           if (!environment.complete || !reachable.complete) environmentInspectionIncomplete = true;
           const bound = new Map<number, ProcessIdentity>(known);

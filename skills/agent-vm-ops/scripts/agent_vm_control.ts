@@ -1016,7 +1016,7 @@ function processPipeTargets(pid: number): Set<string> {
   for (const fd of ["1", "2"]) {
     try {
       const target = readlinkSync(`/proc/${pid}/fd/${fd}`);
-      if (target.startsWith("pipe:[")) targets.add(target);
+      if (/^(?:pipe|socket):\[\d+\]$/.test(target)) targets.add(target);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
     }

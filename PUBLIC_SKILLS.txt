@@ -14,7 +14,6 @@ git-remote-troubleshoot
 git-sync
 linux-server-init
 mcu-agentd-project-integration
-requirements-analysis
 step-stl-print-repair
 tavily-hikari-infra
 xp-infra

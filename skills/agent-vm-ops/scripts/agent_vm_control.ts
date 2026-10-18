@@ -1094,6 +1094,17 @@ function processExists(pid: number): boolean {
   return process.platform !== "linux" || existsSync(`/proc/${pid}/stat`);
 }
 
+function processBelongsToCurrentUser(pid: number): boolean | undefined {
+  const ownerUid = currentOwnerUid();
+  if (ownerUid === undefined) return true;
+  if (ownerUid === 0) return true;
+  try { return statSync(`/proc/${pid}`).uid === ownerUid; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    return undefined;
+  }
+}
+
 function processIsZombie(pid: number): boolean {
   try { return readProcessRecord(pid).state === "Z"; } catch { return false; }
 }
@@ -1121,6 +1132,9 @@ function processPipeMembers(targets: ReadonlySet<string>): { members: ProcessIde
       if (!/^\d+$/.test(entry) || Number(entry) === process.pid) continue;
       const pid = Number(entry);
       try {
+        const owned = processBelongsToCurrentUser(pid);
+        if (owned === false) continue;
+        if (owned === undefined) { complete = false; continue; }
         const record = readProcessRecord(pid);
         if (record.state === "Z") continue;
         let inherited = false;
@@ -1149,16 +1163,17 @@ function processEnvironmentMembers(marker: string): { members: ProcessIdentity[]
   const members: ProcessIdentity[] = [];
   let complete = true;
   if (process.platform !== "linux") return { members, complete };
-  const ownerUid = typeof process.getuid === "function" ? process.getuid() : undefined;
   const markerBytes = Buffer.from(`AGENT_VM_COMMAND_ID=${marker}\0`, "utf8");
   try {
     for (const entry of readdirSync("/proc")) {
       if (!/^\d+$/.test(entry) || Number(entry) === process.pid) continue;
       const pid = Number(entry);
       try {
+        const owned = processBelongsToCurrentUser(pid);
+        if (owned === false) continue;
+        if (owned === undefined) { complete = false; continue; }
         const record = readProcessRecord(pid);
         if (record.state === "Z") continue;
-        if (ownerUid !== undefined && statSync(`/proc/${pid}`).uid !== ownerUid) continue;
         if (readFileSync(`/proc/${pid}/environ`).includes(markerBytes)) members.push({ pid, starttime: record.starttime });
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
@@ -1177,7 +1192,11 @@ function processGroupMembers(pgid: number): { members: ProcessIdentity[]; comple
     for (const entry of readdirSync("/proc")) {
       if (!/^\d+$/.test(entry)) continue;
       try {
-        const record = readProcessRecord(Number(entry));
+        const pid = Number(entry);
+        const owned = processBelongsToCurrentUser(pid);
+        if (owned === false) continue;
+        if (owned === undefined) { complete = false; continue; }
+        const record = readProcessRecord(pid);
         if (record.state !== "Z" && record.pgrp === pgid) members.push({ pid: record.pid, starttime: record.starttime });
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
@@ -1196,7 +1215,11 @@ export function processDescendants(rootPid: number): { members: ProcessIdentity[
     for (const entry of readdirSync("/proc")) {
       if (!/^\d+$/.test(entry)) continue;
       try {
-        const record = readProcessRecord(Number(entry));
+        const pid = Number(entry);
+        const owned = processBelongsToCurrentUser(pid);
+        if (owned === false) continue;
+        if (owned === undefined) { complete = false; continue; }
+        const record = readProcessRecord(pid);
         if (record.state !== "Z") children.set(record.ppid, [...(children.get(record.ppid) ?? []), record]);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
@@ -1226,7 +1249,11 @@ function processDescendantsFromRoots(roots: readonly ProcessIdentity[]): { membe
     for (const entry of readdirSync("/proc")) {
       if (!/^\d+$/.test(entry)) continue;
       try {
-        const record = readProcessRecord(Number(entry));
+        const pid = Number(entry);
+        const owned = processBelongsToCurrentUser(pid);
+        if (owned === false) continue;
+        if (owned === undefined) { complete = false; continue; }
+        const record = readProcessRecord(pid);
         if (record.state !== "Z") {
           records.set(record.pid, record);
           children.set(record.ppid, [...(children.get(record.ppid) ?? []), record]);
@@ -1552,8 +1579,8 @@ export class CommandRunner {
         if (tree.error && tree.error !== "process_tree_members_remain") processGroupCleanupError ??= tree.error;
         processTreeComplete = finalInspectionComplete;
         if (identityMismatch) processGroupCleanupError ??= "process_identity_mismatch";
-        if (!processTreeComplete) processGroupCleanupError ??= "process_tree_inspection_failed";
         if (markerBindingFailure) processGroupCleanupError ??= "process_marker_identity_unbound";
+        if (!processTreeComplete) processGroupCleanupError ??= "process_tree_inspection_failed";
         const knownDescendant = [...known.values()].some((member) => member.pid !== processHandle.pid);
         if (leaderExitedAfterTerm && !knownDescendant) processGroupCleanupError ??= "process_tree_root_lost";
         const leaderStillAlive = Boolean(leaderIdentity && processExists(processHandle.pid) && processStartIdentity(processHandle.pid) === leaderIdentity && !processIsZombie(processHandle.pid));

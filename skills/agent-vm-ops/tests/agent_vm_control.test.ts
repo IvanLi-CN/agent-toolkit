@@ -300,7 +300,7 @@ class Fixture {
       required_guest_tools: ["bun", "python3", "sshd", "rsync", "docker"], state_db: join(this.root, "state.sqlite3"), timer_dir: join(this.root, "systemd"),
     };
     this.runner.configureGuest(this.root);
-    this.store = new StateStore(this.config.state_db);
+    this.store = StateStore.bootstrap(this.config.state_db);
     this.systemd = new SystemdManager(this.runner, this.config, false);
     const resources = { cpu: () => 16, memory: () => ({ scope: "ct-memory", sources: ["lxcfs"], limit_bytes: 32 * GIB, available_bytes: this.memoryAvailable, threshold_bytes: 4 * GIB }) };
     this.control = new Control(this.config, {
@@ -561,7 +561,7 @@ test("preserves JSON float semantics and Python canonical numeric digests", asyn
 
 test("keeps SQLite integer reservations exact beyond the JS safe range", () => {
   const root = mkdtempSync("/tmp/agent-vm-sqlite-test-");
-  const store = new StateStore(join(root, "state.sqlite3"));
+  const store = StateStore.bootstrap(join(root, "state.sqlite3"));
   try {
     const exact = 9007199254740993n;
     store.putTask({ task_id: "avm-exact", session_id: "exact", generation: 1, state: "active", instance_name: "agent-vm-exact", created_at: "2026-10-04T00:00:00+00:00", updated_at: "2026-10-04T00:00:00+00:00", image_fingerprint: "a".repeat(64), resources_json: "{}", reservation_bytes: exact, resource_reservation_json: "{}" });
@@ -569,6 +569,55 @@ test("keeps SQLite integer reservations exact beyond the JS safe range", () => {
     expect(typeof task?.reservation_bytes).toBe("bigint");
     expect(task?.reservation_bytes).toBe(exact);
   } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("fails closed for missing, empty, and invalid runtime state databases", () => {
+  const root = mkdtempSync("/tmp/agent-vm-state-guard-test-");
+  try {
+    const missing = join(root, "missing", "state.sqlite3");
+    expectSyncCode(() => new StateStore(missing), "state_missing");
+    expect(existsSync(missing)).toBe(false);
+    const empty = join(root, "empty.sqlite3");
+    writeFileSync(empty, "", { mode: 0o600 });
+    expectSyncCode(() => new StateStore(empty), "state_invalid");
+    const invalid = join(root, "invalid.sqlite3");
+    writeFileSync(invalid, "not a sqlite database", { mode: 0o600 });
+    expectSyncCode(() => new StateStore(invalid), "state_invalid");
+    const incomplete = join(root, "incomplete.sqlite3");
+    const incompleteStore = StateStore.bootstrap(incomplete);
+    incompleteStore.db.run("DROP TABLE audit");
+    incompleteStore.close();
+    expectSyncCode(() => new StateStore(incomplete), "state_invalid");
+    const durable = join(root, "durable.sqlite3");
+    const bootstrap = StateStore.bootstrap(durable);
+    bootstrap.close();
+    const runtime = new StateStore(durable);
+    runtime.close();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("projects untrusted result JSON before operation and audit persistence", async () => {
+  const f = fixture();
+  const sensitiveName = ["extra", "secret"].join("_");
+  const nestedSensitiveName = ["nested", "secret", "value"].join("_");
+  const canary = "persist-" + "canary";
+  (f.control as any).dispatchAction = async () => ({
+    generation: 0,
+    state: "active",
+    [sensitiveName]: canary,
+    nested: { [nestedSensitiveName]: canary },
+    payload: "x".repeat(20_000),
+  });
+  const response = await f.control.dispatch(f.request("acquire", {}, "op-persistence-boundary"));
+  expect(response.result[sensitiveName]).toBeUndefined();
+  expect(response.result.nested).toBeUndefined();
+  expect(response.result.payload.length).toBeLessThanOrEqual(4096);
+  const operation = String((f.store.db.query("SELECT response_json FROM operations WHERE operation_id = ?") as any).get("op-persistence-boundary").response_json);
+  const audit = String((f.store.db.query("SELECT detail_json FROM audit WHERE action = ?") as any).get("acquire").detail_json);
+  expect(operation).not.toContain(canary);
+  expect(audit).not.toContain(canary);
+  expect(operation.length).toBeLessThan(16_384);
+  expect(audit.length).toBeLessThan(16_384);
 });
 
 test("preserves exact decimal native resources through cache persistence", async () => {
@@ -610,11 +659,11 @@ test("replays a durable response without rounding a large JSON integer", async (
   const start = row.response_json.indexOf(marker) + marker.length;
   const end = row.response_json.indexOf(',"server_time"', start);
   if (start < marker.length || end < 0) throw new Error("operation result marker missing");
-  const responseJson = `${row.response_json.slice(0, start)}{"exact":9007199254740993}${row.response_json.slice(end)}`;
+  const responseJson = `${row.response_json.slice(0, start)}{"memory_mib":9007199254740993}${row.response_json.slice(end)}`;
   (f.store.db as any).run("UPDATE operations SET response_json = ? WHERE operation_id = ?", responseJson, "op-large-response");
   const replay = await f.control.dispatch(request);
   expect(replay.outcome).toBe("replayed");
-  expect(replay.result.exact).toBe(9007199254740993n);
+  expect(replay.result.memory_mib).toBe(9007199254740993n);
 });
 
 test("replays an accepted persisted operation without changing its digest or native state", async () => {
@@ -626,7 +675,7 @@ test("replays an accepted persisted operation without changing its digest or nat
     generation: 0, operation_id: "legacy-op", outcome: "success", result: { state: "active" }, _request_digest: digest,
   };
   writeLegacyOperation(dbPath, response);
-  const store = new StateStore(dbPath);
+  const store = StateStore.bootstrap(dbPath);
   const runner = new NativeCommands();
   const control = new Control({ state_db: dbPath, timer_dir: root }, { store, runner });
   try {
@@ -648,7 +697,7 @@ test("rejects a pending legacy operation without rewriting its journal", async (
   const digest = "c3dccc911349ced563eb9615fb6db8ffa5801d121c9542c29c5a3fc0575a768a";
   const response = { protocol: PROTOCOL_VERSION, action: "acquire", session_id: "legacy", generation: 0, operation_id: "legacy-op", outcome: "pending", _request_digest: digest };
   writeLegacyOperation(dbPath, response);
-  const store = new StateStore(dbPath);
+  const store = StateStore.bootstrap(dbPath);
   const runner = new NativeCommands();
   const control = new Control({ state_db: dbPath, timer_dir: root }, { store, runner });
   try {
@@ -674,7 +723,7 @@ test("replays an accepted operation after restart and preserves an updated renew
   f.storeClosed = true;
   const restartedRunner = new NativeCommands();
   restartedRunner.configureGuest(join(f.root, "restarted-guest"));
-  const restartedStore = new StateStore(f.config.state_db);
+  const restartedStore = StateStore.bootstrap(f.config.state_db);
   const restartedResources = { cpu: () => 16, memory: () => ({ scope: "ct-memory", sources: ["fixture"], limit_bytes: 32 * GIB, available_bytes: f.memoryAvailable, threshold_bytes: 4 * GIB }) };
   const restarted = new Control(f.config, { runner: restartedRunner, store: restartedStore, systemd: new SystemdManager(restartedRunner, f.config, false), resources: restartedResources as unknown as CTResources, clock: () => f.now, which: (command) => command === "conntrack" ? "/usr/sbin/conntrack" : null });
   try {
@@ -804,6 +853,8 @@ test("redacts command stderr before journal, audit, and diagnostic output", asyn
   expect(JSON.stringify(diagnostic)).not.toContain("nested-auth-01");
   expect(JSON.stringify(diagnostic)).not.toContain("field-auth-01");
   expect(JSON.stringify(diagnostic)).not.toContain("quoted-auth-02");
+  const pemDiagnostic = new ControlError("command_failed", "native command failed", { stderr: "-----BEGIN OPENSSH PRIVATE KEY-----\n" + "pem-canary-".repeat(2000) }).asDict();
+  expect(JSON.stringify(pemDiagnostic)).not.toContain("pem-canary");
 });
 
 test("expiry and drain fences stop preparation before a late native effect", async () => {

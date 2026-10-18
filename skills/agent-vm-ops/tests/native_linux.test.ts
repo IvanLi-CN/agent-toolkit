@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { COMMAND_OUTPUT_LIMIT, DIAGNOSTIC_LOG_TRUNCATION_MARKER, CommandRunner, Control, ControlError, IncusClient, StateStore } from "../scripts/agent_vm_control.ts";
+import { acquireWriterIntent, COMMAND_OUTPUT_LIMIT, DIAGNOSTIC_LOG_TRUNCATION_MARKER, CommandRunner, Control, ControlError, hasWriterIntent, IncusClient, StateStore } from "../scripts/agent_vm_control.ts";
 
 type Dict = Record<string, any>;
 
@@ -68,7 +68,7 @@ test("rejects a missing guest prerequisite before the guest write boundary", asy
   }
   const runner = new MissingGuestRunner();
   const dbPath = join(probeRoot, "state.sqlite3");
-  const store = new StateStore(dbPath);
+  const store = StateStore.bootstrap(dbPath);
   const control = new Control({ project: "agents", state_db: dbPath, timer_dir: probeRoot, required_guest_tools: ["bun", "sshd", "rsync", "docker", "growpart"] }, { store, runner });
   try {
     store.putTask({ task_id: "avm-prerequisite", session_id: "prerequisite", generation: 1, state: "active", instance_name: "agent-vm-prerequisite", lease_expires_at: new Date(Date.now() + 60_000).toISOString(), created_at: new Date().toISOString(), updated_at: new Date().toISOString(), image_fingerprint: "a".repeat(64) });
@@ -214,13 +214,13 @@ linuxTest("reaps a descendant when the command closes stdin before a large write
 linuxTest("waits for an independent SQLite writer and preserves durable failure metadata", async () => {
   const probeRoot = root("agent-vm-sqlite-writer");
   const dbPath = join(probeRoot, "state.sqlite3");
-  const initial = new StateStore(dbPath);
+  const initial = StateStore.bootstrap(dbPath);
   initial.close();
   const worker = `
     const { existsSync } = await import("node:fs");
     const { StateStore } = await import(process.env.CONTROL_PATH);
     const root = process.env.PROBE_ROOT;
-    const store = new StateStore(root + "/state.sqlite3");
+    const store = StateStore.bootstrap(root + "/state.sqlite3");
     try {
       if (process.env.PROBE_MODE === "hold") {
         store.db.run("BEGIN IMMEDIATE");
@@ -254,7 +254,7 @@ linuxTest("waits for an independent SQLite writer and preserves durable failure 
   expect(writerResult.exit).toBe(0);
   expect(Number(readFileSync(join(probeRoot, "writer-done"), "utf8"))).toBeGreaterThanOrEqual(600);
 
-  const store = new StateStore(dbPath);
+  const store = StateStore.bootstrap(dbPath);
   try {
     expect(store.operation("op-sqlite-competition")).toMatchObject({ outcome: "error", error: { code: "synthetic_failure" } });
     expect(store.getMeta("last_failure")).toBe("synthetic_failure");
@@ -270,7 +270,7 @@ linuxTest("serializes object locks across real control processes", async () => {
     const { existsSync } = await import("node:fs");
     const { Control, StateStore } = await import(process.env.CONTROL_PATH);
     const root = process.env.PROBE_ROOT;
-    const store = new StateStore(root + "/state.sqlite3");
+    const store = StateStore.bootstrap(root + "/state.sqlite3");
     const control = new Control({ state_db: root + "/state.sqlite3", timer_dir: root }, { store });
     try {
       if (process.env.PROBE_MODE === "hold") {
@@ -310,13 +310,13 @@ linuxTest("serializes object locks across real control processes", async () => {
 linuxTest("prevents a queued cross-process drain writer from being bypassed by readers", async () => {
   const probeRoot = root("agent-vm-native-barrier-fairness");
   const dbPath = join(probeRoot, "state.sqlite3");
-  const initial = new StateStore(dbPath);
+  const initial = StateStore.bootstrap(dbPath);
   initial.close();
   const worker = `
     const { existsSync } = await import("node:fs");
     const { Control, StateStore } = await import(process.env.CONTROL_PATH);
     const root = process.env.PROBE_ROOT;
-    const store = new StateStore(root + "/state.sqlite3");
+    const store = StateStore.bootstrap(root + "/state.sqlite3");
     const control = new Control({ state_db: root + "/state.sqlite3", timer_dir: root }, { store });
     const barrier = (callback, exclusive) => control.nativeBarrier(callback, exclusive);
     try {
@@ -371,7 +371,7 @@ linuxTest("prevents a queued cross-process drain writer from being bypassed by r
 linuxTest("does not reclaim a pending writer marker before its flock transition", async () => {
   const probeRoot = root("agent-vm-native-marker-race");
   const dbPath = join(probeRoot, "state.sqlite3");
-  const initial = new StateStore(dbPath);
+  const initial = StateStore.bootstrap(dbPath);
   initial.close();
   const lockDirectory = join(probeRoot, "locks");
   mkdirSync(lockDirectory, { recursive: true });
@@ -381,7 +381,7 @@ linuxTest("does not reclaim a pending writer marker before its flock transition"
     const { existsSync } = await import("node:fs");
     const { Control, StateStore } = await import(process.env.CONTROL_PATH);
     const root = process.env.PROBE_ROOT;
-    const store = new StateStore(root + "/state.sqlite3");
+    const store = StateStore.bootstrap(root + "/state.sqlite3");
     const control = new Control({ state_db: root + "/state.sqlite3", timer_dir: root }, { store });
     try {
       await control.nativeBarrier(async () => { await Bun.write(root + "/reader-entered", "1"); }, false);
@@ -403,10 +403,35 @@ linuxTest("does not reclaim a pending writer marker before its flock transition"
   }
 });
 
+linuxTest("reclaims empty, malformed, and crashed writer markers", () => {
+  const probeRoot = root("agent-vm-native-marker-recovery");
+  const lockDirectory = join(probeRoot, "locks");
+  mkdirSync(lockDirectory, { recursive: true, mode: 0o700 });
+  writeFileSync(join(lockDirectory, "native-writer-empty"), "", { mode: 0o600 });
+  writeFileSync(join(lockDirectory, "native-writer-malformed"), "corrupt marker\n", { mode: 0o600 });
+  writeFileSync(join(lockDirectory, "native-writer-crashed"), "pending 99999999 dead-token\n", { mode: 0o600 });
+  expect(hasWriterIntent(lockDirectory)).toBe(false);
+  expect(readdirSync(lockDirectory).filter((name) => name.startsWith("native-writer-"))).toEqual([]);
+});
+
+linuxTest("publishes writer marker state atomically and removes it on release", () => {
+  const probeRoot = root("agent-vm-native-marker-atomic");
+  const lockDirectory = join(probeRoot, "locks");
+  const release = acquireWriterIntent(lockDirectory);
+  try {
+    const names = readdirSync(lockDirectory).filter((name) => name.startsWith("native-writer-") && !name.includes(".tmp-"));
+    expect(names.filter((name) => !name.endsWith(".state"))).toHaveLength(1);
+    expect(names.filter((name) => name.endsWith(".state"))).toHaveLength(1);
+    const stateName = names.find((name) => name.endsWith(".state"))!;
+    expect(readFileSync(join(lockDirectory, stateName), "utf8")).toMatch(/^ready__ /);
+  } finally { release(); }
+  expect(readdirSync(lockDirectory).filter((name) => name.startsWith("native-writer-"))).toEqual([]);
+});
+
 linuxTest("serializes concurrent SQLite admission and preserves the single reservation", async () => {
   const probeRoot = root("agent-vm-admission");
   const dbPath = join(probeRoot, "state.sqlite3");
-  const initial = new StateStore(dbPath);
+  const initial = StateStore.bootstrap(dbPath);
   initial.close();
   const worker = `
     const { existsSync } = await import("node:fs");
@@ -424,7 +449,7 @@ linuxTest("serializes concurrent SQLite admission and preserves the single reser
       }
       async runBounded(argv, options = {}) { return this.run(argv, options); }
     }
-    const store = new StateStore(db);
+    const store = StateStore.bootstrap(db);
     const control = new Control({ project: "agents", profile: "agent-vm", state_db: db, timer_dir: root, storage_path: root, cpu_budget: 4, memory_budget_mib: 4096, cpu_overcommit_ratio: 1, memory_overcommit_ratio: 1, create_cost_bytes: 1, resume_cost_bytes: 1, resize_cost_bytes: 1 }, {
       store,
       runner: new Runner(),
@@ -457,7 +482,7 @@ linuxTest("serializes concurrent SQLite admission and preserves the single reser
   const outcomes = [lastJson(oneResult.stdout), lastJson(twoResult.stdout)];
   expect(outcomes.filter((value) => value.outcome === "admitted")).toHaveLength(1);
   expect(outcomes.filter((value) => value.code === "resource_insufficient")).toHaveLength(1);
-  const store = new StateStore(dbPath);
+  const store = StateStore.bootstrap(dbPath);
   try {
     const tasks = store.listTasks();
     expect(tasks).toHaveLength(1);
@@ -470,14 +495,14 @@ linuxTest("serializes concurrent SQLite admission and preserves the single reser
 linuxTest("expiration preempts a lease while cleanup remains contended", async () => {
   const probeRoot = root("agent-vm-expiry");
   const dbPath = join(probeRoot, "state.sqlite3");
-  const store = new StateStore(dbPath);
+  const store = StateStore.bootstrap(dbPath);
   store.putTask({ task_id: "avm-expire", session_id: "expire-session", generation: 1, state: "active", instance_name: "agent-vm-expire", vm_ip: "198.51.100.20", ssh_host_port: 20000, lease_expires_at: "2020-01-01T00:00:00+00:00", inactive_since: null, cleanup_after: null, created_at: "2020-01-01T00:00:00+00:00", updated_at: "2020-01-01T00:00:00+00:00", last_error: null, image_fingerprint: "a".repeat(64), resources_json: "{\"cpu\":2,\"disk_gib\":20,\"memory_mib\":4096}", reservation_bytes: 0n, resource_reservation_json: "{}" });
   store.close();
   const holderWorker = `
     const { existsSync } = await import("node:fs");
     const { Control, StateStore } = await import(process.env.CONTROL_PATH);
     const root = process.env.PROBE_ROOT;
-    const store = new StateStore(root + "/state.sqlite3");
+    const store = StateStore.bootstrap(root + "/state.sqlite3");
     const control = new Control({ state_db: root + "/state.sqlite3", timer_dir: root }, { store });
     try {
       await control.objectLock("cleanup:expire-session", async () => {
@@ -489,7 +514,7 @@ linuxTest("expiration preempts a lease while cleanup remains contended", async (
   const expiryWorker = `
     const { Control, StateStore } = await import(process.env.CONTROL_PATH);
     const root = process.env.PROBE_ROOT;
-    const store = new StateStore(root + "/state.sqlite3");
+    const store = StateStore.bootstrap(root + "/state.sqlite3");
     const control = new Control({ state_db: root + "/state.sqlite3", timer_dir: root, cache_seconds: 86400 }, { store });
     try {
       await control.expirePreempt({ task_id: "avm-expire", generation: 1 });
@@ -501,7 +526,7 @@ linuxTest("expiration preempts a lease while cleanup remains contended", async (
   const expiry = spawnWorker(expiryWorker, { PROBE_ROOT: probeRoot });
   let observed: Dict | undefined;
   for (let attempt = 0; attempt < 200; attempt += 1) {
-    const current = new StateStore(dbPath);
+  const current = StateStore.bootstrap(dbPath);
     observed = current.getTask({ taskId: "avm-expire" });
     current.close();
     if (observed?.state === "closing") break;
@@ -527,7 +552,7 @@ linuxTest("a long native lock does not hold the global admission lock", async ()
     const { existsSync } = await import("node:fs");
     const { Control, StateStore } = await import(process.env.CONTROL_PATH);
     const root = process.env.PROBE_ROOT;
-    const store = new StateStore(root + "/state.sqlite3");
+    const store = StateStore.bootstrap(root + "/state.sqlite3");
     const control = new Control({ state_db: root + "/state.sqlite3", timer_dir: root }, { store });
     try {
       if (process.env.PROBE_MODE === "native") {
@@ -565,8 +590,10 @@ transportTest("the current Python client reaches the Bun controller through isol
   const clientConfig = join(probeRoot, "client-config");
   const clientState = join(probeRoot, "client-state");
   for (const path of [storage, timerDir, fakeBin, clientConfig, clientState]) mkdirSync(path, { recursive: true, mode: 0o700 });
+  const statePath = join(storage, "state.sqlite3");
+  StateStore.bootstrap(statePath).close();
   const configPath = join(probeRoot, "config.json");
-  writeFileSync(configPath, JSON.stringify({ project: "agents", profile: "agent-vm", image_alias: "image", image_fingerprint: "a".repeat(64), network: "agentsbr0", network_acl: "agent-vm-isolation", pool: "agents", host_address: "198.51.100.19", port_start: 20000, port_end: 20030, vm_ip_start: "198.51.100.20", vm_ip_end: "198.51.100.250", gateway_ip: "198.51.100.1", storage_path: storage, state_db: join(storage, "state.sqlite3"), timer_dir: timerDir, cpu_budget: 4, memory_budget_mib: 4096 }));
+  writeFileSync(configPath, JSON.stringify({ project: "agents", profile: "agent-vm", image_alias: "image", image_fingerprint: "a".repeat(64), network: "agentsbr0", network_acl: "agent-vm-isolation", pool: "agents", host_address: "198.51.100.19", port_start: 20000, port_end: 20030, vm_ip_start: "198.51.100.20", vm_ip_end: "198.51.100.250", gateway_ip: "198.51.100.1", storage_path: storage, state_db: statePath, timer_dir: timerDir, cpu_budget: 4, memory_budget_mib: 4096 }));
   const wrapperPath = join(probeRoot, "controller-wrapper.ts");
   writeFileSync(wrapperPath, `const controller = await import(process.env.CONTROL_PATH); const request = JSON.parse(await Bun.stdin.text()); const config = controller.loadConfig(process.env.CONFIG_PATH); const store = new controller.StateStore(config.state_db); const control = new controller.Control(config, { store, systemd: new controller.SystemdManager(new controller.CommandRunner(), config, false) }); try { process.stdout.write(controller.stableJson(await control.dispatch(request)) + "\\n"); } catch (error) { process.stderr.write(controller.stableJson({ ok: false, error: error.asDict ? error.asDict() : { code: "internal_error" } }) + "\\n"); process.exitCode = 2; } finally { store.close(); }`);
   const logPath = join(probeRoot, "ssh-args.log");

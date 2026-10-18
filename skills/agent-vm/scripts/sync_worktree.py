@@ -23,11 +23,13 @@ OWNER = ".agent-vm-sync-owner.json"
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 DIAGNOSTIC_OUTPUT_LIMIT = 8192
 DIAGNOSTIC_TRUNCATION_MARKER = b"\n[TRUNCATED BY DIAGNOSTIC LIMIT]"
+RAW_DIAGNOSTIC_CAPTURE_LIMIT = 1024 * 1024
 STRUCTURED_OUTPUT_LIMIT = 16 * 1024 * 1024
 CHILD_DRAIN_GRACE_SECONDS = 1.0
 DEFAULT_CHILD_TIMEOUT_SECONDS = 600
 SECRET_LABELS = r"(?:[A-Za-z0-9]+[_-])*(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)(?:[_-][A-Za-z0-9]+)*"
 PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 _-]*PRIVATE KEY-----", re.IGNORECASE)
+UNTERMINATED_PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*$", re.IGNORECASE)
 AUTH_SCHEME_RE = re.compile(r"(?i)(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?(?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]+")
 AUTH_BASIC_RE = re.compile(r"(?i)(\bbasic\s+)[A-Za-z0-9._~+/=-]+")
 SECRET_DOUBLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)\"[^\"\r\n]*\"")
@@ -41,6 +43,7 @@ BEARER_RE = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+")
 def redact_stderr(value: bytes) -> bytes:
     text = value.decode("utf-8", "replace")
     text = PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", text)
+    text = UNTERMINATED_PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", text)
     text = AUTH_SCHEME_RE.sub(r"\1[REDACTED]", text)
     text = AUTH_BASIC_RE.sub(r"\1[REDACTED]", text)
     text = SECRET_DOUBLE_RE.sub(r'\1"[REDACTED]"', text)
@@ -52,9 +55,17 @@ def redact_stderr(value: bytes) -> bytes:
     return text.encode("utf-8")
 
 
+def redact_and_bound_stderr(value: bytes, *, truncated: bool = False, limit: int = DIAGNOSTIC_OUTPUT_LIMIT) -> bytes:
+    redacted = redact_stderr(value)
+    if not truncated and len(redacted) <= limit:
+        return redacted
+    available = max(0, limit - len(DIAGNOSTIC_TRUNCATION_MARKER))
+    return redacted[:available] + DIAGNOSTIC_TRUNCATION_MARKER
+
+
 def write_redacted_stderr(value: bytes) -> None:
     if value:
-        sys.stderr.buffer.write(redact_stderr(value))
+        sys.stderr.buffer.write(redact_and_bound_stderr(value))
         sys.stderr.flush()
 
 # Executed as a bounded Python action inside the guest, never installed as a service.
@@ -295,7 +306,7 @@ def _run_bounded(argv: list[str], *, input_data: bytes | None = None, timeout: f
     stdout_capture = _BoundedCapture(stdout_limit, tail=False)
     # Retain a bounded prefix so discarded bytes cannot expose an unlabeled
     # credential suffix after the diagnostic is redacted.
-    stderr_capture = _BoundedCapture(DIAGNOSTIC_OUTPUT_LIMIT, tail=False)
+    stderr_capture = _BoundedCapture(RAW_DIAGNOSTIC_CAPTURE_LIMIT, tail=False)
     input_view = memoryview(input_data or b"")
     input_offset = 0
 
@@ -330,7 +341,7 @@ def _run_bounded(argv: list[str], *, input_data: bytes | None = None, timeout: f
             if remaining is not None and remaining <= 0:
                 if deadline is not None and (drain_deadline is None or deadline <= drain_deadline):
                     _terminate_process_group(process)
-                    raise subprocess.TimeoutExpired(argv, effective_timeout, output=stdout_capture.finish(marker=False), stderr=stderr_capture.finish())
+                    raise subprocess.TimeoutExpired(argv, effective_timeout, output=stdout_capture.finish(marker=False), stderr=redact_and_bound_stderr(stderr_capture.finish(marker=False), truncated=stderr_capture.seen > stderr_capture.limit))
                 _terminate_process_group(process)
                 for stream in (process.stdout, process.stderr):
                     if stream is not None:
@@ -341,7 +352,7 @@ def _run_bounded(argv: list[str], *, input_data: bytes | None = None, timeout: f
                     process.wait(timeout=remaining)
                 except subprocess.TimeoutExpired:
                     _terminate_process_group(process)
-                    raise subprocess.TimeoutExpired(argv, effective_timeout, output=stdout_capture.finish(marker=False), stderr=stderr_capture.finish())
+                    raise subprocess.TimeoutExpired(argv, effective_timeout, output=stdout_capture.finish(marker=False), stderr=redact_and_bound_stderr(stderr_capture.finish(marker=False), truncated=stderr_capture.seen > stderr_capture.limit))
                 break
             for key, _ in selector.select(remaining):
                 stream = key.fileobj
@@ -363,7 +374,7 @@ def _run_bounded(argv: list[str], *, input_data: bytes | None = None, timeout: f
                     (stdout_capture if key.data == "stdout" else stderr_capture).append(chunk)
                 else:
                     close_stream(stream)
-        completed = subprocess.CompletedProcess(argv, process.wait(), stdout_capture.finish(marker=not structured_stdout), stderr_capture.finish())
+        completed = subprocess.CompletedProcess(argv, process.wait(), stdout_capture.finish(marker=not structured_stdout), redact_and_bound_stderr(stderr_capture.finish(marker=False), truncated=stderr_capture.seen > stderr_capture.limit))
         completed.stdout_truncated = stdout_capture.seen > stdout_capture.limit
         return completed
     finally:

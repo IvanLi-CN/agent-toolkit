@@ -9,7 +9,7 @@
 import { Database } from "bun:sqlite";
 import { dlopen } from "bun:ffi";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { closeSync, constants, existsSync, fchmodSync, ftruncateSync, fsyncSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmdirSync, statfsSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, constants, existsSync, fchmodSync, fsyncSync, fstatSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmdirSync, statfsSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { isIP } from "node:net";
 import { availableParallelism, homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -160,6 +160,7 @@ function isDict(value: unknown): value is Dict {
 const SENSITIVE_FIELD_RE = /(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)/i;
 const SECRET_LABEL = "(?:[A-Za-z0-9]+[_-])*(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)(?:[_-][A-Za-z0-9]+)*";
 const PRIVATE_KEY_RE = /-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 _-]*PRIVATE KEY-----/gi;
+const UNTERMINATED_PRIVATE_KEY_RE = /-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*$/gi;
 const AUTH_SCHEME_RE = /(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?(?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]+/gi;
 const AUTH_BASIC_RE = /(\bbasic\s+)[A-Za-z0-9._~+/=-]+/gi;
 const SECRET_DOUBLE_RE = new RegExp(`(['\\\"]?\\b${SECRET_LABEL}\\b['\\\"]?\\s*[:=]\\s*)\\"[^\\"\\r\\n]*\\"`, "gi");
@@ -171,6 +172,7 @@ const BEARER_RE = /(bearer\s+)[A-Za-z0-9._~+/=-]+/gi;
 
 function redactDiagnosticText(rawInput: string): string {
   let redacted = rawInput.replace(PRIVATE_KEY_RE, "[REDACTED PRIVATE KEY]");
+  redacted = redacted.replace(UNTERMINATED_PRIVATE_KEY_RE, "[REDACTED PRIVATE KEY]");
   redacted = redacted.replace(AUTH_SCHEME_RE, "$1[REDACTED]");
   redacted = redacted.replace(AUTH_BASIC_RE, "$1[REDACTED]");
   redacted = redacted.replace(SECRET_DOUBLE_RE, "$1\"[REDACTED]\"");
@@ -197,6 +199,73 @@ function redactDiagnosticValue(value: unknown, depth = 0): unknown {
     return result;
   }
   return value;
+}
+
+const PERSISTED_RESPONSE_FIELDS = new Set([
+  "ok", "protocol", "server_time", "action", "session_id", "generation", "operation_id", "outcome", "result", "current_state", "error", "_request_digest",
+]);
+const PERSISTED_PAYLOAD_FIELDS = new Set([
+  "action", "actions", "active", "admission", "admission_ready", "allocated_and_reserved", "agent", "applied", "args", "attempts",
+  "available", "available_bytes", "base", "budget_seconds", "cached", "cause", "candidates", "capacity", "cleanup_after",
+  "code", "completed", "config", "configured_memory_mib", "condition", "conflicts", "connect", "cost", "cpu", "cpu_budget",
+  "cpu_psi", "create_cost_bytes", "created_at", "ct_capacity", "current_state", "default_admission", "destination", "destination_port",
+  "detail", "device_name", "device_names", "differences", "disk_gib", "doctor", "draining", "dry_run", "effective_lease", "egress",
+  "elapsed_seconds", "error", "errors", "event", "expected", "filesystem", "filesystem_before", "filesystem_bytes", "generation",
+  "gateway_ip", "guest", "guest_available", "guest_boot_id", "guest_error", "guest_filesystem", "host", "host_address", "host_key", "host_key_alias", "host_port",
+  "image_alias", "image_fingerprint", "inactive_since", "incus_version", "ingress", "instance_count", "instance_name", "instances", "issues", "ipv4", "kind",
+  "label", "last_error", "layers", "lease_expires_at", "limit", "limit_bytes", "limits", "listen", "low", "memory", "memory_mib",
+  "memory_pressure", "message", "mode", "native_attempts", "native_status", "network", "observed_at", "ok", "operation_phase", "other",
+  "outcome", "payload", "phase", "phases", "pid", "plan", "policy", "policy_compliant", "pool", "port", "port_name", "ports", "post_check_seconds", "previous_generation",
+  "process_group_cleanup_error", "process_group_killed", "profile", "project", "protocol", "proxy", "qemu_schedstat", "ratios", "ready", "reason", "reasons",
+  "reclaim_required", "reclaimed", "record", "remaining", "removed", "request_cost_bytes", "requested", "reservation_bytes",
+  "resource_reservation", "resource_reservation_json", "resources", "resources_json", "result", "returncode", "runtime_seconds", "scope", "selection", "server_time",
+  "session_id", "sources", "ssh_host_port", "stage_timings", "startup_log", "state", "stderr", "task_id", "tasks", "threshold_bytes",
+  "total", "total_elapsed_seconds", "transport_timeout", "truncated", "type", "updated_at", "user", "verification", "verified", "version",
+  "runqueue_wait_seconds", "source", "status", "storage_path", "text", "timer_dir", "virtual_bytes", "vm_ip", "vm_port", "readiness", "emitted", "native_start_seconds",
+]);
+const PERSISTED_DEPTH_LIMIT = 8;
+const PERSISTED_STRING_LIMIT = 4096;
+const PERSISTED_COLLECTION_LIMIT = 128;
+const PERSISTED_DOCUMENT_LIMIT = 64 * 1024;
+const PERSISTENCE_TRUNCATION_MARKER = "[TRUNCATED BY PERSISTENCE LIMIT]";
+
+function persistedValue(value: unknown, depth = 0): unknown {
+  if (depth > PERSISTED_DEPTH_LIMIT) return PERSISTENCE_TRUNCATION_MARKER;
+  if (typeof value === "string") return boundedDiagnosticText(value, PERSISTED_STRING_LIMIT);
+  if (value === null || typeof value === "boolean" || typeof value === "number" || typeof value === "bigint") return value;
+  if (Array.isArray(value)) return value.slice(0, PERSISTED_COLLECTION_LIMIT).map((entry) => persistedValue(entry, depth + 1));
+  if (isDict(value)) {
+    const result: Dict = Object.create(null);
+    let retained = 0;
+    for (const [key, child] of Object.entries(value)) {
+      if (retained >= PERSISTED_COLLECTION_LIMIT) break;
+      if (!PERSISTED_PAYLOAD_FIELDS.has(key) || SENSITIVE_FIELD_RE.test(key)) continue;
+      setOwn(result, key, persistedValue(child, depth + 1));
+      retained += 1;
+    }
+    return result;
+  }
+  return PERSISTENCE_TRUNCATION_MARKER;
+}
+
+function persistedDocument(value: unknown): unknown {
+  const projected = persistedValue(value);
+  if (stableJson(projected).length <= PERSISTED_DOCUMENT_LIMIT) return projected;
+  return { truncated: true };
+}
+
+function persistedResponse(response: Dict): Dict {
+  const result: Dict = Object.create(null);
+  for (const [key, value] of Object.entries(response)) {
+    if (!PERSISTED_RESPONSE_FIELDS.has(key)) continue;
+    if (key === "result" || key === "error") setOwn(result, key, persistedDocument(value));
+    else setOwn(result, key, persistedValue(value));
+  }
+  if (stableJson(result).length > PERSISTED_DOCUMENT_LIMIT) {
+    if (hasOwn(result, "result")) result.result = { truncated: true };
+    if (hasOwn(result, "error")) result.error = { code: "persisted_error", message: PERSISTENCE_TRUNCATION_MARKER };
+  }
+  return result;
 }
 
 function hasOwn(value: object, key: string): boolean {
@@ -1122,34 +1191,68 @@ const TASK_FIELDS = new Set([
   "reservation_bytes", "previous_generation", "resource_reservation_json",
 ]);
 const PORT_FIELDS = new Set(["task_id", "generation", "port_name", "protocol", "host_port", "vm_port", "device_name", "state", "created_at"]);
+const STATE_TABLES = new Set(["meta", "tasks", "ports", "operations", "audit"]);
+const STATE_COLUMNS: Record<string, readonly string[]> = {
+  meta: ["key", "value"],
+  tasks: ["task_id", "session_id", "generation", "state", "instance_name", "vm_ip", "ssh_host_port", "lease_expires_at", "inactive_since", "cleanup_after", "created_at", "updated_at", "last_error", "image_fingerprint", "resources_json", "reservation_bytes", "previous_generation", "resource_reservation_json"],
+  ports: ["task_id", "generation", "port_name", "protocol", "host_port", "vm_port", "device_name", "state", "created_at"],
+  operations: ["operation_id", "action", "session_id", "generation", "response_json", "created_at"],
+  audit: ["id", "action", "task_id", "session_id", "generation", "outcome", "detail_json", "created_at"],
+};
+
+type StateStoreOptions = { bootstrap?: boolean };
 
 export class StateStore {
   readonly path: string;
   readonly db: Database;
   private depth = 0;
 
-  constructor(path: string) {
+  static bootstrap(path: string): StateStore { return new StateStore(path, { bootstrap: true }); }
+
+  constructor(path: string, options: StateStoreOptions = {}) {
     this.path = path;
-    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    const parent = lstatSync(dirname(path));
+    const bootstrap = options.bootstrap === true;
+    const parentPath = dirname(path);
+    if (bootstrap) mkdirSync(parentPath, { recursive: true, mode: 0o700 });
+    let parent: ReturnType<typeof lstatSync>;
+    try { parent = lstatSync(parentPath); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new ControlError("state_missing", "state parent directory is missing");
+      throw error;
+    }
     if (!parent.isDirectory() || (typeof process.geteuid === "function" && parent.uid !== process.geteuid()) || (parent.mode & 0o77) !== 0) throw new ControlError("state_path_unsafe", "state parent must be a private owned directory");
+    let file: ReturnType<typeof lstatSync> | undefined;
     try {
-      if (lstatSync(path).isSymbolicLink()) throw new ControlError("state_path_unsafe", "state database cannot be a symlink");
+      file = lstatSync(path);
+      if (file.isSymbolicLink()) throw new ControlError("state_path_unsafe", "state database cannot be a symlink");
     } catch (error) {
       if (error instanceof ControlError) throw error;
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        if (!bootstrap) throw new ControlError("state_missing", "durable state database is missing");
+      } else throw error;
     }
-    this.db = new Database(path, { safeIntegers: true });
-    try { chmodPrivate(path); } catch { /* SQLite may create the file lazily. */ }
-    this.db.run("PRAGMA busy_timeout=10000");
-    this.db.run("PRAGMA journal_mode=WAL");
-    this.db.run("PRAGMA synchronous=FULL");
-    this.db.run("PRAGMA foreign_keys=ON");
-    this.schema();
+    if (file && !file.isFile()) throw new ControlError("state_invalid", "state database must be a regular file");
+    if (file && file.size === 0) throw new ControlError("state_invalid", "state database is empty");
+    let opened: Database | undefined;
+    try {
+      opened = new Database(path, { safeIntegers: true });
+      if (!bootstrap) StateStore.verifyDurableState(opened);
+      opened.run("PRAGMA busy_timeout=10000");
+      opened.run("PRAGMA journal_mode=WAL");
+      opened.run("PRAGMA synchronous=FULL");
+      opened.run("PRAGMA foreign_keys=ON");
+      if (bootstrap) this.schemaOn(opened);
+      try { chmodPrivate(path); } catch { throw new ControlError("state_path_unsafe", "state database permissions cannot be secured"); }
+      this.db = opened;
+    } catch (error) {
+      try { opened?.close(); } catch { /* Preserve the durable-state failure. */ }
+      if (error instanceof ControlError) throw error;
+      throw new ControlError("state_invalid", "durable state database cannot be verified");
+    }
   }
 
-  private schema(): void {
-    this.db.run(`
+  private schemaOn(db: Database): void {
+    db.run(`
       CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS tasks (
         task_id TEXT PRIMARY KEY, session_id TEXT NOT NULL UNIQUE, generation INTEGER NOT NULL, state TEXT NOT NULL,
@@ -1173,6 +1276,17 @@ export class StateStore {
         outcome TEXT NOT NULL, detail_json TEXT, created_at TEXT NOT NULL
       );
     `);
+  }
+
+  private static verifyDurableState(db: Database): void {
+    const quickCheck = (db.query("PRAGMA quick_check") as any).get() as Dict | null;
+    if (!quickCheck || String(quickCheck.quick_check) !== "ok") throw new ControlError("state_invalid", "durable state database failed SQLite integrity check");
+    const names = new Set(((db.query("SELECT name FROM sqlite_master WHERE type = 'table'") as any).all() as Dict[]).map((row) => String(row.name)));
+    for (const name of STATE_TABLES) {
+      if (!names.has(name)) throw new ControlError("state_invalid", `durable state database is missing table: ${name}`);
+      const columns = new Set(((db.query(`PRAGMA table_info(${name})`) as any).all() as Dict[]).map((row) => String(row.name)));
+      for (const column of STATE_COLUMNS[name] ?? []) if (!columns.has(column)) throw new ControlError("state_invalid", `durable state database is missing column: ${name}.${column}`);
+    }
   }
 
   close(): void { this.db.close(); }
@@ -1258,15 +1372,17 @@ export class StateStore {
 
   operation(operationId: string): Dict | undefined {
     const row = this.row("SELECT response_json FROM operations WHERE operation_id = ?", [operationId]);
-    return row ? parseJson(String(row.response_json)) as Dict : undefined;
+    if (!row) return undefined;
+    const value = parseJson(String(row.response_json));
+    return isDict(value) ? persistedResponse(value) : undefined;
   }
 
   recordOperation(operationId: string, action: string, sessionId: string | undefined, generation: unknown, response: Dict): void {
-    this.transaction(() => (this.db as any).run("INSERT OR REPLACE INTO operations(operation_id,action,session_id,generation,response_json,created_at) VALUES (?,?,?,?,?,?)", operationId, action, sessionId ?? null, generation ?? null, stableJson(response), isoTime()));
+    this.transaction(() => (this.db as any).run("INSERT OR REPLACE INTO operations(operation_id,action,session_id,generation,response_json,created_at) VALUES (?,?,?,?,?,?)", operationId, action, sessionId ?? null, generation ?? null, stableJson(persistedResponse(response)), isoTime()));
   }
 
   audit(action: string, outcome: string, detail?: unknown, taskId?: string, sessionId?: string, generation?: unknown): void {
-    this.transaction(() => (this.db as any).run("INSERT INTO audit(action,task_id,session_id,generation,outcome,detail_json,created_at) VALUES (?,?,?,?,?,?,?)", action, taskId ?? null, sessionId ?? null, generation ?? null, outcome, detail === undefined ? null : stableJson(detail), isoTime()));
+    this.transaction(() => (this.db as any).run("INSERT INTO audit(action,task_id,session_id,generation,outcome,detail_json,created_at) VALUES (?,?,?,?,?,?,?)", action, taskId ?? null, sessionId ?? null, generation ?? null, outcome, detail === undefined ? null : stableJson(persistedDocument(detail)), isoTime()));
   }
 
   getMeta(key: string): string | undefined { const row = this.row("SELECT value FROM meta WHERE key = ?", [key]); return row ? String(row.value) : undefined; }
@@ -1313,28 +1429,58 @@ function acquireFileLock(path: string, blocking = true, shared = false): () => v
   };
 }
 
-function acquireWriterIntent(directory: string): () => void {
+const NATIVE_WRITER_PREFIX = "native-writer-";
+const NATIVE_WRITER_STATE_SUFFIX = ".state";
+
+function writerStatePath(path: string): string { return `${path}${NATIVE_WRITER_STATE_SUFFIX}`; }
+
+function writeAtomicMarker(path: string, value: string, createOnly = false): void {
+  const noFollow = (constants as any).O_NOFOLLOW ?? 0;
+  const temp = `${path}.tmp-${randomUUID()}`;
+  const fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollow, 0o600);
+  try {
+    const bytes = Buffer.from(value, "utf8");
+    writeSync(fd, bytes, 0, bytes.length, 0);
+    fsyncSync(fd);
+  } finally { closeSync(fd); }
+  try {
+    if (createOnly) {
+      linkSync(temp, path);
+      unlinkSync(temp);
+    } else renameSync(temp, path);
+  } catch (error) {
+    try { unlinkSync(temp); } catch { /* The temporary marker may already be linked. */ }
+    throw error;
+  }
+}
+
+function removeWriterMarker(path: string): void {
+  try { unlinkSync(path); } catch { /* Stale-marker cleanup is best effort. */ }
+  try { unlinkSync(writerStatePath(path)); } catch { /* Stale-marker cleanup is best effort. */ }
+}
+
+function reclaimableWriterFd(fd: number): boolean {
+  try { flock(fd, 2 | 4); return true; } catch { return false; }
+}
+
+export function acquireWriterIntent(directory: string): () => void {
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   const noFollow = (constants as any).O_NOFOLLOW ?? 0;
-  const path = join(directory, `native-writer-${randomUUID()}`);
-  const fd = openSync(path, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | noFollow, 0o600);
+  const path = join(directory, `${NATIVE_WRITER_PREFIX}${randomUUID()}`);
   const token = randomUUID();
-  const writeMarker = (value: string): void => {
-    const bytes = Buffer.from(value, "utf8");
-    ftruncateSync(fd, 0);
-    writeSync(fd, bytes, 0, bytes.length, 0);
-  };
+  const pending = `pending ${process.pid} ${token}\n`;
+  let fd: number | undefined;
   try {
-    // Publish a pending marker before taking the lock. Readers treat this
-    // state as active, so a marker cannot be reclaimed in the pre-flock gap.
-    writeMarker(`pending ${process.pid} ${token}\n`);
-    fsyncSync(fd);
+    // Publish a complete pending marker through a temporary inode before the
+    // lock fd exists. A crash in this gap is therefore either reclaimable by
+    // PID/flock inspection or visibly pending, never an empty active marker.
+    writeAtomicMarker(path, pending, true);
+    fd = openSync(path, constants.O_RDWR | noFollow);
     flock(fd, 2);
-    writeMarker(`ready__ ${process.pid} ${token}\n`);
-    fsyncSync(fd);
+    writeAtomicMarker(writerStatePath(path), `ready__ ${process.pid} ${token}\n`);
   } catch (error) {
-    try { closeSync(fd); } catch { /* The descriptor is already closed. */ }
-    try { unlinkSync(path); } catch { /* The marker may not have been created. */ }
+    try { if (fd !== undefined) closeSync(fd); } catch { /* The descriptor is already closed. */ }
+    removeWriterMarker(path);
     throw new ControlError("lock_failed", "native writer intent could not be acquired");
   }
   nativeWriterIntentPaths.add(path);
@@ -1343,17 +1489,17 @@ function acquireWriterIntent(directory: string): () => void {
     if (released) return;
     released = true;
     nativeWriterIntentPaths.delete(path);
-    try { flock(fd, 8); } catch { /* The descriptor is being closed. */ }
-    closeSync(fd);
-    try { unlinkSync(path); } catch { /* Marker cleanup is best effort. */ }
+    try { flock(fd!, 8); } catch { /* The descriptor is being closed. */ }
+    closeSync(fd!);
+    removeWriterMarker(path);
   };
 }
 
-function hasWriterIntent(directory: string): boolean {
+export function hasWriterIntent(directory: string): boolean {
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   let active = false;
   for (const name of readdirSync(directory)) {
-    if (!name.startsWith("native-writer-")) continue;
+    if (!name.startsWith(NATIVE_WRITER_PREFIX) || name.endsWith(NATIVE_WRITER_STATE_SUFFIX) || name.includes(".tmp-")) continue;
     const path = join(directory, name);
     if (nativeWriterIntentPaths.has(path)) { active = true; continue; }
     const noFollow = (constants as any).O_NOFOLLOW ?? 0;
@@ -1361,21 +1507,31 @@ function hasWriterIntent(directory: string): boolean {
     let stale = false;
     try {
       fd = openSync(path, constants.O_RDWR | noFollow);
-      const marker = String(readFileSync(fd, "utf8"));
+      let marker = "";
+      try { marker = String(readFileSync(writerStatePath(path), "utf8")); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") marker = "";
+        if (!marker) marker = String(readFileSync(fd, "utf8"));
+      }
       if (marker.startsWith("pending ")) {
         const pid = Number(marker.split(/\s+/, 3)[1]);
         if (Number.isSafeInteger(pid) && pid > 1) {
           try { process.kill(pid, 0); active = true; } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== "ESRCH") active = true;
-            else { try { flock(fd, 2 | 4); stale = true; } catch { active = true; } }
+            else stale = reclaimableWriterFd(fd);
           }
-        } else active = true;
+        } else stale = reclaimableWriterFd(fd);
       } else if (marker.startsWith("ready__ ")) {
-        try { flock(fd, 2 | 4); stale = true; } catch { active = true; }
-      } else active = true;
+        stale = reclaimableWriterFd(fd);
+      } else {
+        // Empty, malformed, or unreadable state is fail-closed while the
+        // lock is held, but a free lock is stale and must be reclaimed.
+        stale = reclaimableWriterFd(fd);
+        if (!stale) active = true;
+      }
     } catch { active = true; }
     finally { if (fd !== undefined) closeSync(fd); }
-    if (stale) try { unlinkSync(path); } catch { /* Another process may have reclaimed it. */ }
+    if (stale) removeWriterMarker(path);
   }
   return active;
 }
@@ -1610,7 +1766,7 @@ export class Control {
           response.current_state = task ? this.stateSummary(task) : null;
           if (action === "renew" && task && this.stateSummary(task).effective_lease) await this.scheduleExpiry(task);
         }
-        return validateSuccessEnvelope(response, action, sessionId, operationId);
+        return validateSuccessEnvelope(persistedResponse(response), action, sessionId, operationId);
       }
       numberFromInteger(requiredOwn(request, "generation"), "generation", 0);
       if (action !== "renew") await this.globalLock(() => this.store.recordOperation(operationId!, action, sessionId, request.generation, { outcome: "pending", _request_digest: digest }));
@@ -1619,11 +1775,12 @@ export class Control {
       const result = await this.dispatchAction(action, request, sessionId);
       const response: Dict = { ok: true, protocol: PROTOCOL_VERSION, server_time: isoTime(this.now()), action, session_id: sessionId ?? null, generation: action === "status" ? result.generation ?? null : request.generation ?? null, operation_id: operationId ?? null, outcome: "success", result };
       const validated = validateSuccessEnvelope(response, action, sessionId, operationId);
+      const persisted = persistedResponse(validated);
       await this.globalLock(() => {
-        if (operationId && Control.WRITE_ACTIONS.has(action) && action !== "renew") this.store.recordOperation(operationId, action, sessionId, request.generation, { ...response, _request_digest: digest });
-        if (sessionId) this.store.audit(action, "ok", result, undefined, sessionId, request.generation);
+        if (operationId && Control.WRITE_ACTIONS.has(action) && action !== "renew") this.store.recordOperation(operationId, action, sessionId, request.generation, { ...persisted, _request_digest: digest });
+        if (sessionId) this.store.audit(action, "ok", persisted.result, undefined, sessionId, request.generation);
       });
-      return validated;
+      return persisted;
     } catch (error) {
       if (error instanceof ControlError) {
         await this.globalLock(() => {

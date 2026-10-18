@@ -64,6 +64,10 @@ Only then may an authorized operator run `agent-vm admin drain exit` and immedia
 
 If the state database, operation journal, generation records, protected configuration, or authoritative native inventory is missing, corrupt, or inconsistent, stop the control plane and preserve the remaining data. Do not guess ownership, reset generations, create a fresh state database, reacquire sessions, delete caches, or clean mappings globally.
 
+The runtime opens only an existing private SQLite database that passes an integrity check and contains the complete durable schema; a missing path returns `state_missing`, while an empty, malformed, or incomplete database returns `state_invalid`. Directory/file creation is reserved for an explicit bootstrap or test fixture path and is never an implicit production recovery action, so no new lease can be issued while state verification fails.
+
+Operation and audit records retain only the declared response/result fields after recursive depth, collection, string, document-size, and diagnostic-redaction limits; unrecognized or sensitive guest/agent fields are omitted before durable write and replay.
+
 The minimum evidence needed to continue is an owner-authorized mapping between the control entry and CT109, the matching state/config backups, the installed revision/checksums, the intended Incus project/pool, and a native inventory that can prove task ownership and generations. Without that evidence, the physical/virtual host source and rebuild path remain blockers; the correct outcome is an incident report, not cleanup or admission.
 
 ## Sparse disk and failure domains

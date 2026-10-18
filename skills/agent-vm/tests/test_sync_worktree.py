@@ -59,10 +59,16 @@ class SyncTests(unittest.TestCase):
         self.assertNotIn(b"auth-canary-01", value)
         self.assertNotIn(b"dXNlcjpzZWNyZXQ=", value)
 
-    def test_child_diagnostics_are_bounded_before_redaction(self):
+    def test_child_diagnostics_are_redacted_before_bounding(self):
         result = MOD.run([sys.executable, "-c", "import sys; sys.stderr.write('Authorization: Bearer ' + 'x' * 20000)"], capture_output=True)
         self.assertLessEqual(len(result.stderr), MOD.DIAGNOSTIC_OUTPUT_LIMIT)
-        self.assertIn(MOD.DIAGNOSTIC_TRUNCATION_MARKER, result.stderr)
+        self.assertNotIn(b"x" * 100, result.stderr)
+
+    def test_unterminated_pem_is_redacted_before_bounding(self):
+        value = b"-----BEGIN OPENSSH PRIVATE KEY-----\n" + (b"pem-canary-" * 2000)
+        redacted = MOD.redact_and_bound_stderr(value)
+        self.assertLessEqual(len(redacted), MOD.DIAGNOSTIC_OUTPUT_LIMIT)
+        self.assertNotIn(b"pem-canary", redacted)
 
     def test_truncated_git_inventory_fails_closed(self):
         complete = MOD.subprocess.CompletedProcess([], 0, b"", b"")

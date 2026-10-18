@@ -55,7 +55,7 @@ class SessionContractTests(unittest.TestCase):
         self.assertEqual(command[-2:], ["--session-id", "explicit"])
 
     def test_control_uses_bun_for_the_remote_controller(self):
-        response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "status", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 1, "outcome": "success", "result": {}}
+        response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "status", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 1, "operation_id": None, "outcome": "success", "result": {"generation": 1}}
         process = CLI.subprocess.CompletedProcess([], 0, CLI.json.dumps(response).encode(), b"")
         with mock.patch.object(CLI, "run_child", return_value=process) as run:
             CLI.control_request("status", session="thread")
@@ -114,10 +114,10 @@ class SessionContractTests(unittest.TestCase):
                 self.assertEqual(error.exception.code, "local_journal_invalid")
                 run.assert_not_called()
 
-    def test_child_diagnostics_are_bounded_before_redaction(self):
+    def test_child_diagnostics_are_redacted_before_bounding(self):
         process = CLI.run_child([CLI.sys.executable, "-c", "import sys; sys.stderr.write('Authorization: Bearer ' + 'x' * 20000)"], capture_stdout=True)
         self.assertLessEqual(len(process.stderr), CLI.DIAGNOSTIC_OUTPUT_LIMIT)
-        self.assertIn(CLI.DIAGNOSTIC_TRUNCATION_MARKER, process.stderr)
+        self.assertNotIn(b"x" * 100, process.stderr)
 
     def test_admin_drain_mutations_expose_a_reusable_operation_id(self):
         args = CLI.build_parser().parse_args(["admin", "drain", "enter", "--session-id", "thread", "--operation-id", "drain-op"])
@@ -138,14 +138,14 @@ class SessionContractTests(unittest.TestCase):
         self.assertEqual(request["generation"], 3)
 
     def test_large_structured_response_is_not_diagnostic_truncated(self):
-        response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "status", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 1, "outcome": "success", "result": {"payload": "x" * (CLI.DIAGNOSTIC_OUTPUT_LIMIT * 2)}}
+        response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "status", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 1, "operation_id": None, "outcome": "success", "result": {"generation": 1, "payload": "x" * (CLI.DIAGNOSTIC_OUTPUT_LIMIT * 2)}}
         process = CLI.subprocess.CompletedProcess([], 0, json.dumps(response).encode(), b"")
         with mock.patch.object(CLI, "run_child", return_value=process):
             actual = CLI.control_request("status", session="thread")
         self.assertEqual(len(actual["result"]["payload"]), CLI.DIAGNOSTIC_OUTPUT_LIMIT * 2)
 
     def test_malformed_success_generation_and_outcome_are_rejected(self):
-        base = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "status", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "result": {}}
+        base = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "status", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "operation_id": None, "result": {"generation": 1}}
         for field, value in (("generation", True), ("outcome", "pending")):
             response = {**base, "generation": 1, "outcome": "success", field: value}
             process = CLI.subprocess.CompletedProcess([], 0, json.dumps(response).encode(), b"")
@@ -154,6 +154,22 @@ class SessionContractTests(unittest.TestCase):
                     CLI.control_request("status", session="thread")
             self.assertEqual(error.exception.code, "invalid_remote_response")
 
+    def test_success_requires_null_read_operation_and_consistent_status_generation(self):
+        response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "status", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 1, "outcome": "success", "result": {"generation": 1}}
+        process = CLI.subprocess.CompletedProcess([], 0, json.dumps(response).encode(), b"")
+        with mock.patch.object(CLI, "run_child", return_value=process):
+            with self.assertRaises(CLI.CliError) as error:
+                CLI.control_request("status", session="thread")
+        self.assertEqual(error.exception.code, "invalid_remote_response")
+
+        response["operation_id"] = None
+        response["result"] = {"generation": 2}
+        process = CLI.subprocess.CompletedProcess([], 0, json.dumps(response).encode(), b"")
+        with mock.patch.object(CLI, "run_child", return_value=process):
+            with self.assertRaises(CLI.CliError) as error:
+                CLI.control_request("status", session="thread")
+        self.assertEqual(error.exception.code, "invalid_remote_response")
+
     def test_basic_credentials_and_long_error_messages_are_redacted_before_bounds(self):
         value = 'Authorization: Basic dXNlcjpzZWNyZXQ= url=https://user:secret@example.test sshpass -p very-secret'
         self.assertNotIn("dXNlcjpzZWNyZXQ=", CLI.redact_diagnostic_text(value))
@@ -161,6 +177,12 @@ class SessionContractTests(unittest.TestCase):
         error = CLI.CliError("remote_failed", "Authorization: Basic " + "secret-value" + "x" * 10000)
         self.assertLessEqual(len(error.message), CLI.DIAGNOSTIC_MESSAGE_LIMIT)
         self.assertNotIn("secret-value", error.message)
+
+    def test_unterminated_pem_is_redacted_before_bounding(self):
+        value = b"-----BEGIN OPENSSH PRIVATE KEY-----\n" + (b"pem-canary-" * 2000)
+        redacted = CLI.redact_and_bound_diagnostic(value)
+        self.assertLessEqual(len(redacted), CLI.DIAGNOSTIC_OUTPUT_LIMIT)
+        self.assertNotIn(b"pem-canary", redacted)
 
     def test_timeout_kills_descendant_process_group(self):
         with tempfile.TemporaryDirectory() as directory:

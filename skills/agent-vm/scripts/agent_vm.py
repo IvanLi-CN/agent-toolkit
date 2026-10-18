@@ -34,6 +34,7 @@ DEFAULT_CONTROL_TIMEOUT_SECONDS = 240
 LONG_CONTROL_TIMEOUT_SECONDS = 600
 DIAGNOSTIC_OUTPUT_LIMIT = 8192
 DIAGNOSTIC_TRUNCATION_MARKER = b"\n[TRUNCATED BY DIAGNOSTIC LIMIT]"
+RAW_DIAGNOSTIC_CAPTURE_LIMIT = 1024 * 1024
 CONTROL_RESPONSE_LIMIT = 4 * 1024 * 1024
 CHILD_DRAIN_GRACE_SECONDS = 1.0
 DIAGNOSTIC_MESSAGE_LIMIT = 4096
@@ -50,6 +51,7 @@ NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
 SENSITIVE_FIELD_RE = re.compile(r"(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)", re.IGNORECASE)
 SECRET_LABELS = r"(?:[A-Za-z0-9]+[_-])*(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?)(?:[_-][A-Za-z0-9]+)*"
 PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 _-]*PRIVATE KEY-----", re.IGNORECASE)
+UNTERMINATED_PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*$", re.IGNORECASE)
 AUTH_SCHEME_RE = re.compile(r"(?i)(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?(?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]+")
 AUTH_BASIC_RE = re.compile(r"(?i)(\bbasic\s+)[A-Za-z0-9._~+/=-]+")
 SECRET_DOUBLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)\"[^\"\r\n]*\"")
@@ -62,6 +64,7 @@ BEARER_RE = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+")
 
 def redact_diagnostic_text(value: str) -> str:
     redacted = PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", value)
+    redacted = UNTERMINATED_PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", redacted)
     redacted = AUTH_SCHEME_RE.sub(r"\1[REDACTED]", redacted)
     redacted = AUTH_BASIC_RE.sub(r"\1[REDACTED]", redacted)
     redacted = SECRET_DOUBLE_RE.sub(r'\1"[REDACTED]"', redacted)
@@ -78,6 +81,14 @@ def bounded_diagnostic_text(value: str, limit: int = DIAGNOSTIC_MESSAGE_LIMIT) -
         return redacted
     marker = DIAGNOSTIC_TRUNCATION_MARKER.decode("utf-8")
     return redacted[: max(0, limit - len(marker))] + marker
+
+
+def redact_and_bound_diagnostic(value: bytes, *, truncated: bool = False, limit: int = DIAGNOSTIC_OUTPUT_LIMIT) -> bytes:
+    redacted = redact_diagnostic_text(value.decode("utf-8", "replace")).encode("utf-8")
+    if not truncated and len(redacted) <= limit:
+        return redacted
+    available = max(0, limit - len(DIAGNOSTIC_TRUNCATION_MARKER))
+    return redacted[:available] + DIAGNOSTIC_TRUNCATION_MARKER
 
 
 def redact_diagnostic_value(value: Any, depth: int = 0) -> Any:
@@ -253,7 +264,7 @@ def run_child(argv: Sequence[str], *, input_data: bytes | None = None,
     stdout_capture = _BoundedCapture(stdout_limit, tail=False)
     # Keep the diagnostic prefix. A bounded tail can retain an unlabeled secret
     # suffix after truncation, even when the retained bytes are redacted later.
-    stderr_capture = _BoundedCapture(DIAGNOSTIC_OUTPUT_LIMIT, tail=False)
+    stderr_capture = _BoundedCapture(RAW_DIAGNOSTIC_CAPTURE_LIMIT, tail=False)
     input_view = memoryview(input_data or b"")
     input_offset = 0
 
@@ -289,7 +300,7 @@ def run_child(argv: Sequence[str], *, input_data: bytes | None = None,
             if remaining is not None and remaining <= 0:
                 if deadline is not None and (drain_deadline is None or deadline <= drain_deadline):
                     terminate_process_group(process)
-                    raise subprocess.TimeoutExpired(list(argv), effective_timeout, output=stdout_capture.finish(marker=False), stderr=stderr_capture.finish())
+                    raise subprocess.TimeoutExpired(list(argv), effective_timeout, output=stdout_capture.finish(marker=False), stderr=redact_and_bound_diagnostic(stderr_capture.finish(marker=False), truncated=stderr_capture.seen > stderr_capture.limit))
                 terminate_process_group(process)
                 for stream in (process.stdout, process.stderr):
                     if stream is not None:
@@ -300,7 +311,7 @@ def run_child(argv: Sequence[str], *, input_data: bytes | None = None,
                     process.wait(timeout=remaining)
                 except subprocess.TimeoutExpired:
                     terminate_process_group(process)
-                    raise subprocess.TimeoutExpired(list(argv), effective_timeout, output=stdout_capture.finish(marker=False), stderr=stderr_capture.finish())
+                    raise subprocess.TimeoutExpired(list(argv), effective_timeout, output=stdout_capture.finish(marker=False), stderr=redact_and_bound_diagnostic(stderr_capture.finish(marker=False), truncated=stderr_capture.seen > stderr_capture.limit))
                 break
             events = selector.select(remaining)
             for key, _ in events:
@@ -327,7 +338,7 @@ def run_child(argv: Sequence[str], *, input_data: bytes | None = None,
             list(argv),
             process.wait(),
             stdout_capture.finish(marker=not capture_stdout) if capture_stdout else None,
-            stderr_capture.finish(),
+            redact_and_bound_diagnostic(stderr_capture.finish(marker=False), truncated=stderr_capture.seen > stderr_capture.limit),
         )
         completed.stdout_truncated = stdout_capture.seen > stdout_capture.limit if capture_stdout else False
         return completed
@@ -429,7 +440,7 @@ def control_request(action: str, *, session: str | None, generation: int | None 
         fail("remote_timeout", "control outcome is uncertain; retry the same operation ID",
              {"operation_id": request.get("operation_id")})
     if process.stderr:
-        sys.stderr.buffer.write(redact_diagnostic_text(process.stderr.decode("utf-8", "replace")).encode("utf-8"))
+        sys.stderr.buffer.write(redact_and_bound_diagnostic(process.stderr))
         sys.stderr.flush()
     if process.returncode:
         fail("remote_failed", "remote request failed; retry only with its original operation ID",
@@ -447,8 +458,15 @@ def control_request(action: str, *, session: str | None, generation: int | None 
         fail("invalid_remote_response", "control response outcome is invalid")
     if not response.get("ok") or not isinstance(response.get("result"), dict) or not isinstance(response.get("server_time"), str):
         fail("invalid_remote_response", "invalid control response envelope")
-    if write and response.get("operation_id") != request["operation_id"]:
-        fail("protocol_mismatch", "operation identity differs")
+    expected_operation_id = request.get("operation_id") if write else None
+    if "operation_id" not in response or response.get("operation_id") != expected_operation_id:
+        fail("invalid_remote_response", "control response operation identity is invalid")
+    if action == "status":
+        result_generation = response["result"].get("generation")
+        if (isinstance(generation, bool) or not isinstance(generation, int) or generation < 0 or
+                isinstance(result_generation, bool) or not isinstance(result_generation, int) or result_generation < 0 or
+                generation != result_generation):
+            fail("invalid_remote_response", "status response generation is inconsistent")
     return response
 
 
@@ -461,7 +479,7 @@ def run_command(argv: Sequence[str], *, input_data: bytes | None = None, output:
     except subprocess.TimeoutExpired:
         fail("command_timeout", f"command timed out: {argv[0]}")
     if process.stderr:
-        sys.stderr.buffer.write(redact_diagnostic_text(process.stderr.decode("utf-8", "replace")).encode("utf-8"))
+        sys.stderr.buffer.write(redact_and_bound_diagnostic(process.stderr))
         sys.stderr.flush()
     return process.returncode
 

@@ -1070,6 +1070,12 @@ class IncusWaitTests(unittest.TestCase):
         )
         self.runner.run.assert_not_called()
 
+    def test_instance_list_rejects_malformed_entries(self):
+        self.runner.run.return_value = subprocess.CompletedProcess([], 0, b"[null]", b"")
+        with self.assertRaises(CONTROL.ControlError) as failure:
+            self.client.list_instances()
+        self.assertEqual(failure.exception.code, "incus_invalid_output")
+
 
 class ReclaimTests(Fixture):
     def test_manual_gc_previews_and_deletes_all_eligible_caches(self):

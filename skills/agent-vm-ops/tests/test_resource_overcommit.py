@@ -364,6 +364,14 @@ class AdmissionTests(Fixture):
         self.call("release")
         self.error("operation_unverified", self.control.dispatch, request)
 
+    def test_release_of_missing_native_instance_keeps_absent_state_readable(self):
+        active = self.acquire()
+        self.runner.instances.pop(active["instance_name"])
+        released = self.call("release")
+        self.assertEqual(released["state"], "absent")
+        self.assertEqual(released["resources"], {"cpu": 2, "memory_mib": 4096, "disk_gib": 20})
+        self.assertEqual(self.call("status")["state"], "absent")
+
     def test_acquire_rechecks_drain_before_active_commit(self):
         def enter_drain(*_):
             self.store.set_meta("draining", "1")

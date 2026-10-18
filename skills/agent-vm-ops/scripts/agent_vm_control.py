@@ -578,9 +578,9 @@ class IncusClient:
 
     def list_instances(self) -> list[dict[str, Any]]:
         value = self.json(["list"])
-        if not isinstance(value, list):
+        if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
             raise ControlError("incus_invalid_output", "Incus list output is not an array")
-        return [item for item in value if isinstance(item, dict)]
+        return value
 
     def instance_info(
         self, name: str, *, timeout: float = 30, bounded: bool = False
@@ -1196,26 +1196,35 @@ class SystemdManager:
             self._systemctl("restart", unit)
         return unit
 
-    def expiry_active(self, task_id: str, generation: int) -> bool:
+    def expiry_active(self, task_id: str, generation: int, expires_at: str) -> bool:
         unit = self.timer_unit(task_id, generation)
         if not self.enabled:
             return True
-        if not (self.timer_dir / unit).is_file():
+        path = self.timer_dir / unit
+        if not path.is_file():
             return False
         try:
+            expected_calendar = "OnCalendar=" + parse_time(expires_at).strftime("%Y-%m-%d %H:%M:%S UTC")
+            content = path.read_text(encoding="utf-8")
             result = self.runner.run(
-                ["systemctl", "show", unit, "-p", "ActiveState", "-p", "UnitFileState"],
+                ["systemctl", "show", unit, "-p", "ActiveState", "-p", "FragmentPath", "-p", "UnitFileState"],
                 timeout=10,
                 check=False,
             )
-        except ControlError:
+        except (ControlError, OSError, TypeError, ValueError):
             return False
         values = dict(
             line.split("=", 1)
             for line in result.stdout.decode(errors="replace").splitlines()
             if "=" in line
         )
-        return result.returncode == 0 and values.get("ActiveState") == "active" and values.get("UnitFileState") == "enabled"
+        return (
+            result.returncode == 0
+            and values.get("ActiveState") == "active"
+            and values.get("FragmentPath") == str(path)
+            and values.get("UnitFileState") == "enabled"
+            and content.count(expected_calendar) == 1
+        )
 
     def remove_expiry(self, task_id: str, generation: int) -> str:
         unit = self.timer_unit(task_id, generation)
@@ -1593,7 +1602,8 @@ class Control:
                         or not isinstance(error.get("message"), str)):
                     raise ControlError("operation_unverified", "reconcile journal error is invalid",
                                        {"operation_id": operation_id})
-                continue
+                raise ControlError("operation_unverified", "reconcile journal contains an unverified action error",
+                                   {"operation_id": operation_id})
             if item.get("action") not in allowed:
                 raise ControlError("operation_unverified", "reconcile journal action is unknown",
                                    {"operation_id": operation_id})
@@ -1635,7 +1645,7 @@ class Control:
                         if self.incus.instance_info(task["instance_name"])["status"].lower() != "running":
                             raise ControlError("operation_unverified", "reconciled guest is not running",
                                                {"operation_id": operation_id})
-                        if not self.systemd.expiry_active(task["task_id"], generation):
+                        if not self.systemd.expiry_active(task["task_id"], generation, task["lease_expires_at"]):
                             raise ControlError("operation_unverified", "reconciled expiry timer is not active",
                                                {"operation_id": operation_id})
                     except ControlError as exc:
@@ -1655,6 +1665,10 @@ class Control:
                                                    {"operation_id": operation_id})
                             if self.store.get_ports(task["task_id"]):
                                 raise ControlError("operation_unverified", "reconciled cache still has ports",
+                                                   {"operation_id": operation_id})
+                            owned = self._ownership(task)
+                            if any(device.get("type") == "proxy" for device in owned.get("expanded_devices", {}).values()):
+                                raise ControlError("operation_unverified", "reconciled cache still has native proxies",
                                                    {"operation_id": operation_id})
                         except ControlError as exc:
                             if exc.code == "operation_unverified":
@@ -3211,7 +3225,13 @@ class Control:
             if not absent and task.get("previous_generation") is not None:
                 self._ownership(task)
                 self.incus.config_set(task["instance_name"], "user.agent-vm.generation", str(task["generation"]))
-            resources = self._native_resources(task) if not absent else {}
+            if absent:
+                try:
+                    resources = parse_resource_mapping(task.get("resources_json"), "resources", allow_empty=False)
+                except (TypeError, ValueError) as exc:
+                    raise ControlError("resource_unverified", "absent task resources cannot be verified") from exc
+            else:
+                resources = self._native_resources(task)
             with self._global_lock(), self.store.transaction():
                 for port in self.store.get_ports(task["task_id"]):
                     self.store.remove_port(task["task_id"], port["port_name"], port["protocol"])

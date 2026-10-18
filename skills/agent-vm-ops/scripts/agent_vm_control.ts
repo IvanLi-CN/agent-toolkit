@@ -1419,7 +1419,6 @@ export class CommandRunner {
         let finalInspectionComplete = finalDescendants.complete;
         addKnown(finalDescendants.members);
         const finalEnvironment = processEnvironmentMembers(commandMarker);
-        finalInspectionComplete &&= finalEnvironment.complete;
         addKnown(finalEnvironment.members);
         const finalPipes = processPipeMembers(leaderPipeTargets);
         finalInspectionComplete &&= finalPipes.complete;

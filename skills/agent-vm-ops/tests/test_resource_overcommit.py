@@ -734,11 +734,11 @@ class AdmissionTests(Fixture):
             self.assertTrue(proceed.wait(timeout=5))
             return original(*args, **kwargs)
 
-        request = self.request("acquire", "race", public_key=KEY)
+        request = self.request("acquire", "race", operation="race-acquire", public_key=KEY)
 
         def acquire():
             try:
-                self.control.acquire(request, "race")
+                self.control.dispatch(request)
             except CONTROL.ControlError as error:
                 result.append(error.code)
 
@@ -746,8 +746,8 @@ class AdmissionTests(Fixture):
             thread = threading.Thread(target=acquire)
             thread.start()
             self.assertTrue(started.wait(timeout=5))
-            self.control.drain_enter({}, None)
-            self.control.drain_exit({}, None)
+            self.control.dispatch(self.request("drain-enter", operation="race-drain-enter"))
+            self.control.dispatch(self.request("drain-exit", operation="race-drain-exit"))
             proceed.set()
             thread.join(timeout=5)
         self.assertFalse(thread.is_alive())

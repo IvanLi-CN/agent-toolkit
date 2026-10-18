@@ -74,6 +74,7 @@ class NativeCommands(CONTROL.CommandRunner):
         self.on_wait = None
         self.proxy_allowed = True
         self.project_limits = {}
+        self.storage_source = None
         self.on_config_set = None
 
     def run(self, argv, *, input_data=None, timeout=30, check=True):
@@ -94,6 +95,8 @@ class NativeCommands(CONTROL.CommandRunner):
                 project = parse_qs(urlparse(command[1]).query).get("project", ["agents"])[0]
                 if path == "/1.0/projects": value = [{"name": "agents"}, {"name": "default"}]
                 elif path == "/1.0/projects/agents": value = {"config": {**self.project_limits, "restricted.devices.proxy": "allow" if self.proxy_allowed else "block"}}
+                elif path == "/1.0/storage-pools/agents": value = {"name": "agents", "driver": "dir",
+                                                                       "config": {"source": self.storage_source}}
                 elif path == "/1.0/network-acls/agent-vm-isolation": value = json.loads((ROOT / "skills/agent-vm-ops/assets/network-acl.json").read_text())
                 elif path.startswith("/1.0/images/"):
                     if not self.image_available:
@@ -279,6 +282,7 @@ class Fixture(unittest.TestCase):
                        "cpu_budget": 4, "memory_budget_mib": 16384, "required_guest_tools": ["python3", "sshd", "rsync", "docker"],
                        "state_db": str(self.root / "state.sqlite3"), "timer_dir": str(self.root / "systemd")}
         self.runner = NativeCommands()
+        self.runner.storage_source = self.config["storage_path"]
         self.store = CONTROL.StateStore(Path(self.config["state_db"]))
         self.addCleanup(self.store.close)
         self.systemd = CONTROL.SystemdManager(self.runner, self.config, enabled=False)
@@ -1218,11 +1222,30 @@ class ReclaimTests(Fixture):
         with mock.patch.object(CONTROL.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(100*GIB, 20*GIB, 80*GIB)) as measure:
             facts = self.control._ensure_capacity_verified()
         measure.assert_called_once_with(self.config["storage_path"])
-        self.assertEqual(self.runner.calls, [])
+        self.assertTrue(any(args[:2] == ["incus", "query"] and "/1.0/storage-pools/agents" in args[2]
+                            for args, _, _ in self.runner.calls))
         self.assertEqual(facts["scope"], "ct-filesystem")
         self.assertEqual(len(facts["layers"]), 1)
         self.assertEqual(facts["layers"][0]["free"], 80*GIB)
         self.assertEqual(self.acquire()["state"], "active")
+
+    def test_capacity_rejects_incus_pool_source_drift(self):
+        self.runner.storage_source = str(self.root / "different-pool")
+        with mock.patch.object(CONTROL.shutil, "disk_usage") as measure:
+            self.error("resource_unverified", self.control._ensure_capacity_verified)
+        measure.assert_not_called()
+
+    def test_capacity_rejects_non_directory_incus_pool(self):
+        original = self.runner.run
+
+        def non_dir(args, **kwargs):
+            result = original(args, **kwargs)
+            if args[:2] == ["incus", "query"] and "/1.0/storage-pools/agents" in args[2]:
+                result.stdout = json.dumps({"name": "agents", "driver": "lvm", "config": {"source": ""}}).encode()
+            return result
+
+        with mock.patch.object(self.runner, "run", side_effect=non_dir):
+            self.error("resource_unverified", self.control._ensure_capacity_verified)
 
     def test_config_rejects_removed_external_probe_field(self):
         path = self.root / "legacy-config.json"

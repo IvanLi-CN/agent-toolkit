@@ -2320,7 +2320,29 @@ class Control:
         return target
 
     def _ensure_capacity_verified(self) -> dict[str, Any]:
-        """Measure only the authorized CT pool filesystem; never execute probes."""
+        """Measure the configured Incus dir pool, never an unverified filesystem."""
+        try:
+            pool = self.incus.query("/1.0/storage-pools/" + quote(str(self.config["pool"]), safe=""),
+                                    project="default")
+            if not isinstance(pool, Mapping):
+                raise ValueError("pool response is not an object")
+            if pool.get("name") not in (None, self.config["pool"]):
+                raise ValueError("pool name does not match configuration")
+            if pool.get("driver") != "dir":
+                raise ControlError("resource_unverified", "configured Incus pool is not a directory pool",
+                                   {"pool": self.config["pool"], "driver": pool.get("driver")})
+            pool_config = pool.get("config")
+            source = pool_config.get("source") if isinstance(pool_config, Mapping) else None
+            configured_path = os.path.normpath(str(self.config["storage_path"]))
+            if not isinstance(source, str) or not source or os.path.normpath(source) != configured_path:
+                raise ControlError("resource_unverified", "Incus pool source differs from configured storage path",
+                                   {"pool": self.config["pool"], "pool_source": source,
+                                    "storage_path": configured_path})
+        except ControlError:
+            raise
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ControlError("resource_unverified", "Incus pool source cannot be verified",
+                               {"pool": self.config.get("pool")}) from exc
         try:
             usage = shutil.disk_usage(str(self.config["storage_path"]))
         except OSError as exc:
@@ -4336,77 +4358,83 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
 
 
     def drain_exit(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:
-        with self._admission_lock():
-            if self.store.get_meta("draining") != "1":
-                return {"draining": False}
-            snapshots = sorted(self.store.list_tasks(), key=lambda task: str(task.get("session_id", "")))
-            with ExitStack() as locks:
-                for snapshot in snapshots:
-                    owner = snapshot.get("session_id")
-                    if not isinstance(owner, str) or not owner:
-                        raise ControlError("resource_unverified", "drain state contains an invalid session owner")
-                    locks.enter_context(self._object_lock("session:" + owner, blocking=False))
-                for task in snapshots:
-                    if task.get("state") in {"preparing", "closing", "deleting", "failed"}:
-                        raise ControlError("reconciliation_required", "drain exit requires all task transitions to be reconciled",
-                                           {"task_id": task.get("task_id"), "state": task.get("state")})
-                health = self.doctor(request, session_id)
-                resources = health.get("resources")
-                instances = health.get("instances")
-                capacity = health.get("capacity")
-                if (
-                    not health.get("ready")
-                    or not isinstance(resources, Mapping)
-                    or not resources.get("verified")
-                    or not isinstance(instances, Mapping)
-                    or not instances.get("verified")
-                    or not isinstance(capacity, Mapping)
-                    or "error" in capacity
-                ):
-                    raise ControlError(
-                        "recovery_unverified",
-                        "drain exit requires verified control health and capacity state",
-                        {"issues": health.get("issues", []), "admission": health.get("default_admission")},
-                    )
-                for task in self.store.list_tasks():
-                    state = task.get("state")
-                    if state == "absent":
-                        continue
-                    if state in {"preparing", "closing", "deleting", "failed"}:
-                        raise ControlError("reconciliation_required", "drain exit requires all task transitions to be reconciled",
-                                           {"task_id": task.get("task_id"), "state": state})
-                    if state == "active":
-                        summary = self._state_summary(task)
-                        if not summary["effective_lease"]:
-                            raise ControlError("reconciliation_required", "active task has no effective lease",
-                                               {"task_id": task.get("task_id")})
-                        self._ownership(task)
-                        self._network_guard()
-                        self._verify_network_device(task)
-                        if self.incus.instance_info(task["instance_name"])["status"].lower() != "running":
-                            raise ControlError("state_mismatch", "active task guest is not running",
-                                               {"task_id": task.get("task_id")})
-                        if not self.systemd.expiry_active(task["task_id"], int(task["generation"]), task["lease_expires_at"]):
-                            raise ControlError("timer_unverified", "active task expiry timer is not verified",
-                                               {"task_id": task.get("task_id")})
-                        continue
-                    if state == "cached":
-                        self._ownership(task)
-                        if self.incus.instance_info(task["instance_name"])["status"].lower() != "stopped":
-                            raise ControlError("state_mismatch", "cached task guest is not stopped",
-                                               {"task_id": task.get("task_id")})
-                        if self.store.get_ports(task["task_id"]):
-                            raise ControlError("cleanup_incomplete", "cached task still has port mappings",
-                                               {"task_id": task.get("task_id")})
-                        owned = self._ownership(task)
-                        if any(device.get("type") == "proxy" for device in owned.get("expanded_devices", {}).values()):
-                            raise ControlError("cleanup_incomplete", "cached task still has native proxy mappings",
-                                               {"task_id": task.get("task_id")})
-                        continue
-                    raise ControlError("resource_unverified", "drain state contains an unknown task state",
+        if self.store.get_meta("draining") != "1":
+            return {"draining": False}
+        snapshots = sorted(self.store.list_tasks(), key=lambda task: str(task.get("session_id", "")))
+        # Session operations acquire their session lock before admission.lock.
+        # Keep that order here too; taking admission.lock first can deadlock an
+        # in-flight acquire that is waiting to re-check the drain fence.
+        with ExitStack() as locks:
+            for snapshot in snapshots:
+                owner = snapshot.get("session_id")
+                if not isinstance(owner, str) or not owner:
+                    raise ControlError("resource_unverified", "drain state contains an invalid session owner")
+                locks.enter_context(self._object_lock("session:" + owner, blocking=False))
+            for task in snapshots:
+                if task.get("state") in {"preparing", "closing", "deleting", "failed"}:
+                    raise ControlError("reconciliation_required", "drain exit requires all task transitions to be reconciled",
+                                       {"task_id": task.get("task_id"), "state": task.get("state")})
+            health = self.doctor(request, session_id)
+            resources = health.get("resources")
+            instances = health.get("instances")
+            capacity = health.get("capacity")
+            if (
+                not health.get("ready")
+                or not isinstance(resources, Mapping)
+                or not resources.get("verified")
+                or not isinstance(instances, Mapping)
+                or not instances.get("verified")
+                or not isinstance(capacity, Mapping)
+                or "error" in capacity
+            ):
+                raise ControlError(
+                    "recovery_unverified",
+                    "drain exit requires verified control health and capacity state",
+                    {"issues": health.get("issues", []), "admission": health.get("default_admission")},
+                )
+            for task in self.store.list_tasks():
+                state = task.get("state")
+                if state == "absent":
+                    continue
+                if state in {"preparing", "closing", "deleting", "failed"}:
+                    raise ControlError("reconciliation_required", "drain exit requires all task transitions to be reconciled",
                                        {"task_id": task.get("task_id"), "state": state})
-                with self._global_lock():
-                    if self.store.get_meta("draining") == "1":
+                if state == "active":
+                    summary = self._state_summary(task)
+                    if not summary["effective_lease"]:
+                        raise ControlError("reconciliation_required", "active task has no effective lease",
+                                           {"task_id": task.get("task_id")})
+                    self._ownership(task)
+                    self._network_guard()
+                    self._verify_network_device(task)
+                    if self.incus.instance_info(task["instance_name"])["status"].lower() != "running":
+                        raise ControlError("state_mismatch", "active task guest is not running",
+                                           {"task_id": task.get("task_id")})
+                    if not self.systemd.expiry_active(task["task_id"], int(task["generation"]), task["lease_expires_at"]):
+                        raise ControlError("timer_unverified", "active task expiry timer is not verified",
+                                           {"task_id": task.get("task_id")})
+                    continue
+                if state == "cached":
+                    self._ownership(task)
+                    if self.incus.instance_info(task["instance_name"])["status"].lower() != "stopped":
+                        raise ControlError("state_mismatch", "cached task guest is not stopped",
+                                           {"task_id": task.get("task_id")})
+                    if self.store.get_ports(task["task_id"]):
+                        raise ControlError("cleanup_incomplete", "cached task still has port mappings",
+                                           {"task_id": task.get("task_id")})
+                    owned = self._ownership(task)
+                    if any(device.get("type") == "proxy" for device in owned.get("expanded_devices", {}).values()):
+                        raise ControlError("cleanup_incomplete", "cached task still has native proxy mappings",
+                                           {"task_id": task.get("task_id")})
+                    continue
+                raise ControlError("resource_unverified", "drain state contains an unknown task state",
+                                   {"task_id": task.get("task_id"), "state": state})
+            # New reservations are fenced by draining=1 while the checks above
+            # run. Commit the exit only after reacquiring admission.lock and
+            # rechecking the fence, with the same order as acquire.
+            with self._admission_lock():
+                if self.store.get_meta("draining") == "1":
+                    with self._global_lock():
                         self.store.set_meta("admission_epoch", uuid.uuid4().hex)
                         self.store.set_meta("draining", "0")
         return {"draining": False}

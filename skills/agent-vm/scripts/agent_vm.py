@@ -221,6 +221,9 @@ def _assert_absolute_no_symlink_ancestors(path: Path, *, code: str) -> None:
             continue
         if not stat.S_ISDIR(entry.st_mode):
             fail(code, "local path ancestor must be a directory")
+        # Shared temp roots are safe only when root-owned and sticky; descendants remain private.
+        if current in {Path("/tmp"), Path("/var/tmp")} and entry.st_uid == 0 and stat.S_IMODE(entry.st_mode) & stat.S_ISVTX:
+            continue
         owner = getattr(os, "geteuid", lambda: entry.st_uid)()
         if entry.st_uid not in {0, owner} or stat.S_IMODE(entry.st_mode) & 0o022:
             fail(code, "local path ancestor must be privately owned")

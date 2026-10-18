@@ -1570,15 +1570,23 @@ class Control:
         if task.get("last_error"):
             result["last_error"] = json.loads(task["last_error"])
         result["ports"] = self.store.get_ports(task["task_id"])
+        def validated(raw: str | None, label: str, *, required: bool) -> dict[str, Any]:
+            value = json.loads(raw or "{}")
+            keys = {"cpu", "memory_mib", "disk_gib"}
+            if not isinstance(value, Mapping) or (required and set(value) != keys):
+                raise ValueError(label)
+            if any(key not in keys or isinstance(item, bool) or not isinstance(item, int) or item < 0
+                   for key, item in value.items()):
+                raise ValueError(label)
+            return dict(value)
+
         try:
-            resources = json.loads(task.get("resources_json") or "{}")
-            resource_reservation = json.loads(task.get("resource_reservation_json") or "{}")
-            if not isinstance(resources, Mapping) or not isinstance(resource_reservation, Mapping):
-                raise ValueError()
+            resources = validated(task.get("resources_json"), "resources", required=True)
+            resource_reservation = validated(task.get("resource_reservation_json"), "reservation", required=False)
         except (TypeError, ValueError) as exc:
             raise ControlError("resource_unverified", "task resource state cannot be verified") from exc
-        result["resources"] = dict(resources)
-        result["resource_reservation"] = dict(resource_reservation)
+        result["resources"] = resources
+        result["resource_reservation"] = resource_reservation
         expiry = parse_time(task.get("lease_expires_at"))
         result["effective_lease"] = task["state"] == "active" and expiry is not None and expiry > self.now()
         return result
@@ -2920,19 +2928,24 @@ class Control:
         task = self._task_for_session(session_id)
         self._check_generation(task, request)
         self._require_active(task)
-        if self.store.get_meta("draining") == "1":
-            raise ControlError("draining", "restart work is refused while draining")
-        self._ownership(task)
-        self._require_window(task)
         phase = "native-stop"
         stage_timings: dict[str, Any] = {}
         readiness = None
+        native_touched = False
         try:
-            self._stop_instance(task)
-            phase = "native-start"
-            native_started = time.monotonic()
-            self._start_instance(task)
-            stage_timings["native_start_seconds"] = round(max(0.0, time.monotonic() - native_started), 3)
+            # Serialize the drain check with the native stop/start boundary.
+            # A drain request must not land between the check and the restart.
+            with self._global_lock():
+                if self.store.get_meta("draining") == "1":
+                    raise ControlError("draining", "restart work is refused while draining")
+                self._ownership(task)
+                self._require_window(task)
+                native_touched = True
+                self._stop_instance(task)
+                phase = "native-start"
+                native_started = time.monotonic()
+                self._start_instance(task)
+                stage_timings["native_start_seconds"] = round(max(0.0, time.monotonic() - native_started), 3)
             phase = "guest-readiness"
             readiness = self._wait_guest_ready(task, stage_timings=stage_timings)
             phase = "guest-post-check"
@@ -2948,6 +2961,8 @@ class Control:
                 task = current
             return {**self._state_summary(task), "readiness": readiness, "stage_timings": stage_timings}
         except ControlError as exc:
+            if not native_touched:
+                raise
             cleanup = {"ok": False, "error": {"code": "not_attempted", "message": "cleanup was not attempted"}}
             try:
                 cleanup["result"] = self._release_task(self.store.get_task(task_id=task["task_id"]))

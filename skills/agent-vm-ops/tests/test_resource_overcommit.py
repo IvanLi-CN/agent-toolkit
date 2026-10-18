@@ -239,6 +239,14 @@ class AdmissionTests(Fixture):
         self.store.update_task(active["task_id"], resource_reservation_json="{")
         self.error("resource_unverified", self.call, "status")
 
+    def test_status_invalid_resource_value_is_structured(self):
+        active = self.acquire()
+        self.store.update_task(
+            active["task_id"],
+            resources_json=json.dumps({"cpu": "bogus", "memory_mib": 4096, "disk_gib": 20}),
+        )
+        self.error("resource_unverified", self.call, "status")
+
     def test_admin_metrics_rejects_session_and_operation_without_audit(self):
         before = len(self.store._rows("SELECT action FROM audit"))
         request = self.request("admin-metrics", session="thread-a")

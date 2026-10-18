@@ -567,11 +567,13 @@ def command_port(args: argparse.Namespace) -> int:
 
 
 def command_admin(args: argparse.Namespace) -> int:
-    session = session_id(args.session_id, required=args.admin_command != "metrics")
+    if args.admin_command == "metrics":
+        response = control_request("admin-metrics", session=None)
+        json_output(response)
+        return 0
+    session = session_id(args.session_id, required=True)
     if args.admin_command == "status":
         response = control_request("admin-status", session=session)
-    elif args.admin_command == "metrics":
-        response = control_request("admin-metrics", session=session)
     elif args.admin_command == "session":
         response = control_request("admin-session-list", session=session)
     elif args.admin_command == "drain":

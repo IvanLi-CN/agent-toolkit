@@ -11,6 +11,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -540,6 +541,49 @@ class LifecycleTests(Fixture):
                 self.call("restart")
 
         self.assertEqual(failure.exception.code, "task_not_active")
+
+    def test_restart_serializes_drain_with_native_stop_start(self):
+        self.acquire()
+        attempted = threading.Event()
+        drained = threading.Event()
+        events = []
+
+        def enter_drain():
+            attempted.set()
+            self.control.dispatch({
+                "protocol": CONTROL.PROTOCOL_VERSION,
+                "action": "drain-enter",
+                "generation": 0,
+                "operation_id": "restart-drain-race",
+            })
+            events.append("drain")
+            drained.set()
+
+        original_stop = self.control._stop_instance
+        original_start = self.control._start_instance
+
+        def stop(task):
+            events.append("stop")
+            thread = threading.Thread(target=enter_drain)
+            thread.start()
+            self.assertTrue(attempted.wait(1))
+            original_stop(task)
+            thread.join(1)
+            self.assertTrue(thread.is_alive())
+            self._drain_thread = thread
+
+        def start(task):
+            events.append("start")
+            original_start(task)
+
+        with mock.patch.object(self.control, "_stop_instance", side_effect=stop), \
+             mock.patch.object(self.control, "_start_instance", side_effect=start):
+            self.call("restart")
+
+        self._drain_thread.join(1)
+        self.assertTrue(drained.is_set())
+        self.assertLess(events.index("start"), events.index("drain"))
+        self.call("drain-exit")
 
     def test_readiness_wait_cannot_extend_or_outlive_lease(self):
         def expire(name, condition):
@@ -1121,10 +1165,13 @@ class ReclaimTests(Fixture):
 class NativeCliTests(unittest.TestCase):
     def test_admin_metrics_is_read_only_and_does_not_require_a_session(self):
         args = CLI.build_parser().parse_args(["admin", "metrics"])
-        with mock.patch.object(CLI, "control_request", return_value={}) as request, \
-             mock.patch.object(CLI, "json_output"):
-            self.assertEqual(CLI.command_admin(args), 0)
-        request.assert_called_once_with("admin-metrics", session=None)
+        for environment in ({}, {"AGENT_VM_SESSION_ID": "inherited-session"}):
+            with self.subTest(environment=environment), \
+                 mock.patch.dict(os.environ, environment, clear=False), \
+                 mock.patch.object(CLI, "control_request", return_value={}) as request, \
+                 mock.patch.object(CLI, "json_output"):
+                self.assertEqual(CLI.command_admin(args), 0)
+            request.assert_called_once_with("admin-metrics", session=None)
 
     def test_management_timeout_is_action_specific_and_stderr_is_streamed(self):
         for action, fields, expected in (

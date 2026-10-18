@@ -1388,12 +1388,24 @@ class Control:
         self.clock = clock
         self.resources = resources or CTResources()
         self.lock_path = Path(str(self.config["state_db"])).with_name("control.lock")
+        self.admission_lock_path = Path(str(self.config["state_db"])).with_name("admission.lock")
         self._native_lock_state = threading.local()
 
     @contextmanager
     def _global_lock(self):
         self.lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    @contextmanager
+    def _admission_lock(self):
+        self.admission_lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(self.admission_lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
             yield
@@ -2430,12 +2442,14 @@ class Control:
                 "warnings": warnings}
 
     def _reserve_resources(self, task: Mapping[str, Any], resources: Mapping[str, int],
-                           *, memory_reduction: bool = False) -> dict[str, Any]:
+                           *, memory_reduction: bool = False,
+                           admission_token: str | None = None) -> dict[str, Any]:
         # Only a verified, memory-only reduction may bypass new-demand gates.
         # Its old allocation stays reserved until native completion is verified.
         if memory_reduction:
-            old = json.loads(task["resources_json"])
-            if (task["state"] != "active" or resources != old or json.loads(task["resource_reservation_json"])):
+            old = self._durable_resources(task, "resources_json", allow_empty=False)
+            reservation = self._durable_resources(task, "resource_reservation_json", allow_empty=True)
+            if (task["state"] != "active" or resources != old or reservation):
                 raise ControlError("resize_unverified", "memory reduction requires an intact current allocation")
             policy = None
         else:
@@ -2444,9 +2458,12 @@ class Control:
             disk = self._disk_admission_diagnostics(self._storage_headroom(0))
             if not disk.get("verified"):
                 raise ControlError("resource_unverified", "disk admission state is not verified", disk.get("error"))
-        with self._global_lock(), self.store.transaction():
+        with self._admission_lock(), self._global_lock(), self.store.transaction():
             if self.store.get_meta("draining") == "1":
                 raise ControlError("draining", "new leases and capacity changes are refused while draining")
+            current_token = self.store.get_meta("admission_token") or "initial"
+            if admission_token is not None and current_token != admission_token:
+                raise ControlError("draining", "admission state changed while the request was preparing")
             current = self.store.get_task(task_id=task["task_id"])
             if task["state"] == "active":
                 if current is None or current["generation"] != task["generation"]:
@@ -2507,6 +2524,13 @@ class Control:
                 "device_name": f"agent-vm-{task['task_id']}-{name}-{protocol}", "state": "preparing",
                 "created_at": iso_time(self.now())}
 
+    @staticmethod
+    def _durable_resources(task: Mapping[str, Any], field: str, *, allow_empty: bool) -> dict[str, int]:
+        try:
+            return parse_resource_mapping(task.get(field), field, allow_empty=allow_empty)
+        except (TypeError, ValueError) as exc:
+            raise ControlError("resource_unverified", f"task {field} cannot be verified") from exc
+
 
 
     def _require_active(self, task: Mapping[str, Any]) -> None:
@@ -2558,7 +2582,10 @@ class Control:
                     raise ControlError("port_inventory_unverified", "instance devices are malformed")
                 for device in devices.values():
                     if device.get("type") == "proxy":
-                        listen = str(device.get("listen", ""))
+                        listen = device.get("listen")
+                        if listen is not None and not isinstance(listen, str):
+                            raise ControlError("port_inventory_unverified", "proxy listen address is malformed")
+                        listen = listen or ""
                         if listen.startswith(("tcp:", "udp:")):
                             ports |= self._port_numbers(listen.rsplit(":", 1)[-1])
             for network in networks:
@@ -2578,7 +2605,10 @@ class Control:
                     if not isinstance(forward_ports, list) or any(not isinstance(item, Mapping) for item in forward_ports):
                         raise ControlError("port_inventory_unverified", "network forward ports are malformed")
                     for item in forward_ports:
-                        ports |= self._port_numbers(str(item.get("listen_port", "")))
+                        listen_port = item.get("listen_port")
+                        if not isinstance(listen_port, str):
+                            raise ControlError("port_inventory_unverified", "network forward listen port is malformed")
+                        ports |= self._port_numbers(listen_port)
         return ports
 
     @staticmethod
@@ -2651,6 +2681,8 @@ class Control:
                     raise ControlError("vm_ip_unverified", "instance devices are malformed")
                 if name == self.config["project"] and instance.get("name") == own_name:
                     nic = devices.get("eth0", {})
+                    if not isinstance(nic, Mapping):
+                        raise ControlError("vm_ip_unverified", "instance network device is malformed")
                     instance_config = instance.get("config", {})
                     if not isinstance(instance_config, Mapping):
                         raise ControlError("vm_ip_unverified", "instance config is malformed")
@@ -2660,15 +2692,26 @@ class Control:
                         raise ControlError("vm_ip_unverified", "instance MAC address is malformed")
                     if own_ip is not None and not isinstance(own_ip, str):
                         raise ControlError("vm_ip_unverified", "instance IP address is malformed")
+                    if own_ip:
+                        try:
+                            ipaddress.IPv4Address(own_ip)
+                        except ipaddress.AddressValueError as exc:
+                            raise ControlError("vm_ip_unverified", "instance IP address is invalid") from exc
                     continue
                 for device in devices.values():
                     network = device.get("network")
                     parent = device.get("parent")
                     address = device.get("ipv4.address")
-                    if network is not None and not isinstance(network, str) or parent is not None and not isinstance(parent, str):
+                    if ((network is not None and not isinstance(network, str))
+                            or (parent is not None and not isinstance(parent, str))):
                         raise ControlError("vm_ip_unverified", "instance network identity is malformed")
                     if address is not None and not isinstance(address, str):
                         raise ControlError("vm_ip_unverified", "instance IP address is malformed")
+                    if address:
+                        try:
+                            ipaddress.IPv4Address(address)
+                        except ipaddress.AddressValueError as exc:
+                            raise ControlError("vm_ip_unverified", "instance IP address is invalid") from exc
                     if self.config["network"] in {network, parent} and address:
                         used.add(address)
         leases = self.incus.query("/1.0/networks/" + quote(self.config["network"], safe="") + "/leases", project="default")
@@ -2678,6 +2721,10 @@ class Control:
             hwaddr = lease.get("hwaddr")
             if not isinstance(address, str) or not address:
                 raise ControlError("vm_ip_unverified", "network lease address is malformed")
+            try:
+                ipaddress.IPv4Address(address)
+            except ipaddress.AddressValueError as exc:
+                raise ControlError("vm_ip_unverified", "network lease address is invalid") from exc
             if hwaddr is not None and not isinstance(hwaddr, str):
                 raise ControlError("vm_ip_unverified", "network lease MAC address is malformed")
             if own_mac and hwaddr and hwaddr.lower() == own_mac.lower() and address == own_ip:
@@ -3092,7 +3139,9 @@ class Control:
     def _network_guard(self) -> None:
         name = require_nonempty_string(self.config.get("network_acl"), "network_acl", PORT_NAME_RE)
         project = self.incus.query("/1.0/projects/" + quote(self.config["project"], safe=""), project="default")
-        project_config = project.get("config", {}) if isinstance(project, Mapping) else {}
+        if not isinstance(project, Mapping) or not isinstance(project.get("config"), Mapping):
+            raise ControlError("network_unverified", "Incus project response is malformed")
+        project_config = project["config"]
         if project_config.get("restricted.devices.proxy") != "allow":
             raise ControlError("network_unverified", "Incus project does not allow managed proxy NAT devices")
         acl = self.incus.query("/1.0/network-acls/" + quote(name, safe=""), project="default")
@@ -3335,7 +3384,7 @@ class Control:
             self._check_generation(existing, request)
             self._require_active(existing)
             self._ownership(existing)
-            resources = json.loads(existing["resources_json"])
+            resources = self._durable_resources(existing, "resources_json", allow_empty=False)
             target = self._requested_resources(request, resources, active_reuse=True)
             if target != resources:
                 raise ControlError("resource_config_mismatch", "active lease configuration differs; use resize explicitly",
@@ -3347,7 +3396,10 @@ class Control:
         expected = existing["generation"] if existing else 0
         if request["generation"] != expected:
             raise ControlError("generation_mismatch", "acquire requires the latest observed generation", {"current_generation": expected})
-        if self.store.get_meta("draining") == "1": raise ControlError("draining", "new leases are refused")
+        with self._admission_lock():
+            if self.store.get_meta("draining") == "1":
+                raise ControlError("draining", "new leases are refused")
+            admission_token = self.store.get_meta("admission_token") or "initial"
         self._network_guard()
         public_key = require_nonempty_string(request.get("public_key"), "public_key")
         if not re.fullmatch(r"ssh-ed25519 [A-Za-z0-9+/=]+(?: [^\r\n]*)?", public_key):
@@ -3359,7 +3411,7 @@ class Control:
             self._ownership(existing)
             if self.incus.instance_info(existing["instance_name"])["status"].lower() != "stopped" or self.store.get_ports(existing["task_id"]):
                 raise ControlError("cache_ineligible", "cached instance is not safely stopped")
-        old = json.loads(existing["resources_json"]) if cached else {"cpu": 2, "memory_mib": 4096, "disk_gib": 20}
+        old = self._durable_resources(existing, "resources_json", allow_empty=False) if cached else {"cpu": 2, "memory_mib": 4096, "disk_gib": 20}
         if cached and self._native_resources(existing) != old:
             raise ControlError("resource_unverified", "cached native sizes differ from durable resource sizes")
         resources = self._requested_resources(request, old)
@@ -3375,7 +3427,7 @@ class Control:
         # The deadline/timer exists before either starting the guest or exposing NAT.
         task["lease_expires_at"] = iso_time(self.now() + dt.timedelta(seconds=self.config["initial_lease_seconds"]))
         reserved = {key: max(old[key], resources[key]) for key in old} if cached else resources
-        task = self._reserve_resources(task, reserved)
+        task = self._reserve_resources(task, reserved, admission_token=admission_token)
         completed = []
         phase = "reservation"
         stage_timings: dict[str, Any] = {}
@@ -3611,7 +3663,7 @@ class Control:
         self._check_generation(task, request)
         self._require_active(task)
         self._ownership(task)
-        old = json.loads(task["resources_json"])
+        old = self._durable_resources(task, "resources_json", allow_empty=False)
         values = {"cpu": request.get("cpu"), "memory_mib": request.get("memory_mib"), "disk_gib": request.get("disk_gib")}
         if all(value is None for value in values.values()): raise ControlError("invalid_request", "resize requires at least one resource")
         target = self._requested_resources(request, old)
@@ -3623,7 +3675,7 @@ class Control:
             return self._resize_live_memory(task, request, old, target)
         # Native VM root growth becomes guest-visible after restart.
         # Report that interruption before any reservation, reclaim or mutation.
-        previous_reservation = json.loads(task["resource_reservation_json"])
+        previous_reservation = self._durable_resources(task, "resource_reservation_json", allow_empty=True)
         recovering = bool(previous_reservation)
         needs_restart = target != old or recovering
         if needs_restart and not request.get("allow_restart", False):
@@ -3716,7 +3768,7 @@ class Control:
     def _resize_live_memory(self, task: Mapping[str, Any], request: Mapping[str, Any],
                             old: Mapping[str, int], target: Mapping[str, int]) -> dict[str, Any]:
         self._require_window(task, minimum_seconds=180)
-        if json.loads(task["resource_reservation_json"]):
+        if self._durable_resources(task, "resource_reservation_json", allow_empty=True):
             raise ControlError("resize_incomplete", "a previous partial resize requires inspection and explicit restart recovery or release")
         if self._native_resources(task) != old:
             raise ControlError("resize_unverified", "native configuration differs from the recorded allocation")
@@ -3764,7 +3816,7 @@ class Control:
                 self._require_window(current, minimum_seconds=MEMORY_SETTLE_SECONDS + 60)
                 # Reapplying an already persisted target might be a native
                 # config no-op, which cannot prove effective memory completion.
-                if (json.loads(current["resource_reservation_json"]) != reserved
+                if (self._durable_resources(current, "resource_reservation_json", allow_empty=True) != reserved
                         or self._native_resources(task) != old or self._guest_boot_id(task) != before):
                     raise ControlError("resize_unverified", "native rollback or guest continuity is unverified after balloon timeout")
                 self._reserve_resources(task, reserved, memory_reduction=target["memory_mib"] < old["memory_mib"])
@@ -3776,7 +3828,7 @@ class Control:
                 self._check_generation(current, request)
                 self._require_active(current)
                 self._require_window(current, minimum_seconds=60)
-                if (json.loads(current["resource_reservation_json"]) != reserved
+                if (self._durable_resources(current, "resource_reservation_json", allow_empty=True) != reserved
                         or self._native_resources(task) != old or self._guest_boot_id(task) != before):
                     raise ControlError("resize_unverified", "native rollback, reservation or guest continuity changed during balloon settlement")
                 self._reserve_resources(task, reserved, memory_reduction=True)
@@ -4026,76 +4078,79 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
         return {"draining": self.store.get_meta("draining") == "1"}
 
     def drain_enter(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:
-        with self._global_lock(): self.store.set_meta("draining", "1")
+        with self._admission_lock(), self._global_lock():
+            self.store.set_meta("draining", "1")
         return {"draining": True}
 
 
     def drain_exit(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:
-        if self.store.get_meta("draining") != "1":
-            return {"draining": False}
-        snapshots = sorted(self.store.list_tasks(), key=lambda task: str(task.get("session_id", "")))
-        with ExitStack() as locks:
-            for snapshot in snapshots:
-                owner = snapshot.get("session_id")
-                if not isinstance(owner, str) or not owner:
-                    raise ControlError("resource_unverified", "drain state contains an invalid session owner")
-                locks.enter_context(self._object_lock("session:" + owner, blocking=False))
-            health = self.doctor(request, session_id)
-            resources = health.get("resources")
-            instances = health.get("instances")
-            capacity = health.get("capacity")
-            if (
-                not health.get("ready")
-                or not isinstance(resources, Mapping)
-                or not resources.get("verified")
-                or not isinstance(instances, Mapping)
-                or not instances.get("verified")
-                or not isinstance(capacity, Mapping)
-                or "error" in capacity
-            ):
-                raise ControlError(
-                    "recovery_unverified",
-                    "drain exit requires verified control health and capacity state",
-                    {"issues": health.get("issues", []), "admission": health.get("default_admission")},
-                )
-            for task in self.store.list_tasks():
-                state = task.get("state")
-                if state == "absent":
-                    continue
-                if state in {"preparing", "closing", "deleting", "failed"}:
-                    raise ControlError("reconciliation_required", "drain exit requires all task transitions to be reconciled",
+        with self._admission_lock():
+            if self.store.get_meta("draining") != "1":
+                return {"draining": False}
+            snapshots = sorted(self.store.list_tasks(), key=lambda task: str(task.get("session_id", "")))
+            with ExitStack() as locks:
+                for snapshot in snapshots:
+                    owner = snapshot.get("session_id")
+                    if not isinstance(owner, str) or not owner:
+                        raise ControlError("resource_unverified", "drain state contains an invalid session owner")
+                    locks.enter_context(self._object_lock("session:" + owner, blocking=False))
+                health = self.doctor(request, session_id)
+                resources = health.get("resources")
+                instances = health.get("instances")
+                capacity = health.get("capacity")
+                if (
+                    not health.get("ready")
+                    or not isinstance(resources, Mapping)
+                    or not resources.get("verified")
+                    or not isinstance(instances, Mapping)
+                    or not instances.get("verified")
+                    or not isinstance(capacity, Mapping)
+                    or "error" in capacity
+                ):
+                    raise ControlError(
+                        "recovery_unverified",
+                        "drain exit requires verified control health and capacity state",
+                        {"issues": health.get("issues", []), "admission": health.get("default_admission")},
+                    )
+                for task in self.store.list_tasks():
+                    state = task.get("state")
+                    if state == "absent":
+                        continue
+                    if state in {"preparing", "closing", "deleting", "failed"}:
+                        raise ControlError("reconciliation_required", "drain exit requires all task transitions to be reconciled",
+                                           {"task_id": task.get("task_id"), "state": state})
+                    if state == "active":
+                        summary = self._state_summary(task)
+                        if not summary["effective_lease"]:
+                            raise ControlError("reconciliation_required", "active task has no effective lease",
+                                               {"task_id": task.get("task_id")})
+                        self._ownership(task)
+                        if self.incus.instance_info(task["instance_name"])["status"].lower() != "running":
+                            raise ControlError("state_mismatch", "active task guest is not running",
+                                               {"task_id": task.get("task_id")})
+                        if not self.systemd.expiry_active(task["task_id"], int(task["generation"]), task["lease_expires_at"]):
+                            raise ControlError("timer_unverified", "active task expiry timer is not verified",
+                                               {"task_id": task.get("task_id")})
+                        continue
+                    if state == "cached":
+                        self._ownership(task)
+                        if self.incus.instance_info(task["instance_name"])["status"].lower() != "stopped":
+                            raise ControlError("state_mismatch", "cached task guest is not stopped",
+                                               {"task_id": task.get("task_id")})
+                        if self.store.get_ports(task["task_id"]):
+                            raise ControlError("cleanup_incomplete", "cached task still has port mappings",
+                                               {"task_id": task.get("task_id")})
+                        owned = self._ownership(task)
+                        if any(device.get("type") == "proxy" for device in owned.get("expanded_devices", {}).values()):
+                            raise ControlError("cleanup_incomplete", "cached task still has native proxy mappings",
+                                               {"task_id": task.get("task_id")})
+                        continue
+                    raise ControlError("resource_unverified", "drain state contains an unknown task state",
                                        {"task_id": task.get("task_id"), "state": state})
-                if state == "active":
-                    summary = self._state_summary(task)
-                    if not summary["effective_lease"]:
-                        raise ControlError("reconciliation_required", "active task has no effective lease",
-                                           {"task_id": task.get("task_id")})
-                    self._ownership(task)
-                    if self.incus.instance_info(task["instance_name"])["status"].lower() != "running":
-                        raise ControlError("state_mismatch", "active task guest is not running",
-                                           {"task_id": task.get("task_id")})
-                    if not self.systemd.expiry_active(task["task_id"], int(task["generation"]), task["lease_expires_at"]):
-                        raise ControlError("timer_unverified", "active task expiry timer is not verified",
-                                           {"task_id": task.get("task_id")})
-                    continue
-                if state == "cached":
-                    self._ownership(task)
-                    if self.incus.instance_info(task["instance_name"])["status"].lower() != "stopped":
-                        raise ControlError("state_mismatch", "cached task guest is not stopped",
-                                           {"task_id": task.get("task_id")})
-                    if self.store.get_ports(task["task_id"]):
-                        raise ControlError("cleanup_incomplete", "cached task still has port mappings",
-                                           {"task_id": task.get("task_id")})
-                    owned = self._ownership(task)
-                    if any(device.get("type") == "proxy" for device in owned.get("expanded_devices", {}).values()):
-                        raise ControlError("cleanup_incomplete", "cached task still has native proxy mappings",
-                                           {"task_id": task.get("task_id")})
-                    continue
-                raise ControlError("resource_unverified", "drain state contains an unknown task state",
-                                   {"task_id": task.get("task_id"), "state": state})
-            with self._global_lock():
-                if self.store.get_meta("draining") == "1":
-                    self.store.set_meta("draining", "0")
+                with self._global_lock():
+                    if self.store.get_meta("draining") == "1":
+                        self.store.set_meta("admission_token", uuid.uuid4().hex)
+                        self.store.set_meta("draining", "0")
         return {"draining": False}
 
 

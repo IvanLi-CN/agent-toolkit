@@ -216,6 +216,11 @@ class AdmissionTests(Fixture):
         self.assertFalse(doctor["resources"]["verified"])
         self.error("resource_unverified", self.acquire, "new")
 
+    def test_corrupt_durable_resources_fail_closed_for_resize(self):
+        active = self.acquire()
+        self.store.update_task(active["task_id"], resources_json="not-json")
+        self.error("resource_unverified", self.call, "resize", cpu=3, allow_restart=True)
+
     def test_corrupt_disk_reservation_keeps_doctor_structured(self):
         active = self.acquire()
         for value in ("invalid", 1.5):
@@ -442,6 +447,37 @@ class AdmissionTests(Fixture):
         request = self.request("drain-exit", operation="drain-exit-blocked")
         self.error("reconciliation_required", self.control.dispatch, request)
         self.assertEqual(self.store.get_meta("draining"), "1")
+
+    def test_drain_exit_invalidates_acquire_that_passed_early_gate(self):
+        started = threading.Event()
+        proceed = threading.Event()
+        result = []
+        original = self.control._reserve_resources
+
+        def paused(*args, **kwargs):
+            started.set()
+            self.assertTrue(proceed.wait(timeout=5))
+            return original(*args, **kwargs)
+
+        request = self.request("acquire", "race", public_key=KEY)
+
+        def acquire():
+            try:
+                self.control.acquire(request, "race")
+            except CONTROL.ControlError as error:
+                result.append(error.code)
+
+        with mock.patch.object(self.control, "_reserve_resources", side_effect=paused):
+            thread = threading.Thread(target=acquire)
+            thread.start()
+            self.assertTrue(started.wait(timeout=5))
+            self.control.drain_enter({}, None)
+            self.control.drain_exit({}, None)
+            proceed.set()
+            thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result, ["draining"])
+        self.assertIsNone(self.store.get_task(session_id="race"))
 
     def test_release_of_missing_native_instance_keeps_absent_state_readable(self):
         active = self.acquire()

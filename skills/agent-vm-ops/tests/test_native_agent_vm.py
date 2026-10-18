@@ -702,6 +702,15 @@ class LifecycleTests(Fixture):
             self.control._ownership(task)
         self.assertEqual(failure.exception.code, "ownership_mismatch")
 
+    def test_malformed_native_proxy_listen_is_structured(self):
+        self.runner.proxy_inventory = [{
+            "name": "foreign-proxy",
+            "expanded_devices": {"proxy": {"type": "proxy", "listen": 20001}},
+        }]
+        with self.assertRaises(CONTROL.ControlError) as failure:
+            self.control._native_ports()
+        self.assertEqual(failure.exception.code, "port_inventory_unverified")
+
     def test_early_old_timer_rearms_recorded_deadline(self):
         first = self.acquire()
         renewed = self.call("renew")

@@ -24,7 +24,7 @@ Protocol upgrades enter drain, converge pending operations without replay, repla
 
 ## Observability boundary
 
-The dashboard and its provisioning source are deployment-owned. Use the [public observability contract](../../../docs/specs/agent-vm/contracts/observability.md) for metric semantics, but keep the Grafana JSON, Prometheus scrape target, collector path and datasource identity in the deployment repository. The one-shot controller is not a resident HTTP metrics service; add only an explicitly authorized read-only scrape bridge or textfile collector. Do not treat a Grafana database export or an Incus project limit of `-1` as an authoritative native admission metric.
+The dashboard and its provisioning source are deployment-owned. Use the [public observability contract](../../../docs/specs/agent-vm/contracts/observability.md) for metric semantics, but keep the Grafana JSON, Prometheus scrape target, collector path and datasource identity in the deployment repository. The one-shot controller is not a resident HTTP metrics service; add only an explicitly authorized read-only scrape bridge or textfile collector that invokes `admin-metrics` and exposes freshness/up failure semantics. Verify the deployment configuration's 32768-MiB memory base and 2x ratio before publishing a 65536-MiB logical limit. Do not treat a Grafana database export or an Incus project limit of `-1` as an authoritative native admission metric.
 
 ## Runtime maintenance boundary
 

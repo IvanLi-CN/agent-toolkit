@@ -24,6 +24,13 @@ The deployment-facing collector must expose the following stable metric families
 | `agent_vm_admission_reserved` | gauge | `resource=cpu|memory|disk|instances` |
 | `agent_vm_admission_remaining` | gauge | `resource=cpu|memory|disk|instances` |
 | `agent_vm_admission_limit` | gauge | `resource=cpu|memory|disk|instances`; absent when the limit is unverified |
+| `agent_vm_admission_capacity` | gauge | `resource=cpu|memory|disk|instances`; CT-visible/native capacity before overcommit |
+| `agent_vm_memory_current_bytes` | gauge | CT-local cgroup `memory.current`; absent when unavailable |
+| `agent_vm_memory_available_bytes` | gauge | CT-local verified LXCfs/cgroup available memory |
+| `agent_vm_memory_pressure_threshold_bytes` | gauge | CT-local pressure observation threshold |
+| `agent_vm_memory_pressure` | gauge | `0` or `1`; observation only, never a logical admission limit |
+| `agent_vm_memory_oom_events_total` | counter | CT-local cgroup OOM event kind |
+| `agent_vm_scrape_timestamp_seconds` | gauge | collector observation timestamp |
 | `agent_vm_admission_ready` | gauge | `0` or `1` |
 | `agent_vm_admission_reclaim_required` | gauge | `0` or `1` |
 | `agent_vm_admission_draining` | gauge | `0` or `1` |
@@ -36,7 +43,7 @@ The deployment-facing collector must expose the following stable metric families
 | `agent_vm_warnings_total` | counter | stable warning `code` |
 | `agent_vm_up` | gauge | `0` or `1` |
 
-The one-shot controller remains the source of truth for native state and must not be replaced with a resident HTTP broker solely to serve these metrics. The deployment must provide an authorized, read-only scrape bridge or textfile collector that preserves the controller's failure and freshness semantics. Until that bridge exists, a Grafana query for these families is not a working panel.
+The one-shot controller remains the source of truth for native state and must not be replaced with a resident HTTP broker solely to serve these metrics. The deployment must provide an authorized, read-only scrape bridge or textfile collector that preserves the controller's failure and freshness semantics. `agent_vm_admission_limit{resource="memory"}` is the logical reservation ceiling (for the deployment, 65536 MiB), while `agent_vm_admission_capacity{resource="memory"}` is the CT-visible capacity (32768 MiB). `agent_vm_memory_pressure` is a runtime observation and must not be used to reduce `agent_vm_admission_remaining`. Until that bridge exists, a Grafana query for these families is not a working panel.
 
 ## Dashboard contract
 
@@ -66,4 +73,4 @@ Verify the dashboard JSON has `refresh: "auto"`, a reload leaves Grafana's refre
 
 - [Native Agent VM specification](../SPEC.md)
 - [Agent VM operations runbook](../OPERATIONS.md)
-- [Agent VM capacity and overselling ADR](../../adr/0026-agent-vm-cpu-memory-overselling.md)
+- [Agent VM memory reservation-only admission ADR](../../adr/0029-agent-vm-memory-reservation-only-admission.md)

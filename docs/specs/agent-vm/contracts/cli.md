@@ -27,6 +27,7 @@ The control endpoint is selected from `AGENT_VM_CONTROL_HOST` and `AGENT_VM_REMO
 | `port add NAME --guest-port N [--protocol tcp\|udp] [--host-port N]` | Create an exact native proxy mapping. |
 | `port list` / `port remove NAME` | Inspect or remove an exact mapping. |
 | `admin status` | Read-only native component and maintenance status. |
+| `admin metrics` | Read-only controller metrics snapshot for authorized scrape bridges; it does not create a session or mutate state. |
 | `admin drain enter\|status\|exit` | Control admission while allowing safe retrieval and release. |
 | `admin session list` | List managed session records. |
 | `admin reconcile [--apply]` / `admin gc [--apply]` | Preview by default; apply only inside an authorized operations task. |
@@ -45,7 +46,7 @@ Generated SSH configuration uses the configured control address, leased port, ex
 
 ## Capacity and cleanup
 
-Capacity responses identify their local filesystem scope, observed sources, allocation budgets, requested values and pressure threshold. Missing or contradictory measurements refuse new demand without stopping an effective lease. Manual cleanup is dry-run by default and rechecks ownership, generation and eligibility under object locks before deletion.
+Capacity responses identify their local filesystem scope, observed sources, allocation budgets, allocated and reserved values, logical remaining values and pressure observations. Missing or contradictory capacity measurements refuse new demand without stopping an effective lease. Under reservation-only memory admission, low CT `MemAvailable` is reported as pressure but does not reject a request within the logical memory ceiling. Manual cleanup is dry-run by default and rechecks ownership, generation and eligibility under object locks before deletion.
 
 The dashboard and metric authority rules are defined in the [observability contract](observability.md). Guest rootfs allocation, physical Incus pool usage, CT root/image staging capacity and native admission are separate measurements.
 
@@ -67,7 +68,7 @@ Acquire and restart are bounded operations that may return an uncertain outcome 
 
 ## Resource and live-memory rules
 
-CPU, memory and disk requests are parsed into canonical units before admission. Admission accounts for configured budgets, overcommit ratios, observed host pressure and all effective reservations. A request is rejected when measurements are missing or contradictory, or when the requested value exceeds the configured policy; an existing effective lease remains available for retrieval and release.
+CPU, memory and disk requests are parsed into canonical units before admission. Admission accounts for configured budgets, overcommit ratios and all effective reservations. A request is rejected when capacity measurements are missing or contradictory, when the requested value exceeds the configured logical policy, when disk admission fails, or while draining; memory pressure is reported separately and does not alter logical remaining memory. An existing effective lease remains available for retrieval and release.
 
 `resize --live` is limited to a supported memory-only change. CPU, disk and unsupported live changes fail without falling back to a restart. `--allow-restart` is required for restart-capable changes and uses the longer bounded timeout. A live resize records the requested and observed values in the response so callers can distinguish a pending reconciliation from a completed change.
 

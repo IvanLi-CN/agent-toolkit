@@ -8,6 +8,7 @@ It intentionally has no listener, worker thread, or background loop.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from contextlib import contextmanager
 import datetime as dt
 from decimal import Decimal
@@ -153,14 +154,38 @@ class CTResources:
             raise ControlError("resource_unverified", "LXCfs memory metrics are missing or inconsistent")
         return values
 
+    def _optional_read(self, path: str) -> str | None:
+        try:
+            return self._read(path)
+        except ControlError as exc:
+            if exc.code == "resource_unverified":
+                return None
+            raise
+
+    def _memory_events(self) -> dict[str, int] | None:
+        raw = self._optional_read("/sys/fs/cgroup/memory.events")
+        if raw is None:
+            return None
+        values: dict[str, int] = {}
+        for line in raw.splitlines():
+            fields = line.split()
+            if len(fields) != 2 or fields[0] not in {"oom", "oom_kill", "oom_group_kill"}:
+                continue
+            values[fields[0]] = self._unsigned(fields[1], "memory.events." + fields[0])
+        return values or None
+
     def memory(self) -> dict[str, Any]:
         raw_limit = self._read("/sys/fs/cgroup/memory.max").strip()
         lxcfs = self._lxcfs_meminfo()
         sources = []
+        current = None
         if raw_limit == "max":
             if lxcfs is None:
                 raise ControlError("resource_unverified", "unlimited CT cgroup requires a verified LXCfs memory view")
             limit, available = lxcfs["MemTotal"], lxcfs["MemAvailable"]
+            raw_current = self._optional_read("/sys/fs/cgroup/memory.current")
+            if raw_current is not None:
+                current = self._unsigned(raw_current, "memory.current")
         else:
             limit = self._unsigned(raw_limit, "memory.max", positive=True)
             current = self._unsigned(self._read("/sys/fs/cgroup/memory.current"), "memory.current")
@@ -178,7 +203,9 @@ class CTResources:
         if lxcfs is not None:
             sources.append("lxcfs")
         return {"scope": "ct-memory", "sources": sources, "limit_bytes": limit,
-                "available_bytes": available, "threshold_bytes": max(1024**3, (limit + 9) // 10)}
+                "available_bytes": available, "current_bytes": current,
+                "threshold_bytes": max(1024**3, (limit + 9) // 10),
+                "oom_events": self._memory_events()}
 
 
 def utc_now() -> dt.datetime:
@@ -964,6 +991,31 @@ class StateStore:
                 ),
             )
 
+    def audit_summary(self) -> dict[str, dict[str, int]]:
+        operations: Counter[str] = Counter()
+        image_unpack_failures: Counter[str] = Counter()
+        warnings: Counter[str] = Counter()
+        for row in self._rows("SELECT action, outcome, detail_json FROM audit"):
+            detail: Mapping[str, Any] = {}
+            if row["detail_json"]:
+                try:
+                    parsed = json.loads(row["detail_json"])
+                    if isinstance(parsed, Mapping):
+                        detail = parsed
+                except (TypeError, json.JSONDecodeError):
+                    detail = {}
+            error = detail.get("error") if isinstance(detail.get("error"), Mapping) else detail
+            code = str(error.get("code", "unknown")) if isinstance(error, Mapping) else "unknown"
+            phase = str(detail.get("phase") or detail.get("operation_phase") or "unknown")
+            operations[f"{row['action']}|{row['outcome']}|{phase}"] += 1
+            if row["outcome"] == "error" and code in {"memory_pressure", "resource_unverified", "capacity_insufficient"}:
+                warnings[code] += 1
+            image_text = f"{code} {phase} {detail.get('message', '')}".lower()
+            if "image" in image_text and "unpack" in image_text:
+                image_unpack_failures[f"{phase}|{code}"] += 1
+        return {"operations": dict(operations), "image_unpack_failures": dict(image_unpack_failures),
+                "warnings": dict(warnings)}
+
     def get_meta(self, key: str) -> str | None:
         row = self._row("SELECT value FROM meta WHERE key = ?", (key,))
         return str(row["value"]) if row is not None else None
@@ -1348,6 +1400,7 @@ class Control:
             "port-list": self.port_list,
             "port-remove": self.port_remove,
             "admin-status": self.admin_status,
+            "admin-metrics": self.admin_metrics,
             "drain-status": self.drain_status,
             "drain-enter": self.drain_enter,
             "drain-exit": self.drain_exit,
@@ -1609,8 +1662,9 @@ class Control:
                 "limits": {key: int(Decimal(base[key]) * ratios[key]) for key in base},
                 "ct_capacity": capacity, "memory": {**memory, "observed_at": iso_time(self.now())}}
 
-    def _allocation_totals(self, exclude_task_id: str | None = None) -> dict[str, int]:
-        totals = {"cpu": 0, "memory_mib": 0}
+    def _allocation_breakdown(self, exclude_task_id: str | None = None) -> dict[str, dict[str, int]]:
+        totals = {key: {name: 0 for name in ("allocated", "reserved", "allocated_and_reserved")}
+                  for key in ("cpu", "memory_mib")}
         for other in self.store.list_tasks():
             if other["task_id"] == exclude_task_id or other["state"] in {"absent", "cached"}: continue
             try:
@@ -1618,10 +1672,15 @@ class Control:
                 for key in totals:
                     sizes = (value[key], reservation.get(key, 0))
                     if any(isinstance(size, bool) or not isinstance(size, int) or size < 0 for size in sizes): raise ValueError()
-                    totals[key] += max(sizes)
+                    totals[key]["allocated"] += sizes[0]
+                    totals[key]["reserved"] += sizes[1]
+                    totals[key]["allocated_and_reserved"] += max(sizes)
             except (KeyError, TypeError, ValueError) as exc:
                 raise ControlError("resource_unverified", "occupied object lacks verified resource sizes") from exc
         return totals
+
+    def _allocation_totals(self, exclude_task_id: str | None = None) -> dict[str, int]:
+        return {key: value["allocated_and_reserved"] for key, value in self._allocation_breakdown(exclude_task_id).items()}
 
     def _running_inventory_guard(self) -> None:
         instances = self.incus.list_instances()
@@ -1637,9 +1696,13 @@ class Control:
             policy = self._resource_policy()
             self._running_inventory_guard()
             with self._global_lock(), self.store.transaction():
-                allocated = self._allocation_totals()
-            return {"verified": True, **policy, "allocated_and_reserved": allocated,
-                    "remaining": {key: policy["limits"][key] - allocated[key] for key in allocated},
+                breakdown = self._allocation_breakdown()
+            allocated = {key: value["allocated"] for key, value in breakdown.items()}
+            reserved = {key: value["reserved"] for key, value in breakdown.items()}
+            allocated_and_reserved = {key: value["allocated_and_reserved"] for key, value in breakdown.items()}
+            return {"verified": True, **policy, "allocated": allocated, "reserved": reserved,
+                    "allocated_and_reserved": allocated_and_reserved,
+                    "remaining": {key: policy["limits"][key] - allocated_and_reserved[key] for key in allocated_and_reserved},
                     "memory_pressure": policy["memory"]["available_bytes"] < policy["memory"]["threshold_bytes"]}
         except ControlError as exc:
             return {"verified": False, "error": exc.as_dict()}
@@ -1681,8 +1744,9 @@ class Control:
             if exceeded:
                 reasons.append({"code": "resource_insufficient", "dimensions": exceeded,
                                 "requested": requested, "remaining": resources["remaining"]})
-            if resources["memory_pressure"]:
-                reasons.append({"code": "memory_pressure", "memory": resources["memory"]})
+        warnings = []
+        if resources.get("memory_pressure"):
+            warnings.append({"code": "memory_pressure", "memory": resources.get("memory")})
         if not instances.get("verified"):
             reasons.append(instances["error"])
         elif not instances["policy_compliant"] and not any(reason["code"] == "project_instance_limits_conflict" for reason in reasons):
@@ -1696,7 +1760,9 @@ class Control:
             if reclaim_required:
                 reasons.append({"code": "disk_reclaim_required", "message": "default creation needs capacity reclamation"})
         return {"requested": requested, "request_cost_bytes": self.config["create_cost_bytes"],
-                "ready": not reasons, "reasons": reasons, "reclaim_required": reclaim_required}
+                "ready": not reasons, "reasons": reasons, "reclaim_required": reclaim_required,
+                "observations": {"memory_pressure": bool(resources.get("memory_pressure"))},
+                "warnings": warnings}
 
     def _reserve_resources(self, task: Mapping[str, Any], resources: Mapping[str, int],
                            *, memory_reduction: bool = False) -> dict[str, Any]:
@@ -1709,9 +1775,6 @@ class Control:
             policy = None
         else:
             policy = self._resource_policy()
-            memory = policy["memory"]
-            if memory["available_bytes"] < memory["threshold_bytes"]:
-                raise ControlError("memory_pressure", "CT memory headroom is below the admission threshold", memory)
             self._running_inventory_guard()
         with self._global_lock(), self.store.transaction():
             if self.store.get_meta("draining") == "1":
@@ -3147,6 +3210,38 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
         return {"draining": self.store.get_meta("draining") == "1",
                 "tasks": [self._runtime_summary(task) for task in self.store.list_tasks()],
                 "doctor": self.doctor(request, session_id)}
+
+    def admin_metrics(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:
+        doctor = self.doctor(request, session_id)
+        tasks = self.store.list_tasks()
+        task_states = Counter(str(task["state"]) for task in tasks)
+        resources = doctor.get("resources", {})
+        memory = resources.get("memory", {}) if isinstance(resources, Mapping) else {}
+        warnings = list(doctor.get("default_admission", {}).get("warnings", []))
+        audit = self.store.audit_summary()
+        return {
+            "observed_at": iso_time(self.now()),
+            "up": True,
+            "draining": self.store.get_meta("draining") == "1",
+            "admission_ready": bool(doctor.get("admission_ready")),
+            "reclaim_required": bool(doctor.get("default_admission", {}).get("reclaim_required")),
+            "resources": resources,
+            "ct_memory": {
+                "capacity_bytes": memory.get("limit_bytes"),
+                "current_bytes": memory.get("current_bytes"),
+                "available_bytes": memory.get("available_bytes"),
+                "pressure_threshold_bytes": memory.get("threshold_bytes"),
+                "pressure": bool(resources.get("memory_pressure")) if isinstance(resources, Mapping) else None,
+                "oom_events": memory.get("oom_events"),
+            },
+            "instances": doctor.get("instances"),
+            "task_states": dict(task_states),
+            "operations": audit["operations"],
+            "image_unpack_failures": audit["image_unpack_failures"],
+            "warnings": warnings,
+            "warning_counts": audit["warnings"],
+            "doctor": {"ready": doctor.get("ready"), "issues": doctor.get("issues", [])},
+        }
 
 
     def drain_status(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:

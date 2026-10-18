@@ -36,7 +36,7 @@ class CTObservationTests(unittest.TestCase):
         self.assertEqual(value["limit_bytes"], 12*GIB)
         self.assertEqual(value["available_bytes"], 3*GIB)
         self.assertEqual(value["sources"], ["cgroup-v2", "lxcfs"])
-        self.assertEqual(set(reads), set(values))
+        self.assertTrue(set(values).issubset(reads))
         values["/proc/self/mountinfo"] = ""
         value, reads = self.observe(values)
         self.assertEqual(value["available_bytes"], 6*GIB)
@@ -68,6 +68,14 @@ class CTObservationTests(unittest.TestCase):
         self.assertEqual(self.observe(base)[0]["available_bytes"], 0)
         base["/sys/fs/cgroup/memory.current"] = "0"
         self.assertEqual(self.observe(base)[0]["available_bytes"], 4*GIB)
+
+    def test_memory_observation_includes_current_and_oom_events_when_available(self):
+        values = {"/sys/fs/cgroup/memory.max": str(4*GIB), "/sys/fs/cgroup/memory.current": str(3*GIB),
+                  "/sys/fs/cgroup/memory.stat": "inactive_file 0\n", "/sys/fs/cgroup/memory.events": "oom 2\noom_kill 1\n" ,
+                  "/proc/self/mountinfo": ""}
+        value, _ = self.observe(values)
+        self.assertEqual(value["current_bytes"], 3*GIB)
+        self.assertEqual(value["oom_events"], {"oom": 2, "oom_kill": 1})
 
     def test_cpu_capacity_is_own_quota_and_visible_affinity(self):
         with mock.patch.object(CONTROL.os, "sched_getaffinity", return_value=set(range(16)), create=True), \
@@ -103,18 +111,19 @@ class AdmissionTests(Fixture):
         self.assertEqual(result["resources"]["error"]["detail"]["conflicting_limits"], self.runner.project_limits)
         self.assertFalse(any(args[:3] == ["incus", "project", "set"] for args, _, _ in self.runner.calls))
 
-    def test_quotas_and_pressure_reject_before_reclaim_or_native_stop(self):
+    def test_logical_quota_rejects_but_pressure_does_not_block_new_demand(self):
         active = self.acquire("active")
         cache = self.acquire("cache"); self.call("release", "cache")
         self.runner.free = 10*GIB
         self.config.update(cpu_overcommit_ratio=1, memory_overcommit_ratio=1)
         with mock.patch.object(self.control, "_reclaim_capacity") as reclaim:
+            reclaim.return_value = []
             self.error("resource_insufficient", self.call, "resize", "active", cpu=8, allow_restart=True)
             self.error("resource_insufficient", self.call, "acquire", "new", public_key=KEY, memory_mib=32768)
-            self.resources.memory.return_value["available_bytes"] = 0
-            self.error("memory_pressure", self.call, "resize", "active", cpu=3, allow_restart=True)
-            self.error("memory_pressure", self.acquire, "cache")
             reclaim.assert_not_called()
+            self.runner.free = 80*GIB
+            self.resources.memory.return_value["available_bytes"] = 0
+            self.assertEqual(self.call("resize", "active", cpu=3, allow_restart=True)["resources"]["cpu"], 3)
         self.assertEqual(self.runner.instances[active["instance_name"]]["status"], "Running")
         self.assertEqual(self.store.get_task(task_id=cache["task_id"])["state"], "cached")
 
@@ -124,7 +133,7 @@ class AdmissionTests(Fixture):
         self.assertTrue(self.call("status")["admission"]["memory_pressure"])
         doctor = self.call("doctor")
         self.assertTrue(doctor["ready"])
-        self.assertFalse(doctor["admission_ready"])
+        self.assertTrue(doctor["admission_ready"])
         self.assertEqual(self.acquire()["lease_expires_at"], active["lease_expires_at"])
         self.resources.memory.side_effect = CONTROL.ControlError("resource_unverified", "missing metric")
         self.assertFalse(self.call("status")["admission"]["verified"])
@@ -139,7 +148,30 @@ class AdmissionTests(Fixture):
         self.acquire("active")
         self.call("resize", "active", cpu=4, allow_restart=True)
         self.assertEqual(self.control._resource_diagnostics()["allocated_and_reserved"], {"cpu": 4, "memory_mib": 4096})
+        diagnostics = self.control._resource_diagnostics()
+        self.assertEqual(diagnostics["allocated"], {"cpu": 4, "memory_mib": 4096})
+        self.assertEqual(diagnostics["reserved"], {"cpu": 0, "memory_mib": 0})
         self.error("resource_insufficient", self.acquire, "cache")
+
+    def test_deployment_memory_policy_is_32_gib_visible_and_64_gib_logical(self):
+        self.config.update(memory_budget_mib=32768, memory_overcommit_ratio=2)
+        policy = self.control._resource_policy()
+        self.assertEqual(policy["ct_capacity"]["memory_mib"], 32768)
+        self.assertEqual(policy["limits"]["memory_mib"], 65536)
+        self.assertEqual(self.control._resource_diagnostics()["remaining"]["memory_mib"], 65536)
+
+    def test_admin_metrics_is_read_only_and_separates_pressure_from_admission(self):
+        self.config.update(memory_budget_mib=32768, memory_overcommit_ratio=2)
+        self.acquire()
+        self.resources.memory.return_value["available_bytes"] = 0
+        before = self.store.list_tasks()
+        result = self.call("admin-metrics")
+        self.assertTrue(result["up"])
+        self.assertTrue(result["admission_ready"])
+        self.assertTrue(result["ct_memory"]["pressure"])
+        self.assertEqual(result["resources"]["remaining"]["memory_mib"], 61440)
+        self.assertEqual(result["task_states"]["active"], 1)
+        self.assertEqual(self.store.list_tasks(), before)
 
     def test_pre_native_resize_failure_releases_only_its_reservation(self):
         active = self.acquire()

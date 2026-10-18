@@ -1099,6 +1099,13 @@ class ReclaimTests(Fixture):
 
 
 class NativeCliTests(unittest.TestCase):
+    def test_admin_metrics_is_read_only_and_does_not_require_a_session(self):
+        args = CLI.build_parser().parse_args(["admin", "metrics"])
+        with mock.patch.object(CLI, "control_request", return_value={}) as request, \
+             mock.patch.object(CLI, "json_output"):
+            self.assertEqual(CLI.command_admin(args), 0)
+        request.assert_called_once_with("admin-metrics", session=None)
+
     def test_management_timeout_is_action_specific_and_stderr_is_streamed(self):
         for action, fields, expected in (
             ("acquire", {}, 600),
@@ -1157,7 +1164,7 @@ class NativeCliTests(unittest.TestCase):
     def test_contract_commands_are_available_and_resize_requires_resources(self):
         parser = CLI.build_parser()
         for value in (["sync", "--name", "Task_1"], ["resize", "--disk", "40GiB"], ["ssh-info", "--format", "ssh-config"],
-                      ["admin", "drain", "enter"], ["admin", "session", "list"], ["admin", "gc"], ["version"], ["help"]):
+                      ["admin", "drain", "enter"], ["admin", "session", "list"], ["admin", "metrics"], ["admin", "gc"], ["version"], ["help"]):
             parser.parse_args(value)
 
 

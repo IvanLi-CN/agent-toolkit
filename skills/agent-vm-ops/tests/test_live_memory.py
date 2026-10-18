@@ -150,7 +150,7 @@ class LiveMemoryTests(Fixture):
         self.assertEqual(status["last_error"]["error"]["code"], "command_timeout")
         self.assertFalse(any(change[0] in {"start", "stop", "delete"} for change in self.changes(before)))
         calls = len(self.runner.calls)
-        self.error("resize_partial", self.control.dispatch, request)
+        self.error("operation_incomplete", self.control.dispatch, request)
         self.assertEqual(len(self.runner.calls), calls)  # failed ID replay has no native effects
         self.error("resize_incomplete", self.call, "resize", memory_mib=2048, live_memory=True)
         self.runner.on_config_set = None

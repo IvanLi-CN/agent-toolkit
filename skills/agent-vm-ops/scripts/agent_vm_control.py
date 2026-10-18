@@ -873,6 +873,10 @@ class StateStore:
                     try:
                         self.connection.commit()
                     except sqlite3.Error as exc:
+                        try:
+                            self.connection.rollback()
+                        except sqlite3.Error:
+                            pass
                         raise self._sqlite_failure(exc, phase="commit", sql_operation="write", state_committed=None) from exc
             finally:
                 self.depth -= 1
@@ -1533,12 +1537,16 @@ class Control:
         if error.code != "sqlite_unavailable" or not operation_id or action not in self.WRITE_ACTIONS:
             return error
         detail = dict(error.detail) if isinstance(error.detail, Mapping) else {}
+        journal_lookup_failed = False
         try:
             journal = self.store.operation(operation_id)
         except ControlError:
             journal = None
-        if journal is None:
-            detail["state_committed"] = False
+            journal_lookup_failed = True
+        if journal_lookup_failed:
+            detail["state_committed"] = None
+        elif journal is None:
+            detail["state_committed"] = detail.get("state_committed")
         elif journal.get("outcome") in {"success", "error"}:
             detail["state_committed"] = True
         else:
@@ -1989,7 +1997,7 @@ class Control:
                     # A committed renew must remain replayable even if rearming its
                     # native timer failed after the atomic deadline/journal commit.
                     saved = self.store.operation(operation_id)
-                    if not saved or saved.get("outcome") != "success":
+                    if not saved:
                         self.store.record_operation(operation_id, action, session_id, request.get("generation"),
                                                     {"outcome": "error", "error": exc.as_dict(), "_request_digest": digest})
                 if session_id is not None:

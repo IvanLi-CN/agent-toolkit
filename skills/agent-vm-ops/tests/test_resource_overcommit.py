@@ -34,6 +34,9 @@ class SQLiteStateTests(unittest.TestCase):
             def commit(self):
                 raise sqlite3.OperationalError("database or disk is full")
 
+            def rollback(self):
+                return None
+
         store = object.__new__(CONTROL.StateStore)
         store._lock = threading.RLock()
         store.connection = FailingCommit()
@@ -336,6 +339,25 @@ class AdmissionTests(Fixture):
         self.assertEqual(error.exception.code, "sqlite_unavailable")
         self.assertIs(error.exception.detail["state_committed"], True)
         self.assertEqual(self.store.operation(request["operation_id"])["outcome"], "success")
+
+    def test_journal_lookup_failure_keeps_commit_state_unknown(self):
+        failure = CONTROL.ControlError(
+            "sqlite_unavailable",
+            "state database cannot be verified",
+            {"phase": "read", "state_committed": False},
+        )
+        with mock.patch.object(self.store, "operation", side_effect=failure):
+            annotated = self.control._annotate_state_error(
+                failure, action="acquire", operation_id="journal-read-failure"
+            )
+        self.assertIsNone(annotated.detail["state_committed"])
+
+    def test_pending_operation_is_not_rewritten_as_error_after_action_failure(self):
+        request = self.request("acquire", operation="pending-preserved", public_key=KEY)
+        failure = CONTROL.ControlError("command_failed", "native action failed")
+        with mock.patch.object(self.control, "_dispatch_action", side_effect=failure):
+            self.error("command_failed", self.control.dispatch, request)
+        self.assertEqual(self.store.operation(request["operation_id"])["outcome"], "pending")
 
     def test_corrupt_operation_journal_is_structured(self):
         operation_id = "corrupt-journal"

@@ -568,6 +568,8 @@ def command_port(args: argparse.Namespace) -> int:
 
 def command_admin(args: argparse.Namespace) -> int:
     if args.admin_command == "metrics":
+        if args.session_id is not None:
+            fail("invalid_request", "admin metrics does not accept --session-id")
         response = control_request("admin-metrics", session=None)
         json_output(response)
         return 0

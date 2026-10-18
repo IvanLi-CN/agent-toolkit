@@ -239,6 +239,11 @@ class AdmissionTests(Fixture):
         self.store.update_task(active["task_id"], resource_reservation_json="{")
         self.error("resource_unverified", self.call, "status")
 
+    def test_status_corrupt_last_error_is_structured(self):
+        active = self.acquire()
+        self.store.update_task(active["task_id"], last_error="{")
+        self.error("resource_unverified", self.call, "status")
+
     def test_status_invalid_resource_value_is_structured(self):
         active = self.acquire()
         self.store.update_task(
@@ -263,6 +268,16 @@ class AdmissionTests(Fixture):
             self.control.dispatch(request)
         self.assertEqual(failure.exception.code, "invalid_request")
         self.assertEqual(len(self.store._rows("SELECT action FROM audit")), before)
+
+    def test_corrupt_operation_journal_is_structured(self):
+        operation_id = "corrupt-journal"
+        self.store.record_operation(operation_id, "drain-enter", None, 0, {"outcome": "success"})
+        with self.store.transaction():
+            self.store.connection.execute(
+                "UPDATE operations SET response_json = ? WHERE operation_id = ?", ("{", operation_id)
+            )
+        self.error("operation_unverified", self.control.dispatch,
+                   self.request("drain-enter", operation=operation_id))
 
     def test_acquire_rechecks_drain_before_active_commit(self):
         def enter_drain(*_):
@@ -313,6 +328,12 @@ class AdmissionTests(Fixture):
         })
         summary = self.store.audit_summary()
         self.assertEqual(summary["image_unpack_failures"], {"unknown|command_failed": 1})
+
+    def test_audit_summary_counts_rootfs_unpack_failures(self):
+        self.store.audit("acquire", "error", detail={
+            "code": "command_failed", "message": "failed to unpack rootfs: no space left on device",
+        })
+        self.assertEqual(self.store.audit_summary()["image_unpack_failures"], {"unknown|command_failed": 1})
 
     def test_pre_native_resize_failure_releases_only_its_reservation(self):
         active = self.acquire()

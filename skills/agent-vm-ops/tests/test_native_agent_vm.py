@@ -1174,6 +1174,12 @@ class NativeCliTests(unittest.TestCase):
                 self.assertEqual(CLI.command_admin(args), 0)
             request.assert_called_once_with("admin-metrics", session=None)
 
+    def test_admin_metrics_rejects_explicit_session(self):
+        args = CLI.build_parser().parse_args(["admin", "metrics", "--session-id", "explicit"])
+        with self.assertRaises(CLI.CliError) as failure:
+            CLI.command_admin(args)
+        self.assertEqual(failure.exception.code, "invalid_request")
+
     def test_management_timeout_is_action_specific_and_stderr_is_streamed(self):
         for action, fields, expected in (
             ("acquire", {}, 600),

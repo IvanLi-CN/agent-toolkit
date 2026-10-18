@@ -965,7 +965,15 @@ class StateStore:
         row = self._row("SELECT response_json FROM operations WHERE operation_id = ?", (operation_id,))
         if row is None:
             return None
-        return json.loads(row["response_json"])
+        try:
+            value = json.loads(row["response_json"])
+        except (TypeError, ValueError) as exc:
+            raise ControlError("operation_unverified", "operation journal record is invalid",
+                               {"operation_id": operation_id}) from exc
+        if not isinstance(value, Mapping):
+            raise ControlError("operation_unverified", "operation journal record is not an object",
+                               {"operation_id": operation_id})
+        return dict(value)
 
     def record_operation(
         self,
@@ -1080,7 +1088,8 @@ class StateStore:
                 for item in nested
                 for key in ("code", "phase", "operation_phase", "message")
             ).lower()
-            if row["outcome"] == "error" and "image" in image_text and "unpack" in image_text:
+            if row["outcome"] == "error" and "unpack" in image_text and any(
+                    token in image_text for token in ("image", "rootfs")):
                 image_unpack_failures[f"{phase}|{code}"] += 1
         return {"operations": dict(operations), "image_unpack_failures": dict(image_unpack_failures),
                 "warnings": dict(warnings)}
@@ -1580,7 +1589,13 @@ class Control:
             "cleanup_after": task["cleanup_after"],
         }
         if task.get("last_error"):
-            result["last_error"] = json.loads(task["last_error"])
+            try:
+                last_error = json.loads(task["last_error"])
+            except (TypeError, ValueError) as exc:
+                raise ControlError("resource_unverified", "task error state cannot be verified") from exc
+            if not isinstance(last_error, Mapping):
+                raise ControlError("resource_unverified", "task error state cannot be verified")
+            result["last_error"] = dict(last_error)
         result["ports"] = self.store.get_ports(task["task_id"])
         try:
             resources = parse_resource_mapping(task.get("resources_json"), "resources", allow_empty=False)

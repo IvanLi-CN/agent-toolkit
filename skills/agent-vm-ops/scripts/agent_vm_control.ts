@@ -1016,7 +1016,7 @@ function processPipeTargets(pid: number): Set<string> {
   for (const fd of ["1", "2"]) {
     try {
       const target = readlinkSync(`/proc/${pid}/fd/${fd}`);
-      if (/^(?:pipe|socket):\[\d+\]$/.test(target)) targets.add(target);
+      if (/^pipe:\[\d+\]$/.test(target)) targets.add(target);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
     }
@@ -1048,6 +1048,28 @@ function processPipeMembers(targets: ReadonlySet<string>): { members: ProcessIde
           }
         }
         if (inherited) members.push({ pid, starttime: record.starttime });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        complete = false;
+      }
+    }
+  } catch { return { members: [], complete: false }; }
+  return { members, complete };
+}
+
+function processEnvironmentMembers(marker: string): { members: ProcessIdentity[]; complete: boolean } {
+  const members: ProcessIdentity[] = [];
+  let complete = true;
+  if (process.platform !== "linux") return { members, complete };
+  const markerBytes = Buffer.from(`AGENT_VM_COMMAND_ID=${marker}\0`, "utf8");
+  try {
+    for (const entry of readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry) || Number(entry) === process.pid) continue;
+      const pid = Number(entry);
+      try {
+        const record = readProcessRecord(pid);
+        if (record.state === "Z") continue;
+        if (readFileSync(`/proc/${pid}/environ`).includes(markerBytes)) members.push({ pid, starttime: record.starttime });
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
         complete = false;
@@ -1220,9 +1242,13 @@ export class CommandRunner {
 
   async runBounded(argv: readonly string[], options: BoundedOptions & { inputData?: Uint8Array | string } = {}): Promise<CompletedProcess> {
     if (!argv.length) throw new ControlError("invalid_request", "command argv cannot be empty");
+    const commandMarker = randomUUID();
+    const commandEnv: Record<string, string> = {};
+    for (const [key, value] of Object.entries(process.env)) if (value !== undefined) commandEnv[key] = value;
+    commandEnv.AGENT_VM_COMMAND_ID = commandMarker;
     let processHandle: Bun.Subprocess<"pipe", "pipe", "pipe">;
     try {
-      processHandle = Bun.spawn([...argv], { stdin: options.inputData !== undefined ? "pipe" : "ignore", stdout: "pipe", stderr: "pipe", detached: true });
+      processHandle = Bun.spawn([...argv], { stdin: options.inputData !== undefined ? "pipe" : "ignore", stdout: "pipe", stderr: "pipe", detached: true, env: commandEnv });
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new ControlError("command_missing", `command not found: ${argv[0]}`);
       throw error;
@@ -1336,6 +1362,7 @@ export class CommandRunner {
         };
         addKnown([...trackedMembers.values()]);
         addKnown(descendants.members);
+        addKnown(processEnvironmentMembers(commandMarker).members);
         addKnown(processPipeMembers(leaderPipeTargets).members);
         const term = safeProcessSignal(processHandle.pid, leaderIdentity, 15, true);
         const leaderExitedAfterTerm = await Promise.race([exit.then(() => true), sleep(250).then(() => false)]);
@@ -1347,6 +1374,7 @@ export class CommandRunner {
         for (let attempt = 0; attempt < 4; attempt += 1) {
           const discovered = processDescendantsFromRoots([...known.values()]);
           addKnown(discovered.members);
+          addKnown(processEnvironmentMembers(commandMarker).members);
           addKnown(processPipeMembers(leaderPipeTargets).members);
           for (const [pgid, anchors] of groupAnchors) {
             const liveAnchor = anchors.some((anchor) => {
@@ -1383,10 +1411,14 @@ export class CommandRunner {
           if (!remaining.length && (leaderExitedAfterTerm || !processExists(processHandle.pid))) break;
           await sleep(50);
         }
+        addKnown(processEnvironmentMembers(commandMarker).members);
         addKnown(processPipeMembers(leaderPipeTargets).members);
         const finalDescendants = processDescendantsFromRoots([...known.values()]);
         let finalInspectionComplete = finalDescendants.complete;
         addKnown(finalDescendants.members);
+        const finalEnvironment = processEnvironmentMembers(commandMarker);
+        finalInspectionComplete &&= finalEnvironment.complete;
+        addKnown(finalEnvironment.members);
         const finalPipes = processPipeMembers(leaderPipeTargets);
         finalInspectionComplete &&= finalPipes.complete;
         addKnown(finalPipes.members);
@@ -1417,7 +1449,7 @@ export class CommandRunner {
           sleep(1000).then(() => ({ bytes: encode(DIAGNOSTIC_LOG_TRUNCATION_MARKER), truncated: true })),
         ]);
         if (!processGroupKilled && !processGroupCleanupError) processGroupCleanupError = "process_group_kill_failed";
-        throw new ControlError("command_timeout", `command timed out: ${argv[0]}`, { reaped, process_group_killed: processGroupKilled, process_group_cleanup_error: processGroupCleanupError, process_group_observed_members: known.size, process_group_pipe_anchors: leaderPipeTargets.size, stderr: decode(stderr.bytes), stderr_truncated: stderr.truncated });
+        throw new ControlError("command_timeout", `command timed out: ${argv[0]}`, { reaped, process_group_killed: processGroupKilled, process_group_cleanup_error: processGroupCleanupError, stderr: decode(stderr.bytes), stderr_truncated: stderr.truncated });
       }
       const [, stdout, stderr, returncode] = outcome.value;
       const result: CompletedProcess = { args: [...argv], returncode, stdout: stdout.bytes, stderr: stderr.bytes, stdoutTruncated: stdout.truncated };

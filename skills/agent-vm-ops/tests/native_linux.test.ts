@@ -184,7 +184,6 @@ linuxTest("reaps a TERM-ignoring descendant after the leader exits before timeou
     if (state === undefined || state === "Z") break;
     await Bun.sleep(10);
   }
-  if (!(state === undefined || state === "Z")) console.error(`early-leader-cleanup-debug=${JSON.stringify({ pid, state, detail: failure?.detail })}`);
   expect(state === undefined || state === "Z").toBe(true);
 });
 

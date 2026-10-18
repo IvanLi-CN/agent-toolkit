@@ -1181,15 +1181,23 @@ export class CommandRunner {
       throw error;
     }
     const leaderIdentity = processStartIdentity(processHandle.pid);
+    let leaderPgid: number | undefined;
+    if (process.platform === "linux" && leaderIdentity) {
+      try {
+        const record = readProcessRecord(processHandle.pid);
+        if (record.starttime === leaderIdentity) leaderPgid = record.pgrp;
+      } catch { /* Cleanup will fail closed if the leader identity cannot be anchored. */ }
+    }
     const readAbort = new AbortController();
     const stdoutPromise = readBounded(processHandle.stdout, options.stdoutLimit ?? DIAGNOSTIC_LOG_LIMIT, false, readAbort.signal);
     const stderrPromise = readBounded(processHandle.stderr, options.stderrLimit ?? 4000, true, readAbort.signal, true);
     const timeoutMs = (options.timeout ?? 60) * 1000;
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
     let processMonitorHandle: ReturnType<typeof setInterval> | undefined;
+    let processStartupMonitorHandle: ReturnType<typeof setInterval> | undefined;
+    let processStartupMonitorStopHandle: ReturnType<typeof setTimeout> | undefined;
     const trackedMembers = new Map<number, ProcessIdentity>();
     const trackedGroups = new Map<number, ProcessIdentity[]>();
-    let processTrackingComplete = true;
     let processTrackingIdentityMismatch = false;
     const trackMembers = (members: readonly ProcessIdentity[]): void => {
       for (const member of members) {
@@ -1220,7 +1228,6 @@ export class CommandRunner {
       } catch { return; }
       trackMembers([{ pid: processHandle.pid, starttime: leaderIdentity }]);
       const descendants = processDescendants(processHandle.pid);
-      processTrackingComplete &&= descendants.complete;
       trackMembers(descendants.members);
       for (const [pgid, anchors] of trackedGroups) {
         const liveAnchor = anchors.some((anchor) => {
@@ -1228,12 +1235,18 @@ export class CommandRunner {
         });
         if (!liveAnchor) continue;
         const group = processGroupMembers(pgid);
-        processTrackingComplete &&= group.complete;
         trackMembers(group.members);
       }
     };
     trackProcesses();
-    if (process.platform === "linux") processMonitorHandle = setInterval(trackProcesses, 100);
+    if (process.platform === "linux") {
+      processMonitorHandle = setInterval(trackProcesses, 100);
+      processStartupMonitorHandle = setInterval(trackProcesses, 5);
+      processStartupMonitorStopHandle = setTimeout(() => {
+        if (processStartupMonitorHandle) clearInterval(processStartupMonitorHandle);
+        processStartupMonitorHandle = undefined;
+      }, 500);
+    }
     const exit = processHandle.exited;
     const timeout = new Promise<"timeout">((resolveTimeout) => { timeoutHandle = setTimeout(() => { resolveTimeout("timeout"); }, timeoutMs); });
     const inputPromise = (async (): Promise<unknown> => {
@@ -1276,7 +1289,7 @@ export class CommandRunner {
         const term = safeProcessSignal(processHandle.pid, leaderIdentity, 15, true);
         const leaderExitedAfterTerm = await Promise.race([exit.then(() => true), sleep(250).then(() => false)]);
         let processGroupCleanupError: string | null = identityMismatch ? "process_identity_mismatch" : term.error;
-        let processTreeComplete = descendants.complete && processTrackingComplete;
+        let processTreeComplete = descendants.complete;
         let tree = { killed: true, error: null as string | null };
         let groupKill = { sent: false, error: null as string | null };
         let directKill = { sent: false, error: null as string | null };
@@ -1293,6 +1306,15 @@ export class CommandRunner {
             processTreeComplete &&= group.complete;
             addKnown(group.members);
           }
+          if (leaderExitedAfterTerm && leaderPgid !== undefined) {
+            const currentLeader = processStartIdentity(processHandle.pid);
+            if (currentLeader !== undefined && currentLeader !== leaderIdentity) identityMismatch = true;
+            if (currentLeader === undefined) {
+              const leaderGroup = processGroupMembers(leaderPgid);
+              processTreeComplete &&= leaderGroup.complete;
+              addKnown(leaderGroup.members);
+            }
+          }
           if (!leaderExitedAfterTerm) {
             const leaderGroup = anchoredProcessGroupMembers(processHandle.pid, leaderIdentity ? [{ pid: processHandle.pid, starttime: leaderIdentity }] : []);
             processTreeComplete &&= leaderGroup.complete;
@@ -1302,7 +1324,7 @@ export class CommandRunner {
             processGroupCleanupError ??= groupKill.error ?? directKill.error;
           }
           tree = killProcessTree([...known.values()]);
-          processGroupCleanupError ??= tree.error;
+          if (tree.error && tree.error !== "process_tree_members_remain") processGroupCleanupError ??= tree.error;
           const remaining = [...known.values()].filter((member) => {
             if (!processExists(member.pid)) return false;
             const current = processStartIdentity(member.pid);
@@ -1311,6 +1333,20 @@ export class CommandRunner {
           if (!remaining.length && (leaderExitedAfterTerm || !processExists(processHandle.pid))) break;
           await sleep(50);
         }
+        const finalDescendants = processDescendantsFromRoots([...known.values()]);
+        processTreeComplete &&= finalDescendants.complete;
+        addKnown(finalDescendants.members);
+        for (const [pgid, anchors] of groupAnchors) {
+          const liveAnchor = anchors.some((anchor) => {
+            try { return processStartIdentity(anchor.pid) === anchor.starttime; } catch { return false; }
+          });
+          if (!liveAnchor) continue;
+          const group = anchoredProcessGroupMembers(pgid, anchors);
+          processTreeComplete &&= group.complete;
+          addKnown(group.members);
+        }
+        tree = killProcessTree([...known.values()]);
+        if (tree.error && tree.error !== "process_tree_members_remain") processGroupCleanupError ??= tree.error;
         if (identityMismatch) processGroupCleanupError ??= "process_identity_mismatch";
         if (!descendants.complete || !processTreeComplete) processGroupCleanupError ??= "process_tree_inspection_failed";
         const leaderStillAlive = Boolean(leaderIdentity && processExists(processHandle.pid) && processStartIdentity(processHandle.pid) === leaderIdentity && !processIsZombie(processHandle.pid));
@@ -1335,6 +1371,8 @@ export class CommandRunner {
     } finally {
       if (timeoutHandle) clearTimeout(timeoutHandle);
       if (processMonitorHandle) clearInterval(processMonitorHandle);
+      if (processStartupMonitorHandle) clearInterval(processStartupMonitorHandle);
+      if (processStartupMonitorStopHandle) clearTimeout(processStartupMonitorStopHandle);
     }
   }
 }

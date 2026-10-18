@@ -1368,6 +1368,8 @@ class Control:
             session_id = request.get("session_id")
             if session_id is not None:
                 session_id = require_nonempty_string(session_id, "session_id", SESSION_ID_RE)
+        if action == "admin-metrics" and (session_id is not None or request.get("operation_id") is not None):
+            raise ControlError("invalid_request", "admin-metrics is sessionless and read-only")
         operation_id = request.get("operation_id")
         if action in self.WRITE_ACTIONS:
             operation_id = require_nonempty_string(operation_id, "operation_id", SESSION_ID_RE)
@@ -1568,8 +1570,15 @@ class Control:
         if task.get("last_error"):
             result["last_error"] = json.loads(task["last_error"])
         result["ports"] = self.store.get_ports(task["task_id"])
-        result["resources"] = json.loads(task.get("resources_json") or "{}")
-        result["resource_reservation"] = json.loads(task.get("resource_reservation_json") or "{}")
+        try:
+            resources = json.loads(task.get("resources_json") or "{}")
+            resource_reservation = json.loads(task.get("resource_reservation_json") or "{}")
+            if not isinstance(resources, Mapping) or not isinstance(resource_reservation, Mapping):
+                raise ValueError()
+        except (TypeError, ValueError) as exc:
+            raise ControlError("resource_unverified", "task resource state cannot be verified") from exc
+        result["resources"] = dict(resources)
+        result["resource_reservation"] = dict(resource_reservation)
         expiry = parse_time(task.get("lease_expires_at"))
         result["effective_lease"] = task["state"] == "active" and expiry is not None and expiry > self.now()
         return result

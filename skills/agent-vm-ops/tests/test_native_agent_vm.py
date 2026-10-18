@@ -253,7 +253,9 @@ class Fixture(unittest.TestCase):
     def request(self, action, session="thread-a", operation=None, **fields):
         self.counter += 1
         task = self.store.get_task(session_id=session)
-        value = {"protocol": CONTROL.PROTOCOL_VERSION, "action": action, "session_id": session}
+        value = {"protocol": CONTROL.PROTOCOL_VERSION, "action": action}
+        if action != "admin-metrics":
+            value["session_id"] = session
         if action == "port-list": value["generation"] = task["generation"]
         if action in self.control.WRITE_ACTIONS:
             value.update(operation_id=operation or f"op-{self.counter}", generation=task["generation"] if task else 0)

@@ -234,6 +234,21 @@ class AdmissionTests(Fixture):
         metrics = self.call("admin-metrics")
         self.assertFalse(metrics["disk_admission"]["verified"])
 
+    def test_status_corrupt_resource_reservation_is_structured(self):
+        active = self.acquire()
+        self.store.update_task(active["task_id"], resource_reservation_json="{")
+        self.error("resource_unverified", self.call, "status")
+
+    def test_admin_metrics_rejects_session_and_operation_without_audit(self):
+        before = len(self.store._rows("SELECT action FROM audit"))
+        request = self.request("admin-metrics", session="thread-a")
+        request["session_id"] = "thread-a"
+        request["operation_id"] = "should-not-be-used"
+        with self.assertRaises(CONTROL.ControlError) as failure:
+            self.control.dispatch(request)
+        self.assertEqual(failure.exception.code, "invalid_request")
+        self.assertEqual(len(self.store._rows("SELECT action FROM audit")), before)
+
     def test_acquire_rechecks_drain_before_active_commit(self):
         def enter_drain(*_):
             self.store.set_meta("draining", "1")

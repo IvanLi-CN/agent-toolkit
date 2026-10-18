@@ -1416,7 +1416,7 @@ export class CommandRunner {
           sleep(1000).then(() => ({ bytes: encode(DIAGNOSTIC_LOG_TRUNCATION_MARKER), truncated: true })),
         ]);
         if (!processGroupKilled && !processGroupCleanupError) processGroupCleanupError = "process_group_kill_failed";
-        throw new ControlError("command_timeout", `command timed out: ${argv[0]}`, { reaped, process_group_killed: processGroupKilled, process_group_cleanup_error: processGroupCleanupError, stderr: decode(stderr.bytes), stderr_truncated: stderr.truncated });
+        throw new ControlError("command_timeout", `command timed out: ${argv[0]}`, { reaped, process_group_killed: processGroupKilled, process_group_cleanup_error: processGroupCleanupError, process_group_observed_members: known.size, process_group_pipe_anchors: leaderPipeTargets.size, stderr: decode(stderr.bytes), stderr_truncated: stderr.truncated });
       }
       const [, stdout, stderr, returncode] = outcome.value;
       const result: CompletedProcess = { args: [...argv], returncode, stdout: stdout.bytes, stderr: stderr.bytes, stdoutTruncated: stdout.truncated };

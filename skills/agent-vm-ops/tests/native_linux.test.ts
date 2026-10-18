@@ -3,7 +3,7 @@ import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, 
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { acquireWriterIntent, COMMAND_OUTPUT_LIMIT, DIAGNOSTIC_LOG_TRUNCATION_MARKER, CommandRunner, Control, ControlError, hasWriterIntent, IncusClient, StateStore } from "../scripts/agent_vm_control.ts";
+import { acquireWriterIntent, COMMAND_OUTPUT_LIMIT, DIAGNOSTIC_LOG_TRUNCATION_MARKER, CommandRunner, Control, ControlError, hasWriterIntent, IncusClient, killProcessTree, ProcessIdentity, StateStore } from "../scripts/agent_vm_control.ts";
 
 type Dict = Record<string, any>;
 
@@ -130,6 +130,54 @@ async function waitFor(path: string, timeoutMs = 3000): Promise<boolean> {
   return existsSync(path);
 }
 
+test("refuses to kill a PID after its recorded Linux identity changes", () => {
+  const member: ProcessIdentity = { pid: 4242, starttime: "old-starttime" };
+  const killed: number[] = [];
+  const result = killProcessTree([member], {
+    exists: () => true,
+    readIdentity: () => "reused-starttime",
+    zombie: () => false,
+    kill: (pid) => { killed.push(pid); return true; },
+  });
+  expect(result).toEqual({ killed: false, error: "process_identity_mismatch" });
+  expect(killed).toEqual([]);
+});
+
+linuxTest("kills a TERM-ignoring descendant after the leader exits on SIGTERM", async () => {
+  const runner = new CommandRunner();
+  const probeRoot = root("agent-vm-term-descendant");
+  const pidPath = join(probeRoot, "child.pid");
+  let failure: any;
+  try {
+    await runner.runBounded(["/bin/sh", "-c", `(trap '' TERM; sleep 30) & echo $! > ${pidPath}; trap 'exit 0' TERM; while :; do printf xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done`], { timeout: 0.2, stdoutLimit: 128, stderrLimit: 128 });
+  } catch (error) { failure = error; }
+  expect(failure?.code).toBe("command_timeout");
+  expect(failure?.detail?.reaped).toBe(true);
+  expect(failure?.detail?.process_group_killed).toBe(true);
+  expect(await waitFor(pidPath)).toBe(true);
+  const pid = Number(readFileSync(pidPath, "utf8"));
+  let state: string | undefined;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    state = procState(pid);
+    if (state === undefined || state === "Z") break;
+    await Bun.sleep(10);
+  }
+  expect(state === undefined || state === "Z").toBe(true);
+});
+
+linuxTest("retains bounded redacted stderr in timeout diagnostics", async () => {
+  const runner = new CommandRunner();
+  let failure: any;
+  try {
+    await runner.runBounded(["/bin/sh", "-c", "printf 'password=\"timeout-secret-canary\\ncontinued-secret-canary\"\\n' >&2; sleep 30"], { timeout: 0.05, stderrLimit: 256 });
+  } catch (error) { failure = error; }
+  expect(failure?.code).toBe("command_timeout");
+  expect(failure?.detail?.stderr).toContain("[REDACTED]");
+  expect(failure?.detail?.stderr).not.toContain("timeout-secret-canary");
+  expect(failure?.detail?.stderr).not.toContain("continued-secret-canary");
+  expect(failure?.detail?.stderr.length).toBeLessThanOrEqual(256);
+});
+
 linuxTest("drains noisy stdout and stderr and reaps a real descendant", async () => {
   const runner = new CommandRunner();
   const bounded = await runner.runBounded(["/bin/sh", "-c", "dd if=/dev/zero bs=1M count=8 status=none; dd if=/dev/zero bs=1M count=8 status=none >&2"], { timeout: 5, stdoutLimit: 128, stderrLimit: 128 });
@@ -231,7 +279,7 @@ linuxTest("waits for an independent SQLite writer and preserves durable failure 
       } else {
         await Bun.write(root + "/writer-start", "1");
         const started = Date.now();
-        store.recordOperation("op-sqlite-competition", "acquire", "session-sqlite", 1, { outcome: "error", error: { code: "synthetic_failure" } });
+        store.recordOperation("op-sqlite-competition", "acquire", "session-sqlite", 1, { outcome: "error", error: { code: "synthetic_failure", message: "synthetic failure" }, _request_digest: "0".repeat(64) });
         store.audit("acquire", "error", { code: "synthetic_failure" }, undefined, "session-sqlite", 1);
         store.setMeta("last_failure", "synthetic_failure");
         await Bun.write(root + "/writer-done", String(Date.now() - started));

@@ -35,13 +35,13 @@ Unknown flags and command layouts must be rejected; callers should use `--help` 
 
 ## Request and response
 
-Requests contain `protocol`, `action`, `session_id`, and mutation fields `generation` and `operation_id`. Every successful envelope contains `ok`, `protocol`, `server_time`, `action`, `session_id`, `generation`, `operation_id`, `outcome` and `result`; `generation` is a non-negative integer or `null` for actions without a session generation, and `outcome` is `success` or `replayed`. Drain entry and exit are mutations and accept an explicit operation ID. Error diagnostics are JSON on stderr with a nonzero exit status. A transport timeout reports the operation ID without claiming whether the mutation completed.
+Requests contain `protocol`, `action`, `session_id`, and mutation fields `generation` and `operation_id`; session-scoped `status` and `ssh-info` reads also carry the current generation. Every successful envelope contains `ok`, `protocol`, `server_time`, `action`, `session_id`, `generation`, `operation_id`, `outcome` and `result`; `generation` is a non-negative integer or `null` for actions without a session generation, and `outcome` is `success` or `replayed`. Drain entry and exit are mutations and accept an explicit operation ID. Error diagnostics are JSON on stderr with a nonzero exit status. A transport timeout reports the operation ID without claiming whether the mutation completed.
 
 Acquire, restart and restart-capable resize use a longer bounded transport timeout. No command implicitly renews a lease. Retry an uncertain mutation only with the original operation ID and generation after inspecting status or reconciliation.
 
 ## SSH and ports
 
-Generated SSH configuration uses the configured control address, leased port, explicit identity and known-host files, a generation-bound host-key alias, `StrictHostKeyChecking yes` and `IdentitiesOnly yes`. It must not disable host checking or introduce a gateway. Port allocation considers listeners, native mappings, forwards, reservations and the configured ephemeral range. Lease cleanup removes mappings and their exact conntrack flows before the guest becomes reusable.
+Generated SSH configuration uses the configured control address, leased port, explicit `root` identity and known-host files, an exact `agent-vm-<task-id>-g<generation>` host-key alias, `StrictHostKeyChecking yes` and `IdentitiesOnly yes`. The client accepts `ssh-info` only when its result generation matches the request and envelope, and rejects non-canonical host, port, user, alias or ed25519 host-key fields. It must not disable host checking or introduce a gateway. Port allocation considers listeners, native mappings, forwards, reservations and the configured ephemeral range. Lease cleanup removes mappings and their exact conntrack flows before the guest becomes reusable.
 
 ## Capacity and cleanup
 

@@ -475,6 +475,21 @@ test("uses the sixty-second default for generic and Incus commands while preserv
   expect(runner.timeouts).toEqual([60, 60, 60, 7, 8]);
 });
 
+test("quotes every Incus API path segment without restoring encoded slashes", async () => {
+  class CaptureRunner extends CommandRunner {
+    readonly argv: string[][] = [];
+
+    override async runBounded(argv: readonly string[], _options: RunnerOptions = {}): Promise<ProcessResult> {
+      this.argv.push([...argv]);
+      return result(argv, {});
+    }
+  }
+  const runner = new CaptureRunner();
+  await new IncusClient(runner, { project: "agents" }).instanceInfo("tenant/name");
+  expect(runner.argv.at(-1)?.[2]).toContain("/1.0/instances/tenant%2Fname/state?project=agents");
+  expect(runner.argv.at(-1)?.[2]).not.toContain("/1.0/instances/tenant/name/state");
+});
+
 test("rejects invalid identity, protocol, action and generation before native writes", async () => {
   const f = fixture();
   await expectCode(f.control.dispatch({ protocol: 3, action: "acquire", session_id: "thread-a", generation: 0, operation_id: "old-protocol", public_key: KEY }), "protocol_mismatch");
@@ -529,6 +544,17 @@ test("status envelope generation follows active and absent session state", async
   expect(active.generation).toBe(acquired.result.generation);
   expect(active.generation).toBe(active.result.generation);
   expect(active.operation_id).toBeNull();
+});
+
+test("ssh-info binds the request, envelope, port and alias to one generation", async () => {
+  const f = fixture();
+  const acquired = await f.control.dispatch(f.request("acquire", { public_key: KEY }, "op-ssh-info-generation-acquire"));
+  const generation = acquired.result.generation;
+  const response = await f.control.dispatch({ protocol: PROTOCOL_VERSION, action: "ssh-info", session_id: "thread-a", generation });
+  expect(response.generation).toBe(generation);
+  expect(response.result).toMatchObject({ generation, task_id: acquired.result.task_id, user: "root", host_key_alias: `agent-vm-${acquired.result.task_id}-g${generation}` });
+  expect(response.result.port).toBe(acquired.result.ssh_host_port);
+  await expectCode(f.control.dispatch({ protocol: PROTOCOL_VERSION, action: "ssh-info", session_id: "thread-a", generation: generation + 1 }), "generation_mismatch");
 });
 
 test("success envelopes require a matching operation identity", async () => {
@@ -666,6 +692,56 @@ test("rejects canonical runtime state with invalid task identity data", () => {
   chmodSync(path, 0o600);
   try { expectSyncCode(() => new StateStore(path), "state_invalid"); }
   finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("verifies state-dependent task, port, and operation invariants at runtime", () => {
+  const root = mkdtempSync("/tmp/agent-vm-state-invariants-test-");
+  const timestamp = "2026-10-04T00:00:00+00:00";
+  const task = {
+    task_id: "avm-valid",
+    session_id: "valid-session",
+    generation: 3,
+    state: "active",
+    instance_name: "agent-vm-avm-valid",
+    vm_ip: "198.51.100.20",
+    ssh_host_port: 20000,
+    lease_expires_at: "2026-10-04T01:00:00+00:00",
+    inactive_since: null,
+    cleanup_after: null,
+    created_at: timestamp,
+    updated_at: timestamp,
+    last_error: null,
+    image_fingerprint: "a".repeat(64),
+    resources_json: JSON.stringify({ cpu: 2, memory_mib: 4096, disk_gib: 20 }),
+    reservation_bytes: 0,
+    previous_generation: null,
+    resource_reservation_json: "{}",
+  };
+  const validPath = join(root, "valid.sqlite3");
+  const valid = StateStore.bootstrap(validPath);
+  valid.putTask(task);
+  valid.putPort({ task_id: task.task_id, generation: task.generation, port_name: "ssh", protocol: "tcp", host_port: 20000, vm_port: 22, device_name: "agent-vm-avm-valid-ssh-tcp", state: "active", created_at: timestamp });
+  valid.close();
+  try {
+    const reopened = new StateStore(validPath);
+    reopened.close();
+
+    const invalidPath = join(root, "invalid.sqlite3");
+    const invalid = StateStore.bootstrap(invalidPath);
+    invalid.putTask({ ...task, task_id: "avm-invalid-state", session_id: "invalid-state", instance_name: "agent-vm-avm-invalid-state", state: "cached", ssh_host_port: null, lease_expires_at: null, resources_json: JSON.stringify({ cpu: 2, memory_mib: 4096, disk_gib: 20 }), reservation_bytes: 1, resource_reservation_json: JSON.stringify({ cpu: 2 }) });
+    invalid.putPort({ task_id: "avm-invalid-state", generation: 3, port_name: "ssh", protocol: "tcp", host_port: 20001, vm_port: 22, device_name: "agent-vm-avm-invalid-state-ssh-tcp", state: "active", created_at: timestamp });
+    invalid.close();
+    chmodSync(invalidPath, 0o600);
+    expectSyncCode(() => new StateStore(invalidPath), "state_invalid");
+
+    const operationPath = join(root, "invalid-operation.sqlite3");
+    const operationStore = StateStore.bootstrap(operationPath);
+    operationStore.recordOperation("bad-operation", "acquire", "operation-session", 1, { outcome: "success", protocol: PROTOCOL_VERSION, action: "acquire", session_id: "operation-session", generation: 1, operation_id: "bad-operation", result: {}, server_time: timestamp });
+    expectSyncCode(() => operationStore.operation("bad-operation"), "state_invalid");
+    operationStore.close();
+    chmodSync(operationPath, 0o600);
+    expectSyncCode(() => new StateStore(operationPath), "state_invalid");
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("projects untrusted result JSON before operation and audit persistence", async () => {
@@ -934,6 +1010,9 @@ test("redacts command stderr before journal, audit, and diagnostic output", asyn
   expect(JSON.stringify(diagnostic)).not.toContain("nested-auth-01");
   expect(JSON.stringify(diagnostic)).not.toContain("field-auth-01");
   expect(JSON.stringify(diagnostic)).not.toContain("quoted-auth-02");
+  const quoted = new ControlError("command_failed", "native command failed", { stderr: ["password", "=", '"line-one-secret-canary\nline-two-secret-canary" token=\'escaped\\\'multiline-token-canary\''].join("") }).asDict();
+  expect(JSON.stringify(quoted)).not.toContain("secret-canary");
+  expect(JSON.stringify(quoted)).not.toContain("multiline-token-canary");
   const pemDiagnostic = new ControlError("command_failed", "native command failed", { stderr: "-----BEGIN OPENSSH PRIVATE KEY-----\n" + "pem-canary-".repeat(2000) }).asDict();
   expect(JSON.stringify(pemDiagnostic)).not.toContain("pem-canary");
   const values = [
@@ -1548,6 +1627,18 @@ test("lease expiry cleans durable ports before leaving the VM cached", async () 
   expect(response.result.state).toBe("cached");
   expect(response.result.ports).toEqual([]);
   expect(f.store.getPorts(String(active.task_id))).toEqual([]);
+});
+
+test("does not attach cleanup errors to a stale generation or state", async () => {
+  const f = fixture();
+  const active = await f.call("acquire", { public_key: KEY }, "op-stale-cleanup-create");
+  f.store.updateTask(String(active.task_id), { state: "closing", lease_expires_at: null });
+  await (f.control as any).updateCleanupLastError({ ...active, state: "active" }, JSON.stringify({ code: "stale-state" }));
+  expect(f.store.getTask({ taskId: String(active.task_id) })?.last_error).toBeNull();
+  const closing = f.store.getTask({ taskId: String(active.task_id) })!;
+  f.store.updateTask(String(active.task_id), { generation: 2 });
+  await (f.control as any).updateCleanupLastError(closing, JSON.stringify({ code: "stale-generation" }));
+  expect(f.store.getTask({ taskId: String(active.task_id) })?.last_error).toBeNull();
 });
 
 test("native wait distinguishes timeout from a stopped guest", async () => {

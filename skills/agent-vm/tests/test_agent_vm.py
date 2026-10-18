@@ -190,9 +190,58 @@ class SessionContractTests(unittest.TestCase):
             "password" + r'="escaped\"-secret-canary',
             "token" + "='unterminated-token-canary",
             "token" + r"='escaped\'-token-canary",
+            "password" + "=" + '"line-one-secret-canary\nline-two-secret-canary"',
+            "token" + r'="escaped\"-multiline-token-canary',
         ]
         for value in values:
             self.assertNotIn("canary", CLI.redact_diagnostic_text(value))
+
+    def test_control_requires_boolean_true_and_binds_ssh_info_generation(self):
+        response = {"ok": 1, "protocol": CLI.PROTOCOL_VERSION, "action": "status", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 1, "operation_id": None, "outcome": "success", "result": {"generation": 1}}
+        process = CLI.subprocess.CompletedProcess([], 0, json.dumps(response).encode(), b"")
+        with mock.patch.object(CLI, "run_child", return_value=process):
+            with self.assertRaises(CLI.CliError) as error:
+                CLI.control_request("status", session="thread")
+        self.assertEqual(error.exception.code, "invalid_remote_response")
+
+        ssh = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "ssh-info", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 3, "operation_id": None, "outcome": "success", "result": {"generation": 3}}
+        process = CLI.subprocess.CompletedProcess([], 0, json.dumps(ssh).encode(), b"")
+        with mock.patch.object(CLI, "run_child", return_value=process) as run:
+            CLI.control_request("ssh-info", session="thread", generation=3)
+        self.assertEqual(json.loads(run.call_args.kwargs["input_data"])["generation"], 3)
+        ssh["result"] = {"generation": 4}
+        process = CLI.subprocess.CompletedProcess([], 0, json.dumps(ssh).encode(), b"")
+        with mock.patch.object(CLI, "run_child", return_value=process):
+            with self.assertRaises(CLI.CliError) as error:
+                CLI.control_request("ssh-info", session="thread", generation=3)
+        self.assertEqual(error.exception.code, "invalid_remote_response")
+
+    def test_explicit_operation_without_a_journal_uses_current_generation(self):
+        response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "release", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 7, "operation_id": "release-op", "outcome": "success", "result": {}}
+        process = CLI.subprocess.CompletedProcess([], 0, json.dumps(response).encode(), b"")
+        args = CLI.build_parser().parse_args(["release", "--session-id", "thread", "--operation-id", "release-op"])
+        with tempfile.TemporaryDirectory() as state:
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", Path(state)), mock.patch.object(CLI, "run_child", return_value=process) as run:
+                CLI.write_session_state("thread", {"session_id": "thread", "generation": 7})
+                CLI.mutation("release", args)
+        self.assertEqual(json.loads(run.call_args.kwargs["input_data"])["generation"], 7)
+
+    def test_timeout_diagnostics_preserve_bounded_redacted_stderr(self):
+        error = CLI.subprocess.TimeoutExpired(["ssh"], 1, stderr=b"password" + b"=" + b'"timeout-secret-canary\ncontinued-secret-canary"')
+        with tempfile.TemporaryDirectory() as state:
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", Path(state)), mock.patch.object(CLI, "run_child", side_effect=error):
+                with self.assertRaises(CLI.CliError) as raised:
+                    CLI.control_request("status", session="thread")
+        detail = raised.exception.as_dict()["detail"]
+        self.assertNotIn("timeout-secret-canary", str(detail))
+        self.assertNotIn("continued-secret-canary", str(detail))
+        self.assertIn("[REDACTED]", detail["stderr"])
+
+    def test_ssh_config_rejects_noncanonical_endpoint_fields(self):
+        info = {"task_id": "avm-task", "generation": 3, "host": "198.51.100.20", "port": 2200, "user": "admin", "host_key_alias": "agent-vm-avm-task-g3", "host_key": "ssh-ed25519 AAAA"}
+        with self.assertRaises(CLI.CliError) as error:
+            CLI.write_ssh_config("thread", info, Path("/tmp/id_ed25519"))
+        self.assertEqual(error.exception.code, "invalid_remote_response")
 
     def test_mutation_response_generation_must_match_request(self):
         response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "release", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 4, "operation_id": "release-op", "outcome": "success", "result": {}}

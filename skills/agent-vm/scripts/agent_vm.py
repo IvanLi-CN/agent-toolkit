@@ -8,6 +8,7 @@ access then uses a generation-bound native OpenSSH configuration.
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import fcntl
 import hashlib
@@ -55,10 +56,10 @@ PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?---
 UNTERMINATED_PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*$", re.IGNORECASE)
 AUTH_SCHEME_RE = re.compile(r"(?i)(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?(?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]+")
 AUTH_BASIC_RE = re.compile(r"(?i)(\bbasic\s+)[A-Za-z0-9._~+/=-]+")
-SECRET_DOUBLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)\"(?:\\.|[^\"\\\r\n])*\"")
-SECRET_SINGLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)'(?:\\.|[^'\\\r\n])*'")
-UNTERMINATED_SECRET_DOUBLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)\"(?:\\.|[^\"\\\r\n])*$")
-UNTERMINATED_SECRET_SINGLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)'(?:\\.|[^'\\\r\n])*$")
+SECRET_DOUBLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)\"(?:\\.|[^\"\\])*\"")
+SECRET_SINGLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)'(?:\\.|[^'\\])*'")
+UNTERMINATED_SECRET_DOUBLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)\"(?:\\.|[^\"\\])*$")
+UNTERMINATED_SECRET_SINGLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)'(?:\\.|[^'\\])*$")
 SECRET_TOKEN_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)([^\s,;}}\]\\\"']+)")
 SSHPASS_RE = re.compile(r"(?i)(\bsshpass\b[ \t]+-p)[^\r\n]*")
 URL_CREDENTIAL_RE = re.compile(r"(?i)(\b[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:)([^@\s/]+)(@)")
@@ -450,6 +451,21 @@ def run_child(argv: Sequence[str], *, input_data: bytes | None = None,
                 pass
 
 
+def timeout_detail(error: subprocess.TimeoutExpired, *, operation_id: Any = None) -> dict[str, Any]:
+    stderr = error.stderr
+    if isinstance(stderr, str):
+        raw = stderr.encode("utf-8", "replace")
+    elif isinstance(stderr, (bytes, bytearray)):
+        raw = bytes(stderr)
+    else:
+        raw = b""
+    return {
+        "operation_id": operation_id,
+        "stderr": redact_and_bound_diagnostic(raw, truncated=len(raw) > DIAGNOSTIC_OUTPUT_LIMIT).decode("utf-8", "replace"),
+        "stderr_truncated": len(raw) > DIAGNOSTIC_OUTPUT_LIMIT,
+    }
+
+
 def read_session_state(value: str) -> dict[str, Any]:
     path = _secure_session_directory(value) / "state.json"
     if not os.path.lexists(path):
@@ -542,9 +558,9 @@ def control_request(action: str, *, session: str | None, generation: int | None 
                             stdout_limit=CONTROL_RESPONSE_LIMIT,
                             timeout=control_timeout(action, fields))
     except FileNotFoundError: fail("command_missing", "ssh is not installed")
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as error:
         fail("remote_timeout", "control outcome is uncertain; retry the same operation ID",
-             {"operation_id": request.get("operation_id")})
+             timeout_detail(error, operation_id=request.get("operation_id")))
     if process.stderr:
         sys.stderr.buffer.write(redact_and_bound_diagnostic(process.stderr))
         sys.stderr.flush()
@@ -560,21 +576,25 @@ def control_request(action: str, *, session: str | None, generation: int | None 
     generation = response.get("generation")
     if "generation" not in response or (generation is not None and (isinstance(generation, bool) or not isinstance(generation, int) or generation < 0)):
         fail("invalid_remote_response", "control response generation is invalid")
-    if write and request.get("generation") is not None and generation != request["generation"]:
-        fail("invalid_remote_response", "mutation response generation is inconsistent")
+    if request.get("generation") is not None and generation != request["generation"]:
+        fail("invalid_remote_response", "request and response generation are inconsistent")
     if response.get("outcome") not in {"success", "replayed"}:
         fail("invalid_remote_response", "control response outcome is invalid")
-    if not response.get("ok") or not isinstance(response.get("result"), dict) or not isinstance(response.get("server_time"), str):
+    if response.get("ok") is not True or not isinstance(response.get("result"), dict) or not isinstance(response.get("server_time"), str):
         fail("invalid_remote_response", "invalid control response envelope")
+    try:
+        dt.datetime.fromisoformat(response["server_time"].replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        fail("invalid_remote_response", "control response timestamp is invalid")
     expected_operation_id = request.get("operation_id") if write else None
     if "operation_id" not in response or response.get("operation_id") != expected_operation_id:
         fail("invalid_remote_response", "control response operation identity is invalid")
-    if action == "status":
+    if action in {"status", "ssh-info"}:
         result_generation = response["result"].get("generation")
         if (isinstance(generation, bool) or not isinstance(generation, int) or generation < 0 or
                 isinstance(result_generation, bool) or not isinstance(result_generation, int) or result_generation < 0 or
                 generation != result_generation):
-            fail("invalid_remote_response", "status response generation is inconsistent")
+            fail("invalid_remote_response", f"{action} response generation is inconsistent")
     return response
 
 
@@ -584,8 +604,8 @@ def run_command(argv: Sequence[str], *, input_data: bytes | None = None, output:
         process = run_child(list(argv), input_data=input_data)
     except FileNotFoundError:
         fail("command_missing", f"command not found: {argv[0]}")
-    except subprocess.TimeoutExpired:
-        fail("command_timeout", f"command timed out: {argv[0]}")
+    except subprocess.TimeoutExpired as error:
+        fail("command_timeout", f"command timed out: {argv[0]}", timeout_detail(error))
     if process.stderr:
         sys.stderr.buffer.write(redact_and_bound_diagnostic(process.stderr))
         sys.stderr.flush()
@@ -609,8 +629,8 @@ def make_ssh_key(session: str) -> tuple[Path, str]:
             process = run_child(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(private_key)], capture_stdout=True)
         except FileNotFoundError:
             fail("command_missing", "ssh-keygen is not installed")
-        except subprocess.TimeoutExpired:
-            fail("command_timeout", "ssh-keygen timed out")
+        except subprocess.TimeoutExpired as error:
+            fail("command_timeout", "ssh-keygen timed out", timeout_detail(error))
         if process.returncode != 0:
             fail("keygen_failed", "ssh-keygen failed", process.stderr.decode("utf-8", "replace"))
     os.chmod(private_key, 0o600)
@@ -634,18 +654,37 @@ def ssh_paths(session: str, info: dict[str, Any]) -> tuple[Path, Path]:
 
 
 def write_ssh_config(session: str, info: dict[str, Any], private_key: Path) -> Path:
-    host = str(info["host"])
-    port = int(info["port"])
-    alias = str(info["host_key_alias"])
+    required = {"task_id", "generation", "host", "port", "user", "host_key_alias", "host_key"}
+    if not required.issubset(info):
+        fail("invalid_remote_response", "ssh-info response is missing a required field")
+    task_id = info["task_id"]
+    generation = info["generation"]
+    host = info["host"]
+    port = info["port"]
+    user = info["user"]
+    alias = info["host_key_alias"]
+    host_key = info["host_key"]
+    if not isinstance(task_id, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,47}", task_id) or not task_id.startswith("avm-"):
+        fail("invalid_remote_response", "invalid task identity")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+        fail("invalid_remote_response", "invalid task generation")
+    if not isinstance(host, str):
+        fail("invalid_remote_response", "invalid VM endpoint address")
     try: ipaddress.IPv4Address(host)
     except ValueError: fail("invalid_remote_response", "invalid VM endpoint address")
-    if not 1024 <= port <= 65535 or not re.fullmatch(r"agent-vm-[a-z0-9-]+-g[1-9][0-9]*", alias):
+    if isinstance(port, bool) or not isinstance(port, int) or not 1024 <= port <= 65535 or user != "root":
         fail("invalid_remote_response", "invalid VM endpoint identity")
-    if not re.fullmatch(r"avm-[a-z0-9-]+", str(info["task_id"])) or int(info["generation"]) < 1:
-        fail("invalid_remote_response", "invalid task identity")
-    host_key = str(info["host_key"])
+    expected_alias = f"agent-vm-{task_id}-g{generation}"
+    if not isinstance(alias, str) or alias != expected_alias:
+        fail("invalid_remote_response", "invalid VM endpoint identity")
+    if not isinstance(host_key, str):
+        fail("invalid_host_key", "control returned an invalid trusted host key")
     fields = host_key.split()
-    if len(fields) != 2 or fields[0] != "ssh-ed25519" or not re.fullmatch(r"[A-Za-z0-9+/=]+", fields[1]):
+    try:
+        decoded_key = base64.b64decode(fields[1], validate=True) if len(fields) == 2 else b""
+    except (ValueError, TypeError):
+        decoded_key = b""
+    if len(fields) != 2 or fields[0] != "ssh-ed25519" or not decoded_key or base64.b64encode(decoded_key).decode("ascii") != fields[1]:
         fail("invalid_host_key", "control returned an invalid trusted host key")
     config_path, known_hosts_path = ssh_paths(session, info)
     expected_key = _secure_session_directory(session) / "keys" / "id_ed25519"
@@ -696,14 +735,20 @@ def ssh_config_path(path: Path) -> str:
 
 
 def fetch_ssh_info(session: str) -> tuple[dict[str, Any], dict[str, Any], Path]:
-    response = control_request("ssh-info", session=session)
+    state = read_session_state(session)
+    generation = current_generation(session)
+    response = control_request("ssh-info", session=session, generation=generation)
     info = response["result"]
     if not isinstance(info, dict):
         fail("invalid_remote_response", "ssh-info result is not an object")
-    state = read_session_state(session)
-    private_key = Path(str(state["private_key"]))
-    if state.get("task_id") != info["task_id"] or state.get("generation") != info["generation"]:
+    if state.get("task_id") != info.get("task_id") or state.get("generation") != info.get("generation"):
         fail("generation_mismatch", "connection material belongs to another lease; acquire the current lease first")
+    if info.get("generation") != generation:
+        fail("generation_mismatch", "connection material belongs to another lease; acquire the current lease first")
+    private_key_value = state.get("private_key")
+    if not isinstance(private_key_value, str):
+        fail("local_state_invalid", "local session state has no private key")
+    private_key = Path(private_key_value)
     expected_key = _secure_session_directory(session) / "keys" / "id_ed25519"
     if private_key.absolute() != expected_key.absolute():
         fail("invalid_path", "session state points outside the session key namespace")
@@ -858,7 +903,8 @@ def mutation(
     session = session if session is not None else session_id(getattr(args, "session_id", None))
     requested_operation = getattr(args, "operation_id", None)
     if requested_operation and session is not None:
-        generation = journal_generation(session, requested_operation, generation if generation is not None else 0)
+        current = current_generation(session)
+        generation = journal_generation(session, requested_operation, generation if generation is not None else current)
     if generation is None and action not in {"acquire", "drain-enter", "drain-exit", "admin-reconcile", "admin-gc"}:
         assert session is not None
         generation = current_generation(session)

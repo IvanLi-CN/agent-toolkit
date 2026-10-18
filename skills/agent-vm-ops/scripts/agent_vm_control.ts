@@ -163,10 +163,10 @@ const PRIVATE_KEY_RE = /-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?-----END 
 const UNTERMINATED_PRIVATE_KEY_RE = /-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*$/gi;
 const AUTH_SCHEME_RE = /(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?(?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]+/gi;
 const AUTH_BASIC_RE = /(\bbasic\s+)[A-Za-z0-9._~+/=-]+/gi;
-const SECRET_DOUBLE_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)\"(?:\\\\.|[^\"\\\\\\r\\n])*\"", "gi");
-const SECRET_SINGLE_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)'(?:\\\\.|[^'\\\\\\r\\n])*'", "gi");
-const UNTERMINATED_SECRET_DOUBLE_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)\"(?:\\\\.|[^\"\\\\\\r\\n])*$", "gi");
-const UNTERMINATED_SECRET_SINGLE_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)'(?:\\\\.|[^'\\\\\\r\\n])*$", "gi");
+const SECRET_DOUBLE_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)\"(?:\\\\.|[^\"\\\\])*\"", "gi");
+const SECRET_SINGLE_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)'(?:\\\\.|[^'\\\\])*'", "gi");
+const UNTERMINATED_SECRET_DOUBLE_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)\"(?:\\\\.|[^\"\\\\])*$", "gi");
+const UNTERMINATED_SECRET_SINGLE_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)'(?:\\\\.|[^'\\\\])*$", "gi");
 const SECRET_TOKEN_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)([^\\s,;}}\\]\\\\\"']+)", "gi");
 const SSHPASS_RE = /(\bsshpass\b[ \t]+-p)[^\r\n]*/gi;
 const URL_CREDENTIAL_RE = /(\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s:@]+:)([^@\s/]+)(@)/gi;
@@ -301,8 +301,8 @@ function validateSuccessEnvelope(response: Dict, action: string, sessionId: stri
   if (expectedGeneration !== undefined && !sameInteger(response.generation, expectedGeneration)) {
     throw new ControlError("invalid_response", "mutation success envelope generation is inconsistent");
   }
-  if (action === "status" && sessionId !== undefined && (!hasOwn(response.result, "generation") || !sameInteger(response.generation, response.result.generation))) {
-    throw new ControlError("invalid_response", "status success envelope generation is inconsistent");
+  if (["status", "ssh-info"].includes(action) && sessionId !== undefined && (!hasOwn(response.result, "generation") || !sameInteger(response.generation, response.result.generation))) {
+    throw new ControlError("invalid_response", `${action} success envelope generation is inconsistent`);
   }
   if (response.outcome !== "success" && response.outcome !== "replayed") throw new ControlError("invalid_response", "control success envelope outcome is invalid");
   return response;
@@ -976,22 +976,50 @@ function nativeKill(pid: number, signal: number): boolean {
   } catch { return false; }
 }
 
-function killProcessGroup(pid: number, signal: number): boolean {
-  return nativeKill(-pid, signal);
+export type ProcessIdentity = { pid: number; starttime: string };
+type ProcessRecord = ProcessIdentity & { state: string; ppid: number; pgrp: number };
+type ProcessCleanupOptions = {
+  readIdentity?: (pid: number) => string | undefined;
+  exists?: (pid: number) => boolean;
+  zombie?: (pid: number) => boolean;
+  kill?: (pid: number, signal: number) => boolean;
+};
+
+function readProcessRecord(pid: number): ProcessRecord {
+  if (process.platform !== "linux") throw new Error("process identity is unavailable");
+  const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
+  const closeParen = raw.lastIndexOf(")");
+  const fields = raw.slice(closeParen + 2).trim().split(/\s+/);
+  if (closeParen < 0 || fields.length <= 19 || !/^\d+$/.test(fields[19] ?? "")) throw new Error("invalid process stat");
+  const state = fields[0] ?? "";
+  const ppid = Number(fields[1]);
+  const pgrp = Number(fields[2]);
+  if (!Number.isSafeInteger(ppid) || !Number.isSafeInteger(pgrp)) throw new Error("invalid process parent or group");
+  return { pid, starttime: fields[19]!, state, ppid, pgrp };
 }
 
-function processGroupMembers(pgid: number): { members: number[]; complete: boolean } {
-  const members: number[] = [];
+function processStartIdentity(pid: number): string | undefined {
+  try { return readProcessRecord(pid).starttime; } catch { return undefined; }
+}
+
+function processExists(pid: number): boolean {
+  return process.platform !== "linux" || existsSync(`/proc/${pid}/stat`);
+}
+
+function processIsZombie(pid: number): boolean {
+  try { return readProcessRecord(pid).state === "Z"; } catch { return false; }
+}
+
+function processGroupMembers(pgid: number): { members: ProcessIdentity[]; complete: boolean } {
+  const members: ProcessIdentity[] = [];
   let complete = true;
+  if (process.platform !== "linux") return { members, complete: false };
   try {
     for (const entry of readdirSync("/proc")) {
       if (!/^\d+$/.test(entry)) continue;
       try {
-        const raw = readFileSync(`/proc/${entry}/stat`, "utf8");
-        const closeParen = raw.lastIndexOf(")");
-        const fields = raw.slice(closeParen + 2).trim().split(/\s+/);
-        if (closeParen < 0 || fields.length < 3) throw new Error("invalid process stat");
-        if (fields[0] !== "Z" && Number(fields[2]) === pgid) members.push(Number(entry));
+        const record = readProcessRecord(Number(entry));
+        if (record.state !== "Z" && record.pgrp === pgid) members.push({ pid: record.pid, starttime: record.starttime });
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
         complete = false;
@@ -1001,72 +1029,95 @@ function processGroupMembers(pgid: number): { members: number[]; complete: boole
   return { members, complete };
 }
 
-function processDescendants(rootPid: number): { members: number[]; complete: boolean } {
-  const children = new Map<number, number[]>();
+export function processDescendants(rootPid: number): { members: ProcessIdentity[]; complete: boolean } {
+  const children = new Map<number, ProcessRecord[]>();
   let complete = true;
+  if (process.platform !== "linux") return { members: [], complete: false };
   try {
     for (const entry of readdirSync("/proc")) {
       if (!/^\d+$/.test(entry)) continue;
       try {
-        const raw = readFileSync("/proc/" + entry + "/stat", "utf8");
-        const closeParen = raw.lastIndexOf(")");
-        const fields = raw.slice(closeParen + 2).trim().split(/\s+/);
-        if (closeParen < 0 || fields.length < 3) throw new Error("invalid process stat");
-        const pid = Number(entry);
-        const ppid = Number(fields[1]);
-        if (fields[0] !== "Z" && Number.isSafeInteger(pid) && Number.isSafeInteger(ppid)) children.set(ppid, [...(children.get(ppid) ?? []), pid]);
+        const record = readProcessRecord(Number(entry));
+        if (record.state !== "Z") children.set(record.ppid, [...(children.get(record.ppid) ?? []), record]);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
         complete = false;
       }
     }
   } catch { return { members: [], complete: false }; }
-  const members: number[] = [];
+  const members: ProcessIdentity[] = [];
   const pending = [...(children.get(rootPid) ?? [])];
   const visited = new Set<number>();
   while (pending.length) {
-    const pid = pending.shift()!;
-    if (visited.has(pid)) continue;
-    visited.add(pid);
-    members.push(pid);
-    pending.push(...(children.get(pid) ?? []));
+    const record = pending.shift()!;
+    if (visited.has(record.pid)) continue;
+    visited.add(record.pid);
+    members.push({ pid: record.pid, starttime: record.starttime });
+    pending.push(...(children.get(record.pid) ?? []));
   }
   return { members, complete };
 }
 
-function killProcessTree(members: number[]): { killed: boolean; error: string | null } {
+export function killProcessTree(members: readonly ProcessIdentity[], options: ProcessCleanupOptions = {}): { killed: boolean; error: string | null } {
+  const readIdentity = options.readIdentity ?? processStartIdentity;
+  const exists = options.exists ?? processExists;
+  const zombie = options.zombie ?? processIsZombie;
+  const kill = options.kill ?? nativeKill;
   let cleanupError: string | null = null;
+  let identityBlocked = false;
+  if (!members.length) return { killed: true, error: null };
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    for (const member of members) if (!nativeKill(member, 9)) cleanupError = "PermissionError";
-    const remaining = members.filter((member) => {
-      try {
-        const raw = readFileSync("/proc/" + member + "/stat", "utf8");
-        const closeParen = raw.lastIndexOf(")");
-        const fields = raw.slice(closeParen + 2).trim().split(/\s+/);
-        return closeParen >= 0 && fields[0] !== "Z";
-      } catch (error) {
-        return (error as NodeJS.ErrnoException).code !== "ENOENT";
+    for (const member of members) {
+      if (!exists(member.pid)) continue;
+      const current = readIdentity(member.pid);
+      if (!current) {
+        cleanupError ??= "process_identity_unverified";
+        identityBlocked = true;
+        continue;
       }
+      if (current !== member.starttime) {
+        cleanupError ??= "process_identity_mismatch";
+        identityBlocked = true;
+        continue;
+      }
+      if (!kill(member.pid, 9)) cleanupError ??= "PermissionError";
+    }
+    const remaining = members.filter((member) => {
+      if (!exists(member.pid)) return false;
+      const current = readIdentity(member.pid);
+      if (!current) {
+        cleanupError ??= "process_identity_unverified";
+        identityBlocked = true;
+        return true;
+      }
+      if (current !== member.starttime) {
+        cleanupError ??= "process_identity_mismatch";
+        identityBlocked = true;
+        return false;
+      }
+      return !zombie(member.pid);
     });
-    if (!remaining.length) return { killed: true, error: cleanupError };
+    if (!remaining.length) return { killed: !identityBlocked, error: cleanupError };
   }
   return { killed: false, error: cleanupError ?? "process_tree_members_remain" };
 }
 
 function killProcessGroupMembers(pgid: number): { killed: boolean; error: string | null } {
-  let cleanupError: string | null = null;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const { members, complete } = processGroupMembers(pgid);
-    if (!complete) return { killed: false, error: "process_group_inspection_failed" };
-    if (!members.length) return { killed: true, error: cleanupError };
-    for (const member of members) {
-      if (!nativeKill(member, 9)) cleanupError = "PermissionError";
-    }
+  const snapshot = processGroupMembers(pgid);
+  if (!snapshot.complete) return { killed: false, error: "process_group_inspection_failed" };
+  return killProcessTree(snapshot.members);
+}
+
+function safeProcessSignal(pid: number, expectedIdentity: string | undefined, signal: number, group: boolean): { sent: boolean; error: string | null } {
+  if (process.platform === "linux") {
+    if (!processExists(pid)) return { sent: false, error: null };
+    if (!expectedIdentity) return { sent: false, error: "process_identity_unverified" };
+    const current = processStartIdentity(pid);
+    if (!current) return { sent: false, error: "process_identity_unverified" };
+    if (current !== expectedIdentity) return { sent: false, error: "process_identity_mismatch" };
   }
-  const final = processGroupMembers(pgid);
-  return final.complete && !final.members.length
-    ? { killed: true, error: cleanupError }
-    : { killed: false, error: cleanupError ?? "process_group_members_remain" };
+  const sent = nativeKill(group ? -pid : pid, signal);
+  return { sent, error: sent ? null : "PermissionError" };
 }
 
 export class CommandRunner {
@@ -1085,6 +1136,7 @@ export class CommandRunner {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new ControlError("command_missing", `command not found: ${argv[0]}`);
       throw error;
     }
+    const leaderIdentity = processStartIdentity(processHandle.pid);
     const readAbort = new AbortController();
     const stdoutPromise = readBounded(processHandle.stdout, options.stdoutLimit ?? DIAGNOSTIC_LOG_LIMIT, false, readAbort.signal);
     const stderrPromise = readBounded(processHandle.stderr, options.stderrLimit ?? 4000, true, readAbort.signal, true);
@@ -1109,19 +1161,25 @@ export class CommandRunner {
       const outcome = await Promise.race([communication.then((value) => ({ kind: "complete" as const, value })), timeout.then(() => ({ kind: "timeout" as const }))]);
       if (outcome.kind === "timeout") {
         const descendants = processDescendants(processHandle.pid);
-        const groupKilled = killProcessGroup(processHandle.pid, 9);
-        const fallback = killProcessGroupMembers(processHandle.pid);
+        const term = safeProcessSignal(processHandle.pid, leaderIdentity, 15, true);
+        const leaderExitedAfterTerm = await Promise.race([exit.then(() => true), sleep(250).then(() => false)]);
         const tree = killProcessTree(descendants.members);
         if (!descendants.complete && !tree.error) tree.error = "process_tree_inspection_failed";
-        let processGroupKilled = groupKilled || fallback.killed || tree.killed;
-        let processGroupCleanupError = fallback.error ?? tree.error;
-        try { processHandle.kill("SIGKILL"); } catch { /* The leader may already be gone. */ }
+        const fallback = leaderExitedAfterTerm ? { killed: false, error: null } : killProcessGroupMembers(processHandle.pid);
+        const groupKill = leaderExitedAfterTerm ? { sent: false, error: null } : safeProcessSignal(processHandle.pid, leaderIdentity, 9, true);
+        const directKill = leaderExitedAfterTerm ? { sent: false, error: null } : safeProcessSignal(processHandle.pid, leaderIdentity, 9, false);
+        let processGroupKilled = term.sent || groupKill.sent || directKill.sent || fallback.killed || tree.killed;
+        let processGroupCleanupError = term.error ?? groupKill.error ?? directKill.error ?? fallback.error ?? tree.error;
         const reaped = await Promise.race([exit.then(() => true), sleep(1000).then(() => false)]);
         readAbort.abort();
         try { processHandle.stdin?.end(); } catch { /* The pipe may already be closed. */ }
         await Promise.race([Promise.allSettled([inputPromise, stdoutPromise, stderrPromise, exit]), sleep(1000)]);
+        const stderr = await Promise.race([
+          stderrPromise.catch(() => ({ bytes: encode(DIAGNOSTIC_LOG_TRUNCATION_MARKER), truncated: true })),
+          sleep(1000).then(() => ({ bytes: encode(DIAGNOSTIC_LOG_TRUNCATION_MARKER), truncated: true })),
+        ]);
         if (!processGroupKilled && !processGroupCleanupError) processGroupCleanupError = "process_group_kill_failed";
-        throw new ControlError("command_timeout", `command timed out: ${argv[0]}`, { reaped, process_group_killed: processGroupKilled, process_group_cleanup_error: processGroupCleanupError });
+        throw new ControlError("command_timeout", `command timed out: ${argv[0]}`, { reaped, process_group_killed: processGroupKilled, process_group_cleanup_error: processGroupCleanupError, stderr: decode(stderr.bytes), stderr_truncated: stderr.truncated });
       }
       const [, stdout, stderr, returncode] = outcome.value;
       const result: CompletedProcess = { args: [...argv], returncode, stdout: stdout.bytes, stderr: stderr.bytes, stdoutTruncated: stdout.truncated };
@@ -1273,6 +1331,8 @@ const TASK_FIELDS = new Set([
 ]);
 const PORT_FIELDS = new Set(["task_id", "generation", "port_name", "protocol", "host_port", "vm_port", "device_name", "state", "created_at"]);
 const STATE_TABLES = new Set(["meta", "tasks", "ports", "operations", "audit"]);
+const OPERATION_ACTIONS = new Set(["acquire", "renew", "release", "destroy", "restart", "resize", "port-add", "port-remove", "drain-enter", "drain-exit", "admin-reconcile", "admin-gc"]);
+const OPERATION_SESSION_ACTIONS = new Set(["acquire", "renew", "release", "destroy", "restart", "resize", "port-add", "port-remove"]);
 
 type StateColumnContract = { name: string; type: string; notnull: number; pk: number; defaultValue: string | null };
 const STATE_SCHEMA: Record<string, readonly StateColumnContract[]> = {
@@ -1409,6 +1469,34 @@ export class StateStore {
     `);
   }
 
+  private static validateOperationRow(row: Dict, value: unknown): void {
+    const invalid = (message: string): never => { throw new ControlError("state_invalid", message); };
+    const operationId = String(row.operation_id);
+    const action = String(row.action);
+    if (!OPERATION_ACTIONS.has(action) || !SESSION_ID_RE.test(operationId)) invalid("durable state contains an invalid operation identity");
+    if (row.session_id !== null && row.session_id !== undefined && !SESSION_ID_RE.test(String(row.session_id))) invalid("durable state contains an invalid operation session identity");
+    if (OPERATION_SESSION_ACTIONS.has(action) && (row.session_id === null || row.session_id === undefined)) invalid("durable state contains a missing operation session identity");
+    let generation: IntegerValue = 0n;
+    try { generation = integerBigInt(row.generation, "generation"); if (generation < 0n) throw new Error("range"); }
+    catch { invalid("durable state contains an invalid operation generation"); }
+    if (!isDict(value)) invalid("durable state contains an invalid operation response");
+    const response = value as Dict;
+    if (typeof response._request_digest !== "string" || !/^[0-9a-f]{64}$/.test(response._request_digest)) invalid("durable state contains an invalid operation request digest");
+    const outcome = response.outcome;
+    if (outcome === "pending") {
+      if (["ok", "error", "result", "server_time"].some((key) => hasOwn(response, key)) || (hasOwn(response, "protocol") && response.protocol !== PROTOCOL_VERSION) || (hasOwn(response, "action") && response.action !== action) || (hasOwn(response, "operation_id") && response.operation_id !== operationId) || (hasOwn(response, "session_id") && response.session_id !== (row.session_id ?? null)) || (hasOwn(response, "generation") && !sameInteger(response.generation, generation))) invalid("durable state contains an invalid pending operation record");
+      return;
+    }
+    if (outcome === "error") {
+      if (!isDict(response.error) || typeof response.error.code !== "string" || !response.error.code || typeof response.error.message !== "string" || !response.error.message || ["ok", "protocol", "action", "session_id", "generation", "operation_id", "server_time", "result"].some((key) => hasOwn(response, key))) invalid("durable state contains an invalid operation error record");
+      return;
+    }
+    if (outcome !== "success" || hasOwn(response, "error")) invalid("durable state contains an invalid operation outcome record");
+    try { if (!parseTime(String(response.server_time))) throw new Error("time"); }
+    catch { invalid("durable state contains an invalid operation response timestamp"); }
+    validateSuccessEnvelope(response, action, row.session_id === null || row.session_id === undefined ? undefined : String(row.session_id), operationId, generation);
+  }
+
   private static verifyDurableState(db: Database): void {
     const quickCheck = (db.query("PRAGMA quick_check") as any).get() as Dict | null;
     if (!quickCheck || String(quickCheck.quick_check) !== "ok") throw new ControlError("state_invalid", "durable state database failed SQLite integrity check");
@@ -1458,6 +1546,7 @@ export class StateStore {
     const tasks = (db.query("SELECT * FROM tasks") as any).all() as Dict[];
     const taskIds = new Set<string>();
     const taskGenerations = new Map<string, bigint>();
+    const taskRows = new Map<string, Dict>();
     const states = new Set(["absent", "cached", "preparing", "active", "closing", "deleting", "failed"]);
     const invalid = (message: string): never => { throw new ControlError("state_invalid", message); };
     const timestamp = (value: unknown, field: string): void => {
@@ -1466,6 +1555,17 @@ export class StateStore {
     };
     const optionalTimestamp = (value: unknown, field: string): void => {
       if (value !== null && value !== undefined) timestamp(value, field);
+    };
+    const objectJson = (value: unknown, field: string): Dict => {
+      let parsed: unknown;
+      try { parsed = parseJson(String(value)); } catch { invalid("durable state contains invalid JSON: " + field); }
+      if (!isDict(parsed)) invalid("durable state contains invalid JSON: " + field);
+      const object = parsed as Dict;
+      for (const [key, child] of Object.entries(object)) {
+        if (!["cpu", "memory_mib", "disk_gib"].includes(key)) invalid("durable state contains an invalid resource key: " + field + "." + key);
+        try { if (integerBigInt(child, field + "." + key) < 0n) throw new Error("range"); } catch { invalid("durable state contains an invalid resource value: " + field + "." + key); }
+      }
+      return object;
     };
     for (const task of tasks) {
       const taskId = String(task.task_id);
@@ -1483,14 +1583,31 @@ export class StateStore {
         if (integerBigInt(task.reservation_bytes, "reservation_bytes") < 0n) throw new Error("reservation");
         if (task.previous_generation !== null && task.previous_generation !== undefined && (integerBigInt(task.previous_generation, "previous_generation") < 1n || integerBigInt(task.previous_generation, "previous_generation") >= generation)) throw new Error("previous generation");
       } catch { invalid("durable state contains an invalid task numeric invariant"); }
-      for (const field of ["resources_json", "resource_reservation_json"]) {
-        try { if (!isDict(parseJson(String(task[field])))) throw new Error("object"); } catch { invalid("durable state contains invalid JSON: tasks." + field); }
-      }
+      const resources = objectJson(task.resources_json, "tasks.resources_json");
+      const reservation = objectJson(task.resource_reservation_json, "tasks.resource_reservation_json");
       if (task.last_error !== null && task.last_error !== undefined) {
         try { if (!isDict(parseJson(String(task.last_error)))) throw new Error("object"); } catch { invalid("durable state contains invalid task error JSON"); }
       }
+      const created = parseTime(String(task.created_at))!;
+      const updated = parseTime(String(task.updated_at))!;
+      if (created.getTime() > updated.getTime()) invalid("durable state contains a task timestamp order violation");
+      const inactive = task.inactive_since === null || task.inactive_since === undefined ? undefined : parseTime(String(task.inactive_since));
+      const cleanupAfter = task.cleanup_after === null || task.cleanup_after === undefined ? undefined : parseTime(String(task.cleanup_after));
+      if (inactive && cleanupAfter && cleanupAfter.getTime() < inactive.getTime()) invalid("durable state contains an invalid cleanup timestamp order");
+      const state = String(task.state);
+      if (["preparing", "active"].includes(state) && (task.lease_expires_at === null || task.lease_expires_at === undefined)) invalid("durable state contains an active task without a lease");
+      if (["cached", "absent", "closing", "deleting", "failed"].includes(state) && task.lease_expires_at !== null && task.lease_expires_at !== undefined) invalid("durable state contains a terminal task with a lease");
+      if (["active", "cached"].includes(state) && Object.keys(resources).length !== 3) invalid("durable state contains incomplete committed resources");
+      if (["cached", "absent"].includes(state)) {
+        if (task.ssh_host_port !== null && task.ssh_host_port !== undefined) invalid("durable state contains a cached or absent SSH port");
+        if (integerBigInt(task.reservation_bytes, "reservation_bytes") !== 0n || Object.keys(reservation).length) invalid("durable state contains a cached or absent reservation");
+      }
+      if (state === "absent" && task.vm_ip !== null && task.vm_ip !== undefined) invalid("durable state contains an absent VM address");
+      if (state === "active" && (integerBigInt(task.reservation_bytes, "reservation_bytes") !== 0n || Object.keys(reservation).length)) invalid("durable state contains an active reservation");
       taskGenerations.set(taskId, generation);
+      taskRows.set(taskId, task);
     }
+    const portsByTask = new Map<string, Dict[]>();
     for (const port of (db.query("SELECT * FROM ports") as any).all() as Dict[]) {
       const taskId = String(port.task_id);
       const generation = taskGenerations.get(taskId);
@@ -1501,14 +1618,24 @@ export class StateStore {
       try {
         if (integerBigInt(port.generation, "generation") !== generation || integerBigInt(port.host_port, "host_port") < 1n || integerBigInt(port.host_port, "host_port") > 65535n || integerBigInt(port.vm_port, "vm_port") < 1n || integerBigInt(port.vm_port, "vm_port") > 65535n) throw new Error("range");
       } catch { invalid("durable state contains an invalid port range or generation"); }
+      portsByTask.set(taskId, [...(portsByTask.get(taskId) ?? []), port]);
+    }
+    for (const [taskId, task] of taskRows) {
+      const state = String(task.state);
+      const ports = portsByTask.get(taskId) ?? [];
+      const sshPorts = ports.filter((port) => port.port_name === "ssh" && port.protocol === "tcp");
+      if (task.ssh_host_port !== null && task.ssh_host_port !== undefined) {
+        if (sshPorts.length !== 1 || !sameInteger(sshPorts[0]!.host_port, task.ssh_host_port) || sshPorts[0]!.state === "removed") invalid("durable state contains an SSH port identity mismatch");
+      }
+      if (state === "active" && (sshPorts.length !== 1 || sshPorts[0]!.state !== "active" || !sameInteger(sshPorts[0]!.host_port, task.ssh_host_port))) invalid("durable state contains an active task without an active SSH reservation");
+      if (["cached", "absent"].includes(state) && ports.length) invalid("durable state contains ports for a cached or absent task");
     }
     for (const operation of (db.query("SELECT * FROM operations") as any).all() as Dict[]) {
-      if (!SESSION_ID_RE.test(String(operation.operation_id)) || (operation.session_id !== null && operation.session_id !== undefined && !SESSION_ID_RE.test(String(operation.session_id)))) invalid("durable state contains an invalid operation identity");
       timestamp(operation.created_at, "operations.created_at");
-      try { if (!isDict(parseJson(String(operation.response_json)))) throw new Error("object"); } catch { invalid("durable state contains invalid operation JSON"); }
-      if (operation.generation !== null && operation.generation !== undefined) {
-        try { if (integerBigInt(operation.generation, "generation") < 0n) throw new Error("range"); } catch { invalid("durable state contains an invalid operation generation"); }
-      }
+      let response: unknown;
+      try { response = parseJson(String(operation.response_json)); } catch { invalid("durable state contains invalid operation JSON"); }
+      try { StateStore.validateOperationRow(operation, response); }
+      catch (error) { if (error instanceof ControlError) invalid(error.message); throw error; }
     }
     for (const audit of (db.query("SELECT * FROM audit") as any).all() as Dict[]) {
       if (audit.task_id !== null && audit.task_id !== undefined && !TASK_ID_RE.test(String(audit.task_id))) invalid("durable state contains an invalid audit task identity");
@@ -1604,9 +1731,12 @@ export class StateStore {
   }
 
   operation(operationId: string): Dict | undefined {
-    const row = this.row("SELECT response_json FROM operations WHERE operation_id = ?", [operationId]);
+    const row = this.row("SELECT * FROM operations WHERE operation_id = ?", [operationId]);
     if (!row) return undefined;
-    const value = parseJson(String(row.response_json));
+    let value: unknown;
+    try { value = parseJson(String(row.response_json)); }
+    catch { throw new ControlError("state_invalid", "durable state contains invalid operation JSON"); }
+    StateStore.validateOperationRow(row, value);
     return isDict(value) ? persistedResponse(value) : undefined;
   }
 
@@ -1698,16 +1828,6 @@ function removeWriterMarker(path: string): void {
 
 function reclaimableWriterFd(fd: number): boolean {
   try { flock(fd, 2 | 4); return true; } catch { return false; }
-}
-
-function processStartIdentity(pid: number): string | undefined {
-  if (process.platform !== "linux") return undefined;
-  try {
-    const raw = readFileSync("/proc/" + pid + "/stat", "utf8");
-    const closeParen = raw.lastIndexOf(")");
-    const fields = raw.slice(closeParen + 2).trim().split(/\s+/);
-    return closeParen >= 0 && fields.length > 19 && /^\d+$/.test(fields[19] ?? "") ? fields[19] : undefined;
-  } catch { return undefined; }
 }
 
 function processOwnsMarker(pid: number, path: string): boolean | undefined {
@@ -2046,10 +2166,14 @@ export class Control {
   }
 
   private async updateCleanupLastError(task: Dict, detail: string): Promise<void> {
+    const taskId = String(task.task_id);
+    const instanceName = String(task.instance_name);
+    const generation = task.generation;
+    const expectedState = String(task.state);
     await this.globalLock(() => this.store.transaction(() => {
-      const current = this.store.getTask({ taskId: String(task.task_id) });
-      if (!current || current.instance_name !== task.instance_name || !sameInteger(current.generation, task.generation) || current.state !== "closing") return;
-      this.store.updateTask(String(task.task_id), { last_error: detail });
+      const current = this.store.getTask({ taskId });
+      if (!current || current.instance_name !== instanceName || !sameInteger(current.generation, generation) || current.state !== expectedState) return;
+      this.store.updateTask(taskId, { last_error: detail });
     }));
   }
 
@@ -3403,15 +3527,21 @@ export class Control {
     }
   }
 
-  async sshInfo(_request: Dict, sessionId: string): Promise<Dict> {
-    const task = this.taskForSession(sessionId);
+  async sshInfo(request: Dict, sessionId: string): Promise<Dict> {
+    let task = this.taskForSession(sessionId);
+    this.checkGeneration(task, request);
     this.requireActive(task);
     await this.ownership(task);
-    const port = this.store.getPort(String(task.task_id), "ssh", "tcp");
-    if (!port || port.state !== "active" || !sameInteger(port.generation, task.generation)) throw new ControlError("mapping_unverified", "managed SSH reservation is not active");
+    let port = this.store.getPort(String(task.task_id), "ssh", "tcp");
+    if (!port || port.state !== "active" || !sameInteger(port.generation, task.generation) || !sameInteger(port.host_port, task.ssh_host_port)) throw new ControlError("mapping_unverified", "managed SSH reservation is not active");
     const hostKey = await this.guestHostKey(String(task.instance_name));
-    this.requireActive(this.store.getTask({ taskId: String(task.task_id) })!);
-    return { task_id: task.task_id, generation: integerForJson(task.generation), host: this.config.host_address, port: Number(task.ssh_host_port), user: "root", host_key_alias: `agent-vm-${task.task_id}-g${integerText(task.generation)}`, host_key: hostKey };
+    task = this.store.getTask({ taskId: String(task.task_id) })!;
+    this.checkGeneration(task, request);
+    this.requireActive(task);
+    await this.ownership(task);
+    port = this.store.getPort(String(task.task_id), "ssh", "tcp");
+    if (!port || port.state !== "active" || !sameInteger(port.generation, task.generation) || !sameInteger(port.host_port, task.ssh_host_port)) throw new ControlError("mapping_unverified", "managed SSH reservation changed during inspection");
+    return { task_id: task.task_id, generation: integerForJson(task.generation), host: this.config.host_address, port: Number(port.host_port), user: "root", host_key_alias: `agent-vm-${task.task_id}-g${integerText(task.generation)}`, host_key: hostKey };
   }
 
   async portAdd(request: Dict, sessionId: string): Promise<Dict> {

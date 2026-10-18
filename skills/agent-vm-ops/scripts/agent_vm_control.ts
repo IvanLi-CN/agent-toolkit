@@ -1123,7 +1123,9 @@ function processPipeTargets(pid: number): Set<string> {
   return targets;
 }
 
-function processPipeMembers(targets: ReadonlySet<string>): { members: ProcessIdentity[]; complete: boolean } {
+type ProcessPipeScope = { pids: ReadonlySet<number>; pgids: ReadonlySet<number> };
+
+function processPipeMembers(targets: ReadonlySet<string>, scope?: ProcessPipeScope): { members: ProcessIdentity[]; complete: boolean } {
   const members: ProcessIdentity[] = [];
   let complete = true;
   if (process.platform !== "linux" || !targets.size) return { members, complete };
@@ -1137,6 +1139,7 @@ function processPipeMembers(targets: ReadonlySet<string>): { members: ProcessIde
         if (owned === undefined) { complete = false; continue; }
         const record = readProcessRecord(pid);
         if (record.state === "Z") continue;
+        if (scope && !scope.pids.has(pid) && !scope.pids.has(record.ppid) && !scope.pgids.has(record.pgrp)) continue;
         let inherited = false;
         for (const fd of readdirSync(`/proc/${pid}/fd`)) {
           try {
@@ -1495,6 +1498,7 @@ export class CommandRunner {
             } catch { /* Identity checks below will fail closed if this process remains. */ }
           }
         };
+        const pipeScope = (): ProcessPipeScope => ({ pids: new Set(known.keys()), pgids: new Set(groupAnchors.keys()) });
         const addBoundEnvironmentMembers = (): { complete: boolean } => {
           if (process.platform !== "linux") return { complete: true };
           const environment = processEnvironmentMembers(commandMarker);
@@ -1515,7 +1519,7 @@ export class CommandRunner {
         addKnown([...trackedMembers.values()]);
         addKnown(descendants.members);
         addBoundEnvironmentMembers();
-        addKnown(processPipeMembers(leaderPipeTargets).members);
+        addKnown(processPipeMembers(leaderPipeTargets, pipeScope()).members);
         const term = safeProcessSignal(processHandle.pid, leaderIdentity, 15, true, leaderPgid);
         const leaderExitedAfterTerm = await Promise.race([exit.then(() => true), sleep(250).then(() => false)]);
         let processGroupCleanupError: string | null = identityMismatch ? "process_identity_mismatch" : term.error;
@@ -1527,7 +1531,7 @@ export class CommandRunner {
           const discovered = processDescendantsFromRoots([...known.values()]);
           addKnown(discovered.members);
           addBoundEnvironmentMembers();
-          addKnown(processPipeMembers(leaderPipeTargets).members);
+          addKnown(processPipeMembers(leaderPipeTargets, pipeScope()).members);
           for (const [pgid, anchors] of groupAnchors) {
             const liveAnchor = anchors.some((anchor) => {
               try { return processStartIdentity(anchor.pid) === anchor.starttime; } catch { return false; }
@@ -1564,12 +1568,12 @@ export class CommandRunner {
           await sleep(50);
         }
         const finalEnvironment = addBoundEnvironmentMembers();
-        addKnown(processPipeMembers(leaderPipeTargets).members);
+        addKnown(processPipeMembers(leaderPipeTargets, pipeScope()).members);
         const finalDescendants = processDescendantsFromRoots([...known.values()]);
         let finalInspectionComplete = finalDescendants.complete;
         addKnown(finalDescendants.members);
         finalInspectionComplete &&= finalEnvironment.complete && !environmentInspectionIncomplete;
-        const finalPipes = processPipeMembers(leaderPipeTargets);
+        const finalPipes = processPipeMembers(leaderPipeTargets, pipeScope());
         finalInspectionComplete &&= finalPipes.complete;
         addKnown(finalPipes.members);
         for (const [pgid, anchors] of groupAnchors) {

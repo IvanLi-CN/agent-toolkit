@@ -28,7 +28,7 @@ The deployment configuration supplies the control address and host port range. P
 
 Capacity observations are limited to the configured Incus pool filesystem and visible control-environment CPU and memory boundaries. External storage probes and infrastructure-manager inspection are unsupported. CPU and memory allocation ceilings use separately configurable overselling ratios; stopped caches consume disk only. New demand is refused when local measurements are missing, invalid or below the configured pressure threshold. Existing lease queries, retrieval, renewal and release remain available during pressure.
 
-Disk changes require an explicit restart allowance and grow only. Memory-only live changes require a running owned guest, unchanged boot identity and native acknowledgement. The old reservation remains until verification succeeds. A single bounded convergence retry is allowed for the documented native balloon timeout; no polling loop or third attempt exists. Partial native changes retain conservative reservations and a structured recovery state.
+Disk changes require an explicit restart allowance and grow only. Memory-only live changes require a running owned guest, unchanged boot identity and native acknowledgement. The old reservation remains until verification succeeds. The documented native balloon-timeout path settles for 45 seconds, then permits exactly one bounded convergence retry only after rereading lease, reservation, native-resource and guest-boot guards; there is no polling loop or third attempt. Partial native changes retain conservative reservations and a structured recovery state.
 
 ## Reclamation and operations
 

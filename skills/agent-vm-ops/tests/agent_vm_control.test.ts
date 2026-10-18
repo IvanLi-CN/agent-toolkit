@@ -27,7 +27,7 @@ setDefaultTimeout(15_000);
 type Dict = Record<string, any>;
 type RunnerOptions = { inputData?: Uint8Array | string; timeout?: number; check?: boolean };
 type ProcessResult = { args: string[]; returncode: number; stdout: Uint8Array; stderr: Uint8Array; stdoutTruncated?: boolean };
-type GuestFixtureOptions = { fstype?: "ext4" | "xfs"; parent?: string; virtualBytes?: number; includeGrowpart?: boolean };
+type GuestFixtureOptions = { fstype?: "ext4" | "xfs"; parent?: string; virtualBytes?: number; includeGrowpart?: boolean; delayCommand?: "findmnt" | "growpart" };
 type GuestFixture = { root: string; bin: string; log: string; env: Record<string, string> };
 
 function result(args: readonly string[], stdout: string | Dict | Dict[] = "", returncode = 0, stderr = ""): ProcessResult {
@@ -48,11 +48,12 @@ function createGuestFixture(base: string, options: GuestFixtureOptions = {}): Gu
     writeFileSync(path, `#!/bin/sh\nset -eu\n${body}\n`);
     chmodSync(path, 0o755);
   };
-  writeCommand("findmnt", 'case "$*" in *SOURCE*) printf \'%s/dev/vda1\\n\' "$AGENT_GUEST_ROOT" ;; *FSTYPE*) printf \'%s\\n\' "$AGENT_GUEST_FSTYPE" ;; *) exit 2 ;; esac');
+  const delayed = (name: string, body: string): string => options.delayCommand === name ? "exec sleep 1" : body;
+  writeCommand("findmnt", delayed("findmnt", 'case "$*" in *SOURCE*) printf \'%s/dev/vda1\\n\' "$AGENT_GUEST_ROOT" ;; *FSTYPE*) printf \'%s\\n\' "$AGENT_GUEST_FSTYPE" ;; *) exit 2 ;; esac'));
   writeCommand("realpath", 'printf \'%s\\n\' "$1"');
   writeCommand("lsblk", 'printf \'%s\\n\' "$AGENT_GUEST_PARENT"');
   writeCommand("blockdev", 'printf \'%s\\n\' "$AGENT_GUEST_VIRTUAL_BYTES"');
-  if (options.includeGrowpart !== false) writeCommand("growpart", 'printf \'growpart\\n\' >> "$AGENT_GUEST_LOG"; printf \'CHANGED\\n\'');
+  if (options.includeGrowpart !== false) writeCommand("growpart", delayed("growpart", 'printf \'growpart\\n\' >> "$AGENT_GUEST_LOG"; printf \'CHANGED\\n\''));
   writeCommand("resize2fs", 'printf \'resize2fs\\n\' >> "$AGENT_GUEST_LOG"');
   writeCommand("xfs_growfs", 'printf \'xfs_growfs\\n\' >> "$AGENT_GUEST_LOG"');
   return {
@@ -92,6 +93,8 @@ class NativeCommands extends CommandRunner {
   onWait: ((name: string, condition: string) => void) | undefined;
   onStart: ((name: string) => void) | undefined;
   onConfigSet: ((name: string, key: string, value: string) => void) | undefined;
+  aclMalformedDirection: "ingress" | "egress" | undefined;
+  aclMalformedEntries: unknown[] = [];
   guestFixture: GuestFixture | undefined;
   malformedInventory = false;
   malformedListRecord = false;
@@ -256,7 +259,7 @@ class NativeCommands extends CommandRunner {
   private acl(): Dict {
     const start = "198.51.100.20";
     const end = "198.51.100.250";
-    return {
+    const value: Dict = {
       config: { "user.agent-vm.managed": "native-v1" },
       ingress: [{ action: "drop", state: "enabled", source: `${start}-${end}` }],
       egress: [
@@ -265,6 +268,8 @@ class NativeCommands extends CommandRunner {
         { action: "drop", state: "enabled", destination: "198.51.100.1", protocol: "tcp", destination_port: "22" },
       ],
     };
+    if (this.aclMalformedDirection) value[this.aclMalformedDirection] = [...value[this.aclMalformedDirection], ...this.aclMalformedEntries];
+    return value;
   }
 }
 
@@ -278,6 +283,8 @@ class Fixture {
   memoryAvailable = 24 * GIB;
   storageFree = 80 * GIB;
   storeClosed = false;
+  readonly settleDelays: number[] = [];
+  onSettle: ((milliseconds: number) => void) | undefined;
   readonly config: Dict;
 
   constructor() {
@@ -300,6 +307,7 @@ class Fixture {
       systemd: this.systemd,
       resources: resources as unknown as CTResources,
       clock: () => this.now,
+      sleep: async (milliseconds) => { this.settleDelays.push(milliseconds); this.onSettle?.(milliseconds); },
       which: (command) => command === "conntrack" ? "/usr/sbin/conntrack" : null,
     });
     (this.control as any).ensureCapacityVerified = () => ({ scope: "ct-filesystem", observed_at: this.now.toISOString(), layers: [{ label: "ct-filesystem", total: 100 * GIB, free: this.storageFree, kind: "data", low: 1 * GIB, target: 2 * GIB }] });
@@ -331,6 +339,10 @@ function fixture(): Fixture { const value = new Fixture(); fixtures.push(value);
 async function expectCode(action: Promise<unknown>, code: string): Promise<void> {
   try { await action; throw new Error(`expected ${code}`); }
   catch (error) { if (error instanceof Error && error.message === `expected ${code}`) throw error; expect((error as ControlError).code).toBe(code); }
+}
+
+function balloonTimeout(target: number): ControlError {
+  return new ControlError("command_failed", "balloon update timed out", { returncode: 1, stderr: `Error: Failed updating memory limit: Failed setting memory to ${target}MiB (currently 4096MiB) as it was taking too long` });
 }
 
 function expectSyncCode(action: () => unknown, code: string): void {
@@ -501,6 +513,23 @@ test("keeps SQLite integer reservations exact beyond the JS safe range", () => {
   } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
+test("preserves exact decimal native resources through cache persistence", async () => {
+  const f = fixture();
+  const active = await f.call("acquire", { public_key: KEY }, "op-native-exact");
+  const huge = 9007199254740993n;
+  const instance = f.runner.instances.get(active.instance_name)!;
+  for (const [key, value] of [["limits.cpu", String(huge)], ["limits.memory", `${huge}GiB`]] as const) {
+    instance.config[key] = value;
+    instance.expanded_config[key] = value;
+  }
+  for (const devices of [instance.devices, instance.expanded_devices]) devices.root.size = `${huge}GiB`;
+  const observed = await (f.control as any).nativeResources(f.store.getTask({ taskId: String(active.task_id) }));
+  expect(observed).toEqual({ cpu: huge, memory_mib: huge * 1024n, disk_gib: huge });
+  const cached = await f.call("release", {}, "op-native-exact-release");
+  expect(cached.resources).toEqual(observed);
+  expect(f.store.getTask({ taskId: String(active.task_id) })?.resources_json).toBe(`{"cpu":${huge},"disk_gib":${huge},"memory_mib":${huge * 1024n}}`);
+});
+
 test("keeps request digests compatible with Python Unicode code-point ordering", async () => {
   const f = fixture();
   const request = f.request("acquire", {
@@ -611,6 +640,20 @@ test("executes the embedded guest growth program for ext4 and xfs", () => {
   }
 });
 
+test("bounds every guest growth native command to 45 seconds with kill termination", () => {
+  const boundedScript = GUEST_GROWTH_SCRIPT.replaceAll("45_000", "50");
+  for (const delayCommand of ["findmnt", "growpart"] as const) {
+    const root = mkdtempSync(`/tmp/agent-vm-guest-timeout-${delayCommand}-`);
+    try {
+      const guest = createGuestFixture(root, { delayCommand, virtualBytes: 2 * GIB });
+      const started = performance.now();
+      const run = runGuestGrowth(guest, 1, boundedScript);
+      expect(run.exitCode).not.toBe(0);
+      expect(performance.now() - started).toBeLessThan(500);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }
+});
+
 test("refuses ambiguous guest roots and missing growth commands", () => {
   const ambiguousRoot = mkdtempSync("/tmp/agent-vm-guest-ambiguous-");
   const missingCommandRoot = mkdtempSync("/tmp/agent-vm-guest-missing-command-");
@@ -625,6 +668,21 @@ test("refuses ambiguous guest roots and missing growth commands", () => {
   } finally {
     rmSync(ambiguousRoot, { recursive: true, force: true });
     rmSync(missingCommandRoot, { recursive: true, force: true });
+  }
+});
+
+test("fails closed on primitive, null, and array ACL rules before native init", async () => {
+  const invalidRules: unknown[] = [null, 7, "invalid", []];
+  for (const direction of ["ingress", "egress"] as const) {
+    for (const [index, invalidRule] of invalidRules.entries()) {
+      const f = fixture();
+      f.runner.aclMalformedDirection = direction;
+      f.runner.aclMalformedEntries = [invalidRule];
+      const operation = `op-acl-${direction}-${index}`;
+      await expectCode(f.call("acquire", { public_key: KEY }, operation), "network_unverified");
+      expect(f.store.operation(operation)?.outcome).toBe("error");
+      expect(f.runner.calls.some(({ args }) => args[0] === "incus" && args[3] === "init")).toBe(false);
+    }
   }
 });
 
@@ -956,6 +1014,74 @@ test("partial live-memory failure keeps conservative allocation and no restart f
   expect(f.runner.calls.slice(resizeStart).some(({ args }) => ["start", "stop", "delete"].includes(args[3] ?? ""))).toBe(false);
 });
 
+test("settles a balloon timeout once and retries only after guarded rereads", async () => {
+  const f = fixture();
+  const active = await f.call("acquire", { public_key: KEY }, "op-balloon-success-create");
+  const instance = f.runner.instances.get(active.instance_name)!;
+  const attempts: string[] = [];
+  f.runner.onConfigSet = (_name, key, value) => {
+    if (key !== "limits.memory" || value !== "2048MiB") return;
+    attempts.push(value);
+    if (attempts.length === 1) {
+      instance.config["limits.memory"] = "4096MiB";
+      instance.expanded_config["limits.memory"] = "4096MiB";
+      throw balloonTimeout(2048);
+    }
+  };
+  const resizeStart = f.runner.calls.length;
+  const changed = await f.call("resize", { memory_mib: 2048, live_memory: true }, "op-balloon-success");
+  expect(attempts).toHaveLength(2);
+  expect(f.settleDelays).toEqual([45_000]);
+  expect(f.runner.calls.slice(resizeStart).filter(({ args }) => args.includes("/proc/sys/kernel/random/boot_id")).length).toBeGreaterThanOrEqual(3);
+  expect(changed.native_attempts.map((item: Dict) => item.ok)).toEqual([false, true]);
+  expect(changed.resources.memory_mib).toBe(2048);
+  expect(f.runner.calls.slice(resizeStart).some(({ args }) => args[0] === "incus" && ["start", "stop", "delete"].includes(args[3] ?? ""))).toBe(false);
+});
+
+test("keeps conservative accounting after the only balloon retry fails", async () => {
+  const f = fixture();
+  const active = await f.call("acquire", { public_key: KEY }, "op-balloon-failure-create");
+  const instance = f.runner.instances.get(active.instance_name)!;
+  const attempts: string[] = [];
+  f.runner.onConfigSet = (_name, key, value) => {
+    if (key !== "limits.memory" || value !== "2048MiB") return;
+    attempts.push(value);
+    instance.config["limits.memory"] = "4096MiB";
+    instance.expanded_config["limits.memory"] = "4096MiB";
+    throw balloonTimeout(2048);
+  };
+  const resizeStart = f.runner.calls.length;
+  await expectCode(f.call("resize", { memory_mib: 2048, live_memory: true }, "op-balloon-failure"), "resize_partial");
+  expect(attempts).toHaveLength(2);
+  expect(f.settleDelays).toEqual([45_000]);
+  const status = await f.call("status");
+  expect(status.resources.memory_mib).toBe(4096);
+  expect(status.resource_reservation.memory_mib).toBe(4096);
+  expect(status.effective_lease).toBe(true);
+  expect(status.last_error.native_attempts).toHaveLength(2);
+  expect(f.runner.instances.get(active.instance_name)?.status).toBe("Running");
+  expect(f.runner.calls.slice(resizeStart).some(({ args }) => args[0] === "incus" && ["start", "stop", "delete"].includes(args[3] ?? ""))).toBe(false);
+});
+
+test("does not retry a balloon timeout after settlement guard invalidation", async () => {
+  const f = fixture();
+  const active = await f.call("acquire", { public_key: KEY }, "op-balloon-guard-create");
+  const instance = f.runner.instances.get(active.instance_name)!;
+  const attempts: string[] = [];
+  f.runner.onConfigSet = (_name, key, value) => {
+    if (key !== "limits.memory" || value !== "2048MiB") return;
+    attempts.push(value);
+    instance.config["limits.memory"] = "4096MiB";
+    instance.expanded_config["limits.memory"] = "4096MiB";
+    throw balloonTimeout(2048);
+  };
+  f.onSettle = () => { instance.boot_id = "00000000-0000-4000-8000-000000000002"; };
+  await expectCode(f.call("resize", { memory_mib: 2048, live_memory: true }, "op-balloon-guard"), "resize_partial");
+  expect(attempts).toHaveLength(1);
+  expect(f.settleDelays).toEqual([45_000]);
+  expect(f.store.getTask({ taskId: String(active.task_id) })?.resources_json).toBe('{"cpu":2,"disk_gib":20,"memory_mib":4096}');
+});
+
 test("release caches the VM and reacquire advances the generation without renewing the lease", async () => {
   const f = fixture();
   const first = await f.call("acquire", { public_key: KEY }, "op-create");
@@ -992,6 +1118,21 @@ test("explicit null port protocols and admin apply values fail before native wri
   expect(nativeWrites()).toBe(before);
 });
 
+test("rejects non-scalar port protocols before effects and journals ControlError", async () => {
+  const f = fixture();
+  await f.call("acquire", { public_key: KEY }, "op-protocol-boundary-create");
+  const callsBefore = f.runner.calls.length;
+  for (const [label, value] of [["array", ["tcp"]], ["object", {}], ["null", null]] as const) {
+    const operation = `op-bad-protocol-${label}`;
+    await expectCode(f.call("port-add", { name: `bad-${label}`, vm_port: 8080, port_protocol: value }, operation), "invalid_request");
+    expect(f.store.operation(operation)?.outcome).toBe("error");
+  }
+  const removeOperation = "op-bad-protocol-remove";
+  await expectCode(f.call("port-remove", { name: "missing", port_protocol: ["udp"] }, removeOperation), "invalid_request");
+  expect(f.store.operation(removeOperation)?.outcome).toBe("error");
+  expect(f.runner.calls.length).toBe(callsBefore);
+});
+
 test("fails closed on a mixed native inventory before allocating a project port", async () => {
   const f = fixture();
   await f.call("acquire", { public_key: KEY }, "op-inventory-owner");
@@ -1021,6 +1162,23 @@ test("live memory reduction preserves lease and guest continuity", async () => {
   expect(changed.lease_expires_at).toBe(active.lease_expires_at);
   expect(changed.resource_reservation).toEqual({});
   expect(f.runner.calls.filter(({ args }) => args.includes("limits.memory=2048MiB"))).toHaveLength(1);
+});
+
+test("treats explicit null resize resources as omitted", async () => {
+  const live = fixture();
+  await live.call("acquire", { public_key: KEY }, "op-null-resize-live-create");
+  const liveStart = live.runner.calls.length;
+  const changed = await live.call("resize", { memory_mib: 2048, cpu: null, disk_gib: null, live_memory: true }, "op-null-resize-live");
+  expect(changed.applied).toBe(true);
+  expect(live.runner.calls.slice(liveStart).some(({ args }) => args[0] === "incus" && ["start", "stop", "delete"].includes(args[3] ?? ""))).toBe(false);
+
+  const restart = fixture();
+  await restart.call("acquire", { public_key: KEY }, "op-null-resize-restart-create");
+  const growthBefore = restart.runner.calls.filter(({ args }) => args[0] === "incus" && args[3] === "exec" && args.includes("bun")).length;
+  const resized = await restart.call("resize", { memory_mib: 8192, disk_gib: null, allow_restart: true }, "op-null-resize-restart");
+  const growthAfter = restart.runner.calls.filter(({ args }) => args[0] === "incus" && args[3] === "exec" && args.includes("bun")).length;
+  expect(resized.completed).not.toContain("guest_filesystem");
+  expect(growthAfter).toBe(growthBefore);
 });
 
 test("restart-capable disk growth updates native and guest sizes", async () => {

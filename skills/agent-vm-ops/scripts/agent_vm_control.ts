@@ -42,8 +42,9 @@ type JsonFloat = { readonly value: number; readonly raw: string; readonly [JSON_
 
 export const GUEST_GROWTH_SCRIPT = `
 import { existsSync, readFileSync, statfsSync } from "node:fs";
+const NATIVE_TIMEOUT_MS = 45_000;
 function text(bytes) { return new TextDecoder().decode(bytes).trim(); }
-function run(args) { const result = Bun.spawnSync(args, { stdout: "pipe", stderr: "pipe" }); if (result.exitCode !== 0) throw new Error(text(result.stderr) || "native command failed"); return text(result.stdout); }
+function run(args) { const result = Bun.spawnSync(args, { stdout: "pipe", stderr: "pipe", timeout: NATIVE_TIMEOUT_MS, killSignal: "SIGKILL" }); if (result.exitCode !== 0) throw new Error(text(result.stderr) || "native command failed"); return text(result.stdout); }
 const root = Bun.argv[2] || "";
 const rootPath = (path) => root ? root.replace(/\\/$/, "") + path : path;
 const rootMount = rootPath("/");
@@ -61,7 +62,7 @@ const size = BigInt(run(["blockdev", "--getsize64", disk]));
 if (size < requested) throw new Error("guest virtual disk size is stale");
 const beforeStats = statfsSync(rootMount, { bigint: true });
 const before = beforeStats.blocks * beforeStats.frsize;
-const grown = Bun.spawnSync(["growpart", disk, number], { stdout: "pipe", stderr: "pipe" });
+const grown = Bun.spawnSync(["growpart", disk, number], { stdout: "pipe", stderr: "pipe", timeout: NATIVE_TIMEOUT_MS, killSignal: "SIGKILL" });
 const grownOut = text(grown.stdout);
 if (grown.exitCode !== 0 && !(grown.exitCode === 1 && grownOut.includes("NOCHANGE"))) throw new Error("growpart failed: " + text(grown.stderr));
 run(fstype === "ext4" ? ["resize2fs", source] : ["xfs_growfs", rootMount]);
@@ -332,9 +333,21 @@ function bigintFromInteger(value: unknown, field: string, minimum = 0n): bigint 
   return result;
 }
 
+function nativeDecimalInteger(value: unknown, field: string): bigint {
+  if (typeof value === "bigint" && value >= 0n) return value;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return BigInt(value);
+  if (typeof value === "string" && /^[0-9]+$/.test(value)) return BigInt(value);
+  throw new ControlError("resource_unverified", `${field} is not a decimal integer`);
+}
+
 function requiredString(value: unknown, field: string, pattern?: RegExp): string {
   if (typeof value !== "string" || value.length === 0) throw new ControlError("invalid_request", `${field} must be a non-empty string`);
   if (pattern && !pattern.test(value)) throw new ControlError("invalid_request", `${field} contains unsupported characters`);
+  return value;
+}
+
+function portProtocol(value: unknown): "tcp" | "udp" {
+  if (typeof value !== "string" || (value !== "tcp" && value !== "udp")) throw new ControlError("invalid_request", "port_protocol must be tcp or udp");
   return value;
 }
 
@@ -1186,18 +1199,20 @@ export class Control {
   readonly systemd: SystemdManager;
   readonly resources: CTResources;
   private readonly clock: () => Date;
+  private readonly sleepFor: (milliseconds: number) => Promise<void>;
   private readonly lockPath: string;
   private readonly which: (command: string) => string | null;
   private readonly nativeLockState = new Map<string, number>();
   private expectedVmIp: string | undefined;
 
-  constructor(config: Dict, options: { runner?: CommandRunner; store?: StateStore; systemd?: SystemdManager; clock?: () => Date; resources?: CTResources; which?: (command: string) => string | null } = {}) {
+  constructor(config: Dict, options: { runner?: CommandRunner; store?: StateStore; systemd?: SystemdManager; clock?: () => Date; sleep?: (milliseconds: number) => Promise<void>; resources?: CTResources; which?: (command: string) => string | null } = {}) {
     this.config = { ...config };
     this.runner = options.runner ?? new CommandRunner();
     this.store = options.store ?? new StateStore(String(this.config.state_db));
     this.incus = new IncusClient(this.runner, this.config);
     this.systemd = options.systemd ?? new SystemdManager(this.runner, this.config);
     this.clock = options.clock ?? (() => new Date());
+    this.sleepFor = options.sleep ?? sleep;
     this.resources = options.resources ?? new CTResources();
     this.which = options.which ?? ((command) => Bun.which(command));
     this.lockPath = join(dirname(this.store.path), "control.lock");
@@ -1680,12 +1695,14 @@ export class Control {
     const info = await this.ownership(task);
     const config = isDict(info.expanded_config) ? info.expanded_config : isDict(info.config) ? info.config : {};
     try {
-      const cpu = numberFromInteger(Number(config["limits.cpu"]), "limits.cpu", 1);
+      const cpu = nativeDecimalInteger(config["limits.cpu"], "limits.cpu");
       const memory = /^(\d+)(MiB|GiB)$/.exec(String(config["limits.memory"]));
       const devices = nativeDeviceMaps(info, "resource_unverified").expanded_devices;
       const disk = /^(\d+)GiB$/.exec(String(isDict(devices.root) ? devices.root.size : ""));
-      if (!memory || !disk) throw new Error("size");
-      return { cpu, memory_mib: Number(memory[1]) * (memory[2] === "GiB" ? 1024 : 1), disk_gib: Number(disk[1]) };
+      if (cpu < 1n || !memory || !disk) throw new Error("size");
+      const memoryMib = nativeDecimalInteger(memory[1], "limits.memory") * (memory[2] === "GiB" ? 1024n : 1n);
+      const diskGib = nativeDecimalInteger(disk[1], "root.size");
+      return { cpu: integerForJson(cpu), memory_mib: integerForJson(memoryMib), disk_gib: integerForJson(diskGib) };
     } catch { throw new ControlError("resource_unverified", "native CPU, memory or root size cannot be verified"); }
   }
 
@@ -1997,7 +2014,7 @@ export class Control {
     if (!isDict(acl) || !isDict(acl.config) || acl.config["user.agent-vm.managed"] !== "native-v1") throw new ControlError("network_unverified", "isolation ACL ownership is not verified");
     const fields = ["action", "state", "source", "destination", "protocol", "source_port", "destination_port", "icmp_type", "icmp_code"];
     for (const [direction, rules] of Object.entries(this.isolationRules())) {
-      const normalized = (Array.isArray(acl[direction]) ? acl[direction] : []).filter(isDict).map((value) => Object.fromEntries(fields.map((key) => [key, value[key] ?? (key === "state" ? "enabled" : "")]))) as Dict[];
+      const normalized = dictArray(acl[direction], "network_unverified", `isolation ACL ${direction} contains an invalid rule`).map((value) => Object.fromEntries(fields.map((key) => [key, value[key] ?? (key === "state" ? "enabled" : "")]))) as Dict[];
       for (const rule of rules) { const expected = Object.fromEntries(fields.map((key) => [key, rule[key] ?? (key === "state" ? "enabled" : "")])); if (!normalized.some((item) => stableJson(item) === stableJson(expected))) throw new ControlError("network_unverified", "isolation ACL lacks required peer/host withdrawal rules"); }
     }
   }
@@ -2394,7 +2411,7 @@ export class Control {
         await this.requireWindow(current!, MEMORY_SETTLE_SECONDS + 60);
         if (stableJson(parseJson(String(current?.resource_reservation_json || "{}"))) !== stableJson(reserved) || stableJson(await this.nativeResources(task)) !== stableJson(old) || await this.guestBootId(task) !== before) throw new ControlError("resize_unverified", "native rollback or guest continuity is unverified after balloon timeout");
         await this.reserveResources(task, reserved, true);
-        await sleep(MEMORY_SETTLE_SECONDS * 1000);
+        await this.sleepFor(MEMORY_SETTLE_SECONDS * 1000);
         current = this.store.getTask({ taskId: String(task.task_id) });
         this.checkGeneration(current, request);
         this.requireActive(current!);
@@ -2434,12 +2451,16 @@ export class Control {
     await this.ownership(task);
     const old = parseJson(String(task.resources_json)) as Dict;
     const values = { cpu: request.cpu, memory_mib: request.memory_mib, disk_gib: request.disk_gib };
-    if (Object.values(values).every((value) => value === undefined || value === null)) throw new ControlError("invalid_request", "resize requires at least one resource");
+    const hasValue = (value: unknown): boolean => value !== undefined && value !== null;
+    const hasCpu = hasValue(values.cpu);
+    const hasMemory = hasValue(values.memory_mib);
+    const hasDisk = hasValue(values.disk_gib);
+    if (![hasCpu, hasMemory, hasDisk].some(Boolean)) throw new ControlError("invalid_request", "resize requires at least one resource");
     const target = this.requestedResources(request, old);
     const liveMemory = request.live_memory === undefined ? false : requireBoolean(request.live_memory, "live_memory");
     const allowRestart = request.allow_restart === undefined ? false : requireBoolean(request.allow_restart, "allow_restart");
     if (liveMemory) {
-      if (values.memory_mib === undefined || values.cpu !== undefined || values.disk_gib !== undefined || allowRestart) throw new ControlError("invalid_request", "live resize requires memory only and forbids restart allowance");
+      if (!hasMemory || hasCpu || hasDisk || allowRestart) throw new ControlError("invalid_request", "live resize requires memory only and forbids restart allowance");
       return this.resizeLiveMemory(task, request, old, target);
     }
     const previousReservation = parseJson(String(task.resource_reservation_json || "{}")) as Dict;
@@ -2472,7 +2493,7 @@ export class Control {
       this.requireActive(task);
       this.expectedVmIp = String(task.vm_ip);
       await this.guestIp(String(task.instance_name));
-      if (values.disk_gib !== undefined) { guest = await this.growGuestRoot(task, target.disk_gib); completed.push("guest_filesystem"); }
+      if (hasDisk) { guest = await this.growGuestRoot(task, target.disk_gib); completed.push("guest_filesystem"); }
       stageTimings.post_check_seconds = Math.round((nowMs() - postCheckStarted) / 1000 * 1000) / 1000;
       const committed = await this.globalLock(() => this.store.transaction(() => { const current = this.store.getTask({ taskId: String(task.task_id) }); this.checkGeneration(current, request); this.requireActive(current!); return this.store.updateTask(String(task.task_id), { resources_json: stableJson(target), reservation_bytes: 0n, resource_reservation_json: "{}", last_error: null }); }));
       return { applied: true, completed, guest_filesystem: guest, reclaimed, readiness, stage_timings: stageTimings, ...this.stateSummary(committed) };
@@ -2500,14 +2521,13 @@ export class Control {
   }
 
   async portAdd(request: Dict, sessionId: string): Promise<Dict> {
+    const protocol = portProtocol(hasOwn(request, "port_protocol") ? request.port_protocol : "tcp");
     let task = this.taskForSession(sessionId);
     this.checkGeneration(task, request);
     this.requireActive(task);
     await this.ownership(task);
     const name = requiredString(request.name, "name", PORT_NAME_RE);
     if (name === "ssh") throw new ControlError("invalid_request", "ssh is reserved");
-    const protocol = hasOwn(request, "port_protocol") ? request.port_protocol : "tcp";
-    if (!["tcp", "udp"].includes(String(protocol))) throw new ControlError("invalid_request", "unsupported port protocol");
     const guest = numberFromInteger(request.vm_port, "vm_port", 1, 65535);
     const existing = this.store.getPort(String(task.task_id), name, String(protocol));
     if (existing) {
@@ -2546,12 +2566,12 @@ export class Control {
   }
 
   async portRemove(request: Dict, sessionId: string): Promise<Dict> {
+    const protocol = portProtocol(hasOwn(request, "port_protocol") ? request.port_protocol : "tcp");
     const task = this.taskForSession(sessionId);
     this.checkGeneration(task, request);
     this.requireActive(task);
     const name = requiredString(request.name, "name", PORT_NAME_RE);
-    const protocol = hasOwn(request, "port_protocol") ? request.port_protocol : "tcp";
-    if (name === "ssh" || !["tcp", "udp"].includes(String(protocol))) throw new ControlError("invalid_request", "invalid project mapping");
+    if (name === "ssh") throw new ControlError("invalid_request", "invalid project mapping");
     const port = this.store.getPort(String(task.task_id), name, String(protocol));
     if (port) { this.store.updatePort(String(task.task_id), name, String(protocol), { state: "closing" }); await this.nativeLock(task, async () => { await this.removeProxy(task, port); await this.conntrackDelete(port, task); this.store.removePort(String(task.task_id), name, String(protocol)); }); }
     return { task_id: task.task_id, name, protocol, removed: true };

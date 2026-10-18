@@ -1068,7 +1068,7 @@ class StateStore:
                 for item in nested
                 for key in ("code", "phase", "operation_phase", "message")
             ).lower()
-            if "image" in image_text and "unpack" in image_text:
+            if row["outcome"] == "error" and "image" in image_text and "unpack" in image_text:
                 image_unpack_failures[f"{phase}|{code}"] += 1
         return {"operations": dict(operations), "image_unpack_failures": dict(image_unpack_failures),
                 "warnings": dict(warnings)}
@@ -1608,10 +1608,10 @@ class Control:
         try:
             usage = shutil.disk_usage(str(self.config["storage_path"]))
         except OSError as exc:
-            raise ControlError("capacity_unverified", "cannot measure CT Incus pool filesystem") from exc
+            raise ControlError("resource_unverified", "cannot measure CT Incus pool filesystem") from exc
         total, free = usage.total, usage.free
         if not isinstance(total, int) or not isinstance(free, int) or not 0 < total or not 0 <= free <= total:
-            raise ControlError("capacity_unverified", "invalid CT filesystem capacity")
+            raise ControlError("resource_unverified", "invalid CT filesystem capacity")
         layer = {"label": "ct-filesystem", "total": total, "free": free, "kind": "data"}
         layer["low"] = max(int(self.config.get("disk_low_bytes", 10 * 1024**3)), total * 15 // 100)
         layer["target"] = max(int(self.config.get("disk_target_bytes", 20 * 1024**3)), total * 25 // 100)
@@ -1732,6 +1732,8 @@ class Control:
             if other["task_id"] == exclude_task_id or other["state"] in {"absent", "cached"}: continue
             try:
                 value, reservation = json.loads(other["resources_json"]), json.loads(other["resource_reservation_json"])
+                if not isinstance(value, Mapping) or not isinstance(reservation, Mapping):
+                    raise ValueError()
                 for key in totals:
                     sizes = (value[key], reservation.get(key, 0))
                     if any(isinstance(size, bool) or not isinstance(size, int) or size < 0 for size in sizes): raise ValueError()
@@ -1776,7 +1778,7 @@ class Control:
 
     def _disk_admission_diagnostics(self, capacity: Mapping[str, Any] | None) -> dict[str, Any]:
         if not isinstance(capacity, Mapping) or not isinstance(capacity.get("layers"), list):
-            return {"verified": False, "error": {"code": "capacity_unverified", "message": "disk capacity is unavailable"}}
+            return {"verified": False, "error": {"code": "resource_unverified", "message": "disk capacity is unavailable"}}
         try:
             layers = capacity["layers"]
             if not layers:
@@ -1788,6 +1790,8 @@ class Control:
                     continue
                 resources = json.loads(task["resources_json"])
                 reservation = json.loads(task["resource_reservation_json"])
+                if not isinstance(resources, Mapping) or not isinstance(reservation, Mapping):
+                    raise ValueError()
                 sizes = (resources["disk_gib"], reservation.get("disk_gib", 0))
                 if any(isinstance(size, bool) or not isinstance(size, int) or size < 0 for size in sizes):
                     raise ValueError()
@@ -1812,7 +1816,7 @@ class Control:
                                            "capacity_bytes": total, "free_bytes": sum(int(layer["free"]) for layer in layers),
                                            "durable_reserved_bytes": durable_reserved}}
         except (KeyError, TypeError, ValueError):
-            return {"verified": False, "error": {"code": "capacity_unverified", "message": "invalid disk admission capacity"}}
+            return {"verified": False, "error": {"code": "resource_unverified", "message": "invalid disk admission capacity"}}
 
     @staticmethod
     def _instance_count_limits(config: Mapping[str, Any]) -> dict[str, Any]:

@@ -1057,7 +1057,7 @@ class ReclaimTests(Fixture):
 
     def test_capacity_metrics_and_ram_limits_fail_closed(self):
         with mock.patch.object(CONTROL.shutil, "disk_usage", side_effect=OSError("unavailable CT path")):
-            self.error("capacity_unverified", self.acquire)
+            self.error("resource_unverified", self.acquire)
         self.assertEqual(self.runner.instances, {})
         self.config["cpu_overcommit_ratio"] = 1
         self.acquire("one"); self.acquire("two")
@@ -1069,7 +1069,7 @@ class ReclaimTests(Fixture):
             with self.subTest(total=total, free=free), mock.patch.object(
                 CONTROL.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(total, total-free, free)
             ):
-                self.error("capacity_unverified", self.acquire)
+                self.error("resource_unverified", self.acquire)
         self.assertEqual(self.runner.instances, {})
 
     def test_capacity_measures_only_ct_pool_and_invokes_no_commands(self):

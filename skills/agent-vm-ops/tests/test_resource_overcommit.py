@@ -225,6 +225,15 @@ class AdmissionTests(Fixture):
         metrics = self.call("admin-metrics")
         self.assertFalse(metrics["disk_admission"]["verified"])
 
+    def test_non_object_resource_reservation_keeps_diagnostics_structured(self):
+        active = self.acquire()
+        self.store.update_task(active["task_id"], resource_reservation_json="null")
+        doctor = self.call("doctor")
+        self.assertFalse(doctor["resources"]["verified"])
+        self.assertEqual(doctor["resources"]["error"]["code"], "resource_unverified")
+        metrics = self.call("admin-metrics")
+        self.assertFalse(metrics["disk_admission"]["verified"])
+
     def test_acquire_rechecks_drain_before_active_commit(self):
         def enter_drain(*_):
             self.store.set_meta("draining", "1")
@@ -259,6 +268,9 @@ class AdmissionTests(Fixture):
         })
         self.store.audit("status", "ok", detail={
             "default_admission": {"warnings": [{"code": "memory_pressure"}]},
+        })
+        self.store.audit("status", "ok", detail={
+            "phase": "native-init", "message": "image unpack completed",
         })
         summary = self.store.audit_summary()
         self.assertEqual(summary["image_unpack_failures"], {"native-init|command_failed": 1})

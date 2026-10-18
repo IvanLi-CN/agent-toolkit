@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import datetime as dt
 from decimal import Decimal
 import fcntl
@@ -1506,6 +1506,9 @@ class Control:
                     if task.get("state") != "active":
                         raise ControlError("operation_unverified", "replayed operation is no longer active",
                                            {"operation_id": operation_id})
+                    if not self._state_summary(task)["effective_lease"]:
+                        raise ControlError("operation_unverified", "replayed operation lease is no longer effective",
+                                           {"operation_id": operation_id})
                     self._ownership(task)
                     if self.incus.instance_info(task["instance_name"])["status"].lower() != "running":
                         raise ControlError("operation_unverified", "replayed guest is not running",
@@ -1658,10 +1661,27 @@ class Control:
                 except (KeyError, TypeError, ValueError) as exc:
                     raise ControlError("operation_unverified", "GC task generation cannot be verified",
                                        {"operation_id": operation_id}) from exc
-                if (task.get("state") != "absent"
-                        and current_generation <= candidate["generation"]):
+                if task.get("state") != "absent" or current_generation != candidate["generation"]:
                     raise ControlError("operation_unverified", "GC deletion is not reflected in durable state",
                                        {"operation_id": operation_id})
+                try:
+                    if any(native.get("name") == candidate["instance_name"] for native in self.incus.list_instances()):
+                        raise ControlError("operation_unverified", "GC-deleted native instance still exists",
+                                           {"operation_id": operation_id})
+                except ControlError as exc:
+                    if exc.code == "operation_unverified":
+                        raise
+                    raise ControlError("operation_unverified", "GC native deletion cannot be verified",
+                                       {"operation_id": operation_id}) from exc
+            else:
+                raise ControlError("operation_unverified", "GC task state is unavailable for replay",
+                                   {"operation_id": operation_id})
+
+    @staticmethod
+    def _inventory_mappings(value: Any, code: str, label: str) -> list[Mapping[str, Any]]:
+        if not isinstance(value, list) or any(not isinstance(item, Mapping) for item in value):
+            raise ControlError(code, f"{label} inventory is malformed")
+        return value
 
     def _validate_cached_reconcile_result(self, operation_id: str, result: Mapping[str, Any]) -> None:
         if (not isinstance(result.get("dry_run"), bool)
@@ -2430,29 +2450,40 @@ class Control:
     def _native_ports(self) -> set[int]:
         ports: set[int] = set()
         projects = self.incus.query("/1.0/projects?recursion=1", project="default")
-        if not isinstance(projects, list):
-            raise ControlError("port_inventory_unverified", "project inventory is unavailable")
+        projects = self._inventory_mappings(projects, "port_inventory_unverified", "project")
         for project in projects:
-            name = require_nonempty_string(project.get("name"), "project name")
+            try:
+                name = require_nonempty_string(project.get("name"), "project name")
+            except ControlError as exc:
+                raise ControlError("port_inventory_unverified", "project inventory contains an invalid name") from exc
             instances = self.incus.query("/1.0/instances?recursion=1", project=name)
             networks = self.incus.query("/1.0/networks?recursion=1", project=name)
-            if not isinstance(instances, list) or not isinstance(networks, list):
-                raise ControlError("port_inventory_unverified", "native inventory is unavailable")
+            instances = self._inventory_mappings(instances, "port_inventory_unverified", "instance")
+            networks = self._inventory_mappings(networks, "port_inventory_unverified", "network")
             for instance in instances:
-                for device in instance.get("expanded_devices", {}).values():
+                devices = instance.get("expanded_devices", {})
+                if not isinstance(devices, Mapping) or any(not isinstance(device, Mapping) for device in devices.values()):
+                    raise ControlError("port_inventory_unverified", "instance devices are malformed")
+                for device in devices.values():
                     if device.get("type") == "proxy":
                         listen = str(device.get("listen", ""))
                         if listen.startswith(("tcp:", "udp:")):
                             ports |= self._port_numbers(listen.rsplit(":", 1)[-1])
             for network in networks:
+                network_name = require_nonempty_string(network.get("name"), "network name")
                 if not network.get("managed") or network.get("type") != "bridge": continue
-                forwards = self.incus.query("/1.0/networks/" + quote(network["name"], safe="") + "/forwards?recursion=1", project=name)
-                if not isinstance(forwards, list):
-                    raise ControlError("port_inventory_unverified", "network forward inventory is unavailable")
+                forwards = self.incus.query("/1.0/networks/" + quote(network_name, safe="") + "/forwards?recursion=1", project=name)
+                forwards = self._inventory_mappings(forwards, "port_inventory_unverified", "forward")
                 for forward in forwards:
-                    if forward.get("config", {}).get("target_address"):
+                    config = forward.get("config", {})
+                    if not isinstance(config, Mapping):
+                        raise ControlError("port_inventory_unverified", "network forward config is malformed")
+                    if config.get("target_address"):
                         ports.update(range(self.config["port_start"], self.config["port_end"] + 1))
-                    for item in forward.get("ports", []):
+                    forward_ports = forward.get("ports", [])
+                    if not isinstance(forward_ports, list) or any(not isinstance(item, Mapping) for item in forward_ports):
+                        raise ControlError("port_inventory_unverified", "network forward ports are malformed")
+                    for item in forward_ports:
                         ports |= self._port_numbers(str(item.get("listen_port", "")))
         return ports
 
@@ -2506,18 +2537,31 @@ class Control:
         used = set()
         own_mac, own_ip = None, None
         projects = self.incus.query("/1.0/projects?recursion=1", project="default")
+        projects = self._inventory_mappings(projects, "vm_ip_unverified", "project")
         for project in projects:
-            for instance in self.incus.query("/1.0/instances?recursion=1", project=project["name"]):
-                if project["name"] == self.config["project"] and instance.get("name") == own_name:
-                    nic = instance.get("expanded_devices", {}).get("eth0", {})
-                    own_mac = nic.get("hwaddr") or instance.get("config", {}).get("volatile.eth0.hwaddr")
+            name = require_nonempty_string(project.get("name"), "project name")
+            instances = self._inventory_mappings(
+                self.incus.query("/1.0/instances?recursion=1", project=name),
+                "vm_ip_unverified",
+                "instance",
+            )
+            for instance in instances:
+                devices = instance.get("expanded_devices", {})
+                if not isinstance(devices, Mapping) or any(not isinstance(device, Mapping) for device in devices.values()):
+                    raise ControlError("vm_ip_unverified", "instance devices are malformed")
+                if name == self.config["project"] and instance.get("name") == own_name:
+                    nic = devices.get("eth0", {})
+                    instance_config = instance.get("config", {})
+                    if not isinstance(instance_config, Mapping):
+                        raise ControlError("vm_ip_unverified", "instance config is malformed")
+                    own_mac = nic.get("hwaddr") or instance_config.get("volatile.eth0.hwaddr")
                     own_ip = nic.get("ipv4.address")
                     continue
-                for device in instance.get("expanded_devices", {}).values():
+                for device in devices.values():
                     if self.config["network"] in {device.get("network"), device.get("parent")} and device.get("ipv4.address"):
                         used.add(device["ipv4.address"])
         leases = self.incus.query("/1.0/networks/" + quote(self.config["network"], safe="") + "/leases", project="default")
-        if not isinstance(leases, list): raise ControlError("vm_ip_unverified", "network lease inventory is unavailable")
+        leases = self._inventory_mappings(leases, "vm_ip_unverified", "network lease")
         for lease in leases:
             if own_mac and lease.get("hwaddr", "").lower() == own_mac.lower() and lease.get("address") == own_ip: continue
             if lease.get("address"): used.add(lease["address"])
@@ -3113,6 +3157,17 @@ class Control:
                 if result.returncode: issues.append("unit_inactive:" + unit)
             for unit in ("agent-vm-native-expire@.service", "agent-vm-native-reconcile.service"):
                 if not (self.systemd.timer_dir / unit).is_file(): issues.append("unit_missing:" + unit)
+            for task in self.store.list_tasks():
+                if task.get("state") != "active":
+                    continue
+                try:
+                    valid_timer = self.systemd.expiry_active(
+                        str(task["task_id"]), int(task["generation"]), str(task["lease_expires_at"])
+                    )
+                except (ControlError, KeyError, TypeError, ValueError):
+                    valid_timer = False
+                if not valid_timer:
+                    issues.append("timer_unverified:" + str(task.get("task_id")))
         resources = self._resource_diagnostics()
         instance_policy = self._instance_diagnostics()
         admission = self._default_admission_diagnostics(resources, capacity, instance_policy)
@@ -3835,7 +3890,71 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
 
 
     def drain_exit(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:
-        with self._global_lock(): self.store.set_meta("draining", "0")
+        if self.store.get_meta("draining") != "1":
+            return {"draining": False}
+        snapshots = sorted(self.store.list_tasks(), key=lambda task: str(task.get("session_id", "")))
+        with ExitStack() as locks:
+            for snapshot in snapshots:
+                owner = snapshot.get("session_id")
+                if not isinstance(owner, str) or not owner:
+                    raise ControlError("resource_unverified", "drain state contains an invalid session owner")
+                locks.enter_context(self._object_lock("session:" + owner, blocking=False))
+            health = self.doctor(request, session_id)
+            resources = health.get("resources")
+            instances = health.get("instances")
+            capacity = health.get("capacity")
+            if (
+                not health.get("ready")
+                or not isinstance(resources, Mapping)
+                or not resources.get("verified")
+                or not isinstance(instances, Mapping)
+                or not instances.get("verified")
+                or not isinstance(capacity, Mapping)
+                or "error" in capacity
+            ):
+                raise ControlError(
+                    "recovery_unverified",
+                    "drain exit requires verified control health and capacity state",
+                    {"issues": health.get("issues", []), "admission": health.get("default_admission")},
+                )
+            for task in self.store.list_tasks():
+                state = task.get("state")
+                if state == "absent":
+                    continue
+                if state in {"preparing", "closing", "deleting", "failed"}:
+                    raise ControlError("reconciliation_required", "drain exit requires all task transitions to be reconciled",
+                                       {"task_id": task.get("task_id"), "state": state})
+                if state == "active":
+                    summary = self._state_summary(task)
+                    if not summary["effective_lease"]:
+                        raise ControlError("reconciliation_required", "active task has no effective lease",
+                                           {"task_id": task.get("task_id")})
+                    self._ownership(task)
+                    if self.incus.instance_info(task["instance_name"])["status"].lower() != "running":
+                        raise ControlError("state_mismatch", "active task guest is not running",
+                                           {"task_id": task.get("task_id")})
+                    if not self.systemd.expiry_active(task["task_id"], int(task["generation"]), task["lease_expires_at"]):
+                        raise ControlError("timer_unverified", "active task expiry timer is not verified",
+                                           {"task_id": task.get("task_id")})
+                    continue
+                if state == "cached":
+                    self._ownership(task)
+                    if self.incus.instance_info(task["instance_name"])["status"].lower() != "stopped":
+                        raise ControlError("state_mismatch", "cached task guest is not stopped",
+                                           {"task_id": task.get("task_id")})
+                    if self.store.get_ports(task["task_id"]):
+                        raise ControlError("cleanup_incomplete", "cached task still has port mappings",
+                                           {"task_id": task.get("task_id")})
+                    owned = self._ownership(task)
+                    if any(device.get("type") == "proxy" for device in owned.get("expanded_devices", {}).values()):
+                        raise ControlError("cleanup_incomplete", "cached task still has native proxy mappings",
+                                           {"task_id": task.get("task_id")})
+                    continue
+                raise ControlError("resource_unverified", "drain state contains an unknown task state",
+                                   {"task_id": task.get("task_id"), "state": state})
+            with self._global_lock():
+                if self.store.get_meta("draining") == "1":
+                    self.store.set_meta("draining", "0")
         return {"draining": False}
 
 

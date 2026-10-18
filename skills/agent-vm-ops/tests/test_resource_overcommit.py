@@ -394,6 +394,23 @@ class AdmissionTests(Fixture):
         self.assertEqual(replay["outcome"], "replayed")
         self.assertEqual(replay["result"]["actions"][0]["error"]["code"], "object_busy")
 
+    def test_gc_replay_is_fenced_after_the_task_slot_is_reused(self):
+        first = self.acquire()
+        self.call("release")
+        request = self.request("admin-gc", operation="gc-slot-reuse", apply=True)
+        self.control.dispatch(request)
+        second = self.acquire()
+        self.assertGreater(second["generation"], first["generation"])
+        self.error("operation_unverified", self.control.dispatch, request)
+
+    def test_drain_exit_keeps_admission_closed_for_unreconciled_tasks(self):
+        active = self.acquire()
+        self.store.set_meta("draining", "1")
+        self.store.update_task(active["task_id"], state="closing", lease_expires_at=None)
+        request = self.request("drain-exit", operation="drain-exit-blocked")
+        self.error("reconciliation_required", self.control.dispatch, request)
+        self.assertEqual(self.store.get_meta("draining"), "1")
+
     def test_release_of_missing_native_instance_keeps_absent_state_readable(self):
         active = self.acquire()
         self.runner.instances.pop(active["instance_name"])

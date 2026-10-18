@@ -374,7 +374,7 @@ linuxTest("does not reclaim a pending writer marker before its flock transition"
   const initial = StateStore.bootstrap(dbPath);
   initial.close();
   const lockDirectory = join(probeRoot, "locks");
-  mkdirSync(lockDirectory, { recursive: true });
+  mkdirSync(lockDirectory, { recursive: true, mode: 0o700 });
   const marker = join(lockDirectory, "native-writer-pending");
   writeFileSync(marker, `pending ${process.pid} marker-test\n`, { mode: 0o600 });
   const markerFd = openSync(marker, "r+");

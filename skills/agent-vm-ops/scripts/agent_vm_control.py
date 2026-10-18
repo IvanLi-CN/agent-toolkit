@@ -213,6 +213,8 @@ class CTResources:
             sources.append("cgroup-v2")
             if lxcfs is not None:
                 limit = min(limit, lxcfs["MemTotal"])
+                if current is not None and current > limit:
+                    raise ControlError("resource_unverified", "CT memory accounting exceeds its effective capacity")
                 available = min(available, lxcfs["MemAvailable"], limit)
         if lxcfs is not None:
             sources.append("lxcfs")
@@ -1877,7 +1879,7 @@ class Control:
         reclaim_required = False
         if "error" in capacity:
             reasons.append(capacity["error"])
-        else:
+        elif resources.get("verified"):
             with self._global_lock(), self.store.transaction():
                 reclaim_required = not self._space_sufficient(capacity, self.config["create_cost_bytes"], "low")
             if reclaim_required:

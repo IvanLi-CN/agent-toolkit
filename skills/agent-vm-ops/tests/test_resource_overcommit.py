@@ -28,7 +28,7 @@ class CTObservationTests(unittest.TestCase):
         return result, reads
 
     def test_finite_cgroup_reclaims_inactive_file_and_bounds_lxcfs(self):
-        values = {"/sys/fs/cgroup/memory.max": str(16*GIB), "/sys/fs/cgroup/memory.current": str(14*GIB),
+        values = {"/sys/fs/cgroup/memory.max": str(16*GIB), "/sys/fs/cgroup/memory.current": str(10*GIB),
                   "/sys/fs/cgroup/memory.stat": f"anon 1\ninactive_file {4*GIB}\n",
                   "/proc/self/mountinfo": self.mount,
                   "/proc/meminfo": f"MemTotal: {12*GIB//1024} kB\nMemAvailable: {3*GIB//1024} kB\n"}
@@ -39,8 +39,15 @@ class CTObservationTests(unittest.TestCase):
         self.assertTrue(set(values).issubset(reads))
         values["/proc/self/mountinfo"] = ""
         value, reads = self.observe(values)
-        self.assertEqual(value["available_bytes"], 6*GIB)
+        self.assertEqual(value["available_bytes"], 10*GIB)
         self.assertNotIn("/proc/meminfo", reads)
+
+    def test_finite_cgroup_rejects_current_above_lxcfs_capacity(self):
+        values = {"/sys/fs/cgroup/memory.max": str(16*GIB), "/sys/fs/cgroup/memory.current": str(14*GIB),
+                  "/sys/fs/cgroup/memory.stat": f"inactive_file {1*GIB}\n",
+                  "/proc/self/mountinfo": self.mount,
+                  "/proc/meminfo": f"MemTotal: {12*GIB//1024} kB\nMemAvailable: {3*GIB//1024} kB\n"}
+        with self.assertRaises(CONTROL.ControlError): self.observe(values)
 
     def test_unlimited_cgroup_requires_verified_meminfo_before_reading_it(self):
         values = {"/sys/fs/cgroup/memory.max": "max", "/proc/self/mountinfo": self.mount,
@@ -208,6 +215,15 @@ class AdmissionTests(Fixture):
         doctor = self.call("doctor")
         self.assertFalse(doctor["resources"]["verified"])
         self.error("resource_unverified", self.acquire, "new")
+
+    def test_corrupt_disk_reservation_keeps_doctor_structured(self):
+        active = self.acquire()
+        self.store.update_task(active["task_id"], reservation_bytes="invalid")
+        doctor = self.call("doctor")
+        self.assertFalse(doctor["resources"]["verified"])
+        self.assertEqual(doctor["resources"]["error"]["code"], "resource_unverified")
+        metrics = self.call("admin-metrics")
+        self.assertFalse(metrics["disk_admission"]["verified"])
 
     def test_acquire_rechecks_drain_before_active_commit(self):
         def enter_drain(*_):

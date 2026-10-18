@@ -171,7 +171,12 @@ class CTResources:
             fields = line.split()
             if len(fields) != 2 or fields[0] not in {"oom", "oom_kill", "oom_group_kill"}:
                 continue
-            values[fields[0]] = self._unsigned(fields[1], "memory.events." + fields[0])
+            try:
+                values[fields[0]] = self._unsigned(fields[1], "memory.events." + fields[0])
+            except ControlError:
+                # OOM counters are advisory. A malformed optional counter must
+                # not turn an otherwise verified memory capacity into a gate.
+                return None
         return values or None
 
     def memory(self) -> dict[str, Any]:
@@ -189,6 +194,8 @@ class CTResources:
         else:
             limit = self._unsigned(raw_limit, "memory.max", positive=True)
             current = self._unsigned(self._read("/sys/fs/cgroup/memory.current"), "memory.current")
+            if current > limit:
+                raise ControlError("resource_unverified", "CT memory accounting exceeds its cgroup limit")
             entries = [line.split() for line in self._read("/sys/fs/cgroup/memory.stat").splitlines() if line.split()[:1] == ["inactive_file"]]
             if len(entries) != 1 or len(entries[0]) != 2:
                 raise ControlError("resource_unverified", "inactive_file memory metric is missing or duplicated")
@@ -995,6 +1002,16 @@ class StateStore:
         operations: Counter[str] = Counter()
         image_unpack_failures: Counter[str] = Counter()
         warnings: Counter[str] = Counter()
+
+        def mappings(value: Any):
+            if isinstance(value, Mapping):
+                yield value
+                for child in value.values():
+                    yield from mappings(child)
+            elif isinstance(value, list):
+                for child in value:
+                    yield from mappings(child)
+
         for row in self._rows("SELECT action, outcome, detail_json FROM audit"):
             detail: Mapping[str, Any] = {}
             if row["detail_json"]:
@@ -1004,13 +1021,24 @@ class StateStore:
                         detail = parsed
                 except (TypeError, json.JSONDecodeError):
                     detail = {}
-            error = detail.get("error") if isinstance(detail.get("error"), Mapping) else detail
-            code = str(error.get("code", "unknown")) if isinstance(error, Mapping) else "unknown"
-            phase = str(detail.get("phase") or detail.get("operation_phase") or "unknown")
+            nested = list(mappings(detail))
+            code = next((str(item["code"]) for item in nested if item.get("code") is not None), "unknown")
+            phase = next((str(item.get("phase") or item.get("operation_phase")) for item in nested
+                          if item.get("phase") or item.get("operation_phase")), "unknown")
             operations[f"{row['action']}|{row['outcome']}|{phase}"] += 1
+            for item in nested:
+                warning_list = item.get("warnings")
+                if isinstance(warning_list, list):
+                    for warning in warning_list:
+                        if isinstance(warning, Mapping) and warning.get("code"):
+                            warnings[str(warning["code"])] += 1
             if row["outcome"] == "error" and code in {"memory_pressure", "resource_unverified", "capacity_insufficient"}:
                 warnings[code] += 1
-            image_text = f"{code} {phase} {detail.get('message', '')}".lower()
+            image_text = " ".join(
+                str(item.get(key, ""))
+                for item in nested
+                for key in ("code", "phase", "operation_phase", "message")
+            ).lower()
             if "image" in image_text and "unpack" in image_text:
                 image_unpack_failures[f"{phase}|{code}"] += 1
         return {"operations": dict(operations), "image_unpack_failures": dict(image_unpack_failures),

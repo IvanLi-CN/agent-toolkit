@@ -65,7 +65,7 @@ class CTObservationTests(unittest.TestCase):
         for change in changes:
             with self.subTest(change=change), self.assertRaises(CONTROL.ControlError): self.observe({**base, **change})
         base["/sys/fs/cgroup/memory.current"] = str(6*GIB)
-        self.assertEqual(self.observe(base)[0]["available_bytes"], 0)
+        with self.assertRaises(CONTROL.ControlError): self.observe(base)
         base["/sys/fs/cgroup/memory.current"] = "0"
         self.assertEqual(self.observe(base)[0]["available_bytes"], 4*GIB)
 
@@ -76,6 +76,14 @@ class CTObservationTests(unittest.TestCase):
         value, _ = self.observe(values)
         self.assertEqual(value["current_bytes"], 3*GIB)
         self.assertEqual(value["oom_events"], {"oom": 2, "oom_kill": 1})
+
+    def test_malformed_optional_oom_events_do_not_block_verified_capacity(self):
+        values = {"/sys/fs/cgroup/memory.max": str(4*GIB), "/sys/fs/cgroup/memory.current": str(3*GIB),
+                  "/sys/fs/cgroup/memory.stat": "inactive_file 0\n", "/sys/fs/cgroup/memory.events": "oom invalid\n",
+                  "/proc/self/mountinfo": ""}
+        value, _ = self.observe(values)
+        self.assertEqual(value["limit_bytes"], 4*GIB)
+        self.assertIsNone(value["oom_events"])
 
     def test_cpu_capacity_is_own_quota_and_visible_affinity(self):
         with mock.patch.object(CONTROL.os, "sched_getaffinity", return_value=set(range(16)), create=True), \
@@ -172,6 +180,22 @@ class AdmissionTests(Fixture):
         self.assertEqual(result["resources"]["remaining"]["memory_mib"], 61440)
         self.assertEqual(result["task_states"]["active"], 1)
         self.assertEqual(self.store.list_tasks(), before)
+
+    def test_audit_summary_extracts_nested_image_failures_and_warnings(self):
+        self.store.audit("acquire", "error", detail={
+            "code": "command_failed",
+            "message": "image preparation failed",
+            "detail": {
+                "phase": "native-init",
+                "error": {"code": "command_failed", "message": "Unable to unpack image"},
+            },
+        })
+        self.store.audit("status", "ok", detail={
+            "default_admission": {"warnings": [{"code": "memory_pressure"}]},
+        })
+        summary = self.store.audit_summary()
+        self.assertEqual(summary["image_unpack_failures"], {"native-init|command_failed": 1})
+        self.assertEqual(summary["warnings"], {"memory_pressure": 1})
 
     def test_pre_native_resize_failure_releases_only_its_reservation(self):
         active = self.acquire()

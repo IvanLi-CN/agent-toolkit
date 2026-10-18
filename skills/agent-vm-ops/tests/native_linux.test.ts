@@ -130,6 +130,11 @@ async function waitFor(path: string, timeoutMs = 3000): Promise<boolean> {
   return existsSync(path);
 }
 
+function expectProcessGroupKilled(failure: any): void {
+  if (failure?.detail?.process_group_killed !== true) console.log(`process-cleanup-debug=${JSON.stringify(failure?.detail ?? null)}`);
+  expect(failure?.detail?.process_group_killed).toBe(true);
+}
+
 test("refuses to kill a PID after its recorded Linux identity changes", () => {
   const member: ProcessIdentity = { pid: 4242, starttime: "old-starttime" };
   const killed: number[] = [];
@@ -166,7 +171,7 @@ linuxTest("kills a TERM-ignoring descendant after the leader exits on SIGTERM", 
   } catch (error) { failure = error; }
   expect(failure?.code).toBe("command_timeout");
   expect(failure?.detail?.reaped).toBe(true);
-  expect(failure?.detail?.process_group_killed).toBe(true);
+  expectProcessGroupKilled(failure);
   expect(await waitFor(pidPath)).toBe(true);
   const pid = Number(readFileSync(pidPath, "utf8"));
   let state: string | undefined;
@@ -188,7 +193,7 @@ linuxTest("reaps a TERM-ignoring descendant after the leader exits before timeou
   } catch (error) { failure = error; }
   expect(failure?.code).toBe("command_timeout");
   expect(failure?.detail?.reaped).toBe(true);
-  expect(failure?.detail?.process_group_killed).toBe(true);
+  expectProcessGroupKilled(failure);
   expect(await waitFor(pidPath)).toBe(true);
   const pid = Number(readFileSync(pidPath, "utf8"));
   let state: string | undefined;
@@ -254,7 +259,7 @@ linuxTest("drains noisy stdout and stderr and reaps a real descendant", async ()
   }
   expect(failure?.code).toBe("command_timeout");
   expect(failure?.detail?.reaped).toBe(true);
-  expect(failure?.detail?.process_group_killed).toBe(true);
+  expectProcessGroupKilled(failure);
   expect(await waitFor(pidPath)).toBe(true);
   const pid = Number(readFileSync(pidPath, "utf8"));
   let state: string | undefined;
@@ -305,7 +310,7 @@ linuxTest("reaps a descendant when the command closes stdin before a large write
   } catch (error) { failure = error; }
   expect(failure?.code).toBe("command_timeout");
   expect(failure?.detail?.reaped).toBe(true);
-  expect(failure?.detail?.process_group_killed).toBe(true);
+  expectProcessGroupKilled(failure);
   expect(await waitFor(pidPath)).toBe(true);
   const pid = Number(readFileSync(pidPath, "utf8"));
   let state: string | undefined;

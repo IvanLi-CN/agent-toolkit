@@ -880,6 +880,27 @@ test("overlimit persistence keeps an explicit marker and capacity facts", async 
   expect(stored.result).toMatchObject({ truncated: true, capacity: { total: 100, free: 40 } });
 });
 
+test("bounds task error collections and documents before durable persistence", async () => {
+  const f = fixture();
+  const projectedGuestIpError = new ControlError("guest_ip_mismatch", "guest address differs", {
+    reported: Array.from({ length: 256 }, (_, index) => `198.51.100.${index % 250 + 1}`),
+  }).asDict();
+  expect((projectedGuestIpError.detail as Dict).reported).toHaveLength(128);
+  expect(JSON.stringify(projectedGuestIpError).length).toBeLessThanOrEqual(64 * 1024);
+  const active = await f.call("acquire", { public_key: KEY }, "op-task-error-boundary-create");
+  const taskId = String(active.task_id);
+  f.store.updateTask(taskId, { last_error: { code: "guest_ip_mismatch", reported: Array.from({ length: 256 }, (_, index) => `198.51.100.${index % 250 + 1}`) } });
+  const collectionRaw = String(f.store.getTask({ taskId })?.last_error);
+  const collectionError = JSON.parse(collectionRaw);
+  expect(collectionError.reported.length).toBe(128);
+  expect(collectionRaw.length).toBeLessThanOrEqual(64 * 1024);
+
+  f.store.updateTask(taskId, { last_error: { code: "resize_partial", native_attempts: Array.from({ length: 128 }, () => ({ stderr: "x".repeat(4096) })) } });
+  const documentRaw = String(f.store.getTask({ taskId })?.last_error);
+  expect(documentRaw.length).toBeLessThanOrEqual(64 * 1024);
+  expect(JSON.parse(documentRaw)).toMatchObject({ truncated: true });
+});
+
 test("preserves exact decimal native resources through cache persistence", async () => {
   const f = fixture();
   const active = await f.call("acquire", { public_key: KEY }, "op-native-exact");
@@ -951,6 +972,20 @@ test("replays an accepted persisted operation without changing its digest or nat
     store.close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("rejects conflicting legacy schema migration provenance", () => {
+  const root = mkdtempSync("/tmp/agent-vm-conflicting-migration-test-");
+  const dbPath = join(root, "state.sqlite3");
+  writeLegacyOperation(dbPath, {
+    ok: true, protocol: PROTOCOL_VERSION, server_time: "2026-10-04T00:00:00+00:00", action: "acquire", session_id: "legacy-conflict",
+    generation: 0, operation_id: "legacy-conflict-op", outcome: "success", result: { state: "active" }, _request_digest: "c3dccc911349ced563eb9615fb6db8ffa5801d121c9542c29c5a3fc0575a768a",
+  });
+  const legacy = new Database(dbPath);
+  legacy.run("INSERT INTO meta(key, value) VALUES ('schema_migration', 'untrusted-provenance')");
+  legacy.close();
+  try { expectSyncCode(() => new StateStore(dbPath), "state_invalid"); }
+  finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("serializes concurrent legacy-state startup and records one migration", async () => {

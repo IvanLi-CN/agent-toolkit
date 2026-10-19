@@ -3,7 +3,7 @@ import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, 
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { acquireWriterIntent, COMMAND_OUTPUT_LIMIT, DIAGNOSTIC_LOG_TRUNCATION_MARKER, CommandRunner, Control, ControlError, hasWriterIntent, IncusClient, killProcessTree, ProcessIdentity, StateStore } from "../scripts/agent_vm_control.ts";
+import { acquireWriterIntent, anchoredProcessGroupMembers, COMMAND_OUTPUT_LIMIT, CONFIG_PATH_ENV, DIAGNOSTIC_LOG_TRUNCATION_MARKER, CommandRunner, Control, ControlError, hasWriterIntent, IncusClient, killProcessTree, ProcessIdentity, StateStore } from "../scripts/agent_vm_control.ts";
 
 type Dict = Record<string, any>;
 
@@ -130,6 +130,142 @@ async function waitFor(path: string, timeoutMs = 3000): Promise<boolean> {
   return existsSync(path);
 }
 
+async function runSessionExpiryRace(mode: "status" | "acquire"): Promise<void> {
+  const probeRoot = root("agent-vm-session-race-" + mode);
+  const dbPath = join(probeRoot, "state.sqlite3");
+  const enteredPath = join(probeRoot, "entered");
+  const releasePath = join(probeRoot, "release");
+  const expiryStartedPath = join(probeRoot, "expiry-started");
+  const expiryDonePath = join(probeRoot, "expiry-done");
+  const expiredPath = join(probeRoot, "expired");
+  const leaseExpiresAt = "2030-01-01T00:00:00.000Z";
+  const store = StateStore.bootstrap(dbPath);
+  store.putTask({
+    task_id: "avm-race", session_id: "race-session", generation: 1, state: "active", instance_name: "agent-vm-avm-race",
+    vm_ip: "198.51.100.20", ssh_host_port: 20000, lease_expires_at: leaseExpiresAt, inactive_since: null, cleanup_after: null,
+    created_at: leaseExpiresAt, updated_at: leaseExpiresAt, last_error: null, image_fingerprint: "a".repeat(64),
+    resources_json: JSON.stringify({ cpu: 2, memory_mib: 4096, disk_gib: 20 }), reservation_bytes: 0n,
+    previous_generation: null, resource_reservation_json: "{}",
+  });
+  store.putPort({ task_id: "avm-race", generation: 1, port_name: "ssh", protocol: "tcp", host_port: 20000, vm_port: 22, device_name: "agent-vm-avm-race-ssh-tcp", state: "active", created_at: leaseExpiresAt });
+  store.close();
+  await Bun.write(expiredPath, "1");
+
+  const worker = `
+    const { existsSync } = await import("node:fs");
+    const { Control, CommandRunner, StateStore, SystemdManager } = await import(process.env.CONTROL_PATH);
+    const result = (value) => ({ args: [], returncode: 0, stdout: new TextEncoder().encode(JSON.stringify(value)), stderr: new Uint8Array() });
+    class Runner extends CommandRunner {
+      async run(argv, options = {}) {
+        if (argv[0] !== "incus") throw new Error("unexpected command: " + argv.join(" "));
+        if (argv[1] === "query") {
+          const path = new URL(argv[2], "http://incus.test").pathname;
+          if (path.endsWith("/state")) return result({ status: "Running" });
+          return result({
+            config: {
+              "user.agent-vm.managed": "native-v1",
+              "user.agent-vm.task": "avm-race",
+              "user.agent-vm.session": "race-session",
+              "user.agent-vm.generation": "1",
+            },
+            expanded_config: {},
+            devices: {},
+            expanded_devices: {},
+          });
+        }
+        if (argv[1] === "--project" && argv[3] === "list") return result([]);
+        throw new Error("unexpected incus command: " + argv.join(" "));
+      }
+      async runBounded(argv, options = {}) { return this.run(argv, options); }
+    }
+    const expiry = new Date(process.env.LEASE_EXPIRES);
+    const clock = () => new Date(existsSync(process.env.EXPIRED) ? expiry.getTime() : expiry.getTime() - 1000);
+    const store = new StateStore(process.env.DB_PATH);
+    const config = {
+      project: "agents", profile: "agent-vm", state_db: process.env.DB_PATH, timer_dir: process.env.PROBE_ROOT,
+      storage_path: process.env.PROBE_ROOT, cache_seconds: 86400, image_fingerprint: "a".repeat(64),
+    };
+    const runner = new Runner();
+    const control = new Control(config, { store, runner, systemd: new SystemdManager(runner, config, false), clock });
+    control.resourceDiagnostics = async () => ({ verified: true, remaining: { cpu: 2, memory_mib: 12288 }, allocated_and_reserved: { cpu: 2, memory_mib: 4096 }, memory_pressure: false });
+    control.instanceDiagnostics = async () => ({ verified: true, total: 1, running: 1, stopped: 0, cached: 0, other: 0, limits: {}, policy_compliant: true });
+    const mode = process.env.RACE_MODE;
+    if (mode === "status") {
+      const original = control.runtimeSummary.bind(control);
+      let paused = true;
+      control.runtimeSummary = async (task) => {
+        if (paused) {
+          paused = false;
+          await Bun.write(process.env.ENTERED, "1");
+          while (!existsSync(process.env.RELEASE)) await Bun.sleep(5);
+        }
+        return original(task);
+      };
+    } else if (mode === "acquire") {
+      const original = control.ownership.bind(control);
+      let paused = true;
+      control.ownership = async (task) => {
+        if (paused) {
+          paused = false;
+          await Bun.write(process.env.ENTERED, "1");
+          while (!existsSync(process.env.RELEASE)) await Bun.sleep(5);
+        }
+        return original(task);
+      };
+    } else if (mode === "expire") {
+      control.cleanupTask = async () => [[], []];
+      await Bun.write(process.env.EXPIRY_STARTED, "1");
+    }
+    const request = mode === "status"
+      ? { protocol: 4, action: "status", session_id: "race-session", generation: 1 }
+      : mode === "acquire"
+        ? { protocol: 4, action: "acquire", session_id: "race-session", generation: 1, operation_id: "race-acquire", public_key: "ssh-ed25519 fixture" }
+        : { protocol: 4, action: "timer-expire", task_id: "avm-race", generation: 1 };
+    try {
+      const response = mode === "acquire" ? await control.acquire(request, "race-session") : await control.dispatch(request);
+      console.log(JSON.stringify(response));
+    } catch (error) {
+      console.log(JSON.stringify({ ok: false, error: error.asDict ? error.asDict() : { code: "internal_error" } }));
+      process.exitCode = 2;
+    } finally {
+      if (mode === "expire") await Bun.write(process.env.EXPIRY_DONE, "1");
+      store.close();
+    }
+  `;
+  const baseEnv = {
+    DB_PATH: dbPath, PROBE_ROOT: probeRoot, ENTERED: enteredPath, RELEASE: releasePath, EXPIRED: expiredPath,
+    EXPIRY_STARTED: expiryStartedPath, EXPIRY_DONE: expiryDonePath, LEASE_EXPIRES: leaseExpiresAt, RACE_MODE: mode, CONTROL_PATH,
+  };
+  const primary = spawnWorker(worker, baseEnv);
+  expect(await waitFor(enteredPath)).toBe(true);
+  const expiry = spawnWorker(worker, { ...baseEnv, RACE_MODE: "expire" });
+  expect(await waitFor(expiryStartedPath)).toBe(true);
+  if (mode === "acquire") expect(await waitFor(expiryDonePath)).toBe(true);
+  else await Bun.sleep(50);
+  const beforeRelease = new StateStore(dbPath);
+  expect(beforeRelease.getTask({ taskId: "avm-race" })?.state).toBe(mode === "acquire" ? "absent" : "active");
+  beforeRelease.close();
+  await Bun.write(releasePath, "1");
+  const [primaryResult, expiryResult] = await Promise.all([collect(primary), collect(expiry)]);
+  expect(expiryResult.exit).toBe(0);
+  expect(lastJson(expiryResult.stdout).result.state).toBe("absent");
+  if (mode === "status") {
+    expect(primaryResult.exit).toBe(0);
+    expect(lastJson(primaryResult.stdout).result).toMatchObject({ state: "active", native_status: "Running" });
+  } else {
+    expect(primaryResult.exit).toBe(2);
+    expect(lastJson(primaryResult.stdout).error.code).toBe("task_transition");
+  }
+}
+
+linuxTest("serializes status reads with expiry across control processes", async () => {
+  await runSessionExpiryRace("status");
+});
+
+linuxTest("rejects an active acquire response after expiry revocation across processes", async () => {
+  await runSessionExpiryRace("acquire");
+});
+
 test("refuses to kill a PID after its recorded Linux identity changes", () => {
   const member: ProcessIdentity = { pid: 4242, starttime: "old-starttime" };
   const killed: number[] = [];
@@ -141,6 +277,18 @@ test("refuses to kill a PID after its recorded Linux identity changes", () => {
   });
   expect(result).toEqual({ killed: false, error: "process_identity_mismatch" });
   expect(killed).toEqual([]);
+});
+
+linuxTest("does not scan a reused process group without a live identity anchor", () => {
+  let scanned = false;
+  const result = anchoredProcessGroupMembers(
+    777,
+    [{ pid: 4244, starttime: "old-starttime" }],
+    () => ({ pid: 4244, starttime: "reused-starttime", state: "S", ppid: 1, pgrp: 777 }),
+    () => { scanned = true; return { members: [{ pid: 4245, starttime: "unrelated" }], complete: true }; },
+  );
+  expect(result).toEqual({ members: [], complete: false });
+  expect(scanned).toBe(false);
 });
 
 test("treats an identity-matched zombie as already reaped", () => {
@@ -736,6 +884,33 @@ systemdTest("systemd assets validate against the Bun runtime path", async () => 
   const result = await collect(processHandle);
   if (result.exit !== 0) throw new Error(`systemd verify failed: ${JSON.stringify(result)}`);
   if (result.stderr !== "") throw new Error(`systemd verify stderr: ${result.stderr}`);
+});
+
+linuxTest("the real Bun controller entrypoint handles stdin and timer requests with isolated state", async () => {
+  const probeRoot = root("agent-vm-real-cli");
+  const storage = join(probeRoot, "storage");
+  const timerDir = join(probeRoot, "timer");
+  for (const path of [storage, timerDir]) mkdirSync(path, { recursive: true, mode: 0o700 });
+  const statePath = join(storage, "state.sqlite3");
+  StateStore.bootstrap(statePath).close();
+  const configPath = join(probeRoot, "config.json");
+  writeFileSync(configPath, JSON.stringify({
+    project: "agents", profile: "agent-vm", image_alias: "image", image_fingerprint: "a".repeat(64),
+    network: "agentsbr0", network_acl: "agent-vm-isolation", pool: "agents", host_address: "198.51.100.19",
+    port_start: 20000, port_end: 20030, vm_ip_start: "198.51.100.20", vm_ip_end: "198.51.100.250",
+    gateway_ip: "198.51.100.1", storage_path: storage, state_db: statePath, timer_dir: timerDir,
+  }), { mode: 0o600 });
+  const env = { ...process.env, [CONFIG_PATH_ENV]: configPath };
+  const stdinChild: any = Bun.spawn([process.execPath, CONTROL_PATH], { env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+  await stdinChild.stdin.write(JSON.stringify({ protocol: 4, action: "drain-status" }) + "\n");
+  stdinChild.stdin.end();
+  const stdinResult = await collect(stdinChild);
+  expect(stdinResult).toMatchObject({ exit: 0, stderr: "" });
+  expect(lastJson(stdinResult.stdout)).toMatchObject({ ok: true, action: "drain-status", result: { draining: false } });
+
+  const timerResult = await collect(Bun.spawn([process.execPath, CONTROL_PATH, "--timer-age-gc"], { env, stdout: "pipe", stderr: "pipe" }));
+  expect(timerResult).toMatchObject({ exit: 0, stderr: "" });
+  expect(lastJson(timerResult.stdout)).toMatchObject({ ok: true, action: "timer-age-gc", result: { candidates: [] } });
 });
 
 transportTest("the current Python client reaches the Bun controller through isolated fake SSH", async () => {

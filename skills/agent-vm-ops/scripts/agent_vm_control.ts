@@ -26,6 +26,7 @@ export const DIAGNOSTIC_MESSAGE_LIMIT = 4096;
 export const COMMAND_OUTPUT_LIMIT = 1024 * 1024;
 const RAW_DIAGNOSTIC_CAPTURE_LIMIT = 1024 * 1024;
 export const DEFAULT_CONFIG_PATH = "/etc/agent-vm-native/config.json";
+export const CONFIG_PATH_ENV = "AGENT_VM_CONFIG_PATH";
 export const DEFAULT_TIMER_DIR = "/etc/systemd/system";
 export const REQUIRED_ENVIRONMENT_FIELDS = [
   "project", "profile", "image_alias", "image_fingerprint", "network", "network_acl", "pool",
@@ -236,7 +237,7 @@ const PERSISTED_PAYLOAD_FIELDS = new Set([
   "reclaim_required", "reclaimed", "record", "remaining", "removed", "request_cost_bytes", "requested", "reservation_bytes",
   "resource_reservation", "resource_reservation_json", "resources", "resources_json", "result", "returncode", "runtime_seconds", "scope", "selection", "server_time",
   "session_id", "sources", "ssh_host_port", "stage_timings", "startup_log", "state", "stderr", "task_id", "tasks", "threshold_bytes",
-  "total", "total_elapsed_seconds", "transport_timeout", "truncated", "type", "updated_at", "user", "verification", "verified", "version", "free",
+  "total", "total_elapsed_seconds", "transport_timeout", "truncated", "type", "updated_at", "user", "verification", "verified", "version", "free", "reported",
   "runqueue_wait_seconds", "source", "status", "storage_path", "text", "timer_dir", "virtual_bytes", "vm_ip", "vm_port", "readiness", "emitted", "native_start_seconds",
 ]);
 const PERSISTED_DEPTH_LIMIT = 8;
@@ -270,6 +271,16 @@ function persistedDocument(value: unknown): unknown {
   const result: Dict = { truncated: true };
   if (isDict(projected) && hasOwn(projected, "capacity")) result.capacity = projected.capacity;
   return result;
+}
+
+function persistedTaskError(value: unknown): string {
+  let candidate = value;
+  if (typeof candidate === "string") {
+    try { candidate = parseJson(candidate); }
+    catch { candidate = { code: "internal_error", message: candidate }; }
+  }
+  const projected = persistedDocument(candidate);
+  return stableJson(isDict(projected) ? projected : { error: projected });
 }
 
 function persistedTruncated(value: unknown): Dict {
@@ -1065,7 +1076,7 @@ function nativeKill(pid: number, signal: number): boolean {
 }
 
 export type ProcessIdentity = { pid: number; starttime: string };
-type ProcessRecord = ProcessIdentity & { state: string; ppid: number; pgrp: number };
+export type ProcessRecord = ProcessIdentity & { state: string; ppid: number; pgrp: number };
 type ProcessCleanupOptions = {
   readIdentity?: (pid: number) => string | undefined;
   exists?: (pid: number) => boolean;
@@ -1286,16 +1297,21 @@ function processDescendantsFromRoots(roots: readonly ProcessIdentity[]): { membe
   return { members, complete };
 }
 
-function anchoredProcessGroupMembers(pgid: number, anchors: readonly ProcessIdentity[]): { members: ProcessIdentity[]; complete: boolean } {
+export function anchoredProcessGroupMembers(
+  pgid: number,
+  anchors: readonly ProcessIdentity[],
+  readRecord: (pid: number) => ProcessRecord = readProcessRecord,
+  scan: (pgid: number) => { members: ProcessIdentity[]; complete: boolean } = processGroupMembers,
+): { members: ProcessIdentity[]; complete: boolean } {
   if (!anchors.length) return { members: [], complete: false };
   let verified = false;
   for (const anchor of anchors) {
     try {
-      const record = readProcessRecord(anchor.pid);
+      const record = readRecord(anchor.pid);
       if (record.starttime === anchor.starttime && record.pgrp === pgid) { verified = true; break; }
     } catch { /* The anchor may have exited; another known member can still anchor the group. */ }
   }
-  return verified ? processGroupMembers(pgid) : { members: [], complete: false };
+  return verified ? scan(pgid) : { members: [], complete: false };
 }
 
 export function killProcessTree(members: readonly ProcessIdentity[], options: ProcessCleanupOptions = {}): { killed: boolean; error: string | null } {
@@ -1545,7 +1561,7 @@ export class CommandRunner {
             const currentLeader = processStartIdentity(processHandle.pid);
             if (currentLeader !== undefined && currentLeader !== leaderIdentity) identityMismatch = true;
             if (currentLeader === undefined) {
-              const leaderGroup = processGroupMembers(leaderPgid);
+              const leaderGroup = anchoredProcessGroupMembers(leaderPgid, groupAnchors.get(leaderPgid) ?? []);
               processTreeComplete &&= leaderGroup.complete;
               addKnown(leaderGroup.members);
             }
@@ -1768,6 +1784,7 @@ const TASK_FIELDS = new Set([
 ]);
 const PORT_FIELDS = new Set(["task_id", "generation", "port_name", "protocol", "host_port", "vm_port", "device_name", "state", "created_at"]);
 const STATE_TABLES = new Set(["meta", "tasks", "ports", "operations", "audit"]);
+const PYTHON_BASELINE_MIGRATION = "python-baseline-v1->bun-canonical-v1";
 const OPERATION_ACTIONS = new Set(["acquire", "renew", "release", "destroy", "restart", "resize", "port-add", "port-remove", "drain-enter", "drain-exit", "admin-reconcile", "admin-gc"]);
 const OPERATION_SESSION_ACTIONS = new Set(["acquire", "renew", "release", "destroy", "restart", "resize", "port-add", "port-remove"]);
 
@@ -1995,7 +2012,9 @@ export class StateStore {
         copiedCounts.set(table, count(table));
         if (copiedCounts.get(table) !== count(legacyNames[table])) throw new Error(`row count mismatch: ${table}`);
       }
-      db.run("INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_migration', 'python-baseline-v1->bun-canonical-v1')");
+      const migration = (db.query("SELECT value FROM meta WHERE key = 'schema_migration'") as any).get() as Dict | null;
+      if (migration && (typeof migration.value !== "string" || migration.value !== PYTHON_BASELINE_MIGRATION)) throw new ControlError("state_invalid", "durable state contains conflicting schema migration provenance");
+      if (!migration) db.run("INSERT INTO meta(key, value) VALUES ('schema_migration', ?)", [PYTHON_BASELINE_MIGRATION]);
       db.run("INSERT INTO audit(action, task_id, session_id, generation, outcome, detail_json, created_at) VALUES (?, NULL, NULL, 0, ?, ?, ?)", ["schema-migration", "ok", stableJson({ from: "python-baseline-v1", to: "bun-canonical-v1", tables: [...STATE_TABLES].sort(compareUnicodeCodePoints) }), isoTime()]);
       for (const table of Object.values(legacyNames)) db.run(`DROP TABLE ${table}`);
       StateStore.verifyDurableStateInTransaction(db);
@@ -2295,9 +2314,11 @@ export class StateStore {
   listTasks(): Dict[] { return this.rows("SELECT * FROM tasks ORDER BY created_at"); }
 
   putTask(task: Dict): void {
-    const fields = [...TASK_FIELDS].filter((field) => task[field] !== undefined);
+    const normalized = { ...task };
+    if (normalized.last_error !== null && normalized.last_error !== undefined) normalized.last_error = persistedTaskError(normalized.last_error);
+    const fields = [...TASK_FIELDS].filter((field) => normalized[field] !== undefined);
     const defaults: Dict = { resources_json: "{}", reservation_bytes: 0n, resource_reservation_json: "{}" };
-    const values = fields.map((field) => task[field] ?? defaults[field] ?? null);
+    const values = fields.map((field) => normalized[field] ?? defaults[field] ?? null);
     this.transaction(() => {
       this.db.run(`INSERT INTO tasks (${fields.join(",")}) VALUES (${fields.map(() => "?").join(",")}) ON CONFLICT(task_id) DO UPDATE SET ${fields.filter((field) => field !== "task_id" && field !== "created_at").map((field) => `${field}=excluded.${field}`).join(",")}`, ...values);
     });
@@ -2309,7 +2330,9 @@ export class StateStore {
       if (!task) throw new ControlError("task_missing", `task not found: ${taskId}`);
       return task;
     }
-    const updated = { ...changes, updated_at: isoTime() };
+    const normalized = { ...changes };
+    if (normalized.last_error !== null && normalized.last_error !== undefined) normalized.last_error = persistedTaskError(normalized.last_error);
+    const updated = { ...normalized, updated_at: isoTime() };
     for (const field of Object.keys(updated)) if (!TASK_FIELDS.has(field)) throw new Error(`invalid task field: ${field}`);
     this.transaction(() => (this.db as any).run(`UPDATE tasks SET ${Object.keys(updated).map((field) => `${field} = ?`).join(", ")} WHERE task_id = ?`, ...Object.values(updated), taskId));
     const task = this.getTask({ taskId });
@@ -2755,35 +2778,39 @@ export class Control {
   private async expirePreempt(request: Dict): Promise<void> {
     const taskId = requiredString(requiredOwn(request, "task_id"), "task_id", TASK_ID_RE);
     const generation = numberFromInteger(requiredOwn(request, "generation"), "generation", 1);
-    let task = this.store.getTask({ taskId });
-    if (!task || !sameInteger(task.generation, generation)) return;
-    const expiry = parseTime(task.lease_expires_at);
-    if (!Control.ACTIVE_STATES.has(String(task.state)) || (expiry && expiry.getTime() > this.now().getTime())) return;
-    await this.nativeLock(task, async () => {
-      task = await this.nativeBarrier(() => this.globalLock(() => this.store.transaction(() => {
-          const current = this.store.getTask({ taskId });
-          if (!current || !sameInteger(current.generation, generation)) return undefined;
-          const currentExpiry = parseTime(current.lease_expires_at);
-          if (!Control.ACTIVE_STATES.has(String(current.state)) || (currentExpiry && currentExpiry.getTime() > this.now().getTime())) return undefined;
-          const inactive = parseTime(current.inactive_since) ?? new Date(Math.min(this.now().getTime(), currentExpiry?.getTime() ?? this.now().getTime()));
-          return this.store.updateTask(taskId, {
-            state: "closing", lease_expires_at: null, inactive_since: isoTime(inactive),
-            cleanup_after: isoTime(new Date(inactive.getTime() + Number(this.config.cache_seconds) * 1000)),
-          });
-        })));
-    });
-    if (!task) return;
-    try {
-      await this.objectLock(`cleanup:${task.session_id}`, async () => {
-        const current = await this.cleanupCurrent(task as Dict);
-        if (!current) return;
-        const [errors, completed] = await this.cleanupTask(current);
-        if (errors.length) await this.updateCleanupLastError(current, stableJson({ errors, completed }));
+    const initial = this.store.getTask({ taskId });
+    if (!initial) return;
+    await this.objectLock(`session:${initial.session_id}`, async () => {
+      let task = this.store.getTask({ taskId });
+      if (!task || !sameInteger(task.generation, generation)) return;
+      const expiry = parseTime(task.lease_expires_at);
+      if (!Control.ACTIVE_STATES.has(String(task.state)) || (expiry && expiry.getTime() > this.now().getTime())) return;
+      await this.nativeLock(task, async () => {
+        task = await this.nativeBarrier(() => this.globalLock(() => this.store.transaction(() => {
+            const current = this.store.getTask({ taskId });
+            if (!current || !sameInteger(current.generation, generation)) return undefined;
+            const currentExpiry = parseTime(current.lease_expires_at);
+            if (!Control.ACTIVE_STATES.has(String(current.state)) || (currentExpiry && currentExpiry.getTime() > this.now().getTime())) return undefined;
+            const inactive = parseTime(current.inactive_since) ?? new Date(Math.min(this.now().getTime(), currentExpiry?.getTime() ?? this.now().getTime()));
+            return this.store.updateTask(taskId, {
+              state: "closing", lease_expires_at: null, inactive_since: isoTime(inactive),
+              cleanup_after: isoTime(new Date(inactive.getTime() + Number(this.config.cache_seconds) * 1000)),
+            });
+          })));
       });
-    } catch (error) {
-      const detail = error instanceof ControlError ? error.asDict() : { code: "internal_error", message: (error as Error).name };
-      await this.updateCleanupLastError(task as Dict, stableJson(detail));
-    }
+      if (!task) return;
+      try {
+        await this.objectLock(`cleanup:${task.session_id}`, async () => {
+          const current = await this.cleanupCurrent(task as Dict);
+          if (!current) return;
+          const [errors, completed] = await this.cleanupTask(current);
+          if (errors.length) await this.updateCleanupLastError(current, stableJson({ errors, completed }));
+        });
+      } catch (error) {
+        const detail = error instanceof ControlError ? error.asDict() : { code: "internal_error", message: (error as Error).name };
+        await this.updateCleanupLastError(task as Dict, stableJson(detail));
+      }
+    });
   }
 
   private async updateCleanupLastError(task: Dict, detail: string): Promise<void> {
@@ -2985,20 +3012,55 @@ export class Control {
     return result;
   }
 
-  private async runtimeSummary(task: Dict): Promise<Dict> {
-    const result = this.stateSummary(task);
-    result.guest_available = false;
-    if (task.state === "absent") { result.native_status = "absent"; return result; }
-    try {
-      await this.ownership(task);
-      result.native_status = String((await this.incus.instanceInfo(String(task.instance_name))).status);
-      result.guest_available = result.effective_lease && result.native_status.toLowerCase() === "running";
-      if (result.effective_lease && !result.guest_available) result.guest_error = { code: "guest_unavailable", cause: "unknown", message: "effective lease has no running guest; inspect before explicit restart" };
-    } catch (error) {
-      result.native_status = "unverified";
-      result.guest_error = error instanceof ControlError ? error.asDict() : { code: "internal_error", message: (error as Error).name };
+  private durableTaskSnapshot(taskId: string): { task?: Dict; signature: string } {
+    const task = this.store.getTask({ taskId });
+    const ports = task ? this.store.getPorts(taskId) : [];
+    return { task, signature: stableJson({ task: task ?? null, ports }) };
+  }
+
+  private durableTaskListSnapshot(): { tasks: Dict[]; signature: string } {
+    const tasks = this.store.listTasks();
+    return { tasks, signature: stableJson(tasks.map((task) => ({ task, ports: this.store.getPorts(String(task.task_id)) }))) };
+  }
+
+  private async consistentRuntimeSummary(task: Dict): Promise<Dict> {
+    const taskId = String(task.task_id);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const before = this.durableTaskSnapshot(taskId);
+      if (!before.task) throw new ControlError("task_transition", "task disappeared while reading runtime status");
+      const result = await this.runtimeSummary(before.task);
+      const after = this.durableTaskSnapshot(taskId);
+      if (before.signature === after.signature) return result;
     }
-    return result;
+    throw new ControlError("task_transition", "task state changed while reading runtime status");
+  }
+
+  private async consistentRuntimeSummaries(): Promise<Dict[]> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const before = this.durableTaskListSnapshot();
+      const tasks = await Promise.all(before.tasks.map((task) => this.consistentRuntimeSummary(task)));
+      const after = this.durableTaskListSnapshot();
+      if (before.signature === after.signature) return tasks;
+    }
+    throw new ControlError("task_transition", "task state changed while reading runtime status");
+  }
+
+  private async runtimeSummary(task: Dict): Promise<Dict> {
+    return this.nativeBarrier(async () => {
+      const result = this.stateSummary(task);
+      result.guest_available = false;
+      if (task.state === "absent") { result.native_status = "absent"; return result; }
+      try {
+        await this.ownership(task);
+        result.native_status = String((await this.incus.instanceInfo(String(task.instance_name))).status);
+        result.guest_available = result.effective_lease && result.native_status.toLowerCase() === "running";
+        if (result.effective_lease && !result.guest_available) result.guest_error = { code: "guest_unavailable", cause: "unknown", message: "effective lease has no running guest; inspect before explicit restart" };
+      } catch (error) {
+        result.native_status = "unverified";
+        result.guest_error = error instanceof ControlError ? error.asDict() : { code: "internal_error", message: (error as Error).name };
+      }
+      return result;
+    });
   }
 
   private requestedResources(request: Dict, base: Dict, activeReuse = false): Dict {
@@ -3778,16 +3840,22 @@ export class Control {
   }
 
   async status(request: Dict, sessionId: string): Promise<Dict> {
-    const task = this.store.getTask({ sessionId });
-    if (hasOwn(request, "generation")) {
-      const generation = numberFromInteger(request.generation, "generation", 0);
-      if (task && !sameInteger(task.generation, generation)) throw new ControlError("generation_mismatch", "request generation does not match current task generation", { current_generation: integerForJson(task.generation) });
-      if (!task && !sameInteger(generation, 0)) throw new ControlError("generation_mismatch", "request generation does not match the absent session");
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const task = this.store.getTask({ sessionId });
+      if (hasOwn(request, "generation")) {
+        const generation = numberFromInteger(request.generation, "generation", 0);
+        if (task && !sameInteger(task.generation, generation)) throw new ControlError("generation_mismatch", "request generation does not match current task generation", { current_generation: integerForJson(task.generation) });
+        if (!task && !sameInteger(generation, 0)) throw new ControlError("generation_mismatch", "request generation does not match the absent session");
+      }
+      const before = task ? this.durableTaskSnapshot(String(task.task_id)) : { signature: stableJson({ task: null, ports: [] }) };
+      const result = task ? await this.consistentRuntimeSummary(task) : { state: "absent", generation: 0, effective_lease: false, native_status: "absent", guest_available: false };
+      const admission = await this.resourceDiagnostics();
+      admission.instances = await this.instanceDiagnostics();
+      const afterTask = this.store.getTask({ sessionId });
+      const after = task ? this.durableTaskSnapshot(String(task.task_id)) : afterTask ? this.durableTaskSnapshot(String(afterTask.task_id)) : before;
+      if (before.signature === after.signature) return { ...result, admission };
     }
-    const result = task ? await this.runtimeSummary(task) : { state: "absent", generation: 0, effective_lease: false, native_status: "absent", guest_available: false };
-    const admission = await this.resourceDiagnostics();
-    admission.instances = await this.instanceDiagnostics();
-    return { ...result, admission };
+    throw new ControlError("task_transition", "task state changed while reading status");
   }
 
   async acquire(request: Dict, sessionId: string): Promise<Dict> {
@@ -3799,7 +3867,11 @@ export class Control {
       const resources = parseJson(String(existing.resources_json)) as Dict;
       const target = this.requestedResources(request, resources, true);
       if (stableJson(target) !== stableJson(resources)) throw new ControlError("resource_config_mismatch", "active lease configuration differs; use resize explicitly", { current: resources, requested: target, differences: Object.keys(resources).filter((key) => resources[key] !== target[key]) });
-      return this.runtimeSummary(existing);
+      const result = await this.consistentRuntimeSummary(existing);
+      const current = this.store.getTask({ sessionId });
+      if (!current || current.state !== "active" || !sameInteger(current.generation, existing.generation)) throw new ControlError("task_transition", "active lease changed while it was being reused");
+      this.requireActive(current);
+      return result;
     }
     if (existing && !["absent", "cached"].includes(String(existing.state))) throw new ControlError("task_transition", "session slot is not available until reconciliation completes");
     const expected = existing ? integerBigInt(existing.generation, "generation") : 0n;
@@ -4236,14 +4308,23 @@ export class Control {
   }
 
   async adminStatus(request: Dict, sessionId?: string): Promise<Dict> {
-    const tasks = await Promise.all(this.store.listTasks().map((task) => this.runtimeSummary(task)));
-    return { draining: this.store.getMeta("draining") === "1", tasks, doctor: await this.doctor(request, sessionId) };
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const before = this.durableTaskListSnapshot();
+      const tasks = await this.consistentRuntimeSummaries();
+      const doctor = await this.doctor(request, sessionId);
+      const after = this.durableTaskListSnapshot();
+      if (before.signature === after.signature) return { draining: this.store.getMeta("draining") === "1", tasks, doctor };
+    }
+    throw new ControlError("task_transition", "task state changed while reading admin status");
   }
 
   async drainStatus(_request: Dict, _sessionId?: string): Promise<Dict> { return { draining: this.store.getMeta("draining") === "1" }; }
   async drainEnter(_request: Dict, _sessionId?: string): Promise<Dict> { await this.nativeBarrier(() => this.globalLock(() => this.store.setMeta("draining", "1")), true); return { draining: true }; }
   async drainExit(_request: Dict, _sessionId?: string): Promise<Dict> { await this.nativeBarrier(() => this.globalLock(() => this.store.setMeta("draining", "0")), true); return { draining: false }; }
-  async adminSessionList(_request: Dict, _sessionId?: string): Promise<Dict> { return { tasks: await Promise.all(this.store.listTasks().map((task) => this.runtimeSummary(task))) }; }
+  async adminSessionList(_request: Dict, _sessionId?: string): Promise<Dict> {
+    const tasks = await this.consistentRuntimeSummaries();
+    return { tasks };
+  }
 
   async adminReconcile(request: Dict, _sessionId?: string): Promise<Dict> {
     const apply = requireBoolean(hasOwn(request, "apply") ? request.apply : false, "reconcile apply");
@@ -4390,7 +4471,7 @@ export function writeProcessOutput(value: string): Promise<void> {
 
 export async function runMain(argv: readonly string[] = Bun.argv.slice(2)): Promise<number> {
   try {
-    const config = loadConfig(DEFAULT_CONFIG_PATH);
+    const config = loadConfig(process.env[CONFIG_PATH_ENV] ?? DEFAULT_CONFIG_PATH);
     const timerRequest = parseTimerArgs(argv);
     if (!timerRequest && argv.length) throw new ControlError("invalid_request", "unknown command-line arguments");
     const request = timerRequest ?? await requestFromStdin();

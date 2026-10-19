@@ -114,6 +114,30 @@ class SessionContractTests(unittest.TestCase):
                 self.assertEqual(error.exception.code, "local_journal_invalid")
                 run.assert_not_called()
 
+    def test_operation_journal_read_rejects_a_symlink_swap_after_path_validation(self):
+        with tempfile.TemporaryDirectory() as state, tempfile.TemporaryDirectory() as outside:
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", Path(state)):
+                request = {"session_id": "thread", "generation": 7, "operation_id": "swap-operation"}
+                directory = CLI._secure_directory(CLI._secure_session_directory("thread") / "operations")
+                CLI.ensure_operation_journal(directory, request)
+                journal = CLI.operation_journal_path("thread", "swap-operation")
+                attacker = Path(outside) / "attacker.json"
+                attacker.write_text(json.dumps({"request": {"generation": 99}}), encoding="utf-8")
+
+                original_secure_file = CLI._secure_file
+
+                def swap_after_validation(path, *, code="local_state_invalid"):
+                    result = original_secure_file(path, code=code)
+                    if path == journal:
+                        path.unlink()
+                        path.symlink_to(attacker)
+                    return result
+
+                with mock.patch.object(CLI, "_secure_file", side_effect=swap_after_validation):
+                    with self.assertRaises(CLI.CliError) as error:
+                        CLI.journal_generation("thread", "swap-operation", 0)
+                self.assertEqual(error.exception.code, "local_journal_invalid")
+
     def test_child_diagnostics_are_redacted_before_bounding(self):
         process = CLI.run_child([CLI.sys.executable, "-c", "import sys; sys.stderr.write('Authorization: Bearer ' + 'x' * 20000)"], capture_stdout=True)
         self.assertLessEqual(len(process.stderr), CLI.DIAGNOSTIC_OUTPUT_LIMIT)

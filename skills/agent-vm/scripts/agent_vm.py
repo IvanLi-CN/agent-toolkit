@@ -312,7 +312,10 @@ def operation_journal_path(session: str, operation: str) -> Path:
 def read_operation_journal(path: Path) -> dict[str, Any]:
     try:
         _secure_file(path, code="local_journal_invalid")
-        value = json.loads(path.read_text(encoding="utf-8"))
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            _secure_fd(handle.fileno(), code="local_journal_invalid")
+            value = json.load(handle)
     except CliError:
         raise
     except (OSError, UnicodeError, ValueError):
@@ -619,7 +622,6 @@ def journal_generation(session: str, operation: str, fallback: int) -> int:
     path = operation_journal_path(session, operation)
     if not os.path.lexists(path):
         return fallback
-    _secure_file(path)
     record = read_operation_journal(path)
     value = record["request"].get("generation")
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:

@@ -32,6 +32,7 @@ import uuid
 PROTOCOL_VERSION = 4
 VERSION = "0.4.0-native"
 REMOTE_CONTROL = "/opt/agent-vm-native/agent_vm_control.ts"
+REMOTE_BUN = "/usr/bin/bun"
 DEFAULT_CONTROL_TIMEOUT_SECONDS = 240
 LONG_CONTROL_TIMEOUT_SECONDS = 600
 DIAGNOSTIC_OUTPUT_LIMIT = 8192
@@ -441,20 +442,96 @@ class _BoundedCapture:
         return value[:available] + DIAGNOSTIC_TRUNCATION_MARKER
 
 
-def terminate_process_group(process: subprocess.Popen[Any]) -> None:
-    if os.name == "posix":
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+def _linux_process_record(pid: int) -> tuple[str, int] | None:
+    """Return a Linux process start identity and process group id."""
+    if sys.platform != "linux":
+        return None
+    try:
+        value = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError, UnicodeDecodeError):
+        return None
+    close_paren = value.rfind(")")
+    if close_paren < 0:
+        return None
+    fields = value[close_paren + 2 :].split()
+    if len(fields) <= 19:
+        return None
+    try:
+        process_group = int(fields[2])
+    except ValueError:
+        return None
+    if process_group <= 1:
+        return None
+    return fields[19], process_group
+
+
+def _linux_group_members(process_group: int) -> dict[int, tuple[str, int]]:
+    members: dict[int, tuple[str, int]] = {}
+    try:
+        entries = Path("/proc").iterdir()
+    except OSError:
+        return members
+    for entry in entries:
+        if not entry.name.isdecimal():
+            continue
+        pid = int(entry.name)
+        record = _linux_process_record(pid)
+        if record is not None and record[1] == process_group:
+            members[pid] = record
+    return members
+
+
+def _linux_signal_process(pid: int, expected: tuple[str, int], sig: signal.Signals) -> bool:
+    current = _linux_process_record(pid)
+    if current != expected:
+        return False
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return True
+
+
+def terminate_process_group(process: subprocess.Popen[Any], *, tracked_members: dict[int, tuple[str, int]] | None = None) -> None:
+    if os.name == "posix" and sys.platform == "linux":
+        # A negative-PGID kill remains vulnerable to PGID reuse after the
+        # leader exits. Track members while the leader is alive, then signal
+        # each PID only after rechecking its start identity and PGID.
+        members = dict(tracked_members or {})
+        leader = _linux_process_record(process.pid)
+        if leader is not None:
+            members.update(_linux_group_members(leader[1]))
+        for pid, identity in list(members.items()):
+            _linux_signal_process(pid, identity, signal.SIGTERM)
         try:
             process.wait(timeout=0.25)
         except subprocess.TimeoutExpired:
             pass
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        for pid, identity in list(members.items()):
+            _linux_signal_process(pid, identity, signal.SIGKILL)
+    elif os.name == "posix":
+        # On platforms without /proc, retain group cleanup only while the
+        # session leader is alive and still owns its PGID.
+        group_id: int | None = None
+        if process.poll() is None:
+            try:
+                candidate = os.getpgid(process.pid)
+                if candidate == process.pid:
+                    group_id = candidate
+                    os.killpg(group_id, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                process.wait(timeout=0.25)
+            except subprocess.TimeoutExpired:
+                pass
+            if group_id is not None:
+                try:
+                    os.killpg(group_id, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
     else:
         try:
             process.terminate()
@@ -463,10 +540,15 @@ def terminate_process_group(process: subprocess.Popen[Any]) -> None:
     try:
         process.wait(timeout=1)
     except subprocess.TimeoutExpired:
-        try:
-            process.kill()
-        except ProcessLookupError:
-            pass
+        if os.name == "posix" and sys.platform == "linux":
+            leader = _linux_process_record(process.pid)
+            if leader is not None:
+                _linux_signal_process(process.pid, leader, signal.SIGKILL)
+        else:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
         try:
             process.wait(timeout=1)
         except subprocess.TimeoutExpired:
@@ -494,6 +576,22 @@ def run_child(argv: Sequence[str], *, input_data: bytes | None = None,
     stderr_capture = _BoundedCapture(RAW_DIAGNOSTIC_CAPTURE_LIMIT, tail=False)
     input_view = memoryview(input_data or b"")
     input_offset = 0
+    tracked_members: dict[int, tuple[str, int]] = {}
+    last_group_scan = 0.0
+
+    def refresh_group_members(*, force: bool = False) -> None:
+        nonlocal last_group_scan
+        if sys.platform != "linux":
+            return
+        now = time.monotonic()
+        if not force and now - last_group_scan < 0.05:
+            return
+        last_group_scan = now
+        leader = _linux_process_record(process.pid)
+        if leader is not None:
+            tracked_members.update(_linux_group_members(leader[1]))
+
+    refresh_group_members(force=True)
 
     def close_stream(stream: Any) -> None:
         try:
@@ -520,6 +618,7 @@ def run_child(argv: Sequence[str], *, input_data: bytes | None = None,
     drain_deadline: float | None = None
     try:
         while selector.get_map() or process.poll() is None:
+            refresh_group_members()
             if process.poll() is not None and drain_deadline is None:
                 if process.stdin is not None:
                     close_stream(process.stdin)
@@ -528,9 +627,9 @@ def run_child(argv: Sequence[str], *, input_data: bytes | None = None,
             remaining = None if not deadlines else min(deadlines) - time.monotonic()
             if remaining is not None and remaining <= 0:
                 if deadline is not None and (drain_deadline is None or deadline <= drain_deadline):
-                    terminate_process_group(process)
+                    terminate_process_group(process, tracked_members=tracked_members)
                     raise subprocess.TimeoutExpired(list(argv), effective_timeout, output=stdout_capture.finish(marker=False), stderr=redact_and_bound_diagnostic(stderr_capture.finish(marker=False), truncated=stderr_capture.seen > stderr_capture.limit))
-                terminate_process_group(process)
+                terminate_process_group(process, tracked_members=tracked_members)
                 for stream in (process.stdin, process.stdout, process.stderr):
                     if stream is not None:
                         close_stream(stream)
@@ -539,10 +638,11 @@ def run_child(argv: Sequence[str], *, input_data: bytes | None = None,
                 try:
                     process.wait(timeout=remaining)
                 except subprocess.TimeoutExpired:
-                    terminate_process_group(process)
+                    terminate_process_group(process, tracked_members=tracked_members)
                     raise subprocess.TimeoutExpired(list(argv), effective_timeout, output=stdout_capture.finish(marker=False), stderr=redact_and_bound_diagnostic(stderr_capture.finish(marker=False), truncated=stderr_capture.seen > stderr_capture.limit))
                 break
-            events = selector.select(remaining)
+            select_timeout = min(remaining, 0.05) if remaining is not None else 0.05
+            events = selector.select(select_timeout)
             for key, _ in events:
                 stream = key.fileobj
                 if key.data == "stdin":
@@ -573,7 +673,7 @@ def run_child(argv: Sequence[str], *, input_data: bytes | None = None,
         return completed
     finally:
         if process.poll() is None:
-            terminate_process_group(process)
+            terminate_process_group(process, tracked_members=tracked_members)
         for stream in (process.stdin, process.stdout, process.stderr):
             if stream is not None:
                 close_stream(stream)
@@ -702,7 +802,7 @@ def control_request(action: str, *, session: str | None, generation: int | None 
         control_host = os.environ.get(CONTROL_HOST_ENV, DEFAULT_CONTROL_HOST)
         remote_control = os.environ.get(REMOTE_CONTROL_ENV, DEFAULT_REMOTE_CONTROL)
         process = run_child(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", control_host,
-                             shlex.join(["bun", remote_control])],
+                             shlex.join([REMOTE_BUN, remote_control])],
                             input_data=json.dumps(request, sort_keys=True).encode(), capture_stdout=True,
                             stdout_limit=CONTROL_RESPONSE_LIMIT,
                             timeout=control_timeout(action, fields))

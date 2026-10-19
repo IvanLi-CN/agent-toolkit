@@ -1011,6 +1011,8 @@ systemdTest("systemd assets validate against the Bun runtime path", async () => 
   for (const unit of UNIT_PATHS) {
     const content = readFileSync(unit, "utf8");
     expect(content).toContain("ExecStartPre=/bin/sh -c");
+    expect(content).toContain("parent=$(dirname -- \"$path\")");
+    expect(content).toContain("stat -c %%u -- \"$parent\"");
     expect(content).toContain("ExecStart=/usr/bin/bun ");
   }
   const processHandle = Bun.spawn(["systemd-analyze", "verify", ...UNIT_PATHS], { stdout: "pipe", stderr: "pipe" });
@@ -1069,7 +1071,7 @@ transportTest("the current Python client reaches the Bun controller through isol
   if (result.exit !== 0) throw new Error(`transport failed: ${JSON.stringify(result)}`);
   if (result.stderr !== "") throw new Error(`transport stderr: ${result.stderr}`);
   expect(JSON.parse(result.stdout)).toMatchObject({ action: "drain-status", protocol: 4, outcome: "success", result: { draining: false } });
-  expect(readFileSync(logPath, "utf8")).toContain("bun /opt/agent-vm-native/agent_vm_control.ts");
+  expect(readFileSync(logPath, "utf8")).toContain("/usr/bin/bun /opt/agent-vm-native/agent_vm_control.ts");
   const invalid = Bun.spawn([process.execPath, CONTROL_PATH], { env: { ...process.env, [CONFIG_PATH_ENV]: configPath }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
   await invalid.stdin.write(JSON.stringify({ protocol: 4, action: "unknown", session_id: "transport-smoke" }) + "\n");
   invalid.stdin.end();

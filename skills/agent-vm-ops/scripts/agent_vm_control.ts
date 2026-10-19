@@ -1463,7 +1463,12 @@ function safeProcessSignal(pid: number, expectedIdentity: string | undefined, si
         if (record.pgrp !== targetPgid) return { sent: false, error: "process_group_identity_mismatch" };
         if (record.state === "Z") return { sent: false, error: null };
       } catch { return { sent: false, error: "process_group_identity_unverified" }; }
-      target = -targetPgid;
+      // Linux group signals are deliberately avoided here.  The PGID check
+      // above is an identity guard for the caller's member discovery, but a
+      // subsequent kill(-pgid, signal) could still race with PGID reuse and
+      // signal an unrelated group.  Cleanup sends identity-checked signals to
+      // the tracked members below instead.
+      target = pid;
     } else if (processIsZombie(pid)) {
       return { sent: false, error: null };
     }
@@ -1475,7 +1480,7 @@ function safeProcessSignal(pid: number, expectedIdentity: string | undefined, si
     target = -targetPgid;
   }
   const sent = nativeKill(target, signal);
-  if (sent || (!group && !processExists(pid)) || (group && !processExists(pid) && groupAnchorVerified) || processIsZombie(pid)) return { sent, error: null };
+  if (sent || (!processExists(pid) && (!group || process.platform === "linux" || groupAnchorVerified)) || processIsZombie(pid)) return { sent, error: null };
   return { sent: false, error: "PermissionError" };
 }
 
@@ -2390,7 +2395,8 @@ export class StateStore {
       if (state === "preparing") {
         exactResources(resources, "tasks.resources_json", true);
         validateReservation(reservation, "tasks.resource_reservation_json", resources);
-        if (reservationBytes === 0n && (task.vm_ip !== null && task.vm_ip !== undefined || task.ssh_host_port !== null && task.ssh_host_port !== undefined)) invalid("durable state contains a preparing native reservation without reservation bytes");
+        const cachedReacquireIdentity = task.previous_generation !== null && task.previous_generation !== undefined && task.vm_ip !== null && task.vm_ip !== undefined && (task.ssh_host_port === null || task.ssh_host_port === undefined);
+        if (reservationBytes === 0n && (task.vm_ip !== null && task.vm_ip !== undefined || task.ssh_host_port !== null && task.ssh_host_port !== undefined) && !cachedReacquireIdentity) invalid("durable state contains a preparing native reservation without reservation bytes");
         if (reservationBytes > 0n && (task.vm_ip === null || task.vm_ip === undefined || task.ssh_host_port === null || task.ssh_host_port === undefined)) invalid("durable state contains an incomplete preparing native reservation");
       }
       if (state === "active") {
@@ -2405,7 +2411,7 @@ export class StateStore {
         validateReservation(reservation, "tasks.resource_reservation_json", resources);
         if (task.vm_ip === null || task.vm_ip === undefined) {
           if (task.ssh_host_port !== null && task.ssh_host_port !== undefined || reservationBytes !== 0n) invalid("durable state contains a closing task without a native identity");
-        } else if (task.ssh_host_port === null || task.ssh_host_port === undefined) invalid("durable state contains a closing VM without an SSH identity");
+        } else if ((task.ssh_host_port === null || task.ssh_host_port === undefined) && (task.previous_generation === null || task.previous_generation === undefined || reservationBytes !== 0n)) invalid("durable state contains a closing VM without an SSH identity");
       }
       taskGenerations.set(taskId, generation);
       taskRows.set(taskId, task);
@@ -2881,7 +2887,12 @@ export class SystemdManager {
       try { lstatSync(path); pathExists = true; } catch (pathError) { if ((pathError as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
       if ((probe.returncode !== 0 && probe.returncode !== 1) || stableJson(properties) !== stableJson({ LoadState: "not-found", ActiveState: "inactive", FragmentPath: "", UnitFileState: "" }) || pathExists) throw error;
     }
-    if (this.enabled) { try { unlinkSync(path); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; } await this.systemctl("daemon-reload"); }
+    if (this.enabled) {
+      let removed = false;
+      try { unlinkSync(path); removed = true; } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      if (removed) fsyncParentDirectory(path);
+      await this.systemctl("daemon-reload");
+    }
     return unit;
   }
 
@@ -3532,12 +3543,8 @@ export class Control {
       const record = { ...task, resource_reservation_json: stableJson(resources), resources_json: task.resources_json || stableJson(resources) };
       const persisted: Dict = { ...record };
       const preNative = String(task.state) === "preparing" && integerBigInt(task.reservation_bytes ?? 0, "reservation_bytes") === 0n;
-      if (preNative) {
-        // A cached reacquire keeps the old address in memory for reserveNative,
-        // but does not publish native identity until its disk reservation exists.
-        persisted.vm_ip = null;
-        persisted.ssh_host_port = null;
-      }
+      if (preNative && (task.previous_generation === null || task.previous_generation === undefined)) persisted.vm_ip = null;
+      if (preNative) persisted.ssh_host_port = null;
       this.store.putTask(persisted);
       return record;
     }));

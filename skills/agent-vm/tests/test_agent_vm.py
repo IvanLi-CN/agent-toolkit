@@ -60,7 +60,7 @@ class SessionContractTests(unittest.TestCase):
         with mock.patch.object(CLI, "run_child", return_value=process) as run:
             CLI.control_request("status", session="thread")
         remote = run.call_args.args[0][-1]
-        self.assertEqual(remote, "bun /opt/agent-vm-native/agent_vm_control.ts")
+        self.assertEqual(remote, "/usr/bin/bun /opt/agent-vm-native/agent_vm_control.ts")
 
     def test_remote_stderr_is_redacted_before_cli_output(self):
         response = CLI.subprocess.CompletedProcess([], 2, b"", b'{"password":"secret-value"} bearer super-token Authorization: Bearer auth-canary-01 Authorization: Bearer "quoted-auth-canary" "Authorization": "Bearer quoted-auth-01"\n')

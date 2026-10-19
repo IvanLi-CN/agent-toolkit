@@ -640,6 +640,14 @@ test("treats prototype-sensitive JSON keys as data and requires own envelope fie
   await expectCode(f.control.dispatch(parseRequestBytes(new TextEncoder().encode('{"protocol":4,"action":"drain-enter","operation_id":"missing-generation","__proto__":{"generation":0}}'))), "invalid_request");
 });
 
+test("invalid write generation requests do not poison durable state", async () => {
+  const f = fixture();
+  await expectCode(f.control.dispatch(parseRequestBytes(new TextEncoder().encode('{"protocol":4,"action":"drain-enter","operation_id":"invalid-generation-restart","__proto__":{"generation":0}}'))), "invalid_request");
+  const reopened = new StateStore(f.config.state_db);
+  expect(() => reopened.verifyRuntimeState()).not.toThrow();
+  reopened.close();
+});
+
 test("preserves JSON float semantics and Python canonical numeric digests", async () => {
   const root = mkdtempSync("/tmp/agent-vm-numeric-boundary-test-");
   mkdirSync(join(root, "systemd"), { recursive: true, mode: 0o755 });
@@ -863,6 +871,39 @@ test("keeps cached reacquire reservation failure restartable after a restart", a
   const reopened = new StateStore(f.config.state_db);
   try { reopened.verifyRuntimeState(); }
   finally { reopened.close(); }
+});
+
+test("reconciles a cached reacquire reservation after a controller restart", async () => {
+  const f = fixture();
+  const first = await f.call("acquire", { public_key: KEY }, "op-restart-reconcile-create");
+  await f.call("release", {}, "op-restart-reconcile-release");
+  const cached = f.store.getTask({ taskId: String(first.task_id) })!;
+  const next = {
+    ...cached,
+    generation: Number(cached.generation) + 1,
+    state: "preparing",
+    previous_generation: cached.generation,
+    lease_expires_at: new Date(f.now.getTime() + 1_800_000).toISOString(),
+    inactive_since: null,
+    cleanup_after: null,
+    reservation_bytes: 0n,
+    resource_reservation_json: "{}",
+    ssh_host_port: null,
+  };
+  await (f.control as any).reserveResources(next, JSON.parse(String(cached.resources_json)));
+  expect(f.store.getTask({ taskId: String(first.task_id) })?.vm_ip).toBe(cached.vm_ip);
+  f.store.close();
+  f.storeClosed = true;
+  const reopened = new StateStore(f.config.state_db);
+  const restarted = new Control(f.config, { runner: f.runner, store: reopened, systemd: f.systemd, clock: () => f.now, which: () => null });
+  try {
+    await restarted.dispatch({ protocol: PROTOCOL_VERSION, action: "admin-reconcile", generation: 0, operation_id: "op-restart-reconcile", apply: true });
+    const restored = reopened.getTask({ taskId: String(first.task_id) });
+    expect(restored?.state).toBe("cached");
+    expect(restored?.vm_ip).toBe(cached.vm_ip);
+  } finally {
+    reopened.close();
+  }
 });
 
 test("restores a valid cached VM address after timer and capacity reacquire failures", async () => {

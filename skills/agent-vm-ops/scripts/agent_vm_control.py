@@ -1965,6 +1965,7 @@ class Control:
         allowed = {
             "inspect", "finish-delete", "close-incomplete-or-expired",
             "stop-unexpected-running-cache", "rearm-current-expiry",
+            "verify-absent-resources",
         }
         for item in result["actions"]:
             if (not isinstance(item, Mapping) or not isinstance(item.get("task_id"), str)
@@ -2001,6 +2002,7 @@ class Control:
                 "close-incomplete-or-expired": {"active", "closing", "preparing", "failed"},
                 "stop-unexpected-running-cache": {"cached"},
                 "rearm-current-expiry": {"active"},
+                "verify-absent-resources": {"absent"},
             }
             applied_states = {
                 "inspect": {"active", "cached", "closing", "preparing", "failed", "deleting"},
@@ -2008,6 +2010,7 @@ class Control:
                 "close-incomplete-or-expired": {"cached", "absent"},
                 "stop-unexpected-running-cache": {"cached", "absent"},
                 "rearm-current-expiry": {"active"},
+                "verify-absent-resources": {"absent"},
             }
             expected_states = dry_states if result["dry_run"] else applied_states
             if task.get("state") not in expected_states[item["action"]]:
@@ -2636,12 +2639,15 @@ class Control:
             # outside the admission transaction; only the durable accounting
             # read and disk projection need the short global lock.
             self._running_inventory_guard()
+            disk_capacity = (
+                capacity_observation
+                if capacity_observation is not None
+                else self._storage_headroom(0)
+            )
             lock = nullcontext() if global_locked else self._global_lock()
             with lock, self.store.transaction():
                 breakdown = self._allocation_breakdown()
-                disk = self._disk_admission_diagnostics(
-                    capacity_observation if capacity_observation is not None else self._storage_headroom(0)
-                )
+                disk = self._disk_admission_diagnostics(disk_capacity)
             if not disk.get("verified"):
                 raise ControlError("resource_unverified", "disk admission state is not verified", disk.get("error"))
             allocated = {key: value["allocated"] for key, value in breakdown.items()}
@@ -4441,7 +4447,8 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
     def admin_status(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:
         with self._global_lock():
             draining = self.store.get_meta("draining") == "1"
-            tasks = [self._runtime_summary(task) for task in self.store.list_tasks()]
+            task_snapshots = self.store.list_tasks()
+        tasks = [self._runtime_summary(task) for task in task_snapshots]
         return {"draining": draining, "tasks": tasks, "doctor": self.doctor(request, session_id)}
 
     def admin_metrics(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:

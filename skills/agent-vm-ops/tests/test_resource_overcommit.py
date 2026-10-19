@@ -573,6 +573,38 @@ class AdmissionTests(Fixture):
         self.runner.on_list_instances = probe_lock
         self.control.doctor(self.request("doctor"), None)
 
+    def test_status_does_not_hold_global_lock_during_capacity_probe(self):
+        import fcntl
+        Path(self.control.lock_path).touch()
+
+        def probe_lock(*_args, **_kwargs):
+            fd = os.open(self.control.lock_path, os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+            return {"scope": "ct-filesystem", "layers": [{
+                "path": str(self.root), "total": 100 * GIB, "free": self.runner.free,
+                "target": 20 * GIB, "low": 10 * GIB,
+            }]}
+
+        with mock.patch.object(self.control, "_storage_headroom", side_effect=probe_lock):
+            self.control.status(self.request("status"), "thread-a")
+
+    def test_admin_status_does_not_hold_global_lock_during_doctor_probe(self):
+        import fcntl
+        Path(self.control.lock_path).touch()
+
+        def probe_lock():
+            fd = os.open(self.control.lock_path, os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+
+        self.runner.on_version = probe_lock
+        self.control.admin_status(self.request("admin-status"), None)
+
     def test_drain_exit_keeps_admission_closed_with_pending_operation(self):
         self.store.set_meta("draining", "1")
         self.store.record_operation(
@@ -784,6 +816,18 @@ class AdmissionTests(Fixture):
         self.assertEqual(response["result"]["actions"][0]["action"], "rearm-current-expiry")
         self.call("release")
         self.error("operation_unverified", self.control.dispatch, request)
+
+    def test_absent_resource_reconcile_replay_is_verified(self):
+        active = self.acquire()
+        self.call("release")
+        self.runner.instances.pop(active["instance_name"])
+        self.store.update_task(active["task_id"], state="absent", resources_json="{}", resource_reservation_json="{}")
+        request = self.request("admin-reconcile", operation="reconcile-absent", apply=True)
+        response = self.control.dispatch(request)
+        self.assertEqual(response["result"]["actions"][0]["action"], "verify-absent-resources")
+        replay = self.control.dispatch(request)
+        self.assertEqual(replay["outcome"], "replayed")
+        self.assertEqual(replay["result"], response["result"])
 
     def test_reconcile_action_error_replays_as_the_committed_result(self):
         active = self.acquire()

@@ -4756,6 +4756,20 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
                         ):
                             repair_required = True
                         if apply and repair_required:
+                            native_exists = any(
+                                native.get("name") == task["instance_name"]
+                                for native in self.incus.list_instances()
+                            )
+                            if native_exists:
+                                raise ControlError(
+                                    "resource_unverified",
+                                    "absent task still has a native instance",
+                                )
+                            if self.store.get_ports(task["task_id"]):
+                                raise ControlError(
+                                    "cleanup_incomplete",
+                                    "absent task still has port mappings",
+                                )
                             with self._global_lock(), self.store.transaction():
                                 current = self.store.get_task(task_id=task["task_id"])
                                 if current is None or current["state"] != "absent":

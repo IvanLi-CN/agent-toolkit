@@ -881,6 +881,8 @@ class AdmissionTests(Fixture):
         self.store.update_task(
             active["task_id"],
             resources_json=json.dumps({"cpu": 1, "memory_mib": 0, "disk_gib": 0}),
+            resource_reservation_json=json.dumps({"disk_gib": 1}),
+            reservation_bytes=1,
         )
         resource_request = self.request(
             "admin-reconcile", session="dry-run-absent", operation="reconcile-absent-resources", apply=True
@@ -889,6 +891,10 @@ class AdmissionTests(Fixture):
         self.assertEqual(
             json.loads(self.store.get_task(task_id=active["task_id"])["resources_json"]),
             {"cpu": 0, "memory_mib": 0, "disk_gib": 0},
+        )
+        self.assertEqual(
+            json.loads(self.store.get_task(task_id=active["task_id"])["resource_reservation_json"]),
+            {},
         )
         resource_replay = self.control.dispatch(resource_request)
         self.assertEqual(resource_replay["outcome"], "replayed")

@@ -489,6 +489,28 @@ class AdmissionTests(Fixture):
         self.assertEqual(json.loads(repaired["resources_json"]), {"cpu": 0, "memory_mib": 0, "disk_gib": 0})
         self.assertTrue(self.call("doctor")["resources"]["verified"])
 
+    def test_absent_task_with_native_instance_blocks_admission_and_reconcile(self):
+        active = self.acquire()
+        self.store.update_task(active["task_id"], state="absent")
+
+        doctor = self.call("doctor")
+        self.assertFalse(doctor["resources"]["verified"])
+        self.assertEqual(doctor["resources"]["error"]["code"], "resource_unverified")
+        result = self.call("admin-reconcile", apply=True)
+        self.assertEqual(result["actions"][0]["error"]["code"], "resource_unverified")
+
+    def test_absent_task_with_port_mapping_blocks_admission_and_reconcile(self):
+        active = self.acquire()
+        self.call("port-add", name="app", vm_port=8080)
+        self.store.update_task(active["task_id"], state="absent")
+        self.runner.instances.pop(active["instance_name"])
+
+        doctor = self.call("doctor")
+        self.assertFalse(doctor["resources"]["verified"])
+        self.assertEqual(doctor["resources"]["error"]["code"], "cleanup_incomplete")
+        result = self.call("admin-reconcile", apply=True)
+        self.assertEqual(result["actions"][0]["error"]["code"], "cleanup_incomplete")
+
     def test_status_corrupt_last_error_is_structured(self):
         active = self.acquire()
         self.store.update_task(active["task_id"], last_error="{")

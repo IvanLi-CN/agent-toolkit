@@ -2551,6 +2551,18 @@ class Control:
         for record in records.values():
             if record["state"] != "absent":
                 continue
+            if any(instance.get("name") == record["instance_name"] for instance in instances):
+                raise ControlError(
+                    "resource_unverified",
+                    "absent task still has a native instance; reconciliation is required",
+                    {"task_id": record.get("task_id")},
+                )
+            if self.store.get_ports(record["task_id"]):
+                raise ControlError(
+                    "cleanup_incomplete",
+                    "absent task still has port mappings; reconciliation is required",
+                    {"task_id": record.get("task_id")},
+                )
             try:
                 parse_resource_mapping(record.get("resources_json"), "resources", allow_empty=False)
                 parse_resource_mapping(record.get("resource_reservation_json"), "reservation", allow_empty=True)
@@ -2575,7 +2587,12 @@ class Control:
                 raise ControlError("resource_unverified", "transitional native instance blocks admission")
             self._verify_native_allocation(record)
 
-    def _resource_diagnostics(self, *, global_locked: bool = False) -> dict[str, Any]:
+    def _resource_diagnostics(
+        self,
+        *,
+        global_locked: bool = False,
+        capacity_observation: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         memory = None
         memory_error = None
         try:
@@ -2591,7 +2608,9 @@ class Control:
             with lock, self.store.transaction():
                 self._running_inventory_guard()
                 breakdown = self._allocation_breakdown()
-                disk = self._disk_admission_diagnostics(self._storage_headroom(0))
+                disk = self._disk_admission_diagnostics(
+                    capacity_observation if capacity_observation is not None else self._storage_headroom(0)
+                )
             if not disk.get("verified"):
                 raise ControlError("resource_unverified", "disk admission state is not verified", disk.get("error"))
             allocated = {key: value["allocated"] for key, value in breakdown.items()}
@@ -3700,7 +3719,10 @@ class Control:
                     valid_timer = False
                 if not valid_timer:
                     issues.append("timer_unverified:" + str(task.get("task_id")))
-        resources = self._resource_diagnostics(global_locked=global_locked)
+        resources = self._resource_diagnostics(
+            global_locked=global_locked,
+            capacity_observation=capacity if "error" not in capacity else None,
+        )
         instance_policy = self._instance_diagnostics()
         admission = self._default_admission_diagnostics(
             resources, capacity, instance_policy, global_locked=global_locked
@@ -4398,6 +4420,9 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
             memory = resources.get("memory") or {} if isinstance(resources, Mapping) else {}
             warnings = list(doctor.get("default_admission", {}).get("warnings", []))
             audit = self.store.audit_summary()
+            disk_admission = resources.get("disk_admission") if isinstance(resources, Mapping) else None
+            if not isinstance(disk_admission, Mapping):
+                disk_admission = self._disk_admission_diagnostics(doctor.get("capacity"))
             return {
                 "observed_at": iso_time(self.now()),
                 "up": True,
@@ -4406,7 +4431,7 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
                 "reclaim_required": doctor.get("default_admission", {}).get("reclaim_required"),
                 "resources": resources,
                 "capacity": doctor.get("capacity"),
-                "disk_admission": self._disk_admission_diagnostics(doctor.get("capacity")),
+                "disk_admission": disk_admission,
                 "ct_memory": {
                     "capacity_bytes": memory.get("limit_bytes"),
                     "current_bytes": memory.get("current_bytes"),
@@ -4542,16 +4567,17 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
                         raise ControlError("resource_unverified", "task generation cannot be verified")
                     item = {"task_id": task["task_id"], "generation": task["generation"], "action": "inspect"}
                     if task["state"] == "absent":
+                        item["action"] = "verify-absent-resources"
+                        native_exists = any(native.get("name") == task["instance_name"] for native in self.incus.list_instances())
+                        if native_exists:
+                            raise ControlError("resource_unverified", "absent task still has a native instance")
+                        if self.store.get_ports(task["task_id"]):
+                            raise ControlError("cleanup_incomplete", "absent task still has port mappings")
                         try:
                             parse_resource_mapping(task.get("resources_json"), "resources", allow_empty=False)
                             parse_resource_mapping(task.get("resource_reservation_json"), "reservation", allow_empty=True)
-                        except (TypeError, ValueError) as exc:
-                            item["action"] = "verify-absent-resources"
+                        except (TypeError, ValueError):
                             if apply:
-                                if any(native.get("name") == task["instance_name"] for native in self.incus.list_instances()):
-                                    raise ControlError("resource_unverified", "absent task still has a native instance")
-                                if self.store.get_ports(task["task_id"]):
-                                    raise ControlError("cleanup_incomplete", "absent task still has port mappings")
                                 with self._global_lock(), self.store.transaction():
                                     current = self.store.get_task(task_id=task["task_id"])
                                     if current is None or current["state"] != "absent":

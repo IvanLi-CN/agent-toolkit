@@ -4736,8 +4736,17 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
                             raise ControlError("cleanup_incomplete", "absent task still has port mappings")
                         repair_required = False
                         try:
-                            parse_resource_mapping(task.get("resources_json"), "resources", allow_empty=False)
-                            parse_resource_mapping(task.get("resource_reservation_json"), "reservation", allow_empty=True)
+                            resources = parse_resource_mapping(
+                                task.get("resources_json"), "resources", allow_empty=False
+                            )
+                            reservation = parse_resource_mapping(
+                                task.get("resource_reservation_json"), "reservation", allow_empty=True
+                            )
+                            if (
+                                resources != {"cpu": 0, "memory_mib": 0, "disk_gib": 0}
+                                or reservation
+                            ):
+                                repair_required = True
                         except (TypeError, ValueError):
                             repair_required = True
                         if (

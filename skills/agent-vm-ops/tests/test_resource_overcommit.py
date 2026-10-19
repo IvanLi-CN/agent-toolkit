@@ -878,6 +878,22 @@ class AdmissionTests(Fixture):
         self.assertEqual(replayed["outcome"], "replayed")
         self.assertEqual(replayed["result"], applied["result"])
 
+        self.store.update_task(
+            active["task_id"],
+            resources_json=json.dumps({"cpu": 1, "memory_mib": 0, "disk_gib": 0}),
+        )
+        resource_request = self.request(
+            "admin-reconcile", session="dry-run-absent", operation="reconcile-absent-resources", apply=True
+        )
+        resource_applied = self.control.dispatch(resource_request)
+        self.assertEqual(
+            json.loads(self.store.get_task(task_id=active["task_id"])["resources_json"]),
+            {"cpu": 0, "memory_mib": 0, "disk_gib": 0},
+        )
+        resource_replay = self.control.dispatch(resource_request)
+        self.assertEqual(resource_replay["outcome"], "replayed")
+        self.assertEqual(resource_replay["result"], resource_applied["result"])
+
     def test_reconcile_action_error_replays_as_the_committed_result(self):
         active = self.acquire()
         request = self.request("admin-reconcile", operation="reconcile-error", apply=False)

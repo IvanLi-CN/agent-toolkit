@@ -44,7 +44,8 @@ def main() -> None:
     if len(sys.argv) != 3:
         raise SystemExit("usage: legacy_state_fixture.py DB_PATH RESPONSE_JSON")
     path = Path(sys.argv[1])
-    response = json.loads(sys.argv[2])
+    response_arg = sys.argv[2]
+    response = json.loads(Path(response_arg[1:]).read_text() if response_arg.startswith("@") else response_arg)
     if not isinstance(response, dict):
         raise SystemExit("response must be an object")
     operation_id = str(response["operation_id"])

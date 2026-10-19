@@ -160,6 +160,7 @@ function isDict(value: unknown): value is Dict {
 
 const SENSITIVE_FIELD_RE = /(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?|cookie|set[-_]?cookie|sessionid|session-id)/i;
 const SECRET_LABEL = "(?:[A-Za-z0-9]+[_-])*(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?|cookie|set[-_]?cookie)(?:[_-][A-Za-z0-9]+)*";
+const CAMEL_SECRET_LABEL = "(?:password|passwd|passphrase|secret|token|authorization|privateKey|publicKey|apiKey|accessKey|clientSecret|credentials?|cookie|setCookie)[A-Z][A-Za-z0-9]*";
 const PRIVATE_KEY_RE = /-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 _-]*PRIVATE KEY-----/gi;
 const UNTERMINATED_PRIVATE_KEY_RE = /-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*$/gi;
 const AUTH_SCHEME_RE = /(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?(?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]+/gi;
@@ -170,6 +171,7 @@ const SESSION_VALUE_RE = /(\b(?:session[_-]?id)\b\s*[:=]\s*)[^\s,;}\]\r\n]+/gi;
 const DIGEST_FIELD_RE = /(\b(?:response|nonce|cnonce|opaque|nc|qop)\s*[:=]\s*)[^\s,;}\]\r\n]+/gi;
 const JWT_RE = /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?![A-Za-z0-9_-])/g;
 const COMMAND_MARKER_RE = /(\bAGENT_VM_COMMAND_ID\s*[:=]\s*)[^\s,;}\]\r\n]+/gi;
+const CAMEL_SECRET_RE = new RegExp("(['\"]?\\b" + CAMEL_SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)(?:\"(?:\\\\.|[^\"\\\\])*\"|'(?:\\\\.|[^'\\\\])*'|[^\\s,;{}\\[\\]\\\"']+)", "g");
 const SECRET_DOUBLE_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)\"(?:\\\\.|[^\"\\\\])*\"", "gi");
 const SECRET_SINGLE_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)'(?:\\\\.|[^'\\\\])*'", "gi");
 const UNTERMINATED_SECRET_DOUBLE_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)\"(?:\\\\.|[^\"\\\\])*\\\\?$", "gi");
@@ -189,6 +191,7 @@ function redactDiagnosticText(rawInput: string): string {
   redacted = redacted.replace(SESSION_VALUE_RE, "$1[REDACTED]");
   redacted = redacted.replace(DIGEST_FIELD_RE, "$1[REDACTED]");
   redacted = redacted.replace(COMMAND_MARKER_RE, "$1[REDACTED]");
+  redacted = redacted.replace(CAMEL_SECRET_RE, "$1[REDACTED]");
   redacted = redacted.replace(SECRET_DOUBLE_RE, "$1\"[REDACTED]\"");
   redacted = redacted.replace(SECRET_SINGLE_RE, "$1'[REDACTED]'");
   redacted = redacted.replace(UNTERMINATED_SECRET_DOUBLE_RE, "$1\"[REDACTED]");
@@ -1615,6 +1618,8 @@ export class CommandRunner {
         };
         if (!processTreeComplete) processGroupCleanupError ??= "process_tree_inspection_failed";
         const knownDescendant = [...known.values()].some((member) => member.pid !== processHandle.pid);
+        // Once the leader is gone, an unanchored group may belong to a reused
+        // PID/PGID. Report root loss instead of scanning or killing by PGID.
         if (leaderExitedAfterTerm && !knownDescendant) processGroupCleanupError ??= "process_tree_root_lost";
         const leaderStillAlive = Boolean(leaderIdentity && processExists(processHandle.pid) && processStartIdentity(processHandle.pid) === leaderIdentity && !processIsZombie(processHandle.pid));
         const remainingKnown = [...known.values()].some((member) => processExists(member.pid) && processStartIdentity(member.pid) === member.starttime && !processIsZombie(member.pid));
@@ -2006,9 +2011,40 @@ export class StateStore {
       for (const name of Object.values(legacyNames)) if (existingNames.has(name)) throw new ControlError("state_invalid", "durable state contains a schema migration residue");
       for (const table of ["meta", "tasks", "ports", "operations", "audit"] as const) db.run(`ALTER TABLE ${table} RENAME TO ${legacyNames[table]}`);
       StateStore.schemaOn(db);
+      const legacyJson = (table: string, column: string, row: Dict): unknown => {
+        const raw = row[column];
+        if (raw === null || raw === undefined) return null;
+        try { return parseJson(String(raw)); }
+        catch { throw new ControlError("state_invalid", `durable state contains invalid legacy ${table}.${column} JSON`); }
+      };
+      const migratedValue = (table: string, column: string, row: Dict): unknown => {
+        if (table === "tasks" && column === "last_error") {
+          const value = legacyJson(table, column, row);
+          if (value === null) return null;
+          if (!isDict(value)) throw new ControlError("state_invalid", "durable state contains invalid legacy tasks.last_error object");
+          return persistedTaskError(value);
+        }
+        if (table === "operations" && column === "response_json") {
+          const value = legacyJson(table, column, row);
+          if (!isDict(value)) throw new ControlError("state_invalid", "durable state contains invalid legacy operations.response_json object");
+          const projected = persistedResponse(value);
+          StateStore.validateOperationRow(row, projected);
+          return stableJson(projected);
+        }
+        if (table === "audit" && column === "detail_json") {
+          const value = legacyJson(table, column, row);
+          if (value === null) return null;
+          if (!isDict(value)) throw new ControlError("state_invalid", "durable state contains invalid legacy audit.detail_json object");
+          return stableJson(persistedDocument(value));
+        }
+        return row[column];
+      };
       for (const table of ["meta", "tasks", "ports", "operations", "audit"] as const) {
         const columns = (STATE_SCHEMA[table] ?? []).map((column) => column.name).join(", ");
-        db.run(`INSERT INTO ${table} (${columns}) SELECT ${columns} FROM ${legacyNames[table]}`);
+        const columnNames = (STATE_SCHEMA[table] ?? []).map((column) => column.name);
+        const rows = (db.query(`SELECT ${columns} FROM ${legacyNames[table]}`) as any).all() as Dict[];
+        const placeholders = columnNames.map(() => "?").join(", ");
+        for (const row of rows) db.run(`INSERT INTO ${table} (${columns}) VALUES (${placeholders})`, ...columnNames.map((column) => migratedValue(table, column, row)) as any[]);
         copiedCounts.set(table, count(table));
         if (copiedCounts.get(table) !== count(legacyNames[table])) throw new Error(`row count mismatch: ${table}`);
       }
@@ -2724,6 +2760,7 @@ export class Control {
         let blockedByWriter = false;
         try {
           blockedByWriter = !exclusive && hasWriterIntent(lockDirectory);
+          if (blockedByWriter && process.platform !== "linux") throw new ControlError("lock_unavailable", "native writer identity cannot be verified on this platform");
           if (!blockedByWriter) {
             releaseLocal = await acquireNativeBarrier(lockPath, exclusive);
             releaseNative = acquireFileLock(lockPath, true, !exclusive);
@@ -3960,7 +3997,10 @@ export class Control {
     } catch (error) {
       const controlError = error instanceof ControlError ? error : new ControlError("internal_error", (error as Error).name);
       let cleanup: Dict = { ok: false, error: { code: "not_attempted", message: "cleanup was not attempted" } };
-      try { cleanup.result = await this.releaseTask(this.store.getTask({ taskId: String(task.task_id) }) ?? task); cleanup.ok = true; } catch (cleanupError) { cleanup.error = cleanupError instanceof ControlError ? cleanupError.asDict() : { code: "internal_error", message: (cleanupError as Error).name }; }
+      // The reservation phase clears the durable VM address before native work starts.
+      // Keep the local pre-reacquire task as the cleanup source so a failed cached
+      // reacquire can restore the previously verified cache identity.
+      try { cleanup.result = await this.releaseTask(task); cleanup.ok = true; } catch (cleanupError) { cleanup.error = cleanupError instanceof ControlError ? cleanupError.asDict() : { code: "internal_error", message: (cleanupError as Error).name }; }
       const detail: Dict = isDict(controlError.detail) ? redactDiagnosticValue(controlError.detail) as Dict : { cause: controlError.asDict() };
       const failurePhase = detail.phase ?? phase;
       Object.assign(detail, { phase: failurePhase, operation_phase: phase, completed, requested: resources, cleanup });
@@ -4001,6 +4041,7 @@ export class Control {
     return this.objectLock(`cleanup:${inputTask.session_id}`, async () => {
       const current = this.store.getTask({ taskId: String(inputTask.task_id) });
       if (!current || !sameInteger(current.generation, inputTask.generation)) throw new ControlError("generation_mismatch", "cleanup generation changed");
+      const cachedVmIp = inputTask.vm_ip ?? current.vm_ip;
       let task = current;
       if (["cached", "absent"].includes(String(task.state)) && requestedState !== "closing") return this.stateSummary(task);
       task = await this.nativeLock(task, () => this.nativeBarrier(() => this.globalLock(() => this.store.transaction(() => {
@@ -4031,9 +4072,10 @@ export class Control {
         });
       }
       const resources = absent ? {} : await this.nativeResources(task);
+      if (!absent && (cachedVmIp === null || cachedVmIp === undefined || isIP(String(cachedVmIp)) !== 4)) throw new ControlError("cleanup_incomplete", "cached instance has no verified VM address");
       task = await this.globalLock(() => this.store.transaction(() => {
         for (const port of this.store.getPorts(String(task.task_id))) this.store.removePort(String(task.task_id), String(port.port_name), String(port.protocol));
-        return this.store.updateTask(String(task.task_id), { state: absent ? "absent" : "cached", ssh_host_port: null, reservation_bytes: 0n, last_error: null, previous_generation: null, resource_reservation_json: "{}", resources_json: stableJson(resources), vm_ip: absent ? null : task.vm_ip });
+        return this.store.updateTask(String(task.task_id), { state: absent ? "absent" : "cached", ssh_host_port: null, reservation_bytes: 0n, last_error: null, previous_generation: null, resource_reservation_json: "{}", resources_json: stableJson(resources), vm_ip: absent ? null : cachedVmIp });
       }));
       return this.stateSummary(task);
     });

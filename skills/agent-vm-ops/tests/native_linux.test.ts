@@ -3,7 +3,7 @@ import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, 
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { acquireWriterIntent, anchoredProcessGroupMembers, COMMAND_OUTPUT_LIMIT, CONFIG_PATH_ENV, DIAGNOSTIC_LOG_TRUNCATION_MARKER, CommandRunner, Control, ControlError, hasWriterIntent, IncusClient, killProcessTree, ProcessIdentity, StateStore } from "../scripts/agent_vm_control.ts";
+import { acquireWriterIntent, anchoredProcessGroupMembers, COMMAND_OUTPUT_LIMIT, CONFIG_PATH_ENV, DIAGNOSTIC_LOG_TRUNCATION_MARKER, CommandRunner, Control, ControlError, hasWriterIntent, IncusClient, killProcessTree, ProcessIdentity, StateStore, SystemdManager } from "../scripts/agent_vm_control.ts";
 
 type Dict = Record<string, any>;
 
@@ -25,6 +25,11 @@ type TestCallback = () => void | Promise<void>;
 
 function linuxTest(name: string, callback: TestCallback): void {
   if (isLinux) test(name, callback);
+  else test.skip(name, callback);
+}
+
+function nonLinuxTest(name: string, callback: TestCallback): void {
+  if (!isLinux) test(name, callback);
   else test.skip(name, callback);
 }
 
@@ -98,6 +103,16 @@ async function collect(child: any): Promise<{ exit: number; stdout: string; stde
   const stderr = new Response(child.stderr).text();
   const exit = await child.exited;
   return { exit, stdout: await stdout, stderr: await stderr };
+}
+
+async function expectCode(action: Promise<unknown>, code: string): Promise<void> {
+  try {
+    await action;
+    throw new Error(`expected ${code}`);
+  } catch (error) {
+    if (error instanceof Error && error.message === `expected ${code}`) throw error;
+    expect((error as ControlError).code).toBe(code);
+  }
 }
 
 function spawnWorker(source: string, env: Dict): any {
@@ -289,7 +304,7 @@ test("refuses to kill a PID after its recorded Linux identity changes", () => {
   expect(killed).toEqual([]);
 });
 
-linuxTest("does not scan a reused process group without a live identity anchor", () => {
+linuxTest("fails closed when a leader exits before a live process identity anchor is available", () => {
   let scanned = false;
   const result = anchoredProcessGroupMembers(
     777,
@@ -682,6 +697,22 @@ linuxTest("reclaims empty, malformed, and crashed writer markers", () => {
   expect(readdirSync(lockDirectory).filter((name) => name.startsWith("native-writer-"))).toEqual([]);
 });
 
+nonLinuxTest("fails closed instead of waiting forever on an unverified writer marker", async () => {
+  const probeRoot = root("agent-vm-native-marker-nonlinux");
+  const dbPath = join(probeRoot, "state.sqlite3");
+  const store = StateStore.bootstrap(dbPath);
+  const systemd = new SystemdManager(new CommandRunner(), { timer_dir: probeRoot }, false);
+  const control = new Control({ state_db: dbPath, timer_dir: probeRoot }, { store, systemd });
+  const marker = join(probeRoot, "locks", "native-writer-unverified");
+  writeFileSync(marker, `pending ${process.pid} unknown-identity token\n`, { mode: 0o600 });
+  try {
+    await expectCode((control as any).nativeBarrier(async () => undefined, false), "lock_unavailable");
+  } finally {
+    store.close();
+    rmSync(probeRoot, { recursive: true, force: true });
+  }
+});
+
 linuxTest("publishes writer marker state atomically and removes it on release", () => {
   const probeRoot = root("agent-vm-native-marker-atomic");
   const lockDirectory = join(probeRoot, "locks");
@@ -896,7 +927,7 @@ systemdTest("systemd assets validate against the Bun runtime path", async () => 
   if (result.stderr !== "") throw new Error(`systemd verify stderr: ${result.stderr}`);
 });
 
-linuxTest("the real Bun controller entrypoint handles stdin and timer requests with isolated state", async () => {
+linuxTest("the real Bun controller entrypoint accepts an isolated protected config override", async () => {
   const probeRoot = root("agent-vm-real-cli");
   const storage = join(probeRoot, "storage");
   const timerDir = join(probeRoot, "timer");
@@ -935,13 +966,11 @@ transportTest("the current Python client reaches the Bun controller through isol
   StateStore.bootstrap(statePath).close();
   const configPath = join(probeRoot, "config.json");
   writeFileSync(configPath, JSON.stringify({ project: "agents", profile: "agent-vm", image_alias: "image", image_fingerprint: "a".repeat(64), network: "agentsbr0", network_acl: "agent-vm-isolation", pool: "agents", host_address: "198.51.100.19", port_start: 20000, port_end: 20030, vm_ip_start: "198.51.100.20", vm_ip_end: "198.51.100.250", gateway_ip: "198.51.100.1", storage_path: storage, state_db: statePath, timer_dir: timerDir, cpu_budget: 4, memory_budget_mib: 4096 }));
-  const wrapperPath = join(probeRoot, "controller-wrapper.ts");
-  writeFileSync(wrapperPath, `const controller = await import(process.env.CONTROL_PATH); const request = JSON.parse(await Bun.stdin.text()); const config = controller.loadConfig(process.env.CONFIG_PATH); const store = new controller.StateStore(config.state_db); const control = new controller.Control(config, { store, systemd: new controller.SystemdManager(new controller.CommandRunner(), config, false) }); try { process.stdout.write(controller.stableJson(await control.dispatch(request)) + "\\n"); } catch (error) { process.stderr.write(controller.stableJson({ ok: false, error: error.asDict ? error.asDict() : { code: "internal_error" } }) + "\\n"); process.exitCode = 2; } finally { store.close(); }`);
   const logPath = join(probeRoot, "ssh-args.log");
   const sshPath = join(fakeBin, "ssh");
   writeFileSync(sshPath, `#!/bin/sh\nprintf '%s\\n' "$@" > "$FAKE_SSH_LOG"\nexec "$BUN_BIN" "$FAKE_CONTROLLER"\n`, { mode: 0o700 });
   const result = await collect(Bun.spawn(["python3", CLIENT_PATH, "admin", "drain", "status"], {
-    env: { ...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ""}`, AGENT_VM_SESSION_ID: "transport-smoke", AGENT_VM_CONTROL_HOST: "isolated-control", AGENT_VM_REMOTE_CONTROL: "/opt/agent-vm-native/agent_vm_control.ts", XDG_CONFIG_HOME: clientConfig, XDG_STATE_HOME: clientState, CONTROL_PATH, CONFIG_PATH: configPath, BUN_BIN: process.execPath, FAKE_CONTROLLER: wrapperPath, FAKE_SSH_LOG: logPath },
+    env: { ...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ""}`, AGENT_VM_SESSION_ID: "transport-smoke", AGENT_VM_CONTROL_HOST: "isolated-control", AGENT_VM_REMOTE_CONTROL: "/opt/agent-vm-native/agent_vm_control.ts", XDG_CONFIG_HOME: clientConfig, XDG_STATE_HOME: clientState, CONTROL_PATH, [CONFIG_PATH_ENV]: configPath, BUN_BIN: process.execPath, FAKE_CONTROLLER: CONTROL_PATH, FAKE_SSH_LOG: logPath },
     stdout: "pipe",
     stderr: "pipe",
   }));
@@ -949,4 +978,11 @@ transportTest("the current Python client reaches the Bun controller through isol
   if (result.stderr !== "") throw new Error(`transport stderr: ${result.stderr}`);
   expect(JSON.parse(result.stdout)).toMatchObject({ action: "drain-status", protocol: 4, outcome: "success", result: { draining: false } });
   expect(readFileSync(logPath, "utf8")).toContain("bun /opt/agent-vm-native/agent_vm_control.ts");
+  const invalid = Bun.spawn([process.execPath, CONTROL_PATH], { env: { ...process.env, [CONFIG_PATH_ENV]: configPath }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+  await invalid.stdin.write(JSON.stringify({ protocol: 4, action: "unknown", session_id: "transport-smoke" }) + "\n");
+  invalid.stdin.end();
+  const invalidResult = await collect(invalid);
+  expect(invalidResult.exit).toBe(2);
+  expect(invalidResult.stdout).toBe("");
+  expect(JSON.parse(invalidResult.stderr)).toMatchObject({ ok: false, error: { code: "unknown_action" } });
 });

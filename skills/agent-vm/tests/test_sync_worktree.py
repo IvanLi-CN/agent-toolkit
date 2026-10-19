@@ -53,9 +53,11 @@ class SyncTests(unittest.TestCase):
 
     def test_stderr_redaction_covers_assignments_and_json_fields(self):
         jwt = b".".join((b"eyJhbGciOiJIUzI1NiJ9", b"eyJzdWIiOiJhZ2VudCJ9", b"jwt-signature"))
-        value = MOD.redact_stderr(b'{"password":"secret-value", "private_key": "private-value"} token=token-value Authorization: Bearer auth-canary-01 Authorization: Basic dXNlcjpzZWNyZXQ= Cookie: sessionid=cookie-secret Set-Cookie: sessionid=set-cookie-secret Authorization: Digest response=digest-secret jwt=' + jwt)
+        value = MOD.redact_stderr(b'{"password":"secret-value", "private_key": "private-value"} secretValue=camel-secret-value tokenValue: camel-token-value token=token-value Authorization: Bearer auth-canary-01 Authorization: Basic dXNlcjpzZWNyZXQ= Cookie: sessionid=cookie-secret Set-Cookie: sessionid=set-cookie-secret Authorization: Digest response=digest-secret jwt=' + jwt)
         self.assertNotIn(b"secret-value", value)
         self.assertNotIn(b"private-value", value)
+        self.assertNotIn(b"camel-secret-value", value)
+        self.assertNotIn(b"camel-token-value", value)
         self.assertNotIn(b"token-value", value)
         self.assertNotIn(b"auth-canary-01", value)
         self.assertNotIn(b"dXNlcjpzZWNyZXQ=", value)

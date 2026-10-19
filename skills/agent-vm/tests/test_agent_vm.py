@@ -216,6 +216,11 @@ class SessionContractTests(unittest.TestCase):
         value = 'Authorization: Basic dXNlcjpzZWNyZXQ= url=https://user:secret@example.test sshpass -p very-secret'
         self.assertNotIn("dXNlcjpzZWNyZXQ=", CLI.redact_diagnostic_text(value))
         self.assertNotIn("secret", CLI.redact_diagnostic_text(value))
+        camel = CLI.redact_diagnostic_text("secretValue=camel-secret-value tokenValue: camel-token-value")
+        self.assertNotIn("camel-secret-value", camel)
+        self.assertNotIn("camel-token-value", camel)
+        structured = CLI.redact_diagnostic_value({"secretValue": "structured-secret-value", "tokenValue": "structured-token-value"})
+        self.assertEqual(structured, {"secretValue": "[REDACTED]", "tokenValue": "[REDACTED]"})
         error = CLI.CliError("remote_failed", "Authorization: Basic " + "secret-value" + "x" * 10000)
         self.assertLessEqual(len(error.message), CLI.DIAGNOSTIC_MESSAGE_LIMIT)
         self.assertNotIn("secret-value", error.message)

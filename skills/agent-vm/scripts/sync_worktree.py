@@ -28,6 +28,7 @@ STRUCTURED_OUTPUT_LIMIT = 16 * 1024 * 1024
 CHILD_DRAIN_GRACE_SECONDS = 1.0
 DEFAULT_CHILD_TIMEOUT_SECONDS = 600
 SECRET_LABELS = r"(?:[A-Za-z0-9]+[_-])*(?:password|passwd|passphrase|secret|token|authorization|private[_ -]?key|public[_ -]?key|api[_ -]?key|access[_ -]?key|client[_ -]?secret|credentials?|cookie|set[-_]?cookie)(?:[_-][A-Za-z0-9]+)*"
+CAMEL_SECRET_LABELS = r"(?:password|passwd|passphrase|secret|token|authorization|privateKey|publicKey|apiKey|accessKey|clientSecret|credentials?|cookie|setCookie)[A-Z][A-Za-z0-9]*"
 PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 _-]*PRIVATE KEY-----", re.IGNORECASE)
 UNTERMINATED_PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*$", re.IGNORECASE)
 AUTH_SCHEME_RE = re.compile(r"(?i)(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?(?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]+")
@@ -38,6 +39,7 @@ SESSION_VALUE_RE = re.compile(r"(?i)(\b(?:session[_-]?id)\b\s*[:=]\s*)[^\s,;}\]\
 DIGEST_FIELD_RE = re.compile(r"(?i)(\b(?:response|nonce|cnonce|opaque|nc|qop)\s*[:=]\s*)[^\s,;}\]\r\n]+")
 JWT_RE = re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?![A-Za-z0-9_-])")
 COMMAND_MARKER_RE = re.compile(r"(?i)(\bAGENT_VM_COMMAND_ID\s*[:=]\s*)[^\s,;}\]\r\n]+")
+CAMEL_SECRET_RE = re.compile(rf"(['\"]?\b{CAMEL_SECRET_LABELS}\b['\"]?\s*[:=]\s*)(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;{{}}\[\]\\\"']+)")
 SECRET_DOUBLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)\"(?:\\.|[^\"\\])*\"")
 SECRET_SINGLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)'(?:\\.|[^'\\])*'")
 UNTERMINATED_SECRET_DOUBLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)\"(?:\\.|[^\"\\])*\\?$")
@@ -59,6 +61,7 @@ def redact_stderr(value: bytes) -> bytes:
     text = SESSION_VALUE_RE.sub(r"\1[REDACTED]", text)
     text = DIGEST_FIELD_RE.sub(r"\1[REDACTED]", text)
     text = COMMAND_MARKER_RE.sub(r"\1[REDACTED]", text)
+    text = CAMEL_SECRET_RE.sub(r"\1[REDACTED]", text)
     text = SECRET_DOUBLE_RE.sub(r'\1"[REDACTED]"', text)
     text = SECRET_SINGLE_RE.sub(r"\1'[REDACTED]'", text)
     text = UNTERMINATED_SECRET_DOUBLE_RE.sub(r'\1"[REDACTED]', text)

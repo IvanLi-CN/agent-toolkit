@@ -357,8 +357,12 @@ function expectSyncCode(action: () => unknown, code: string): void {
 
 function writeLegacyOperation(dbPath: string, response: Dict): void {
   const fixtureScript = join(import.meta.dir, "fixtures", "legacy_state_fixture.py");
-  const child = Bun.spawnSync(["python3", fixtureScript, dbPath, JSON.stringify(response)], { stdout: "pipe", stderr: "pipe" });
-  if (child.exitCode !== 0) throw new Error(`legacy fixture failed: ${new TextDecoder().decode(child.stderr)}`);
+  const responsePath = dbPath + ".response.json";
+  writeFileSync(responsePath, JSON.stringify(response), { mode: 0o600 });
+  try {
+    const child = Bun.spawnSync(["python3", fixtureScript, dbPath, "@" + responsePath], { stdout: "pipe", stderr: "pipe" });
+    if (child.exitCode !== 0) throw new Error(`legacy fixture failed: ${new TextDecoder().decode(child.stderr)}`);
+  } finally { rmSync(responsePath, { force: true }); }
 }
 
 async function collect(child: any): Promise<{ exit: number; stdout: string; stderr: string }> {
@@ -818,7 +822,7 @@ test("fails closed on unknown draining and preserves legal active resize reserva
   rmSync(root, { recursive: true, force: true });
 });
 
-test("keeps cached reacquire pre-native state restartable", async () => {
+test("keeps cached reacquire reservation failure restartable after a restart", async () => {
   const f = fixture();
   const task = (f.control as any).baseTask("cached-reopen", 2) as Dict;
   Object.assign(task, {
@@ -838,6 +842,28 @@ test("keeps cached reacquire pre-native state restartable", async () => {
   const reopened = new StateStore(f.config.state_db);
   try { reopened.verifyRuntimeState(); }
   finally { reopened.close(); }
+});
+
+test("restores a valid cached VM address after timer and capacity reacquire failures", async () => {
+  for (const mode of ["timer", "capacity"] as const) {
+    const f = fixture();
+    const created = await f.call("acquire", { public_key: KEY }, `op-${mode}-create`);
+    const cached = await f.call("release", {}, `op-${mode}-release`);
+    const originalIp = cached.vm_ip;
+    if (mode === "timer") (f.control as any).scheduleExpiry = async () => { throw new ControlError("timer_failed", "injected timer failure"); };
+    else (f.control as any).reclaimCapacity = async () => { throw new ControlError("capacity_insufficient", "injected capacity failure"); };
+    await expectCode(f.call("acquire", { public_key: KEY }, `op-${mode}-failure`), mode === "timer" ? "timer_failed" : "capacity_insufficient");
+    const failed = f.store.getTask({ taskId: String(created.task_id) })!;
+    expect(failed.state).toBe("cached");
+    expect(failed.vm_ip).toBe(originalIp);
+    expect(failed.ssh_host_port).toBeNull();
+    expect(failed.reservation_bytes).toBe(0n);
+    f.store.close();
+    f.storeClosed = true;
+    const reopened = new StateStore(f.config.state_db);
+    try { reopened.verifyRuntimeState(); }
+    finally { reopened.close(); }
+  }
 });
 
 test("projects untrusted result JSON before operation and audit persistence", async () => {
@@ -972,6 +998,67 @@ test("replays an accepted persisted operation without changing its digest or nat
     store.close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("projects and bounds every JSON payload during legacy state migration", () => {
+  const root = mkdtempSync("/tmp/agent-vm-projected-migration-test-");
+  const dbPath = join(root, "state.sqlite3");
+  const digest = "c3dccc911349ced563eb9615fb6db8ffa5801d121c9542c29c5a3fc0575a768a";
+  const canary = "legacy-projection-canary";
+  const huge = Array.from({ length: 256 }, () => "x".repeat(4096));
+  const response = {
+    ok: true, protocol: PROTOCOL_VERSION, server_time: "2026-10-04T00:00:00+00:00", action: "acquire", session_id: "legacy-projected",
+    generation: 0, operation_id: "legacy-projected-op", outcome: "success",
+    result: { state: "active", capacity: { secretValue: canary }, payload: huge, secretValue: canary, tokenValue: canary }, _request_digest: digest,
+  };
+  writeLegacyOperation(dbPath, response);
+  const legacy = new Database(dbPath);
+  const timestamp = "2026-10-04T00:00:00+00:00";
+  legacy.run("INSERT INTO tasks (task_id, session_id, generation, state, instance_name, vm_ip, ssh_host_port, lease_expires_at, inactive_since, cleanup_after, created_at, updated_at, last_error, image_fingerprint, resources_json, reservation_bytes, previous_generation, resource_reservation_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+    "avm-legacy-projected", "legacy-projected", 1, "cached", "agent-vm-avm-legacy-projected", "198.51.100.20", null, null, null, null, timestamp, timestamp,
+    JSON.stringify({ code: "command_failed", payload: huge, secretValue: canary, tokenValue: canary }), "a".repeat(64), JSON.stringify({ cpu: 2, memory_mib: 4096, disk_gib: 20 }), 0, null, "{}",
+  ]);
+  legacy.run("INSERT INTO audit (action, task_id, session_id, generation, outcome, detail_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", [
+    "legacy-test", "avm-legacy-projected", "legacy-projected", 1, "error", JSON.stringify({ capacity: { secretValue: canary }, payload: huge, tokenValue: canary }), timestamp,
+  ]);
+  legacy.close();
+  const store = new StateStore(dbPath);
+  try {
+    const task = store.getTask({ taskId: "avm-legacy-projected" })!;
+    const operation = JSON.parse(String((store.db.query("SELECT response_json FROM operations WHERE operation_id = ?") as any).get("legacy-projected-op").response_json));
+    const audit = JSON.parse(String((store.db.query("SELECT detail_json FROM audit WHERE action = 'legacy-test'") as any).get().detail_json));
+    for (const value of [task.last_error, JSON.stringify(operation), JSON.stringify(audit)]) {
+      expect(String(value)).not.toContain(canary);
+      expect(String(value).length).toBeLessThanOrEqual(64 * 1024);
+    }
+    expect(JSON.parse(String(task.last_error))).toMatchObject({ truncated: true });
+    expect(operation.result).toMatchObject({ truncated: true, capacity: {} });
+    expect(audit).toMatchObject({ truncated: true, capacity: {} });
+    store.verifyRuntimeState();
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fails closed and rolls back a legacy migration with invalid JSON", () => {
+  const root = mkdtempSync("/tmp/agent-vm-invalid-migration-test-");
+  const dbPath = join(root, "state.sqlite3");
+  writeLegacyOperation(dbPath, {
+    ok: true, protocol: PROTOCOL_VERSION, server_time: "2026-10-04T00:00:00+00:00", action: "acquire", session_id: "legacy-invalid",
+    generation: 0, operation_id: "legacy-invalid-op", outcome: "success", result: { state: "active" }, _request_digest: "c3dccc911349ced563eb9615fb6db8ffa5801d121c9542c29c5a3fc0575a768a",
+  });
+  const legacy = new Database(dbPath);
+  legacy.run("UPDATE operations SET response_json = ? WHERE operation_id = ?", ["not-json", "legacy-invalid-op"]);
+  legacy.close();
+  try {
+    expectSyncCode(() => new StateStore(dbPath), "state_invalid");
+    const rolledBack = new Database(dbPath);
+    try {
+      expect(rolledBack.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'operations'").get()).toBeTruthy();
+      expect(rolledBack.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = '__agent_vm_legacy_operations'").get()).toBeNull();
+    } finally { rolledBack.close(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("rejects conflicting legacy schema migration provenance", () => {
@@ -1148,7 +1235,7 @@ test("redacts command stderr before journal, audit, and diagnostic output", asyn
   const originalFailure = f.runner.failure;
   f.runner.failure = (args) => {
     if (!originalFailure?.(args)) return false;
-    throw new ControlError("command_failed", "native command failed", { returncode: 1, stderr: "password=secret-value bearer super-token Authorization: Bearer auth-canary-01 \"Authorization\": \"Bearer quoted-auth-01\"" });
+    throw new ControlError("command_failed", "native command failed", { returncode: 1, stderr: "password=secret-value secretValue=camel-secret-value tokenValue: camel-token-value bearer super-token Authorization: Bearer auth-canary-01 \"Authorization\": \"Bearer quoted-auth-01\"" });
   };
   await expectCode(f.call("acquire", { public_key: KEY }, "op-redacted-native-error"), "command_failed");
   const operation = JSON.stringify(f.store.operation("op-redacted-native-error"));
@@ -1158,16 +1245,24 @@ test("redacts command stderr before journal, audit, and diagnostic output", asyn
   expect(operation).not.toContain("super-token");
   expect(operation).not.toContain("auth-canary-01");
   expect(operation).not.toContain("quoted-auth-01");
+  expect(operation).not.toContain("camel-secret-value");
+  expect(operation).not.toContain("camel-token-value");
   expect(audit).not.toContain("secret-value");
   expect(audit).not.toContain("super-token");
   expect(audit).not.toContain("auth-canary-01");
   expect(audit).not.toContain("quoted-auth-01");
+  expect(audit).not.toContain("camel-secret-value");
+  expect(audit).not.toContain("camel-token-value");
   expect(task).not.toContain("secret-value");
   expect(task).not.toContain("auth-canary-01");
-  const diagnostic = new ControlError("command_failed", "native command failed", { nested: [{ stderr: "Authorization: Bearer nested-auth-01" }, { Authorization: "Bearer field-auth-01" }], stderr: "private_key=secret-value \"Authorization\": \"Bearer quoted-auth-02\"" }).asDict();
+  expect(task).not.toContain("camel-secret-value");
+  expect(task).not.toContain("camel-token-value");
+  const diagnostic = new ControlError("command_failed", "native command failed", { nested: [{ stderr: "Authorization: Bearer nested-auth-01" }, { Authorization: "Bearer field-auth-01", secretValue: "structured-secret-value", tokenValue: "structured-token-value" }], stderr: "private_key=secret-value \"Authorization\": \"Bearer quoted-auth-02\"" }).asDict();
   expect(JSON.stringify(diagnostic)).not.toContain("secret-value");
   expect(JSON.stringify(diagnostic)).not.toContain("nested-auth-01");
   expect(JSON.stringify(diagnostic)).not.toContain("field-auth-01");
+  expect(JSON.stringify(diagnostic)).not.toContain("structured-secret-value");
+  expect(JSON.stringify(diagnostic)).not.toContain("structured-token-value");
   expect(JSON.stringify(diagnostic)).not.toContain("quoted-auth-02");
   const quoted = new ControlError("command_failed", "native command failed", { stderr: ["password", "=", '"line-one-secret-canary\nline-two-secret-canary" token=\'escaped\\\'multiline-token-canary\''].join("") }).asDict();
   expect(JSON.stringify(quoted)).not.toContain("secret-canary");

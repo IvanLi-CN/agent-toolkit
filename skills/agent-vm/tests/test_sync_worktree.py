@@ -341,6 +341,16 @@ class SyncTests(unittest.TestCase):
                 self.assertEqual(MOD.main(), 1)
         self.assertNotIn("unexpected-secret", stderr.getvalue())
 
+    def test_main_redacts_and_bounds_sync_failure_text(self):
+        message = "Bearer sync-secret secretValue=camel-secret " + ("x" * (MOD.DIAGNOSTIC_OUTPUT_LIMIT * 2))
+        with patch.object(MOD, "sync", side_effect=MOD.SyncFailure(message, 75)):
+            with patch.object(MOD.sys, "argv", ["sync_worktree", "--name", "repo"]), patch.object(MOD.sys, "stderr", new_callable=io.StringIO) as stderr:
+                self.assertEqual(MOD.main(), 75)
+        output = stderr.getvalue()
+        self.assertNotIn("sync-secret", output)
+        self.assertNotIn("camel-secret", output)
+        self.assertLessEqual(len(output.encode("utf-8")), MOD.DIAGNOSTIC_OUTPUT_LIMIT)
+
     def test_invalid_name_fails_before_remote_and_missing_cli_preserves_exit(self):
         with patch.object(MOD, "run") as runner:
             with self.assertRaises(MOD.SyncFailure): MOD.sync("../escape")

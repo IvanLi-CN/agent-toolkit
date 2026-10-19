@@ -1078,6 +1078,15 @@ function nativeKill(pid: number, signal: number): boolean {
   } catch { return false; }
 }
 
+let getpgidNative: ((pid: number) => number) | undefined;
+function processGroupId(pid: number): number | undefined {
+  try {
+    getpgidNative ??= (dlopen(process.platform === "darwin" ? "/usr/lib/libSystem.B.dylib" : "libc.so.6", { getpgid: { args: ["int"], returns: "int" } }).symbols.getpgid as (pid: number) => number);
+    const pgid = getpgidNative(pid);
+    return Number.isSafeInteger(pgid) && pgid > 1 ? pgid : undefined;
+  } catch { return undefined; }
+}
+
 export type ProcessIdentity = { pid: number; starttime: string };
 export type ProcessRecord = ProcessIdentity & { state: string; ppid: number; pgrp: number };
 type ProcessCleanupOptions = {
@@ -1105,7 +1114,9 @@ function processStartIdentity(pid: number): string | undefined {
 }
 
 function processExists(pid: number): boolean {
-  return process.platform !== "linux" || existsSync(`/proc/${pid}/stat`);
+  if (process.platform === "linux") return existsSync(`/proc/${pid}/stat`);
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
 }
 
 function processBelongsToCurrentUser(pid: number): boolean | undefined {
@@ -1362,7 +1373,7 @@ export function killProcessTree(members: readonly ProcessIdentity[], options: Pr
   return { killed: false, error: cleanupError ?? "process_tree_members_remain" };
 }
 
-function safeProcessSignal(pid: number, expectedIdentity: string | undefined, signal: number, group: boolean, targetPgid?: number): { sent: boolean; error: string | null } {
+function safeProcessSignal(pid: number, expectedIdentity: string | undefined, signal: number, group: boolean, targetPgid?: number, groupAnchorVerified = false): { sent: boolean; error: string | null } {
   let target = pid;
   if (process.platform === "linux") {
     if (!processExists(pid)) return { sent: false, error: null };
@@ -1382,10 +1393,14 @@ function safeProcessSignal(pid: number, expectedIdentity: string | undefined, si
       return { sent: false, error: null };
     }
   } else if (group) {
-    target = -(targetPgid ?? pid);
+    if (targetPgid === undefined) return { sent: false, error: "process_group_identity_unverified" };
+    const currentPgid = processGroupId(pid);
+    if (currentPgid !== undefined && currentPgid !== targetPgid) return { sent: false, error: "process_group_identity_mismatch" };
+    if (currentPgid === undefined && !groupAnchorVerified) return { sent: false, error: "process_group_identity_unverified" };
+    target = -targetPgid;
   }
   const sent = nativeKill(target, signal);
-  if (sent || !processExists(pid) || processIsZombie(pid)) return { sent, error: null };
+  if (sent || (!group && !processExists(pid)) || (group && !processExists(pid) && groupAnchorVerified) || processIsZombie(pid)) return { sent, error: null };
   return { sent: false, error: "PermissionError" };
 }
 
@@ -1411,11 +1426,18 @@ export class CommandRunner {
     }
     const leaderIdentity = processStartIdentity(processHandle.pid);
     let leaderPgid: number | undefined;
+    let leaderGroupAnchored = false;
     if (process.platform === "linux" && leaderIdentity) {
       try {
         const record = readProcessRecord(processHandle.pid);
         if (record.starttime === leaderIdentity) leaderPgid = record.pgrp;
       } catch { /* Cleanup will fail closed if the leader identity cannot be anchored. */ }
+    } else if (process.platform !== "linux") {
+      const pgid = processGroupId(processHandle.pid);
+      if (pgid === processHandle.pid) {
+        leaderPgid = pgid;
+        leaderGroupAnchored = true;
+      }
     }
     const leaderPipeTargets = processPipeTargets(processHandle.pid);
     const readAbort = new AbortController();
@@ -1540,7 +1562,7 @@ export class CommandRunner {
         addKnown(descendants.members);
         addBoundEnvironmentMembers();
         addKnown(processPipeMembers(leaderPipeTargets, pipeScope()).members);
-        const term = safeProcessSignal(processHandle.pid, leaderIdentity, 15, true, leaderPgid);
+        const term = safeProcessSignal(processHandle.pid, leaderIdentity, 15, true, leaderPgid, leaderGroupAnchored);
         const leaderExitedAfterTerm = await Promise.race([exit.then(() => true), sleep(250).then(() => false)]);
         let processGroupCleanupError: string | null = identityMismatch ? "process_identity_mismatch" : term.error;
         let processTreeComplete = true;
@@ -1569,12 +1591,12 @@ export class CommandRunner {
               addKnown(leaderGroup.members);
             }
           }
-          if (!leaderExitedAfterTerm) {
+          if (!leaderExitedAfterTerm || process.platform !== "linux") {
             const leaderGroup = anchoredProcessGroupMembers(processHandle.pid, leaderIdentity ? [{ pid: processHandle.pid, starttime: leaderIdentity }] : []);
             processTreeComplete &&= leaderGroup.complete;
             addKnown(leaderGroup.members);
-            groupKill = safeProcessSignal(processHandle.pid, leaderIdentity, 9, true, leaderPgid);
-            directKill = safeProcessSignal(processHandle.pid, leaderIdentity, 9, false);
+            groupKill = safeProcessSignal(processHandle.pid, leaderIdentity, 9, true, leaderPgid, leaderGroupAnchored);
+            directKill = process.platform === "linux" ? safeProcessSignal(processHandle.pid, leaderIdentity, 9, false) : { sent: false, error: null };
             processGroupCleanupError ??= groupKill.error ?? directKill.error;
           }
           tree = killProcessTree([...known.values()]);
@@ -1616,11 +1638,11 @@ export class CommandRunner {
           environment_scan_complete: !environmentInspectionIncomplete,
           pipes_complete: finalPipes.complete,
         };
-        if (!processTreeComplete) processGroupCleanupError ??= "process_tree_inspection_failed";
+        if (process.platform === "linux" && !processTreeComplete) processGroupCleanupError ??= "process_tree_inspection_failed";
         const knownDescendant = [...known.values()].some((member) => member.pid !== processHandle.pid);
         // Once the leader is gone, an unanchored group may belong to a reused
         // PID/PGID. Report root loss instead of scanning or killing by PGID.
-        if (leaderExitedAfterTerm && !knownDescendant) processGroupCleanupError ??= "process_tree_root_lost";
+        if (process.platform === "linux" && leaderExitedAfterTerm && !knownDescendant) processGroupCleanupError ??= "process_tree_root_lost";
         const leaderStillAlive = Boolean(leaderIdentity && processExists(processHandle.pid) && processStartIdentity(processHandle.pid) === leaderIdentity && !processIsZombie(processHandle.pid));
         const remainingKnown = [...known.values()].some((member) => processExists(member.pid) && processStartIdentity(member.pid) === member.starttime && !processIsZombie(member.pid));
         const processGroupKilled = !leaderStillAlive && !remainingKnown && !processGroupCleanupError;
@@ -1894,18 +1916,18 @@ export class StateStore {
       opened = new Database(canonicalPath, { safeIntegers: true });
       opened.run("PRAGMA foreign_keys=ON");
       opened.run("PRAGMA busy_timeout=10000");
-      if (!bootstrap) {
-        const stateLock = acquireFileLock(join(parentPath, "control.lock"), true);
-        try {
+      const stateLock = acquireFileLock(join(parentPath, "control.lock"), true);
+      try {
+        if (!bootstrap) {
           StateStore.migratePythonBaseline(opened);
           StateStore.verifyDurableState(opened);
-        } finally {
-          stateLock();
         }
+        opened.run("PRAGMA journal_mode=WAL");
+        opened.run("PRAGMA synchronous=FULL");
+        if (bootstrap) StateStore.schemaOn(opened);
+      } finally {
+        stateLock();
       }
-      opened.run("PRAGMA journal_mode=WAL");
-      opened.run("PRAGMA synchronous=FULL");
-      if (bootstrap) StateStore.schemaOn(opened);
       try { chmodPrivate(canonicalPath); } catch { throw new ControlError("state_path_unsafe", "state database permissions cannot be secured"); }
       this.db = opened;
     } catch (error) {
@@ -2140,6 +2162,8 @@ export class StateStore {
     const foreignKeys = (db.query("PRAGMA foreign_key_list(ports)") as any).all() as Dict[];
     if (foreignKeys.length !== 1 || String(foreignKeys[0]?.table) !== "tasks" || String(foreignKeys[0]?.from) !== "task_id" || String(foreignKeys[0]?.to) !== "task_id" || String(foreignKeys[0]?.on_update).toUpperCase() !== "NO ACTION" || String(foreignKeys[0]?.on_delete).toUpperCase() !== "NO ACTION" || String(foreignKeys[0]?.match).toUpperCase() !== "NONE") throw new ControlError("state_invalid", "durable state database foreign-key contract differs");
     if ((db.query("PRAGMA foreign_key_check") as any).all().length) throw new ControlError("state_invalid", "durable state database contains dangling foreign keys");
+    const schemaMigration = (db.query("SELECT value FROM meta WHERE key = 'schema_migration'") as any).get() as Dict | null;
+    if (schemaMigration && schemaMigration.value !== PYTHON_BASELINE_MIGRATION) throw new ControlError("state_invalid", "durable state contains unknown schema migration provenance");
     const draining = (db.query("SELECT value FROM meta WHERE key = 'draining'") as any).get() as Dict | null;
     if (draining && !["0", "1"].includes(String(draining.value))) throw new ControlError("state_invalid", "durable state contains an invalid draining flag");
     const duplicateGroups = [["tasks", "session_id"], ["tasks", "instance_name"], ["operations", "operation_id"]] as const;
@@ -2475,8 +2499,31 @@ function acquireFileLock(path: string, blocking = true, shared = false): () => v
 
 const NATIVE_WRITER_PREFIX = "native-writer-";
 const NATIVE_WRITER_STATE_SUFFIX = ".state";
+const WRITER_TEMP_MAX_AGE_MS = 60_000;
+const MAX_WRITER_TEMP_CLEANUP = 64;
 
 function writerStatePath(path: string): string { return path + NATIVE_WRITER_STATE_SUFFIX; }
+
+function cleanupOrphanWriterTemps(directory: string): void {
+  let cleaned = 0;
+  for (const name of readdirSync(directory)) {
+    if (cleaned >= MAX_WRITER_TEMP_CLEANUP || !name.startsWith(NATIVE_WRITER_PREFIX)) continue;
+    const separator = name.indexOf(".tmp-");
+    if (separator <= NATIVE_WRITER_PREFIX.length) continue;
+    const baseName = name.slice(0, separator);
+    const markerName = baseName.endsWith(NATIVE_WRITER_STATE_SUFFIX) ? baseName.slice(0, -NATIVE_WRITER_STATE_SUFFIX.length) : baseName;
+    const markerPath = join(directory, markerName);
+    try { lstatSync(markerPath); continue; } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
+    }
+    try {
+      const info = lstatSync(join(directory, name));
+      if (!info.isFile() || Date.now() - info.mtimeMs < WRITER_TEMP_MAX_AGE_MS) continue;
+      unlinkSync(join(directory, name));
+      cleaned += 1;
+    } catch { /* A concurrent publisher or a protected entry is left for the next scan. */ }
+  }
+}
 
 function writeAtomicMarker(path: string, value: string, createOnly = false, beforePublish?: (fd: number) => void): number {
   const noFollow = (constants as any).O_NOFOLLOW ?? 0;
@@ -2565,6 +2612,7 @@ export function acquireWriterIntent(directory: string): () => void {
 
 export function hasWriterIntent(directory: string): boolean {
   mkdirSync(directory, { recursive: true, mode: 0o700 });
+  cleanupOrphanWriterTemps(directory);
   let active = false;
   for (const name of readdirSync(directory)) {
     if (!name.startsWith(NATIVE_WRITER_PREFIX) || name.endsWith(NATIVE_WRITER_STATE_SUFFIX) || name.includes(".tmp-")) continue;
@@ -2613,10 +2661,23 @@ export function hasWriterIntent(directory: string): boolean {
         stale = true;
       }
     } catch {
-      active = true;
+      try {
+        const info = lstatSync(path);
+        if (info.isSymbolicLink()) {
+          stale = true;
+        } else if (!info.isFile()) {
+          throw new ControlError("lock_unavailable", "native writer marker cannot be verified");
+        } else {
+          throw new ControlError("lock_unavailable", "native writer marker cannot be verified");
+        }
+      } catch (error) {
+        if (error instanceof ControlError) throw error;
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new ControlError("lock_unavailable", "native writer marker cannot be verified");
+        stale = true;
+      }
     } finally {
-      if (stateFd !== undefined) closeSync(stateFd);
-      if (fd !== undefined) closeSync(fd);
+      if (stateFd !== undefined) try { closeSync(stateFd); } catch { /* The descriptor is already closed. */ }
+      if (fd !== undefined) try { closeSync(fd); } catch { /* The descriptor is already closed. */ }
     }
     if (stale) removeWriterMarker(path);
   }

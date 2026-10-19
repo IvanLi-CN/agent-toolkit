@@ -1159,8 +1159,8 @@ def command_sync(args: argparse.Namespace) -> int:
 def command_port(args: argparse.Namespace) -> int:
     session = session_id(args.session_id)
     assert session is not None
-    generation = current_generation(session)
     if args.port_command == "list":
+        generation = current_generation(session)
         response = control_request("port-list", session=session, generation=generation)
     elif args.port_command == "add":
         response = mutation(
@@ -1172,7 +1172,6 @@ def command_port(args: argparse.Namespace) -> int:
                 "port_protocol": args.protocol,
                 **({"host_port": args.host_port} if args.host_port is not None else {}),
             },
-            generation=generation,
             session=session,
         )
     else:
@@ -1180,7 +1179,6 @@ def command_port(args: argparse.Namespace) -> int:
             "port-remove",
             args,
             fields={"name": args.name, "port_protocol": args.protocol},
-            generation=generation,
             session=session,
         )
     json_output(response)

@@ -83,7 +83,12 @@ def redact_and_bound_stderr(value: bytes, *, truncated: bool = False, limit: int
 
 def write_redacted_stderr(value: bytes) -> None:
     if value:
-        sys.stderr.buffer.write(redact_and_bound_stderr(value))
+        output = redact_and_bound_stderr(value)
+        stream = getattr(sys.stderr, "buffer", None)
+        if stream is not None:
+            stream.write(output)
+        else:
+            sys.stderr.write(output.decode("utf-8", "replace"))
         sys.stderr.flush()
 
 # Executed as a bounded Python action inside the guest, never installed as a service.
@@ -575,7 +580,7 @@ def main() -> int:
     try:
         return sync(args.name, args.cli, session_id=args.session_id)
     except SyncFailure as e:
-        print(str(e), file=sys.stderr)
+        write_redacted_stderr((str(e) + "\n").encode("utf-8", "replace"))
         return e.code
     except (OSError, ValueError, KeyError) as e:
         print("sync failed: " + redact_stderr(str(e).encode()).decode("utf-8", "replace")[:DIAGNOSTIC_OUTPUT_LIMIT], file=sys.stderr)

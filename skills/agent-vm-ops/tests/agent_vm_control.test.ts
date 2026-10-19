@@ -1075,6 +1075,16 @@ test("rejects conflicting legacy schema migration provenance", () => {
   finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("rejects unknown canonical schema migration provenance", () => {
+  const root = mkdtempSync("/tmp/agent-vm-unknown-canonical-migration-test-");
+  const dbPath = join(root, "state.sqlite3");
+  const store = StateStore.bootstrap(dbPath);
+  store.setMeta("schema_migration", "untrusted-provenance");
+  store.close();
+  try { expectSyncCode(() => new StateStore(dbPath), "state_invalid"); }
+  finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("serializes concurrent legacy-state startup and records one migration", async () => {
   const root = mkdtempSync("/tmp/agent-vm-concurrent-migration-test-");
   const dbPath = join(root, "state.sqlite3");

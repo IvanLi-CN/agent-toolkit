@@ -158,6 +158,32 @@ class SessionContractTests(unittest.TestCase):
         request = json.loads(run.call_args_list[-1].kwargs["input_data"])
         self.assertEqual(request["generation"], 7)
 
+    def test_port_mutation_retries_use_journal_or_remote_generation_without_local_state(self):
+        for port_command, action, operation, fields in (
+            ("add", "port-add", "port-add-op", {"name": "web", "vm_port": 8080, "port_protocol": "tcp"}),
+            ("remove", "port-remove", "port-remove-op", {"name": "web", "port_protocol": "tcp"}),
+        ):
+            response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": action, "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 7, "operation_id": operation, "outcome": "success", "result": {}}
+            process = CLI.subprocess.CompletedProcess([], 0, json.dumps(response).encode(), b"")
+            args = CLI.build_parser().parse_args(["port", port_command, *(["web", "--guest-port", "8080"] if port_command == "add" else ["web"]), "--session-id", "thread", "--operation-id", operation])
+            with tempfile.TemporaryDirectory() as state:
+                with mock.patch.object(CLI, "LOCAL_STATE_ROOT", Path(state)), mock.patch.object(CLI, "run_child", return_value=process) as run, mock.patch.object(CLI, "json_output"):
+                    journal_dir = CLI._secure_directory(CLI._secure_session_directory("thread") / "operations")
+                    CLI.ensure_operation_journal(journal_dir, {"protocol": CLI.PROTOCOL_VERSION, "action": action, "session_id": "thread", "generation": 7, "operation_id": operation, **fields})
+                    self.assertEqual(CLI.command_port(args), 0)
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(json.loads(run.call_args.kwargs["input_data"])["generation"], 7)
+
+        status = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "status", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 7, "operation_id": None, "outcome": "success", "result": {"generation": 7}}
+        response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "port-add", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 7, "operation_id": "port-fallback-op", "outcome": "success", "result": {}}
+        args = CLI.build_parser().parse_args(["port", "add", "web", "--guest-port", "8080", "--session-id", "thread", "--operation-id", "port-fallback-op"])
+        with tempfile.TemporaryDirectory() as state:
+            processes = [CLI.subprocess.CompletedProcess([], 0, json.dumps(item).encode(), b"") for item in (status, response)]
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", Path(state)), mock.patch.object(CLI, "run_child", side_effect=processes) as run, mock.patch.object(CLI, "json_output"):
+                self.assertEqual(CLI.command_port(args), 0)
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(json.loads(run.call_args_list[-1].kwargs["input_data"])["generation"], 7)
+
     def test_explicit_acquire_without_state_uses_remote_status_generation(self):
         status = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "status", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 0, "operation_id": None, "outcome": "success", "result": {"generation": 0}}
         response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "acquire", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 0, "operation_id": "acquire-op", "outcome": "success", "result": {}}

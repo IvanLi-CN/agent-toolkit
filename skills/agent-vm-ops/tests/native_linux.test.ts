@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -351,6 +351,31 @@ linuxTest("kills a TERM-ignoring descendant after the leader exits on SIGTERM", 
   expect(state === undefined || state === "Z").toBe(true);
 });
 
+nonLinuxTest("kills an anchored process group after its leader exits on SIGTERM", async () => {
+  const runner = new CommandRunner();
+  const probeRoot = root("agent-vm-darwin-term-descendant");
+  const pidPath = join(probeRoot, "child.pid");
+  let failure: any;
+  try {
+    await runner.runBounded(["/bin/sh", "-c", `(sh -c 'trap "" TERM; sleep 30') & echo $! > ${pidPath}; trap 'exit 0' TERM; while :; do printf xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done`], { timeout: 0.2, stdoutLimit: 128, stderrLimit: 128 });
+  } catch (error) { failure = error; }
+  expect(failure?.code).toBe("command_timeout");
+  expect(failure?.detail?.reaped).toBe(true);
+  expect(failure?.detail?.process_group_killed).toBe(true);
+  expect(await waitFor(pidPath)).toBe(true);
+  const pid = Number(readFileSync(pidPath, "utf8"));
+  let alive = true;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try { process.kill(pid, 0); }
+    catch (error) {
+      alive = (error as NodeJS.ErrnoException).code !== "ESRCH";
+      if (!alive) break;
+    }
+    await Bun.sleep(10);
+  }
+  expect(alive).toBe(false);
+});
+
 linuxTest("reaps a TERM-ignoring descendant after the leader exits before timeout", async () => {
   const runner = new CommandRunner();
   const probeRoot = root("agent-vm-early-leader");
@@ -695,6 +720,47 @@ linuxTest("reclaims empty, malformed, and crashed writer markers", () => {
   writeFileSync(join(lockDirectory, "native-writer-crashed"), "pending 99999999 dead-token\n", { mode: 0o600 });
   expect(hasWriterIntent(lockDirectory)).toBe(false);
   expect(readdirSync(lockDirectory).filter((name) => name.startsWith("native-writer-"))).toEqual([]);
+});
+
+linuxTest("fails closed on filesystem-shaped writer markers without retrying forever", () => {
+  const probeRoot = root("agent-vm-native-marker-shape");
+  const lockDirectory = join(probeRoot, "locks");
+  mkdirSync(lockDirectory, { recursive: true, mode: 0o700 });
+  const symlink = join(lockDirectory, "native-writer-symlink");
+  const target = join(probeRoot, "outside");
+  writeFileSync(target, "not a marker\n", { mode: 0o600 });
+  symlinkSync(target, symlink);
+  expect(hasWriterIntent(lockDirectory)).toBe(false);
+  expect(existsSync(symlink)).toBe(false);
+
+  mkdirSync(join(lockDirectory, "native-writer-directory"), { mode: 0o700 });
+  let failure: any;
+  try { hasWriterIntent(lockDirectory); }
+  catch (error) { failure = error; }
+  expect(failure?.code).toBe("lock_unavailable");
+});
+
+linuxTest("reclaims only aged orphan writer marker temporary files within a bounded scan", () => {
+  const probeRoot = root("agent-vm-native-marker-temp-recovery");
+  const lockDirectory = join(probeRoot, "locks");
+  mkdirSync(lockDirectory, { recursive: true, mode: 0o700 });
+  const oldTemp = join(lockDirectory, "native-writer-crashed.tmp-old");
+  const freshTemp = join(lockDirectory, "native-writer-fresh.tmp-new");
+  writeFileSync(oldTemp, "orphan\n", { mode: 0o600 });
+  writeFileSync(freshTemp, "in flight\n", { mode: 0o600 });
+  const old = new Date(Date.now() - 120_000);
+  utimesSync(oldTemp, old, old);
+  expect(hasWriterIntent(lockDirectory)).toBe(false);
+  expect(existsSync(oldTemp)).toBe(false);
+  expect(existsSync(freshTemp)).toBe(true);
+});
+
+test("systemd assets fence the alternate configuration environment", () => {
+  for (const path of UNIT_PATHS) {
+    const content = readFileSync(path, "utf8");
+    expect(content).toContain("UnsetEnvironment=AGENT_VM_CONFIG_PATH");
+    expect(content).not.toMatch(/^Environment=AGENT_VM_CONFIG_PATH=/m);
+  }
 });
 
 nonLinuxTest("fails closed instead of waiting forever on an unverified writer marker", async () => {

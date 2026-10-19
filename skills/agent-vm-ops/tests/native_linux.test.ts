@@ -945,11 +945,14 @@ linuxTest("expiration preempts a lease while cleanup remains contended", async (
     } finally { store.close(); }
   `;
   const expiryWorker = `
+    const { existsSync } = await import("node:fs");
     const { Control, StateStore } = await import(process.env.CONTROL_PATH);
     const root = process.env.PROBE_ROOT;
     const store = StateStore.bootstrap(root + "/state.sqlite3");
     const control = new Control({ state_db: root + "/state.sqlite3", timer_dir: root, cache_seconds: 86400 }, { store });
     try {
+      await Bun.write(root + "/expiry-ready", "1");
+      while (!existsSync(root + "/expiry-go")) await Bun.sleep(10);
       await control.expirePreempt({ task_id: "avm-expire", generation: 1 });
       console.log("preempt-complete");
     } finally { store.close(); }
@@ -957,13 +960,18 @@ linuxTest("expiration preempts a lease while cleanup remains contended", async (
   const holder = spawnWorker(holderWorker, { PROBE_ROOT: probeRoot });
   expect(await waitFor(join(probeRoot, "held"))).toBe(true);
   const expiry = spawnWorker(expiryWorker, { PROBE_ROOT: probeRoot });
+  expect(await waitFor(join(probeRoot, "expiry-ready"))).toBe(true);
+  const observer = StateStore.bootstrap(dbPath);
+  await Bun.write(join(probeRoot, "expiry-go"), "1");
   let observed: Dict | undefined;
-  for (let attempt = 0; attempt < 200; attempt += 1) {
-  const current = StateStore.bootstrap(dbPath);
-    observed = current.getTask({ taskId: "avm-expire" });
-    current.close();
-    if (observed?.state === "closing") break;
-    await Bun.sleep(10);
+  try {
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      observed = observer.getTask({ taskId: "avm-expire" });
+      if (observed?.state === "closing") break;
+      await Bun.sleep(10);
+    }
+  } finally {
+    observer.close();
   }
   if (observed?.state !== "closing") {
     await Bun.write(join(probeRoot, "release"), "1");

@@ -453,6 +453,15 @@ class AdmissionTests(Fixture):
         self.store.update_task(active["task_id"], resource_reservation_json="{")
         self.error("resource_unverified", self.call, "status")
 
+    def test_absent_partial_task_status_preserves_unknown_resource_state(self):
+        active = self.acquire()
+        self.call("release")
+        self.store.update_task(active["task_id"], state="absent", resources_json="{}", resource_reservation_json="{}")
+        result = self.call("status")
+        self.assertIsNone(result["resources"])
+        self.assertFalse(result["resource_state"]["verified"])
+        self.assertEqual(result["resource_state"]["error"]["code"], "resource_unverified")
+
     def test_status_corrupt_last_error_is_structured(self):
         active = self.acquire()
         self.store.update_task(active["task_id"], last_error="{")

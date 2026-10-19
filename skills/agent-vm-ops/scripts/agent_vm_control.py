@@ -1367,6 +1367,14 @@ class SystemdManager:
             return False
         try:
             lines = path.read_text(encoding="utf-8").splitlines()
+            if unit.endswith("@.service"):
+                result = self.runner.run(["systemctl", "cat", unit], timeout=10, check=False)
+                output = result.stdout.decode(errors="replace")
+                return (
+                    result.returncode == 0
+                    and f"# {path}\n" in output
+                    and all(line in lines for line in required_lines)
+                )
             result = self.runner.run(
                 ["systemctl", "show", unit, "-p", "LoadState", "-p", "FragmentPath"],
                 timeout=10,
@@ -1405,6 +1413,29 @@ class SystemdManager:
         return (
             result.returncode == 0
             and values.get("ActiveState") == "active"
+            and values.get("UnitFileState") == "enabled"
+        )
+
+    def enabled_service_ready(self, unit: str) -> bool:
+        """Verify a loaded, enabled service without requiring a oneshot to stay active."""
+        if not self.enabled:
+            return True
+        try:
+            result = self.runner.run(
+                ["systemctl", "show", unit, "-p", "LoadState", "-p", "UnitFileState"],
+                timeout=10,
+                check=False,
+            )
+        except (ControlError, OSError, TypeError, ValueError):
+            return False
+        values = dict(
+            line.split("=", 1)
+            for line in result.stdout.decode(errors="replace").splitlines()
+            if "=" in line
+        )
+        return (
+            result.returncode == 0
+            and values.get("LoadState") == "loaded"
             and values.get("UnitFileState") == "enabled"
         )
 
@@ -2279,13 +2310,28 @@ class Control:
                 raise ControlError("resource_unverified", "task error state cannot be verified")
             result["last_error"] = dict(last_error)
         result["ports"] = self.store.get_ports(task["task_id"])
+        resource_state_error = None
         try:
             resources = parse_resource_mapping(task.get("resources_json"), "resources", allow_empty=False)
             resource_reservation = parse_resource_mapping(task.get("resource_reservation_json"), "reservation", allow_empty=True)
         except (TypeError, ValueError) as exc:
-            raise ControlError("resource_unverified", "task resource state cannot be verified") from exc
+            if (
+                task.get("state") == "absent"
+                and str(task.get("resources_json", "")).strip() in {"", "{}"}
+                and str(task.get("resource_reservation_json", "")).strip() in {"", "{}"}
+            ):
+                resources = None
+                resource_reservation = None
+                resource_state_error = {
+                    "code": "resource_unverified",
+                    "message": "absent task has no durable resource allocation",
+                }
+            else:
+                raise ControlError("resource_unverified", "task resource state cannot be verified") from exc
         result["resources"] = resources
         result["resource_reservation"] = resource_reservation
+        if resource_state_error is not None:
+            result["resource_state"] = {"verified": False, "error": resource_state_error}
         expiry = parse_time(task.get("lease_expires_at"))
         result["effective_lease"] = task["state"] == "active" and expiry is not None and expiry > self.now()
         return result
@@ -3610,7 +3656,7 @@ class Control:
                 }[unit]
                 if not self.systemd.service_asset_active(unit, required):
                     issues.append("unit_unverified:" + unit)
-                if unit == "agent-vm-native-reconcile.service" and not self.systemd.enabled_unit_active(unit):
+                if unit == "agent-vm-native-reconcile.service" and not self.systemd.enabled_service_ready(unit):
                     issues.append("unit_disabled:" + unit)
             if not self.systemd.service_asset_active(
                 "agent-vm-native-age-gc.service",

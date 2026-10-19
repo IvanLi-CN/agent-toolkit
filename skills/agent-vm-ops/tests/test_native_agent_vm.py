@@ -256,6 +256,16 @@ class NativeTimerTests(unittest.TestCase):
             ("ExecStart=/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py --timer-reconcile",),
         ))
 
+    def test_service_asset_validates_template_with_systemd_cat(self):
+        unit = "agent-vm-native-expire@.service"
+        path = self.root / unit
+        required = "ExecStart=/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py --timer-expire %i"
+        path.write_text(f"[Service]\n{required}\n")
+        self.runner.run.return_value = subprocess.CompletedProcess(
+            [], 0, f"# {path}\n[Service]\n{required}\n".encode(), b""
+        )
+        self.assertTrue(self.systemd.service_asset_active(unit, (required,)))
+
     def test_enabled_unit_active_requires_active_enabled_unit(self):
         self.runner.run.return_value = subprocess.CompletedProcess(
             [], 0, b"ActiveState=active\nUnitFileState=disabled\n", b""
@@ -265,6 +275,12 @@ class NativeTimerTests(unittest.TestCase):
             [], 0, b"ActiveState=active\nUnitFileState=enabled\n", b""
         )
         self.assertTrue(self.systemd.enabled_unit_active("agent-vm-native-reconcile.service"))
+
+    def test_enabled_service_ready_accepts_completed_oneshot_service(self):
+        self.runner.run.return_value = subprocess.CompletedProcess(
+            [], 0, b"LoadState=loaded\nUnitFileState=enabled\n", b""
+        )
+        self.assertTrue(self.systemd.enabled_service_ready("agent-vm-native-reconcile.service"))
 
 
 class Fixture(unittest.TestCase):

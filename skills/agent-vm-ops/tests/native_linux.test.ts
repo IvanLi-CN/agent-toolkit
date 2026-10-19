@@ -266,7 +266,7 @@ async function runSessionExpiryRace(mode: "status" | "acquire"): Promise<void> {
   expect(expiryResult.exit).toBe(0);
   expect(lastJson(expiryResult.stdout).result.state).toBe("absent");
   if (mode === "status") {
-    expect(primaryResult.exit).toBe(0);
+    if (primaryResult.exit !== 0) throw new Error(`status worker failed: ${JSON.stringify(primaryResult)}`);
     expect(lastJson(primaryResult.stdout).result).toMatchObject({ state: "active", native_status: "Running" });
   } else {
     expect(primaryResult.exit).toBe(2);

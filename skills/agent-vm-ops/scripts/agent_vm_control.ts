@@ -2036,6 +2036,9 @@ export class StateStore {
     let opened: Database | undefined;
     const previousUmask = process.umask(0o077);
     try {
+      // Reject or tighten any pre-existing WAL/journal sidecars before SQLite
+      // can open the database and resolve those paths.
+      secureStateSidecars(canonicalPath);
       opened = new Database(canonicalPath, { safeIntegers: true });
       opened.run("PRAGMA foreign_keys=ON");
       opened.run("PRAGMA busy_timeout=10000");
@@ -2492,9 +2495,9 @@ export class StateStore {
       this.depth += 1;
       const value = callback();
       if (outer) {
+        secureStateSidecars(this.path);
         this.db.run("COMMIT");
         committed = true;
-        secureStateSidecars(this.path);
       }
       return value;
     } catch (error) {

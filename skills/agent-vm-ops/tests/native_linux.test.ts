@@ -134,10 +134,7 @@ async function requireWorkerMarker(child: any, path: string, label: string): Pro
   if (await waitFor(path)) return;
   child.kill();
   const result = await collect(child);
-  const traces = readdirSync(join(path, ".."))
-    .filter((name) => name.startsWith("race-trace-"))
-    .map((name) => `${name}:${readFileSync(join(path, "..", name), "utf8").trim()}`);
-  throw new Error(`${label} worker exited before synchronization marker: ${JSON.stringify({ result, traces })}`);
+  throw new Error(`${label} worker exited before synchronization marker: ${JSON.stringify(result)}`);
 }
 
 async function runSessionExpiryRace(mode: "status" | "acquire"): Promise<void> {
@@ -161,11 +158,8 @@ async function runSessionExpiryRace(mode: "status" | "acquire"): Promise<void> {
   store.close();
 
   const worker = `
-    const { appendFileSync, existsSync } = await import("node:fs");
-    const trace = (label) => appendFileSync(process.env.TRACE_PREFIX + "-" + process.pid, label + "\\n");
-    trace("start");
-    const { Control, CommandRunner, StateStore, SystemdManager } = await import(process.env.CONTROL_PATH);
-    trace("imported");
+    const { existsSync } = await import("node:fs");
+    const { Control, CommandRunner, stableJson, StateStore, SystemdManager } = await import(process.env.CONTROL_PATH);
     const result = (value) => ({ args: [], returncode: 0, stdout: new TextEncoder().encode(JSON.stringify(value)), stderr: new Uint8Array() });
     class Runner extends CommandRunner {
       async run(argv, options = {}) {
@@ -193,14 +187,12 @@ async function runSessionExpiryRace(mode: "status" | "acquire"): Promise<void> {
     const expiry = new Date(process.env.LEASE_EXPIRES);
     const clock = () => new Date(existsSync(process.env.EXPIRED) ? expiry.getTime() : expiry.getTime() - 1000);
     const store = StateStore.bootstrap(process.env.DB_PATH);
-    trace("store");
     const config = {
       project: "agents", profile: "agent-vm", state_db: process.env.DB_PATH, timer_dir: process.env.PROBE_ROOT,
       storage_path: process.env.PROBE_ROOT, cache_seconds: 86400, image_fingerprint: "a".repeat(64),
     };
     const runner = new Runner();
     const control = new Control(config, { store, runner, systemd: new SystemdManager(runner, config, false), clock });
-    trace("control");
     control.resourceDiagnostics = async () => ({ verified: true, remaining: { cpu: 2, memory_mib: 12288 }, allocated_and_reserved: { cpu: 2, memory_mib: 4096 }, memory_pressure: false });
     control.instanceDiagnostics = async () => ({ verified: true, total: 1, running: 1, stopped: 0, cached: 0, other: 0, limits: {}, policy_compliant: true });
     const mode = process.env.RACE_MODE;
@@ -231,7 +223,6 @@ async function runSessionExpiryRace(mode: "status" | "acquire"): Promise<void> {
       control.cleanupTask = async () => [[], []];
       await Bun.write(process.env.EXPIRY_STARTED, "1");
     }
-    trace("prepared");
     const request = mode === "status"
       ? { protocol: 4, action: "status", session_id: "race-session", generation: 1 }
       : mode === "acquire"
@@ -239,7 +230,7 @@ async function runSessionExpiryRace(mode: "status" | "acquire"): Promise<void> {
         : { protocol: 4, action: "timer-expire", task_id: "avm-race", generation: 1 };
     try {
       const response = mode === "acquire" ? await control.acquire(request, "race-session") : await control.dispatch(request);
-      console.log(JSON.stringify(response));
+      console.log(stableJson(response));
     } catch (error) {
       const detail = error && typeof error.asDict === "function"
         ? error.asDict()
@@ -253,7 +244,7 @@ async function runSessionExpiryRace(mode: "status" | "acquire"): Promise<void> {
   `;
   const baseEnv = {
     DB_PATH: dbPath, PROBE_ROOT: probeRoot, ENTERED: enteredPath, RELEASE: releasePath, EXPIRED: expiredPath,
-    EXPIRY_STARTED: expiryStartedPath, EXPIRY_DONE: expiryDonePath, TRACE_PREFIX: join(probeRoot, "race-trace"), LEASE_EXPIRES: leaseExpiresAt, RACE_MODE: mode, CONTROL_PATH,
+    EXPIRY_STARTED: expiryStartedPath, EXPIRY_DONE: expiryDonePath, LEASE_EXPIRES: leaseExpiresAt, RACE_MODE: mode, CONTROL_PATH,
   };
   const primary = spawnWorker(worker, baseEnv);
   await requireWorkerMarker(primary, enteredPath, mode);

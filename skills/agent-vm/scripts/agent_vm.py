@@ -355,6 +355,15 @@ def read_operation_journal(path: Path) -> dict[str, Any]:
     return value
 
 
+def fsync_directory(directory: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(directory, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def ensure_operation_journal(directory: Path, request: dict[str, Any]) -> None:
     session = request.get("session_id")
     if not isinstance(session, str):
@@ -392,6 +401,7 @@ def ensure_operation_journal(directory: Path, request: dict[str, Any]) -> None:
                     json.dump({"request": request, "outcome": "pending"}, handle, sort_keys=True)
                     handle.flush()
                     os.fsync(handle.fileno())
+                fsync_directory(directory)
             except FileExistsError:
                 _secure_file(path, code="local_journal_invalid")
                 old = read_operation_journal(path)
@@ -632,6 +642,7 @@ def write_session_state(value: str, state: dict[str, Any]) -> None:
             os.fchmod(handle.fileno(), 0o600)
             os.fsync(handle.fileno())
         os.replace(temp, path)
+        fsync_directory(directory)
         _secure_file(path)
     finally:
         try:
@@ -879,6 +890,7 @@ def write_ssh_config(session: str, info: dict[str, Any], private_key: Path) -> P
                 os.fchmod(handle.fileno(), 0o600)
                 os.fsync(handle.fileno())
             os.replace(temp, path)
+            fsync_directory(path.parent)
             _secure_file(path, code="local_config_invalid")
         finally:
             try:

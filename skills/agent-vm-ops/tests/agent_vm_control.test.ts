@@ -1792,6 +1792,9 @@ test("GC previews and deletes only eligible stopped caches", async () => {
   expect(previewReplay.result.minimum_idle_seconds).toBe(0);
   await f.control.dispatch(f.request("admin-gc", { apply: true }, "op-gc-apply"));
   expect(f.store.getTask({ taskId: String(old.task_id) })?.state).toBe("absent");
+  expect(f.store.getTask({ taskId: String(old.task_id) })?.resources_json).toBe("{}");
+  const reopened = new StateStore(f.config.state_db);
+  reopened.close();
   expect(f.store.getTask({ taskId: String(active.task_id) })?.state).toBe("active");
   expect(f.runner.instances.has(old.instance_name)).toBe(false);
   expect(f.runner.instances.has(active.instance_name)).toBe(true);

@@ -2850,7 +2850,9 @@ export class SystemdManager {
         writeFileSync(temp, content, { mode: 0o600 });
         const fd = openSync(temp, constants.O_WRONLY);
         try { fsyncSync(fd); } finally { closeSync(fd); }
-        renameSync(temp, join(this.timerDir, unit));
+        const published = join(this.timerDir, unit);
+        renameSync(temp, published);
+        fsyncParentDirectory(published);
         await this.systemctl("daemon-reload");
         await this.systemctl("enable", "--now", unit);
         await this.systemctl("restart", unit);
@@ -3379,7 +3381,7 @@ export class Control {
       this.store.updateTask(String(task.task_id), { last_error: stableJson(error instanceof ControlError ? error.asDict() : { code: "internal_error", message: (error as Error).name }) });
       throw error;
     }
-    await this.globalLock(() => this.store.updateTask(String(task.task_id), { state: "absent", vm_ip: null, ssh_host_port: null, lease_expires_at: null, inactive_since: null, cleanup_after: null, reservation_bytes: 0n, last_error: null }));
+    await this.globalLock(() => this.store.updateTask(String(task.task_id), { state: "absent", vm_ip: null, ssh_host_port: null, lease_expires_at: null, inactive_since: null, cleanup_after: null, reservation_bytes: 0n, resource_reservation_json: "{}", resources_json: "{}", last_error: null }));
   }
 
   private async reclaimCapacity(requestCost: bigint, excludeTaskId?: string): Promise<string[]> {
@@ -4616,7 +4618,7 @@ export class Control {
                 });
               });
               if ((await this.incus.listInstances()).some((native) => native.name === task.instance_name)) throw new ControlError("cleanup_incomplete", "deletion is not confirmed");
-              await this.globalLock(() => this.store.updateTask(String(task.task_id), { state: "absent", vm_ip: null, ssh_host_port: null, lease_expires_at: null, inactive_since: null, cleanup_after: null, reservation_bytes: 0n, resource_reservation_json: "{}", last_error: null }));
+              await this.globalLock(() => this.store.updateTask(String(task.task_id), { state: "absent", vm_ip: null, ssh_host_port: null, lease_expires_at: null, inactive_since: null, cleanup_after: null, reservation_bytes: 0n, resource_reservation_json: "{}", resources_json: "{}", last_error: null }));
             }
           } else if (["closing", "preparing", "failed"].includes(String(task.state)) || (task.state === "active" && !this.stateSummary(task).effective_lease)) {
             item.action = "close-incomplete-or-expired";

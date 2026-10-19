@@ -12,6 +12,13 @@ function fixture(content: string): { root: string; manifest: string } {
   return { root, manifest };
 }
 
+function git(root: string, ...args: string[]): void {
+  const result = Bun.spawnSync(["git", "-C", root, ...args], { stdout: "pipe", stderr: "pipe" });
+  if (result.exitCode !== 0) {
+    throw new Error(new TextDecoder().decode(result.stderr));
+  }
+}
+
 test("accepts a standalone Skill", () => {
   const { root, manifest } = fixture("# standalone\n");
   try {
@@ -89,6 +96,28 @@ test("rejects unlisted files directly under the public Skills root", () => {
   try {
     writeFileSync(join(root, "skills", "private-data.md"), "private operator notes\n");
     expect(check(root, manifest)).toEqual(["UNEXPECTED_PUBLIC_SKILLS_ENTRY private-data.md"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("ignores untracked macOS metadata directly under the public Skills root", () => {
+  const { root, manifest } = fixture("# standalone\n");
+  try {
+    writeFileSync(join(root, "skills", ".DS_Store"), "Finder metadata\n");
+    expect(check(root, manifest)).toEqual([]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects tracked macOS metadata directly under the public Skills root", () => {
+  const { root, manifest } = fixture("# standalone\n");
+  try {
+    git(root, "init", "--quiet");
+    writeFileSync(join(root, "skills", ".DS_Store"), "tracked metadata\n");
+    git(root, "add", "--force", "skills/.DS_Store");
+    expect(check(root, manifest)).toEqual(["UNEXPECTED_PUBLIC_SKILLS_ENTRY .DS_Store"]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

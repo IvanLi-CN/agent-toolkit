@@ -638,6 +638,7 @@ function ratio(value: unknown, name: string): { numerator: bigint; denominator: 
   const [whole, fraction = ""] = digits.split(".");
   const mantissa = BigInt(`${whole || "0"}${fraction}`);
   const scale = exponent - fraction.length;
+  if (Math.abs(scale) > 4096) throw new ControlError("config_invalid", `${name} is outside the supported magnitude`);
   const denominator = scale >= 0 ? 1n : 10n ** BigInt(-scale);
   const numerator = scale >= 0 ? mantissa * 10n ** BigInt(scale) : mantissa;
   if (numerator < denominator) throw new ControlError("config_invalid", `${name} must be a finite number at least one`);
@@ -661,6 +662,7 @@ function readText(path: string): string {
 function parseTime(value: unknown): Date | undefined {
   if (!value) return undefined;
   if (typeof value !== "string") throw new ControlError("invalid_time", `invalid timestamp: ${String(value)}`);
+  if (!/^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,9})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.test(value)) throw new ControlError("invalid_time", `invalid timestamp: ${value}`);
   const parsed = new Date(value.replace(/Z$/, "+00:00"));
   if (Number.isNaN(parsed.getTime())) throw new ControlError("invalid_time", `invalid timestamp: ${value}`);
   return parsed;
@@ -1618,12 +1620,20 @@ export class CommandRunner {
       if (outcome.kind === "timeout" || outcome.kind === "communication_error") {
         const communicationError = outcome.kind === "communication_error" ? outcome.error : undefined;
         await stopReaders();
-        const descendants = processDescendants(processHandle.pid);
+        let identityMismatch = processTrackingIdentityMismatch;
+        const currentRootIdentity = leaderIdentity === undefined ? undefined : processStartIdentity(processHandle.pid);
+        if (currentRootIdentity !== undefined && currentRootIdentity !== leaderIdentity) identityMismatch = true;
+        // A numeric PID is not an ownership proof after the leader exits. Only
+        // expand a descendant tree from the starttime identity captured at
+        // spawn; tracked members and anchored groups cover already observed
+        // descendants when that root is gone.
+        const descendants = leaderIdentity === undefined
+          ? { members: [], complete: false }
+          : processDescendantsFromRoots([{ pid: processHandle.pid, starttime: leaderIdentity }]);
         for (const target of processPipeTargets(processHandle.pid)) leaderPipeTargets.add(target);
         const known = new Map<number, ProcessIdentity>();
         const groupAnchors = new Map<number, ProcessIdentity[]>();
         for (const [pgid, anchors] of trackedGroups) groupAnchors.set(pgid, [...anchors]);
-        let identityMismatch = processTrackingIdentityMismatch;
         let markerBindingFailure = false;
         let environmentInspectionIncomplete = false;
         const addKnown = (members: readonly ProcessIdentity[]): void => {
@@ -2024,6 +2034,7 @@ export class StateStore {
     if (file && (!file.isFile() || (typeof process.geteuid === "function" && file.uid !== process.geteuid()) || (Number(file.mode) & 0o77) !== 0)) throw new ControlError("state_path_unsafe", "state database must be a private owned file");
     if (file && file.size === 0) throw new ControlError("state_invalid", "state database is empty");
     let opened: Database | undefined;
+    const previousUmask = process.umask(0o077);
     try {
       opened = new Database(canonicalPath, { safeIntegers: true });
       opened.run("PRAGMA foreign_keys=ON");
@@ -2040,12 +2051,17 @@ export class StateStore {
       } finally {
         stateLock();
       }
-      try { chmodPrivate(canonicalPath); } catch { throw new ControlError("state_path_unsafe", "state database permissions cannot be secured"); }
+      try {
+        chmodPrivate(canonicalPath);
+        secureStateSidecars(canonicalPath);
+      } catch { throw new ControlError("state_path_unsafe", "state database permissions cannot be secured"); }
       this.db = opened;
     } catch (error) {
       try { opened?.close(); } catch { /* Preserve the durable-state failure. */ }
       if (error instanceof ControlError) throw error;
       throw new ControlError("state_invalid", "durable state database cannot be verified");
+    } finally {
+      process.umask(previousUmask);
     }
   }
 
@@ -2469,17 +2485,24 @@ export class StateStore {
 
   transaction<T>(callback: () => T): T {
     const outer = this.depth === 0;
-    if (outer) this.db.run("BEGIN IMMEDIATE");
-    this.depth += 1;
+    const previousUmask = outer ? process.umask(0o077) : undefined;
+    let committed = false;
     try {
+      if (outer) this.db.run("BEGIN IMMEDIATE");
+      this.depth += 1;
       const value = callback();
-      if (outer) this.db.run("COMMIT");
+      if (outer) {
+        this.db.run("COMMIT");
+        committed = true;
+        secureStateSidecars(this.path);
+      }
       return value;
     } catch (error) {
-      if (outer) this.db.run("ROLLBACK");
+      if (outer && this.depth > 0 && !committed) this.db.run("ROLLBACK");
       throw error;
     } finally {
-      this.depth -= 1;
+      if (this.depth > 0) this.depth -= 1;
+      if (previousUmask !== undefined) process.umask(previousUmask);
     }
   }
 
@@ -2587,6 +2610,24 @@ function chmodPrivate(path: string): void {
   const noFollow = (constants as any).O_NOFOLLOW ?? 0;
   const fd = openSync(path, constants.O_WRONLY | noFollow);
   try { fchmodSync(fd, 0o600); } finally { closeSync(fd); }
+}
+
+function secureStateSidecars(path: string): void {
+  for (const suffix of ["-wal", "-shm", "-journal"]) {
+    const sidecar = path + suffix;
+    let stats: ReturnType<typeof lstatSync>;
+    try { stats = lstatSync(sidecar); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
+    if (stats.isSymbolicLink() || !stats.isFile()) throw new ControlError("state_path_unsafe", "state database sidecar must be a regular file");
+    const owner = currentOwnerUid();
+    if (owner !== undefined && stats.uid !== owner) throw new ControlError("state_path_unsafe", "state database sidecar has an untrusted owner");
+    chmodPrivate(sidecar);
+    const secured = lstatSync(sidecar);
+    if (secured.isSymbolicLink() || !secured.isFile() || (Number(secured.mode) & 0o077) !== 0 || (owner !== undefined && secured.uid !== owner)) throw new ControlError("state_path_unsafe", "state database sidecar permissions cannot be secured");
+  }
 }
 
 let flockNative: ((fd: number, operation: number) => number) | undefined;

@@ -1,6 +1,6 @@
 import { afterEach, expect, setDefaultTimeout, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -484,6 +484,38 @@ test("accepts scientific ratios and preserves large integer config and request v
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("rejects malformed timestamps and impractically large scientific ratios", () => {
+  const root = mkdtempSync("/tmp/agent-vm-input-boundary-test-");
+  mkdirSync(join(root, "systemd"), { recursive: true, mode: 0o755 });
+  const base: Dict = { project: "agents", profile: "agent-vm", image_alias: "image", image_fingerprint: "a".repeat(64), network: "agentsbr0", network_acl: "agent-vm-isolation", pool: "agents", host_address: "198.51.100.19", port_start: 20000, port_end: 20030, vm_ip_start: "198.51.100.20", vm_ip_end: "198.51.100.250", gateway_ip: "198.51.100.1", storage_path: root, state_db: join(root, "state.sqlite3"), timer_dir: join(root, "systemd") };
+  try {
+    const hugeRatioPath = join(root, "huge-ratio.json");
+    writeFileSync(hugeRatioPath, JSON.stringify({ ...base, cpu_overcommit_ratio: "1e1000000000" }));
+    expectSyncCode(() => loadConfig(hugeRatioPath), "config_invalid");
+
+    const statePath = join(root, "state.sqlite3");
+    const store = StateStore.bootstrap(statePath);
+    store.putTask({
+      task_id: "avm-invalid-time",
+      session_id: "invalid-time",
+      generation: 1,
+      state: "active",
+      instance_name: "agent-vm-avm-invalid-time",
+      vm_ip: "198.51.100.20",
+      ssh_host_port: 20000,
+      lease_expires_at: "2026-10-04T01:00:00+00:00",
+      created_at: "1",
+      updated_at: "2026-10-04T00:00:00+00:00",
+      image_fingerprint: "a".repeat(64),
+      resources_json: JSON.stringify({ cpu: 2, memory_mib: 4096, disk_gib: 20 }),
+      reservation_bytes: 0,
+      resource_reservation_json: "{}",
+    });
+    store.close();
+    expectSyncCode(() => new StateStore(statePath), "state_invalid");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("rejects invalid UTF-8 at both config and request boundaries", () => {
   const root = mkdtempSync("/tmp/agent-vm-utf8-contract-test-");
   const configPath = join(root, "config.json");
@@ -685,6 +717,26 @@ test("keeps SQLite integer reservations exact beyond the JS safe range", () => {
     expect(typeof task?.reservation_bytes).toBe("bigint");
     expect(task?.reservation_bytes).toBe(exact);
   } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("secures SQLite sidecar files when WAL is active", () => {
+  const root = mkdtempSync("/tmp/agent-vm-sqlite-sidecar-test-");
+  const path = join(root, "state.sqlite3");
+  const store = StateStore.bootstrap(path);
+  try {
+    store.setMeta("draining", "0");
+    for (const suffix of ["-wal", "-shm", "-journal"]) {
+      const sidecar = path + suffix;
+      if (!existsSync(sidecar)) continue;
+      const stats = lstatSync(sidecar);
+      expect(stats.isSymbolicLink()).toBe(false);
+      expect(stats.isFile()).toBe(true);
+      expect(stats.mode & 0o077).toBe(0);
+    }
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("fails closed for missing, empty, and invalid runtime state databases", () => {

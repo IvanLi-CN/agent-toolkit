@@ -60,9 +60,9 @@ SECRET_LABELS = r"(?:[A-Za-z0-9]+[_-])*(?:password|passwd|passphrase|secret|toke
 CAMEL_SECRET_LABELS = r"(?:password|passwd|passphrase|secret|token|authorization|privateKey|publicKey|apiKey|accessKey|clientSecret|credentials?|cookie|setCookie)[A-Z][A-Za-z0-9]*"
 PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 _-]*PRIVATE KEY-----", re.IGNORECASE)
 UNTERMINATED_PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*$", re.IGNORECASE)
-AUTH_SCHEME_RE = re.compile(r"(?i)(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?(?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]+")
+AUTH_SCHEME_RE = re.compile(r"(?i)(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?(?:bearer|basic)\s+)(?:(['\"])(?:\\.|(?!\2)[^\r\n])*\2|[A-Za-z0-9._~+/=-]+)")
 AUTH_DIGEST_RE = re.compile(r"(?i)(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?digest\s+)[^\r\n]+")
-AUTH_BASIC_RE = re.compile(r"(?i)(\bbasic\s+)[A-Za-z0-9._~+/=-]+")
+AUTH_BASIC_RE = re.compile(r"(?i)(\bbasic\s+)(?:(['\"])(?:\\.|(?!\2)[^\r\n])*\2|[A-Za-z0-9._~+/=-]+)")
 COOKIE_HEADER_RE = re.compile(r"(?i)(\b(?:set-cookie|cookie)\s*:\s*)[^\r\n]+")
 SESSION_VALUE_RE = re.compile(r"(?i)(\b(?:session[_-]?id)\b\s*[:=]\s*)[^\s,;}\]\r\n]+")
 DIGEST_FIELD_RE = re.compile(r"(?i)(\b(?:response|nonce|cnonce|opaque|nc|qop)\s*[:=]\s*)[^\s,;}\]\r\n]+")
@@ -73,10 +73,16 @@ SECRET_DOUBLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)
 SECRET_SINGLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)'(?:\\.|[^'\\])*'")
 UNTERMINATED_SECRET_DOUBLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)\"(?:\\.|[^\"\\])*\\?$")
 UNTERMINATED_SECRET_SINGLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)'(?:\\.|[^'\\])*\\?$")
-SECRET_TOKEN_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)([^\s,;}}\]\\\"']+)")
+SECRET_TOKEN_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)(?!(?:bearer|basic|digest)\b)([^\s,;}}\]\\\"']+)")
 SSHPASS_RE = re.compile(r"(?i)(\bsshpass\b[ \t]+-p)[^\r\n]*")
 URL_CREDENTIAL_RE = re.compile(r"(?i)(\b[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:)([^@\s/]+)(@)")
-BEARER_RE = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+")
+BEARER_RE = re.compile(r"(?i)(bearer\s+)(?:(['\"])(?:\\.|(?!\2)[^\r\n])*\2|[A-Za-z0-9._~+/=-]+)")
+
+
+def redact_credential_match(match: re.Match[str]) -> str:
+    prefix = match.group(1)
+    quote = match.group(2)
+    return prefix + (quote + "[REDACTED]" + quote if quote else "[REDACTED]")
 
 
 def redact_diagnostic_text(value: str) -> str:
@@ -84,8 +90,8 @@ def redact_diagnostic_text(value: str) -> str:
     redacted = UNTERMINATED_PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", redacted)
     redacted = COOKIE_HEADER_RE.sub(r"\1[REDACTED]", redacted)
     redacted = AUTH_DIGEST_RE.sub(r"\1[REDACTED]", redacted)
-    redacted = AUTH_SCHEME_RE.sub(r"\1[REDACTED]", redacted)
-    redacted = AUTH_BASIC_RE.sub(r"\1[REDACTED]", redacted)
+    redacted = AUTH_SCHEME_RE.sub(redact_credential_match, redacted)
+    redacted = AUTH_BASIC_RE.sub(redact_credential_match, redacted)
     redacted = SESSION_VALUE_RE.sub(r"\1[REDACTED]", redacted)
     redacted = DIGEST_FIELD_RE.sub(r"\1[REDACTED]", redacted)
     redacted = COMMAND_MARKER_RE.sub(r"\1[REDACTED]", redacted)
@@ -97,16 +103,37 @@ def redact_diagnostic_text(value: str) -> str:
     redacted = SECRET_TOKEN_RE.sub(r"\1[REDACTED]", redacted)
     redacted = SSHPASS_RE.sub(r"\1 [REDACTED]", redacted)
     redacted = URL_CREDENTIAL_RE.sub(r"\1[REDACTED]\3", redacted)
-    redacted = BEARER_RE.sub(r"\1[REDACTED]", redacted)
+    redacted = BEARER_RE.sub(redact_credential_match, redacted)
     return JWT_RE.sub("[REDACTED JWT]", redacted)
+
+
+def _utf8_length(value: str) -> int:
+    return len(value.encode("utf-8"))
+
+
+def _take_utf8(value: str, limit: int) -> str:
+    if limit <= 0:
+        return ""
+    result: list[str] = []
+    used = 0
+    for character in value:
+        size = len(character.encode("utf-8"))
+        if used + size > limit:
+            break
+        result.append(character)
+        used += size
+    return "".join(result)
 
 
 def bounded_diagnostic_text(value: str, limit: int = DIAGNOSTIC_MESSAGE_LIMIT) -> str:
     redacted = redact_diagnostic_text(value)
-    if len(redacted) <= limit:
+    if _utf8_length(redacted) <= limit:
         return redacted
     marker = DIAGNOSTIC_TRUNCATION_MARKER.decode("utf-8")
-    return redacted[: max(0, limit - len(marker))] + marker
+    marker_bytes = _utf8_length(marker)
+    if marker_bytes >= limit:
+        return _take_utf8(marker, limit)
+    return _take_utf8(redacted, limit - marker_bytes) + marker
 
 
 def redact_and_bound_diagnostic(value: bytes, *, truncated: bool = False, limit: int = DIAGNOSTIC_OUTPUT_LIMIT) -> bytes:
@@ -165,7 +192,7 @@ def persisted_document(value: Any) -> Any:
         encoded = json.dumps(projected, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     except (TypeError, ValueError, OverflowError):
         return {"truncated": True}
-    if len(encoded) <= PERSISTED_DOCUMENT_LIMIT:
+    if len(encoded.encode("utf-8")) <= PERSISTED_DOCUMENT_LIMIT:
         return projected
     result: dict[str, Any] = {"truncated": True}
     if isinstance(projected, dict) and "capacity" in projected:
@@ -1064,10 +1091,11 @@ def command_acquire(args: argparse.Namespace) -> int:
     private_key, public_key = make_ssh_key(session)
     # Observation never renews. Reuse a saved operation's original generation
     # when retrying after a lost acknowledgement.
-    generation = control_request("status", session=session)["result"]["generation"]
     requested_op = getattr(args, "operation_id", None)
-    if requested_op:
-        generation = journal_generation(session, requested_op, generation)
+    if requested_op and os.path.lexists(operation_journal_path(session, requested_op)):
+        generation = journal_generation(session, requested_op, 0)
+    else:
+        generation = remote_generation(session)
     fields = {"public_key": public_key}
     if args.ssh_host_port is not None: fields["ssh_host_port"] = args.ssh_host_port
     if args.cpu is not None: fields["cpu"] = args.cpu

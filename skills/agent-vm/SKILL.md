@@ -25,7 +25,7 @@ While actively progressing or tracking the task, use explicit `agent-vm renew` b
 
 ## Source, ports and capacity
 
-Use `agent-vm sync --name <safe-name>` or `python3 <loaded-skill-dir>/scripts/sync_worktree.py --name <safe-name>` from the Git worktree. The helper writes only `/workspace/worktrees/<name>/src`; keep results beside `src`. It selects tracked/unignored files, replaces only its own source directory, excludes `.git` and rejects submodules before writes. For submodules or other data use explicit native upload/download or trusted SSH/rsync. Normal SSH is not limited to the helper path.
+Use `agent-vm sync --name <safe-name>` or `python3 <loaded-skill-dir>/scripts/sync_worktree.py --name <safe-name>` from the Git worktree. The helper writes only `/workspace/worktrees/<name>/src`; keep results beside `src`. It selects tracked/unignored files, replaces only its own source directory, excludes `.git` and rejects submodules before writes. The guest `/workspace/worktrees` and named worktree directories must be owned by the guest control user and not group- or world-writable; the helper fails closed before replacement when that boundary is not verified. For submodules or other data use explicit native upload/download or trusted SSH/rsync. Normal SSH is not limited to the helper path.
 
 Native clients use `agent-vm ssh-info --format ssh-config`, saved with mode 0600, then `ssh -F <config> agent-vm` (or rsync with that configuration). Keep host checking enabled and consume the returned port/key settings; do not assemble permanent ports or gateway routes. Delete temporary configuration when finished.
 

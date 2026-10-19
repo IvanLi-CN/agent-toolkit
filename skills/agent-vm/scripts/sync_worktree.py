@@ -31,9 +31,9 @@ SECRET_LABELS = r"(?:[A-Za-z0-9]+[_-])*(?:password|passwd|passphrase|secret|toke
 CAMEL_SECRET_LABELS = r"(?:password|passwd|passphrase|secret|token|authorization|privateKey|publicKey|apiKey|accessKey|clientSecret|credentials?|cookie|setCookie)[A-Z][A-Za-z0-9]*"
 PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 _-]*PRIVATE KEY-----", re.IGNORECASE)
 UNTERMINATED_PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*$", re.IGNORECASE)
-AUTH_SCHEME_RE = re.compile(r"(?i)(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?(?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]+")
+AUTH_SCHEME_RE = re.compile(r"(?i)(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?(?:bearer|basic)\s+)(?:(['\"])(?:\\.|(?!\2)[^\r\n])*\2|[A-Za-z0-9._~+/=-]+)")
 AUTH_DIGEST_RE = re.compile(r"(?i)(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?digest\s+)[^\r\n]+")
-AUTH_BASIC_RE = re.compile(r"(?i)(\bbasic\s+)[A-Za-z0-9._~+/=-]+")
+AUTH_BASIC_RE = re.compile(r"(?i)(\bbasic\s+)(?:(['\"])(?:\\.|(?!\2)[^\r\n])*\2|[A-Za-z0-9._~+/=-]+)")
 COOKIE_HEADER_RE = re.compile(r"(?i)(\b(?:set-cookie|cookie)\s*:\s*)[^\r\n]+")
 SESSION_VALUE_RE = re.compile(r"(?i)(\b(?:session[_-]?id)\b\s*[:=]\s*)[^\s,;}\]\r\n]+")
 DIGEST_FIELD_RE = re.compile(r"(?i)(\b(?:response|nonce|cnonce|opaque|nc|qop)\s*[:=]\s*)[^\s,;}\]\r\n]+")
@@ -44,10 +44,16 @@ SECRET_DOUBLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)
 SECRET_SINGLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)'(?:\\.|[^'\\])*'")
 UNTERMINATED_SECRET_DOUBLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)\"(?:\\.|[^\"\\])*\\?$")
 UNTERMINATED_SECRET_SINGLE_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)'(?:\\.|[^'\\])*\\?$")
-SECRET_TOKEN_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)([^\s,;}}\]\\\"']+)")
+SECRET_TOKEN_RE = re.compile(rf"(?i)(['\"]?\b{SECRET_LABELS}\b['\"]?\s*[:=]\s*)(?!(?:bearer|basic|digest)\b)([^\s,;}}\]\\\"']+)")
 SSHPASS_RE = re.compile(r"(?i)(\bsshpass\b[ \t]+-p)[^\r\n]*")
 URL_CREDENTIAL_RE = re.compile(r"(?i)(\b[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:)([^@\s/]+)(@)")
-BEARER_RE = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+")
+BEARER_RE = re.compile(r"(?i)(bearer\s+)(?:(['\"])(?:\\.|(?!\2)[^\r\n])*\2|[A-Za-z0-9._~+/=-]+)")
+
+
+def redact_credential_match(match: re.Match[str]) -> str:
+    prefix = match.group(1)
+    quote = match.group(2)
+    return prefix + (quote + "[REDACTED]" + quote if quote else "[REDACTED]")
 
 
 def redact_stderr(value: bytes) -> bytes:
@@ -56,8 +62,8 @@ def redact_stderr(value: bytes) -> bytes:
     text = UNTERMINATED_PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", text)
     text = COOKIE_HEADER_RE.sub(r"\1[REDACTED]", text)
     text = AUTH_DIGEST_RE.sub(r"\1[REDACTED]", text)
-    text = AUTH_SCHEME_RE.sub(r"\1[REDACTED]", text)
-    text = AUTH_BASIC_RE.sub(r"\1[REDACTED]", text)
+    text = AUTH_SCHEME_RE.sub(redact_credential_match, text)
+    text = AUTH_BASIC_RE.sub(redact_credential_match, text)
     text = SESSION_VALUE_RE.sub(r"\1[REDACTED]", text)
     text = DIGEST_FIELD_RE.sub(r"\1[REDACTED]", text)
     text = COMMAND_MARKER_RE.sub(r"\1[REDACTED]", text)
@@ -69,7 +75,7 @@ def redact_stderr(value: bytes) -> bytes:
     text = SECRET_TOKEN_RE.sub(r"\1[REDACTED]", text)
     text = SSHPASS_RE.sub(r"\1 [REDACTED]", text)
     text = URL_CREDENTIAL_RE.sub(r"\1[REDACTED]\3", text)
-    text = BEARER_RE.sub(r"\1[REDACTED]", text)
+    text = BEARER_RE.sub(redact_credential_match, text)
     return JWT_RE.sub("[REDACTED JWT]", text).encode("utf-8")
 
 
@@ -97,6 +103,7 @@ import ctypes, errno, fcntl, hashlib, json, os, pathlib, shutil, stat, sys
 
 OWNER = ".agent-vm-sync-owner.json"
 TAG = "agent-vm-source-v1"
+TRUSTED_SHARED_ROOTS = {"/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp"}
 r = json.load(sys.stdin)
 name, tx, action = r["name"], r["tx"], r["action"]
 import re
@@ -125,10 +132,23 @@ def directory(p, create=False):
     if str(p.resolve(strict=True)) != str(p):
         raise ValueError("non-canonical directory")
 
+def secure_directory(p):
+    directory(p)
+    cur = pathlib.Path("/")
+    for part in p.parts[1:]:
+        cur = cur / part
+        s = cur.lstat()
+        mode = stat.S_IMODE(s.st_mode)
+        if str(cur) in TRUSTED_SHARED_ROOTS and stat.S_ISDIR(s.st_mode) and s.st_uid == 0 and mode & 0o1000 and mode & 0o077 == 0o077:
+            continue
+        if mode & 0o022 or (cur == p and s.st_uid != os.geteuid()):
+            raise ValueError("workspace directory ownership or mode is unsafe")
+
 def read_json(p):
     fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd) as f:
-        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+        s = os.fstat(f.fileno())
+        if not stat.S_ISREG(s.st_mode) or s.st_uid != os.geteuid() or stat.S_IMODE(s.st_mode) & 0o077:
             raise ValueError("metadata is not a regular file")
         return json.load(f)
 
@@ -157,7 +177,7 @@ def fsync_parent():
     finally: os.close(fd)
 
 def owned(p):
-    directory(p)
+    secure_directory(p)
     m = read_json(p / OWNER)
     if m.get("helper") != TAG or m.get("name") != name:
         raise ValueError("source is not owned by this helper")
@@ -175,6 +195,10 @@ def remove_owned(p):
     fsync_parent()
 
 directory(parent, create=(action == "begin"))
+secure_directory(parent.parent)
+secure_directory(parent)
+if os.path.lexists(src):
+    secure_directory(src)
 lock = os.open(parent / ".agent-vm-sync.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
 if not stat.S_ISREG(os.fstat(lock).st_mode): raise ValueError("invalid lock")
 fcntl.flock(lock, fcntl.LOCK_EX)

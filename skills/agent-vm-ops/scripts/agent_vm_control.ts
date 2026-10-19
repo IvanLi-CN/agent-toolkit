@@ -163,9 +163,9 @@ const SECRET_LABEL = "(?:[A-Za-z0-9]+[_-])*(?:password|passwd|passphrase|secret|
 const CAMEL_SECRET_LABEL = "(?:password|passwd|passphrase|secret|token|authorization|privateKey|publicKey|apiKey|accessKey|clientSecret|credentials?|cookie|setCookie)[A-Z][A-Za-z0-9]*";
 const PRIVATE_KEY_RE = /-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 _-]*PRIVATE KEY-----/gi;
 const UNTERMINATED_PRIVATE_KEY_RE = /-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*$/gi;
-const AUTH_SCHEME_RE = /(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?(?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]+/gi;
+const AUTH_SCHEME_RE = /(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?(?:bearer|basic)\s+)(?:(['\"])(?:\\.|(?!\2)[^\r\n])*\2|[A-Za-z0-9._~+/=-]+)/gi;
 const AUTH_DIGEST_RE = /(['\"]?\bauthorization\b['\"]?\s*(?:[:=]\s*)?['\"]?digest\s+)[^\r\n]+/gi;
-const AUTH_BASIC_RE = /(\bbasic\s+)[A-Za-z0-9._~+/=-]+/gi;
+const AUTH_BASIC_RE = /(\bbasic\s+)(?:(['\"])(?:\\.|(?!\2)[^\r\n])*\2|[A-Za-z0-9._~+/=-]+)/gi;
 const COOKIE_HEADER_RE = /(\b(?:set-cookie|cookie)\s*:\s*)[^\r\n]+/gi;
 const SESSION_VALUE_RE = /(\b(?:session[_-]?id)\b\s*[:=]\s*)[^\s,;}\]\r\n]+/gi;
 const DIGEST_FIELD_RE = /(\b(?:response|nonce|cnonce|opaque|nc|qop)\s*[:=]\s*)[^\s,;}\]\r\n]+/gi;
@@ -176,18 +176,22 @@ const SECRET_DOUBLE_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*
 const SECRET_SINGLE_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)'(?:\\\\.|[^'\\\\])*'", "gi");
 const UNTERMINATED_SECRET_DOUBLE_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)\"(?:\\\\.|[^\"\\\\])*\\\\?$", "gi");
 const UNTERMINATED_SECRET_SINGLE_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)'(?:\\\\.|[^'\\\\])*\\\\?$", "gi");
-const SECRET_TOKEN_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)([^\\s,;}}\\]\\\\\"']+)", "gi");
+const SECRET_TOKEN_RE = new RegExp("(['\"]?\\b" + SECRET_LABEL + "\\b['\"]?\\s*[:=]\\s*)(?!(?:bearer|basic|digest)\\b)([^\\s,;}}\\]\\\\\"']+)", "gi");
 const SSHPASS_RE = /(\bsshpass\b[ \t]+-p)[^\r\n]*/gi;
 const URL_CREDENTIAL_RE = /(\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s:@]+:)([^@\s/]+)(@)/gi;
-const BEARER_RE = /(bearer\s+)[A-Za-z0-9._~+/=-]+/gi;
+const BEARER_RE = /(bearer\s+)(?:(['\"])(?:\\.|(?!\2)[^\r\n])*\2|[A-Za-z0-9._~+/=-]+)/gi;
+
+function redactCredentialMatch(_match: string, prefix: string, quote?: string): string {
+  return prefix + (quote ? quote + "[REDACTED]" + quote : "[REDACTED]");
+}
 
 function redactDiagnosticText(rawInput: string): string {
   let redacted = rawInput.replace(PRIVATE_KEY_RE, "[REDACTED PRIVATE KEY]");
   redacted = redacted.replace(UNTERMINATED_PRIVATE_KEY_RE, "[REDACTED PRIVATE KEY]");
   redacted = redacted.replace(COOKIE_HEADER_RE, "$1[REDACTED]");
   redacted = redacted.replace(AUTH_DIGEST_RE, "$1[REDACTED]");
-  redacted = redacted.replace(AUTH_SCHEME_RE, "$1[REDACTED]");
-  redacted = redacted.replace(AUTH_BASIC_RE, "$1[REDACTED]");
+  redacted = redacted.replace(AUTH_SCHEME_RE, redactCredentialMatch);
+  redacted = redacted.replace(AUTH_BASIC_RE, redactCredentialMatch);
   redacted = redacted.replace(SESSION_VALUE_RE, "$1[REDACTED]");
   redacted = redacted.replace(DIGEST_FIELD_RE, "$1[REDACTED]");
   redacted = redacted.replace(COMMAND_MARKER_RE, "$1[REDACTED]");
@@ -199,14 +203,33 @@ function redactDiagnosticText(rawInput: string): string {
   redacted = redacted.replace(SECRET_TOKEN_RE, "$1[REDACTED]");
   redacted = redacted.replace(SSHPASS_RE, "$1 [REDACTED]");
   redacted = redacted.replace(URL_CREDENTIAL_RE, "$1[REDACTED]$3");
-  redacted = redacted.replace(BEARER_RE, "$1[REDACTED]");
+  redacted = redacted.replace(BEARER_RE, redactCredentialMatch);
   return redacted.replace(JWT_RE, "[REDACTED JWT]");
+}
+
+function utf8ByteLength(value: string): number {
+  return Buffer.byteLength(value, "utf8");
+}
+
+function takeUtf8(value: string, limit: number): string {
+  if (limit <= 0) return "";
+  let bytes = 0;
+  let result = "";
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + characterBytes > limit) break;
+    result += character;
+    bytes += characterBytes;
+  }
+  return result;
 }
 
 function boundedDiagnosticText(rawInput: string, limit: number): string {
   const redacted = redactDiagnosticText(rawInput);
-  if (redacted.length <= limit) return redacted;
-  return redacted.slice(0, Math.max(0, limit - DIAGNOSTIC_LOG_TRUNCATION_MARKER.length)) + DIAGNOSTIC_LOG_TRUNCATION_MARKER;
+  if (utf8ByteLength(redacted) <= limit) return redacted;
+  const markerBytes = utf8ByteLength(DIAGNOSTIC_LOG_TRUNCATION_MARKER);
+  if (markerBytes >= limit) return takeUtf8(DIAGNOSTIC_LOG_TRUNCATION_MARKER, limit);
+  return takeUtf8(redacted, limit - markerBytes) + DIAGNOSTIC_LOG_TRUNCATION_MARKER;
 }
 
 function redactDiagnosticValue(value: unknown, depth = 0): unknown {
@@ -270,7 +293,7 @@ function persistedValue(value: unknown, depth = 0): unknown {
 
 function persistedDocument(value: unknown): unknown {
   const projected = persistedValue(value);
-  if (stableJson(projected).length <= PERSISTED_DOCUMENT_LIMIT) return projected;
+  if (utf8ByteLength(stableJson(projected)) <= PERSISTED_DOCUMENT_LIMIT) return projected;
   const result: Dict = { truncated: true };
   if (isDict(projected) && hasOwn(projected, "capacity")) result.capacity = projected.capacity;
   return result;
@@ -299,7 +322,7 @@ function persistedResponse(response: Dict): Dict {
     if (key === "result" || key === "error") setOwn(result, key, persistedDocument(value));
     else setOwn(result, key, persistedValue(value));
   }
-  if (stableJson(result).length > PERSISTED_DOCUMENT_LIMIT) {
+  if (utf8ByteLength(stableJson(result)) > PERSISTED_DOCUMENT_LIMIT) {
     if (hasOwn(result, "result")) result.result = persistedTruncated(result.result);
     if (hasOwn(result, "error")) result.error = { code: "persisted_error", message: PERSISTENCE_TRUNCATION_MARKER };
   }
@@ -1025,7 +1048,7 @@ async function readBounded(stream: ReadableStream<Uint8Array>, limit: number, ta
   let seen = 0;
   let truncated = false;
   let rawTruncated = false;
-  const cancel = (): void => { void reader.cancel(); };
+  const cancel = (): void => { void reader.cancel().catch(() => undefined); };
   signal?.addEventListener("abort", cancel, { once: true });
   try {
     while (true) {
@@ -1328,6 +1351,21 @@ export function anchoredProcessGroupMembers(
   return verified ? scan(pgid) : { members: [], complete: false };
 }
 
+function hasLiveGroupAnchor(pgid: number, anchors: readonly ProcessIdentity[], excludedPid?: number): boolean {
+  for (const anchor of anchors) {
+    if (anchor.pid === excludedPid) continue;
+    try {
+      if (process.platform === "linux") {
+        const record = readProcessRecord(anchor.pid);
+        if (record.starttime === anchor.starttime && record.pgrp === pgid) return true;
+      } else if (processExists(anchor.pid) && processGroupId(anchor.pid) === pgid) {
+        return true;
+      }
+    } catch { /* A vanished or unqueryable member cannot anchor a group signal. */ }
+  }
+  return false;
+}
+
 export function killProcessTree(members: readonly ProcessIdentity[], options: ProcessCleanupOptions = {}): { killed: boolean; error: string | null } {
   const readIdentity = options.readIdentity ?? processStartIdentity;
   const exists = options.exists ?? processExists;
@@ -1405,6 +1443,10 @@ function safeProcessSignal(pid: number, expectedIdentity: string | undefined, si
 }
 
 export class CommandRunner {
+  protected spawn(argv: readonly string[], options: Record<string, unknown>): Bun.Subprocess<"pipe", "pipe", "pipe"> {
+    return Bun.spawn([...argv], options as any) as Bun.Subprocess<"pipe", "pipe", "pipe">;
+  }
+
   async run(argv: readonly string[], options: RunOptions = {}): Promise<CompletedProcess> {
     const result = await this.runBounded(argv, { timeout: options.timeout ?? 60, stdoutLimit: COMMAND_OUTPUT_LIMIT, stderrLimit: 4000, check: options.check ?? true, inputData: options.inputData });
     if (result.stdoutTruncated) throw new ControlError("command_output_truncated", `command stdout exceeded retained limit: ${argv[0]}`, { limit: COMMAND_OUTPUT_LIMIT });
@@ -1419,7 +1461,7 @@ export class CommandRunner {
     commandEnv.AGENT_VM_COMMAND_ID = commandMarker;
     let processHandle: Bun.Subprocess<"pipe", "pipe", "pipe">;
     try {
-      processHandle = Bun.spawn([...argv], { stdin: options.inputData !== undefined ? "pipe" : "ignore", stdout: "pipe", stderr: "pipe", detached: true, env: commandEnv });
+      processHandle = this.spawn(argv, { stdin: options.inputData !== undefined ? "pipe" : "ignore", stdout: "pipe", stderr: "pipe", detached: true, env: commandEnv });
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new ControlError("command_missing", `command not found: ${argv[0]}`);
       throw error;
@@ -1514,10 +1556,26 @@ export class CommandRunner {
       }
       return undefined;
     })();
-    const communication = Promise.all([inputPromise, stdoutPromise, stderrPromise, exit]);
+    const communication = Promise.all([inputPromise, stdoutPromise, stderrPromise, exit]).then(
+      (value) => ({ kind: "complete" as const, value }),
+      (error) => ({ kind: "communication_error" as const, error }),
+    );
+    const stopReaders = async (): Promise<void> => {
+      readAbort.abort();
+      try { processHandle.stdin?.end(); } catch { /* The input pipe may already be closed. */ }
+      await Promise.race([
+        Promise.allSettled([
+          processHandle.stdout.cancel().catch(() => undefined),
+          processHandle.stderr.cancel().catch(() => undefined),
+        ]),
+        sleep(250),
+      ]);
+    };
     try {
-      const outcome = await Promise.race([communication.then((value) => ({ kind: "complete" as const, value })), timeout.then(() => ({ kind: "timeout" as const }))]);
-      if (outcome.kind === "timeout") {
+      const outcome = await Promise.race([communication, timeout.then(() => ({ kind: "timeout" as const }))]);
+      if (outcome.kind === "timeout" || outcome.kind === "communication_error") {
+        const communicationError = outcome.kind === "communication_error" ? outcome.error : undefined;
+        await stopReaders();
         const descendants = processDescendants(processHandle.pid);
         for (const target of processPipeTargets(processHandle.pid)) leaderPipeTargets.add(target);
         const known = new Map<number, ProcessIdentity>();
@@ -1575,9 +1633,7 @@ export class CommandRunner {
           addBoundEnvironmentMembers();
           addKnown(processPipeMembers(leaderPipeTargets, pipeScope()).members);
           for (const [pgid, anchors] of groupAnchors) {
-            const liveAnchor = anchors.some((anchor) => {
-              try { return processStartIdentity(anchor.pid) === anchor.starttime; } catch { return false; }
-            });
+            const liveAnchor = hasLiveGroupAnchor(pgid, anchors, process.platform !== "linux" && leaderExitedAfterTerm ? processHandle.pid : undefined);
             if (!liveAnchor) continue;
             const group = anchoredProcessGroupMembers(pgid, anchors);
             addKnown(group.members);
@@ -1592,10 +1648,21 @@ export class CommandRunner {
             }
           }
           if (!leaderExitedAfterTerm || process.platform !== "linux") {
-            const leaderGroup = anchoredProcessGroupMembers(processHandle.pid, leaderIdentity ? [{ pid: processHandle.pid, starttime: leaderIdentity }] : []);
-            processTreeComplete &&= leaderGroup.complete;
-            addKnown(leaderGroup.members);
-            groupKill = safeProcessSignal(processHandle.pid, leaderIdentity, 9, true, leaderPgid, leaderGroupAnchored);
+            const independentAnchor = process.platform !== "linux" && leaderExitedAfterTerm && leaderPgid !== undefined
+              ? (groupAnchors.get(leaderPgid) ?? []).find((anchor) => hasLiveGroupAnchor(leaderPgid, [anchor], processHandle.pid))
+              : undefined;
+            if (process.platform !== "linux" && leaderExitedAfterTerm && !independentAnchor) {
+              processGroupCleanupError ??= "process_group_anchor_lost";
+            } else {
+              if (process.platform === "linux" || !leaderExitedAfterTerm) {
+                const leaderGroup = anchoredProcessGroupMembers(processHandle.pid, leaderIdentity ? [{ pid: processHandle.pid, starttime: leaderIdentity }] : []);
+                processTreeComplete &&= leaderGroup.complete;
+                addKnown(leaderGroup.members);
+              }
+              const signalPid = independentAnchor?.pid ?? processHandle.pid;
+              const signalIdentity = process.platform === "linux" ? leaderIdentity : undefined;
+              groupKill = safeProcessSignal(signalPid, signalIdentity, 9, true, leaderPgid, Boolean(leaderGroupAnchored || independentAnchor));
+            }
             directKill = process.platform === "linux" ? safeProcessSignal(processHandle.pid, leaderIdentity, 9, false) : { sent: false, error: null };
             processGroupCleanupError ??= groupKill.error ?? directKill.error;
           }
@@ -1619,9 +1686,7 @@ export class CommandRunner {
         finalInspectionComplete &&= finalPipes.complete;
         addKnown(finalPipes.members);
         for (const [pgid, anchors] of groupAnchors) {
-          const liveAnchor = anchors.some((anchor) => {
-            try { return processStartIdentity(anchor.pid) === anchor.starttime; } catch { return false; }
-          });
+          const liveAnchor = hasLiveGroupAnchor(pgid, anchors, process.platform !== "linux" && leaderExitedAfterTerm ? processHandle.pid : undefined);
           if (!liveAnchor) continue;
           const group = anchoredProcessGroupMembers(pgid, anchors);
           finalInspectionComplete &&= group.complete;
@@ -1648,15 +1713,18 @@ export class CommandRunner {
         const processGroupKilled = !leaderStillAlive && !remainingKnown && !processGroupCleanupError;
         processGroupCleanupError ??= processGroupKilled ? null : "process_group_members_remain";
         const reaped = await Promise.race([exit.then(() => true), sleep(1000).then(() => false)]);
-        readAbort.abort();
-        try { processHandle.stdin?.end(); } catch { /* The pipe may already be closed. */ }
         await Promise.race([Promise.allSettled([inputPromise, stdoutPromise, stderrPromise, exit]), sleep(1000)]);
         const stderr = await Promise.race([
           stderrPromise.catch(() => ({ bytes: encode(DIAGNOSTIC_LOG_TRUNCATION_MARKER), truncated: true })),
           sleep(1000).then(() => ({ bytes: encode(DIAGNOSTIC_LOG_TRUNCATION_MARKER), truncated: true })),
         ]);
         if (!processGroupKilled && !processGroupCleanupError) processGroupCleanupError = "process_group_kill_failed";
-        throw new ControlError("command_timeout", `command timed out: ${argv[0]}`, { reaped, process_group_killed: processGroupKilled, process_group_cleanup_error: processGroupCleanupError, process_tree_inspection: inspectionDetail, stderr: decode(stderr.bytes), stderr_truncated: stderr.truncated });
+        const detail: Dict = { reaped, process_group_killed: processGroupKilled, process_group_cleanup_error: processGroupCleanupError, process_tree_inspection: inspectionDetail, stderr: decode(stderr.bytes), stderr_truncated: stderr.truncated };
+        if (communicationError !== undefined) {
+          detail.communication_error = communicationError instanceof Error ? communicationError.name : "unknown";
+          throw new ControlError("command_io", "command communication failed: " + argv[0], detail);
+        }
+        throw new ControlError("command_timeout", "command timed out: " + argv[0], detail);
       }
       const [, stdout, stderr, returncode] = outcome.value;
       const result: CompletedProcess = { args: [...argv], returncode, stdout: stdout.bytes, stderr: stderr.bytes, stdoutTruncated: stdout.truncated };
@@ -1811,6 +1879,8 @@ const TASK_FIELDS = new Set([
 ]);
 const PORT_FIELDS = new Set(["task_id", "generation", "port_name", "protocol", "host_port", "vm_port", "device_name", "state", "created_at"]);
 const STATE_TABLES = new Set(["meta", "tasks", "ports", "operations", "audit"]);
+const META_KEYS = new Set(["draining", "schema_migration"]);
+const GUEST_CAPABILITY_CONFIG_KEY = "user.agent-vm.guest-tools";
 const PYTHON_BASELINE_MIGRATION = "python-baseline-v1->bun-canonical-v1";
 const OPERATION_ACTIONS = new Set(["acquire", "renew", "release", "destroy", "restart", "resize", "port-add", "port-remove", "drain-enter", "drain-exit", "admin-reconcile", "admin-gc"]);
 const OPERATION_SESSION_ACTIONS = new Set(["acquire", "renew", "release", "destroy", "restart", "resize", "port-add", "port-remove"]);
@@ -2040,6 +2110,14 @@ export class StateStore {
         catch { throw new ControlError("state_invalid", `durable state contains invalid legacy ${table}.${column} JSON`); }
       };
       const migratedValue = (table: string, column: string, row: Dict): unknown => {
+        if (table === "meta") {
+          const key = String(row.key);
+          if (!META_KEYS.has(key)) throw new ControlError("state_invalid", "durable state contains an unsupported metadata key: " + key);
+          const value = String(row.value);
+          if (key === "draining" && !["0", "1"].includes(value)) throw new ControlError("state_invalid", "durable state contains an invalid draining flag");
+          if (key === "schema_migration" && value !== PYTHON_BASELINE_MIGRATION) throw new ControlError("state_invalid", "durable state contains conflicting schema migration provenance");
+          return value;
+        }
         if (table === "tasks" && column === "last_error") {
           const value = legacyJson(table, column, row);
           if (value === null) return null;
@@ -2162,6 +2240,11 @@ export class StateStore {
     const foreignKeys = (db.query("PRAGMA foreign_key_list(ports)") as any).all() as Dict[];
     if (foreignKeys.length !== 1 || String(foreignKeys[0]?.table) !== "tasks" || String(foreignKeys[0]?.from) !== "task_id" || String(foreignKeys[0]?.to) !== "task_id" || String(foreignKeys[0]?.on_update).toUpperCase() !== "NO ACTION" || String(foreignKeys[0]?.on_delete).toUpperCase() !== "NO ACTION" || String(foreignKeys[0]?.match).toUpperCase() !== "NONE") throw new ControlError("state_invalid", "durable state database foreign-key contract differs");
     if ((db.query("PRAGMA foreign_key_check") as any).all().length) throw new ControlError("state_invalid", "durable state database contains dangling foreign keys");
+    const metaRows = (db.query("SELECT key, value FROM meta") as any).all() as Dict[];
+    for (const row of metaRows) {
+      const key = String(row.key);
+      if (!META_KEYS.has(key)) throw new ControlError("state_invalid", "durable state contains an unsupported metadata key: " + key);
+    }
     const schemaMigration = (db.query("SELECT value FROM meta WHERE key = 'schema_migration'") as any).get() as Dict | null;
     if (schemaMigration && schemaMigration.value !== PYTHON_BASELINE_MIGRATION) throw new ControlError("state_invalid", "durable state contains unknown schema migration provenance");
     const draining = (db.query("SELECT value FROM meta WHERE key = 'draining'") as any).get() as Dict | null;
@@ -2450,6 +2533,7 @@ export class StateStore {
   }
 
   setMeta(key: string, value: string): void {
+    if (!META_KEYS.has(key)) throw new ControlError("state_invalid", "unsupported metadata key: " + key);
     if (key === "draining" && value !== "0" && value !== "1") throw new ControlError("state_invalid", "draining must be exactly 0 or 1");
     this.transaction(() => (this.db as any).run("INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", key, value));
   }
@@ -2504,22 +2588,31 @@ const MAX_WRITER_TEMP_CLEANUP = 64;
 
 function writerStatePath(path: string): string { return path + NATIVE_WRITER_STATE_SUFFIX; }
 
+function fsyncParentDirectory(path: string): void {
+  const fd = openSync(dirname(path), constants.O_RDONLY);
+  try { fsyncSync(fd); } finally { closeSync(fd); }
+}
+
 function cleanupOrphanWriterTemps(directory: string): void {
   let cleaned = 0;
   for (const name of readdirSync(directory)) {
     if (cleaned >= MAX_WRITER_TEMP_CLEANUP || !name.startsWith(NATIVE_WRITER_PREFIX)) continue;
     const separator = name.indexOf(".tmp-");
-    if (separator <= NATIVE_WRITER_PREFIX.length) continue;
-    const baseName = name.slice(0, separator);
-    const markerName = baseName.endsWith(NATIVE_WRITER_STATE_SUFFIX) ? baseName.slice(0, -NATIVE_WRITER_STATE_SUFFIX.length) : baseName;
+    const isTemp = separator > NATIVE_WRITER_PREFIX.length;
+    const isState = name.endsWith(NATIVE_WRITER_STATE_SUFFIX);
+    if (!isTemp && !isState) continue;
+    const markerName = isTemp
+      ? name.slice(0, separator).replace(new RegExp(`${NATIVE_WRITER_STATE_SUFFIX.replace(".", "\\.")}$`), "")
+      : name.slice(0, -NATIVE_WRITER_STATE_SUFFIX.length);
     const markerPath = join(directory, markerName);
     try { lstatSync(markerPath); continue; } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
     }
+    const path = join(directory, name);
     try {
-      const info = lstatSync(join(directory, name));
+      const info = lstatSync(path);
       if (!info.isFile() || Date.now() - info.mtimeMs < WRITER_TEMP_MAX_AGE_MS) continue;
-      unlinkSync(join(directory, name));
+      unlinkSync(path);
       cleaned += 1;
     } catch { /* A concurrent publisher or a protected entry is left for the next scan. */ }
   }
@@ -2540,6 +2633,7 @@ function writeAtomicMarker(path: string, value: string, createOnly = false, befo
     } else {
       renameSync(temp, path);
     }
+    fsyncParentDirectory(path);
     return fd;
   } catch (error) {
     try { closeSync(fd); } catch { /* The descriptor is already closed. */ }
@@ -2686,6 +2780,14 @@ export function hasWriterIntent(directory: string): boolean {
 export class SystemdManager {
   constructor(readonly runner: CommandRunner, readonly config: Dict, readonly enabled = true) {
     if (enabled) {
+      if (process.platform === "linux") {
+        try {
+          const bun = lstatSync("/usr/bin/bun");
+          if (!bun.isFile() || (bun.mode & 0o111) === 0) throw new Error("bun");
+        } catch {
+          throw new ControlError("config_invalid", "systemd deployment requires an executable regular file at /usr/bin/bun");
+        }
+      }
       try { validateProtectedDirectory(String(config.timer_dir)); } catch (error) {
         if (error instanceof ControlError) throw error;
         throw new ControlError("config_invalid", "timer directory cannot be verified");
@@ -2711,16 +2813,22 @@ export class SystemdManager {
     const content = `[Unit]\nDescription=Expire native agent VM lease\nAfter=agent-vm-native-reconcile.service\n\n[Timer]\nOnCalendar=${date.toISOString().replace("T", " ").replace(".000Z", " UTC")}\nPersistent=yes\nAccuracySec=1s\nRandomizedDelaySec=0\nUnit=agent-vm-native-expire@${SystemdManager.instanceName(taskId, generation)}.service\n\n[Install]\nWantedBy=timers.target\n`;
     if (this.enabled) {
       mkdirSync(this.timerDir, { recursive: true, mode: 0o755 });
-      const tempDir = mkdtempSync(join(this.timerDir, ".agent-vm-timer-"));
-      const temp = join(tempDir, unit);
-      writeFileSync(temp, content, { mode: 0o600 });
-      const fd = openSync(temp, constants.O_WRONLY);
-      try { fsyncSync(fd); } finally { closeSync(fd); }
-      renameSync(temp, join(this.timerDir, unit));
-      try { rmdirSync(tempDir); } catch { /* Directory cleanup is best effort. */ }
-      await this.systemctl("daemon-reload");
-      await this.systemctl("enable", "--now", unit);
-      await this.systemctl("restart", unit);
+      let tempDir: string | undefined;
+      let temp: string | undefined;
+      try {
+        tempDir = mkdtempSync(join(this.timerDir, ".agent-vm-timer-"));
+        temp = join(tempDir, unit);
+        writeFileSync(temp, content, { mode: 0o600 });
+        const fd = openSync(temp, constants.O_WRONLY);
+        try { fsyncSync(fd); } finally { closeSync(fd); }
+        renameSync(temp, join(this.timerDir, unit));
+        await this.systemctl("daemon-reload");
+        await this.systemctl("enable", "--now", unit);
+        await this.systemctl("restart", unit);
+      } finally {
+        if (temp) try { unlinkSync(temp); } catch { /* The file was published or is already gone. */ }
+        if (tempDir) try { rmdirSync(tempDir); } catch { /* Bounded cleanup leaves no known temporary file behind. */ }
+      }
     }
     return unit;
   }
@@ -3034,6 +3142,19 @@ export class Control {
     const valid = Object.entries(expected).every(([key, value]) => config[key] === value) && generations.has(String(config["user.agent-vm.generation"]));
     if (!valid) throw new ControlError("ownership_mismatch", "native instance identity differs from durable ownership; refusing mutation");
     return info;
+  }
+
+  private guestCapabilityMarker(): string {
+    const configured = Array.isArray(this.config.required_guest_tools) ? this.config.required_guest_tools as string[] : [];
+    return [...new Set(["bun", ...configured])].sort(compareUnicodeCodePoints).join(",");
+  }
+
+  private async assertCachedGuestCapability(task: Dict): Promise<void> {
+    const info = await this.ownership(task);
+    const config = isDict(info.config) ? info.config : {};
+    if (config[GUEST_CAPABILITY_CONFIG_KEY] !== this.guestCapabilityMarker()) {
+      throw new ControlError("cache_ineligible", "cached instance guest capability marker is missing or stale");
+    }
   }
 
   private async assertNoNativeProxies(task: Dict, code = "cache_ineligible"): Promise<void> {
@@ -3979,8 +4100,13 @@ export class Control {
     const publicKey = requiredString(request.public_key, "public_key");
     if (!/^ssh-ed25519 [A-Za-z0-9+/=]+(?: [^\r\n]*)?$/.test(publicKey)) throw new ControlError("invalid_request", "acquire requires a single ed25519 public key");
     const cached = Boolean(existing && existing.state === "cached");
-    if (!cached) await this.imageGuard();
+    // A stopped cache can outlive the image configuration and the guest
+    // prerequisite contract. Revalidate the pinned image before reserving or
+    // resizing a cache; never select a cache created from an older image.
+    await this.imageGuard();
+    if (cached && String(existing?.image_fingerprint) !== String(this.config.image_fingerprint)) throw new ControlError("cache_ineligible", "cached instance was created from a different pinned image");
     if (cached) {
+      await this.assertCachedGuestCapability(existing as Dict);
       await this.assertNoNativeProxies(existing as Dict);
       if (String((await this.incus.instanceInfo(String(existing?.instance_name))).status).toLowerCase() !== "stopped" || this.store.getPorts(String(existing?.task_id)).length) throw new ControlError("cache_ineligible", "cached instance is not safely stopped");
     }
@@ -4036,6 +4162,7 @@ export class Control {
         const postCheckStarted = nowMs();
         this.expectedVmIp = String(task.vm_ip);
         await this.verifyGuestTools(task);
+        await this.nativeConfigSet(task, GUEST_CAPABILITY_CONFIG_KEY, this.guestCapabilityMarker());
         await this.guestIp(String(task.instance_name));
         guest = await this.growGuestRoot(task, resources.disk_gib);
         completed.push("guest_filesystem");
@@ -4176,6 +4303,7 @@ export class Control {
       this.expectedVmIp = String(task.vm_ip);
       await this.guestIp(String(task.instance_name));
       await this.verifyGuestTools(task);
+      await this.nativeConfigSet(task, GUEST_CAPABILITY_CONFIG_KEY, this.guestCapabilityMarker());
       stageTimings.post_check_seconds = Math.round((nowMs() - postCheckStarted) / 1000 * 1000) / 1000;
       task = await this.globalLock(() => this.store.transaction(() => { const current = this.store.getTask({ taskId: String(task.task_id) }); if (!current) throw new ControlError("task_missing", "task disappeared during restart"); this.checkGeneration(current, request); this.requireActive(current); return current; }));
       return { ...this.stateSummary(task), readiness, stage_timings: stageTimings };
@@ -4411,14 +4539,18 @@ export class Control {
   }
 
   async adminStatus(request: Dict, sessionId?: string): Promise<Dict> {
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const before = this.durableTaskListSnapshot();
-      const tasks = await this.consistentRuntimeSummaries();
-      const doctor = await this.doctor(request, sessionId);
-      const after = this.durableTaskListSnapshot();
-      if (before.signature === after.signature) return { draining: this.store.getMeta("draining") === "1", tasks, doctor };
-    }
-    throw new ControlError("task_transition", "task state changed while reading admin status");
+    return this.nativeBarrier(async () => {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const before = this.durableTaskListSnapshot();
+        const beforeDraining = this.store.getMeta("draining") === "1";
+        const tasks = await this.consistentRuntimeSummaries();
+        const doctor = await this.doctor(request, sessionId);
+        const after = this.durableTaskListSnapshot();
+        const afterDraining = this.store.getMeta("draining") === "1";
+        if (before.signature === after.signature && beforeDraining === afterDraining) return { draining: afterDraining, tasks, doctor };
+      }
+      throw new ControlError("task_transition", "task state changed while reading admin status");
+    });
   }
 
   async drainStatus(_request: Dict, _sessionId?: string): Promise<Dict> { return { draining: this.store.getMeta("draining") === "1" }; }

@@ -36,7 +36,7 @@ jobs:
       - name: Prepare isolated Linux native evidence
         if: runner.os == 'Linux'
         run: |
-          sudo ln -sf "$(command -v bun)" /usr/bin/bun
+          sudo install -m 0755 "$(command -v bun)" /usr/bin/bun
           echo "AGENT_VM_ISOLATED_TRANSPORT_EVIDENCE=1" >> "$GITHUB_ENV"
       - name: Typecheck
         run: bun run typecheck

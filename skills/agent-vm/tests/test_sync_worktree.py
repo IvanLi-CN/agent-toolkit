@@ -53,13 +53,14 @@ class SyncTests(unittest.TestCase):
 
     def test_stderr_redaction_covers_assignments_and_json_fields(self):
         jwt = b".".join((b"eyJhbGciOiJIUzI1NiJ9", b"eyJzdWIiOiJhZ2VudCJ9", b"jwt-signature"))
-        value = MOD.redact_stderr(b'{"password":"secret-value", "private_key": "private-value"} secretValue=camel-secret-value tokenValue: camel-token-value token=token-value Authorization: Bearer auth-canary-01 Authorization: Basic dXNlcjpzZWNyZXQ= Cookie: sessionid=cookie-secret Set-Cookie: sessionid=set-cookie-secret Authorization: Digest response=digest-secret jwt=' + jwt)
+        value = MOD.redact_stderr(b'{"password":"secret-value", "private_key": "private-value"} secretValue=camel-secret-value tokenValue: camel-token-value token=token-value Authorization: Bearer auth-canary-01 Authorization: Bearer "quoted-sync-auth-canary" Authorization: Basic dXNlcjpzZWNyZXQ= Cookie: sessionid=cookie-secret Set-Cookie: sessionid=set-cookie-secret Authorization: Digest response=digest-secret jwt=' + jwt)
         self.assertNotIn(b"secret-value", value)
         self.assertNotIn(b"private-value", value)
         self.assertNotIn(b"camel-secret-value", value)
         self.assertNotIn(b"camel-token-value", value)
         self.assertNotIn(b"token-value", value)
         self.assertNotIn(b"auth-canary-01", value)
+        self.assertNotIn(b"quoted-sync-auth-canary", value)
         self.assertNotIn(b"dXNlcjpzZWNyZXQ=", value)
         for secret in (b"cookie-secret", b"set-cookie-secret", b"digest-secret", b"jwt-signature"):
             self.assertNotIn(secret, value)
@@ -178,6 +179,15 @@ class SyncTests(unittest.TestCase):
         with self.assertRaisesRegex(MOD.SyncFailure, "symlink"):
             self.request("begin")
         self.assertEqual(list(outside.iterdir()), [])
+
+    def test_private_boundary_is_required_before_replacing_a_source(self):
+        source = self.workspace / "repo/src"
+        source.mkdir(parents=True)
+        (source / "keep").write_text("not ours")
+        source.chmod(0o777)
+        with self.assertRaisesRegex(MOD.SyncFailure, "ownership or mode"):
+            self.request("begin")
+        self.assertEqual((source / "keep").read_text(), "not ours")
 
     def test_invalid_stage_manifest_and_exchange_failure_preserve_old_source(self):
         a, b = "a" * 32, "b" * 32

@@ -63,7 +63,7 @@ class SessionContractTests(unittest.TestCase):
         self.assertEqual(remote, "bun /opt/agent-vm-native/agent_vm_control.ts")
 
     def test_remote_stderr_is_redacted_before_cli_output(self):
-        response = CLI.subprocess.CompletedProcess([], 2, b"", b'{"password":"secret-value"} bearer super-token Authorization: Bearer auth-canary-01 "Authorization": "Bearer quoted-auth-01"\n')
+        response = CLI.subprocess.CompletedProcess([], 2, b"", b'{"password":"secret-value"} bearer super-token Authorization: Bearer auth-canary-01 Authorization: Bearer "quoted-auth-canary" "Authorization": "Bearer quoted-auth-01"\n')
         stderr = io.BytesIO()
         stream = mock.Mock()
         stream.buffer = stderr
@@ -74,6 +74,7 @@ class SessionContractTests(unittest.TestCase):
         self.assertNotIn(b"secret-value", stderr.getvalue())
         self.assertNotIn(b"super-token", stderr.getvalue())
         self.assertNotIn(b"auth-canary-01", stderr.getvalue())
+        self.assertNotIn(b"quoted-auth-canary", stderr.getvalue())
         self.assertNotIn(b"quoted-auth-01", stderr.getvalue())
         self.assertNotIn("secret-value", str(error.exception.as_dict()))
 
@@ -194,6 +195,23 @@ class SessionContractTests(unittest.TestCase):
                 CLI.mutation("acquire", args, session="thread")
         request = json.loads(run.call_args_list[-1].kwargs["input_data"])
         self.assertEqual(request["generation"], 0)
+
+    def test_acquire_retry_uses_existing_journal_before_remote_status(self):
+        args = CLI.build_parser().parse_args(["acquire", "--session-id", "thread", "--operation-id", "acquire-retry-op"])
+        response = {"result": {"effective_lease": True, "task_id": "avm-task", "generation": 7}}
+        with tempfile.TemporaryDirectory() as state, tempfile.TemporaryDirectory() as config:
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", Path(state)), mock.patch.object(CLI, "LOCAL_CONFIG_ROOT", Path(config)):
+                directory = CLI._secure_directory(CLI._secure_session_directory("thread") / "operations")
+                CLI.ensure_operation_journal(directory, {
+                    "protocol": CLI.PROTOCOL_VERSION, "action": "acquire", "session_id": "thread",
+                    "generation": 7, "operation_id": "acquire-retry-op", "public_key": "ssh-ed25519 fixture",
+                })
+                with mock.patch.object(CLI, "make_ssh_key", return_value=(Path(config) / "id_ed25519", "ssh-ed25519 fixture")), \
+                     mock.patch.object(CLI, "mutation", return_value=response) as mutation, \
+                     mock.patch.object(CLI, "remote_generation", side_effect=AssertionError("remote status must not be consulted")), \
+                     mock.patch.object(CLI, "write_session_state"), mock.patch.object(CLI, "json_output"):
+                    self.assertEqual(CLI.command_acquire(args), 0)
+        self.assertEqual(mutation.call_args.kwargs["generation"], 7)
 
     def test_zero_generation_admin_retry_does_not_read_local_state(self):
         response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": "admin-reconcile", "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "generation": 0, "operation_id": "admin-op", "outcome": "success", "result": {}}

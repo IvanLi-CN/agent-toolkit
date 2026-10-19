@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -18,7 +18,15 @@ const UNIT_PATHS = [
 const getEuid = (process as unknown as { geteuid?: () => number }).geteuid;
 const isRoot = typeof getEuid === "function" && getEuid() === 0;
 const isLinux = process.platform === "linux";
-const hasSystemdPrerequisites = isLinux && existsSync("/usr/bin/bun") && Bun.which("systemd-analyze") !== null;
+function hasManagedBun(): boolean {
+  try {
+    const info = lstatSync("/usr/bin/bun");
+    return info.isFile() && (info.mode & 0o111) !== 0;
+  } catch {
+    return false;
+  }
+}
+const hasSystemdPrerequisites = isLinux && hasManagedBun() && Bun.which("systemd-analyze") !== null;
 const hasIsolatedTransportEvidence = isLinux && process.env.AGENT_VM_ISOLATED_TRANSPORT_EVIDENCE === "1";
 
 type TestCallback = () => void | Promise<void>;
@@ -40,8 +48,9 @@ function systemdTest(name: string, callback: TestCallback): void {
 
 function transportTest(name: string, callback: TestCallback): void {
   // This case only uses a temporary fake SSH transport and a non-systemd controller wrapper.
-  // The explicit CI flag does not relax the root gate for any real transport/native test.
-  if (isLinux && (isRoot || hasIsolatedTransportEvidence)) test(name, callback);
+  // macOS exercises the same client/controller transport boundary; Linux real
+  // native transport remains root-gated and CI uses only the isolated fake path.
+  if (!isLinux || isRoot || hasIsolatedTransportEvidence) test(name, callback);
   else test.skip(name, callback);
 }
 
@@ -50,7 +59,7 @@ test("records native prerequisite availability", () => {
     platform: process.platform,
     euid: typeof getEuid === "function" ? getEuid() : null,
     root: isRoot,
-    managed_bun: existsSync("/usr/bin/bun"),
+    managed_bun: hasManagedBun(),
     systemd_analyze: Bun.which("systemd-analyze"),
   };
   console.log(`native-prerequisites=${JSON.stringify(prerequisites)}`);
@@ -351,7 +360,7 @@ linuxTest("kills a TERM-ignoring descendant after the leader exits on SIGTERM", 
   expect(state === undefined || state === "Z").toBe(true);
 });
 
-nonLinuxTest("kills an anchored process group after its leader exits on SIGTERM", async () => {
+nonLinuxTest("fails closed when a process-group anchor is lost after leader exit", async () => {
   const runner = new CommandRunner();
   const probeRoot = root("agent-vm-darwin-term-descendant");
   const pidPath = join(probeRoot, "child.pid");
@@ -361,19 +370,13 @@ nonLinuxTest("kills an anchored process group after its leader exits on SIGTERM"
   } catch (error) { failure = error; }
   expect(failure?.code).toBe("command_timeout");
   expect(failure?.detail?.reaped).toBe(true);
-  expect(failure?.detail?.process_group_killed).toBe(true);
+  // Once the leader has exited, this platform has no independent process
+  // identity anchor that can prove the PGID has not been reused.
+  expect(failure?.detail?.process_group_killed).toBe(false);
+  expect(failure?.detail?.process_group_cleanup_error).toBe("process_group_anchor_lost");
   expect(await waitFor(pidPath)).toBe(true);
   const pid = Number(readFileSync(pidPath, "utf8"));
-  let alive = true;
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    try { process.kill(pid, 0); }
-    catch (error) {
-      alive = (error as NodeJS.ErrnoException).code !== "ESRCH";
-      if (!alive) break;
-    }
-    await Bun.sleep(10);
-  }
-  expect(alive).toBe(false);
+  try { process.kill(pid, "SIGKILL"); } catch { /* The child may have exited during cleanup. */ }
 });
 
 linuxTest("reaps a TERM-ignoring descendant after the leader exits before timeout", async () => {
@@ -755,6 +758,21 @@ linuxTest("reclaims only aged orphan writer marker temporary files within a boun
   expect(existsSync(freshTemp)).toBe(true);
 });
 
+linuxTest("reclaims only aged orphan writer state sidecars within a bounded scan", () => {
+  const probeRoot = root("agent-vm-native-marker-state-recovery");
+  const lockDirectory = join(probeRoot, "locks");
+  mkdirSync(lockDirectory, { recursive: true, mode: 0o700 });
+  const oldState = join(lockDirectory, "native-writer-orphan.state");
+  const freshState = join(lockDirectory, "native-writer-fresh.state");
+  writeFileSync(oldState, "orphan\n", { mode: 0o600 });
+  writeFileSync(freshState, "in flight\n", { mode: 0o600 });
+  const old = new Date(Date.now() - 120_000);
+  utimesSync(oldState, old, old);
+  expect(hasWriterIntent(lockDirectory)).toBe(false);
+  expect(existsSync(oldState)).toBe(false);
+  expect(existsSync(freshState)).toBe(true);
+});
+
 test("systemd assets fence the alternate configuration environment", () => {
   for (const path of UNIT_PATHS) {
     const content = readFileSync(path, "utf8");
@@ -987,6 +1005,10 @@ linuxTest("a long native lock does not hold the global admission lock", async ()
 });
 
 systemdTest("systemd assets validate against the Bun runtime path", async () => {
+  const managedBun = lstatSync("/usr/bin/bun");
+  expect(managedBun.isFile()).toBe(true);
+  expect((managedBun.mode & 0o111) !== 0).toBe(true);
+  for (const unit of UNIT_PATHS) expect(readFileSync(unit, "utf8")).toContain("ExecStart=/usr/bin/bun ");
   const processHandle = Bun.spawn(["systemd-analyze", "verify", ...UNIT_PATHS], { stdout: "pipe", stderr: "pipe" });
   const result = await collect(processHandle);
   if (result.exit !== 0) throw new Error(`systemd verify failed: ${JSON.stringify(result)}`);
@@ -1008,14 +1030,14 @@ linuxTest("the real Bun controller entrypoint accepts an isolated protected conf
     gateway_ip: "198.51.100.1", storage_path: storage, state_db: statePath, timer_dir: timerDir,
   }), { mode: 0o600 });
   const env = { ...process.env, [CONFIG_PATH_ENV]: configPath };
-  const stdinChild: any = Bun.spawn([process.execPath, CONTROL_PATH], { env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+  const stdinChild: any = Bun.spawn(["/usr/bin/bun", CONTROL_PATH], { env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
   await stdinChild.stdin.write(JSON.stringify({ protocol: 4, action: "drain-status" }) + "\n");
   stdinChild.stdin.end();
   const stdinResult = await collect(stdinChild);
   expect(stdinResult).toMatchObject({ exit: 0, stderr: "" });
   expect(lastJson(stdinResult.stdout)).toMatchObject({ ok: true, action: "drain-status", result: { draining: false } });
 
-  const timerResult = await collect(Bun.spawn([process.execPath, CONTROL_PATH, "--timer-age-gc"], { env, stdout: "pipe", stderr: "pipe" }));
+  const timerResult = await collect(Bun.spawn(["/usr/bin/bun", CONTROL_PATH, "--timer-age-gc"], { env, stdout: "pipe", stderr: "pipe" }));
   expect(timerResult).toMatchObject({ exit: 0, stderr: "" });
   expect(lastJson(timerResult.stdout)).toMatchObject({ ok: true, action: "timer-age-gc", result: { candidates: [] } });
 });

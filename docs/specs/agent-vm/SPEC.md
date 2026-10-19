@@ -18,7 +18,7 @@ Local config, state and operation-journal roots are fail-closed: relative roots,
 
 ## Lifecycle
 
-Each session owns at most one VM slot, including preparing, stopping, deleting and cached states. Acquire creates or reuses a stopped cache, records a new generation and waits for guest agent and IPv4 readiness within one bounded monotonic budget. Lease expiry and release revoke access, remove only owned mappings and stop the guest before making the slot reusable. A stopped disk may remain as a disposable cache; no recovery guarantee is made.
+Each session owns at most one VM slot, including preparing, stopping, deleting and cached states. Acquire creates or reuses a stopped cache, records a new generation and waits for guest agent and IPv4 readiness within one bounded monotonic budget. Lease expiry and release revoke access, remove only owned mappings and stop the guest before making the slot reusable. A stopped disk may remain as a disposable cache; no recovery guarantee is made. A cache is reusable only when its pinned image fingerprint and `user.agent-vm.guest-tools` capability marker match the current controller contract; legacy caches without that marker fail closed and require disposal.
 
 Renewal is explicit and bounded. Acquire, status, SSH, execution and transfer do not renew a lease. A changed generation or expired lease rejects late readiness and native results; expiry and drain transitions coordinate with per-session native locks and the native effect barrier before permitting state changes. Durable state, locks and timers make repeated requests idempotent without hiding partial cleanup. The durable verifier rejects unknown drain values, missing active VM/SSH/resource identity, cached or absent residual reservations and ports, and malformed transition reservations; active resize/restart recovery reservations are accepted only when their resource vectors remain exact and measurable.
 
@@ -56,7 +56,7 @@ Operational dashboards MUST distinguish CT filesystem capacity, transient image 
 
 ## Synchronization and retrieval
 
-The synchronization helper transfers tracked, unignored worktree files to its own guest source directory and atomically replaces only helper-owned content. It rejects submodules and unsafe names. Export streams a tar archive directly to the caller and does not create a server-side archive.
+The synchronization helper transfers tracked, unignored worktree files to its own guest source directory and atomically replaces only helper-owned content. The guest workspace root and named worktree directory must be owned by the guest control user and not group- or world-writable; the helper fails closed before destructive replacement when that boundary is not verified. It rejects submodules and unsafe names. Export streams a tar archive directly to the caller and does not create a server-side archive.
 
 ## Verification
 

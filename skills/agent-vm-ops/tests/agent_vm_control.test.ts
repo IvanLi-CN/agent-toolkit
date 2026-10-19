@@ -31,6 +31,12 @@ type RunnerOptions = { inputData?: Uint8Array | string; timeout?: number; check?
 type ProcessResult = { args: string[]; returncode: number; stdout: Uint8Array; stderr: Uint8Array; stdoutTruncated?: boolean };
 type GuestFixtureOptions = { fstype?: "ext4" | "xfs"; parent?: string; virtualBytes?: number; includeGrowpart?: boolean; delayCommand?: "findmnt" | "growpart" };
 type GuestFixture = { root: string; bin: string; log: string; env: Record<string, string> };
+type TestCallback = () => void | Promise<void>;
+
+function linuxTest(name: string, callback: TestCallback): void {
+  if (process.platform === "linux") test(name, callback);
+  else test.skip(name, callback);
+}
 
 function result(args: readonly string[], stdout: string | Dict | Dict[] = "", returncode = 0, stderr = ""): ProcessResult {
   const text = typeof stdout === "string" ? stdout : JSON.stringify(stdout);
@@ -866,6 +872,31 @@ test("restores a valid cached VM address after timer and capacity reacquire fail
   }
 });
 
+test("rejects a cached instance from an older pinned image before native resume", async () => {
+  const f = fixture();
+  const active = await f.call("acquire", { public_key: KEY }, "op-cache-image-create");
+  const cached = await f.call("release", {}, "op-cache-image-release");
+  f.store.updateTask(String(active.task_id), { image_fingerprint: "b".repeat(64) });
+  const callsBefore = f.runner.calls.length;
+  await expectCode(f.call("acquire", { public_key: KEY }, "op-cache-image-retry"), "cache_ineligible");
+  expect(f.store.getTask({ taskId: String(cached.task_id) })?.state).toBe("cached");
+  expect(f.runner.calls.slice(callsBefore).some(({ args }) => args[0] === "incus" && ["start", "config"].includes(args[3] ?? ""))).toBe(false);
+});
+
+test("rejects a legacy cached image without the Bun capability marker before resume", async () => {
+  const f = fixture();
+  const active = await f.call("acquire", { public_key: KEY }, "op-cache-tools-create");
+  const cached = await f.call("release", {}, "op-cache-tools-release");
+  const instance = f.runner.instances.get(String(cached.instance_name))!;
+  delete instance.config["user.agent-vm.guest-tools"];
+  delete instance.expanded_config["user.agent-vm.guest-tools"];
+  f.runner.missingGuestTool = "bun";
+  const callsBefore = f.runner.calls.length;
+  await expectCode(f.call("acquire", { public_key: KEY }, "op-cache-tools-retry"), "cache_ineligible");
+  expect(f.store.getTask({ taskId: String(active.task_id) })?.state).toBe("cached");
+  expect(f.runner.calls.slice(callsBefore).some(({ args }) => args[0] === "incus" && args[3] === "start")).toBe(false);
+});
+
 test("projects untrusted result JSON before operation and audit persistence", async () => {
   const f = fixture();
   const sensitiveName = ["extra", "secret"].join("_");
@@ -904,6 +935,15 @@ test("overlimit persistence keeps an explicit marker and capacity facts", async 
   expect(response.result).toMatchObject({ truncated: true, capacity: { total: 100, free: 40 } });
   const stored = JSON.parse(String((f.store.db.query("SELECT response_json FROM operations WHERE operation_id = ?") as any).get("op-persistence-capacity").response_json));
   expect(stored.result).toMatchObject({ truncated: true, capacity: { total: 100, free: 40 } });
+});
+
+test("bounds persisted documents by UTF-8 bytes", async () => {
+  const f = fixture();
+  (f.control as any).dispatchAction = async () => ({ generation: 0, errors: Array.from({ length: 128 }, () => ({ message: "界".repeat(4096) })) });
+  await f.control.dispatch(f.request("acquire", {}, "op-persistence-utf8"));
+  const raw = String((f.store.db.query("SELECT response_json FROM operations WHERE operation_id = ?") as any).get("op-persistence-utf8").response_json);
+  expect(Buffer.byteLength(raw, "utf8")).toBeLessThanOrEqual(64 * 1024);
+  expect(JSON.parse(raw).result).toMatchObject({ truncated: true });
 });
 
 test("bounds task error collections and documents before durable persistence", async () => {
@@ -1039,6 +1079,26 @@ test("projects and bounds every JSON payload during legacy state migration", () 
     store.close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("rejects unknown legacy metadata instead of copying its raw value", () => {
+  const root = mkdtempSync("/tmp/agent-vm-unknown-meta-migration-test-");
+  const dbPath = join(root, "state.sqlite3");
+  writeLegacyOperation(dbPath, {
+    ok: true, protocol: PROTOCOL_VERSION, server_time: "2026-10-04T00:00:00+00:00", action: "acquire", session_id: "legacy-meta",
+    generation: 0, operation_id: "legacy-meta-op", outcome: "success", result: { state: "active" }, _request_digest: "c3dccc911349ced563eb9615fb6db8ffa5801d121c9542c29c5a3fc0575a768a",
+  });
+  const legacy = new Database(dbPath);
+  legacy.run("INSERT INTO meta(key, value) VALUES (?, ?)", ["api_token", "legacy-secret-canary-" + "界".repeat(40_000)]);
+  legacy.close();
+  try {
+    expectSyncCode(() => new StateStore(dbPath), "state_invalid");
+    const rolledBack = new Database(dbPath);
+    try {
+      expect(rolledBack.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = '__agent_vm_legacy_meta'").get()).toBeNull();
+      expect((rolledBack.query("SELECT value FROM meta WHERE key = 'api_token'").get() as any)?.value).toContain("legacy-secret-canary");
+    } finally { rolledBack.close(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("fails closed and rolls back a legacy migration with invalid JSON", () => {
@@ -1239,13 +1299,50 @@ test("keeps bounded output and reaps a timed out process group", async () => {
   }
 });
 
+linuxTest("reaps a process group after a reader communication failure", async () => {
+  let childPid = 0;
+  class ReaderRejectingRunner extends CommandRunner {
+    override spawn(argv: readonly string[], options: Record<string, unknown>): Bun.Subprocess<"pipe", "pipe", "pipe"> {
+      const child = super.spawn(argv, options);
+      childPid = child.pid;
+      const rejected = new ReadableStream<Uint8Array>({
+        start(controller) { controller.error(new Error("injected reader failure")); },
+      });
+      return new Proxy(child, {
+        get(target, property) {
+          if (property === "stdout") return rejected;
+          return Reflect.get(target, property, target);
+        },
+      }) as Bun.Subprocess<"pipe", "pipe", "pipe">;
+    }
+  }
+  const runner = new ReaderRejectingRunner();
+  let failure: any;
+  try { await runner.runBounded(["/bin/sh", "-c", "sleep 30 & wait"], { timeout: 5 }); }
+  catch (error) { failure = error; }
+  expect(failure?.code).toBe("command_io");
+  expect(failure?.detail?.reaped).toBe(true);
+  expect(failure?.detail?.process_group_killed).toBe(true);
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try { process.kill(childPid, 0); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") break;
+    }
+    await Bun.sleep(10);
+  }
+  let alive = true;
+  try { process.kill(childPid, 0); }
+  catch (error) { alive = (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+  expect(alive).toBe(false);
+});
+
 test("redacts command stderr before journal, audit, and diagnostic output", async () => {
   const f = fixture();
   f.runner.failure = (args) => args[0] === "incus" && args[3] === "init";
   const originalFailure = f.runner.failure;
   f.runner.failure = (args) => {
     if (!originalFailure?.(args)) return false;
-    throw new ControlError("command_failed", "native command failed", { returncode: 1, stderr: "password=secret-value secretValue=camel-secret-value tokenValue: camel-token-value bearer super-token Authorization: Bearer auth-canary-01 \"Authorization\": \"Bearer quoted-auth-01\"" });
+    throw new ControlError("command_failed", "native command failed", { returncode: 1, stderr: "password=secret-value secretValue=camel-secret-value tokenValue: camel-token-value bearer super-token Authorization: Bearer auth-canary-01 Authorization: Bearer \"quoted-secret-canary\" \"Authorization\": \"Bearer quoted-auth-01\"" });
   };
   await expectCode(f.call("acquire", { public_key: KEY }, "op-redacted-native-error"), "command_failed");
   const operation = JSON.stringify(f.store.operation("op-redacted-native-error"));
@@ -1254,26 +1351,30 @@ test("redacts command stderr before journal, audit, and diagnostic output", asyn
   expect(operation).not.toContain("secret-value");
   expect(operation).not.toContain("super-token");
   expect(operation).not.toContain("auth-canary-01");
+  expect(operation).not.toContain("quoted-secret-canary");
   expect(operation).not.toContain("quoted-auth-01");
   expect(operation).not.toContain("camel-secret-value");
   expect(operation).not.toContain("camel-token-value");
   expect(audit).not.toContain("secret-value");
   expect(audit).not.toContain("super-token");
   expect(audit).not.toContain("auth-canary-01");
+  expect(audit).not.toContain("quoted-secret-canary");
   expect(audit).not.toContain("quoted-auth-01");
   expect(audit).not.toContain("camel-secret-value");
   expect(audit).not.toContain("camel-token-value");
   expect(task).not.toContain("secret-value");
   expect(task).not.toContain("auth-canary-01");
+  expect(task).not.toContain("quoted-secret-canary");
   expect(task).not.toContain("camel-secret-value");
   expect(task).not.toContain("camel-token-value");
-  const diagnostic = new ControlError("command_failed", "native command failed", { nested: [{ stderr: "Authorization: Bearer nested-auth-01" }, { Authorization: "Bearer field-auth-01", secretValue: "structured-secret-value", tokenValue: "structured-token-value" }], stderr: "private_key=secret-value \"Authorization\": \"Bearer quoted-auth-02\"" }).asDict();
+  const diagnostic = new ControlError("command_failed", "native command failed", { nested: [{ stderr: "Authorization: Bearer nested-auth-01" }, { Authorization: "Bearer field-auth-01", secretValue: "structured-secret-value", tokenValue: "structured-token-value" }], stderr: "private_key=secret-value Authorization: Bearer \"quoted-secret-diagnostic\" \"Authorization\": \"Bearer quoted-auth-02\"" }).asDict();
   expect(JSON.stringify(diagnostic)).not.toContain("secret-value");
   expect(JSON.stringify(diagnostic)).not.toContain("nested-auth-01");
   expect(JSON.stringify(diagnostic)).not.toContain("field-auth-01");
   expect(JSON.stringify(diagnostic)).not.toContain("structured-secret-value");
   expect(JSON.stringify(diagnostic)).not.toContain("structured-token-value");
   expect(JSON.stringify(diagnostic)).not.toContain("quoted-auth-02");
+  expect(JSON.stringify(diagnostic)).not.toContain("quoted-secret-diagnostic");
   const quoted = new ControlError("command_failed", "native command failed", { stderr: ["password", "=", '"line-one-secret-canary\nline-two-secret-canary" token=\'escaped\\\'multiline-token-canary\''].join("") }).asDict();
   expect(JSON.stringify(quoted)).not.toContain("secret-canary");
   expect(JSON.stringify(quoted)).not.toContain("multiline-token-canary");
@@ -1290,6 +1391,27 @@ test("redacts command stderr before journal, audit, and diagnostic output", asyn
   for (const value of values) {
     expect(JSON.stringify(new ControlError("command_failed", "native command failed", { stderr: value }).asDict())).not.toContain("canary");
   }
+});
+
+test("admin status retries when durable task state changes during the native snapshot", async () => {
+  const f = fixture();
+  const active = await f.call("acquire", { public_key: KEY }, "op-admin-snapshot-create");
+  const original = (f.control as any).consistentRuntimeSummaries.bind(f.control);
+  let injected = false;
+  (f.control as any).consistentRuntimeSummaries = async () => {
+    const summaries = await original();
+    if (!injected) {
+      injected = true;
+      f.store.updateTask(String(active.task_id), { last_error: JSON.stringify({ code: "snapshot-race" }) });
+    }
+    return summaries;
+  };
+  (f.control as any).doctor = async () => ({ ready: true });
+  const status = await (f.control as any).adminStatus({}, undefined);
+  expect(injected).toBe(true);
+  expect(status.doctor).toEqual({ ready: true });
+  expect(status.tasks).toHaveLength(1);
+  expect(status.tasks[0].last_error).toMatchObject({ code: "snapshot-race" });
 });
 
 test("real guest readiness shares one budget and emits a projected slow-start diagnostic", async () => {
@@ -1405,6 +1527,17 @@ test("removes an orphaned systemd timer only after native absence proof", async 
     const unit = await systemd.scheduleExpiry("avm-timer", 1, "2026-10-04T00:00:00+00:00");
     expect(readFileSync(join(root, unit), "utf8")).toContain("OnCalendar=2026-10-04 00:00:00 UTC");
     expect(readdirSync(root).filter((name) => name.startsWith(".agent-vm-timer-")).length).toBe(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("removes timer temporary artifacts when systemctl setup fails", async () => {
+  const root = mkdtempSync("/tmp/agent-vm-timer-failure-test-");
+  const runner = new NativeCommands();
+  runner.failure = (args) => args[0] === "systemctl";
+  const systemd = new SystemdManager(runner, { timer_dir: root }, true);
+  try {
+    await expectCode(systemd.scheduleExpiry("avm-timer-failure", 1, "2026-10-04T00:00:00+00:00"), "command_failed");
+    expect(readdirSync(root).filter((name) => name.startsWith(".agent-vm-timer-"))).toEqual([]);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

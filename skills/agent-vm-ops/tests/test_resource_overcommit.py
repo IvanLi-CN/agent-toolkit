@@ -511,6 +511,28 @@ class AdmissionTests(Fixture):
         result = self.call("admin-reconcile", apply=True)
         self.assertEqual(result["actions"][0]["error"]["code"], "cleanup_incomplete")
 
+    def test_unknown_task_state_fails_closed_and_reconcile_reports_error(self):
+        active = self.acquire()
+        self.store.update_task(active["task_id"], state="mystery")
+
+        doctor = self.call("doctor")
+        self.assertFalse(doctor["resources"]["verified"])
+        self.assertEqual(doctor["resources"]["error"]["code"], "resource_unverified")
+        result = self.call("admin-reconcile", apply=True)
+        self.assertEqual(result["actions"][0]["error"]["code"], "resource_unverified")
+
+    def test_doctor_structures_systemd_probe_failure(self):
+        self.control.systemd.enabled = True
+        with mock.patch.object(self.control, "_image_guard"), \
+             mock.patch.object(self.control, "_ensure_capacity_verified", return_value={"layers": []}), \
+             mock.patch.object(self.control, "_network_guard"), \
+             mock.patch.object(self.control, "_resource_diagnostics", return_value={"verified": True, "memory_pressure": False}), \
+             mock.patch.object(self.control, "_instance_diagnostics", return_value={"verified": True, "policy_compliant": True}), \
+             mock.patch.object(self.control, "_default_admission_diagnostics", return_value={"ready": True}), \
+             mock.patch.object(self.runner, "run", side_effect=CONTROL.ControlError("command_timeout", "systemd unavailable")):
+            doctor = self.control.doctor(self.request("doctor"), None)
+        self.assertIn("unit_unverified:incus.service", doctor["issues"])
+
     def test_status_corrupt_last_error_is_structured(self):
         active = self.acquire()
         self.store.update_task(active["task_id"], last_error="{")

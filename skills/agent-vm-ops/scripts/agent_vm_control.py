@@ -2528,7 +2528,14 @@ class Control:
         totals = {key: {name: 0 for name in ("allocated", "reserved", "allocated_and_reserved")}
                   for key in ("cpu", "memory_mib")}
         for other in self.store.list_tasks():
-            if other["task_id"] == exclude_task_id or other["state"] in {"absent", "cached"}: continue
+            state = other.get("state")
+            if other["task_id"] == exclude_task_id or state in {"absent", "cached"}: continue
+            if state not in {"preparing", "active", "closing", "deleting", "failed"}:
+                raise ControlError(
+                    "resource_unverified",
+                    "task state cannot be verified",
+                    {"task_id": other.get("task_id"), "state": state},
+                )
             try:
                 value = parse_resource_mapping(other["resources_json"], "resources", allow_empty=False)
                 reservation = parse_resource_mapping(other["resource_reservation_json"], "reservation", allow_empty=True)
@@ -2549,6 +2556,12 @@ class Control:
         instances = self.incus.list_instances()
         records = {item["instance_name"]: item for item in self.store.list_tasks()}
         for record in records.values():
+            if record.get("state") not in {"absent", "cached", "preparing", "active", "closing", "deleting", "failed"}:
+                raise ControlError(
+                    "resource_unverified",
+                    "task state cannot be verified; reconciliation is required",
+                    {"task_id": record.get("task_id"), "state": record.get("state")},
+                )
             if record["state"] != "absent":
                 continue
             if any(instance.get("name") == record["instance_name"] for instance in instances):
@@ -3667,6 +3680,9 @@ class Control:
         *,
         global_locked: bool = False,
     ) -> dict[str, Any]:
+        if not global_locked:
+            with self._global_lock():
+                return self.doctor(request, session_id, global_locked=True)
         issues = []
         try:
             version = self.runner.run(["incus", "version"], timeout=15).stdout.decode().strip()
@@ -3686,8 +3702,12 @@ class Control:
         except ControlError as exc: issues.append(exc.code)
         if self.systemd.enabled:
             for unit in ("incus.service", "agent-vm-native-age-gc.timer"):
-                result = self.runner.run(["systemctl", "is-active", "--quiet", unit], timeout=5, check=False)
-                if result.returncode: issues.append("unit_inactive:" + unit)
+                try:
+                    result = self.runner.run(["systemctl", "is-active", "--quiet", unit], timeout=5, check=False)
+                except ControlError:
+                    issues.append("unit_unverified:" + unit)
+                else:
+                    if result.returncode: issues.append("unit_inactive:" + unit)
             if not self.systemd.enabled_unit_active("agent-vm-native-age-gc.timer"):
                 issues.append("unit_disabled:agent-vm-native-age-gc.timer")
             for unit in ("agent-vm-native-expire@.service", "agent-vm-native-reconcile.service"):
@@ -4566,6 +4586,12 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
                     if isinstance(task.get("generation"), bool) or not isinstance(task.get("generation"), int):
                         raise ControlError("resource_unverified", "task generation cannot be verified")
                     item = {"task_id": task["task_id"], "generation": task["generation"], "action": "inspect"}
+                    if task.get("state") not in {"absent", "cached", "preparing", "active", "closing", "deleting", "failed"}:
+                        raise ControlError(
+                            "resource_unverified",
+                            "task state cannot be verified; reconciliation is required",
+                            {"task_id": task["task_id"], "state": task.get("state")},
+                        )
                     if task["state"] == "absent":
                         item["action"] = "verify-absent-resources"
                         native_exists = any(native.get("name") == task["instance_name"] for native in self.incus.list_instances())

@@ -241,7 +241,10 @@ async function runSessionExpiryRace(mode: "status" | "acquire"): Promise<void> {
       const response = mode === "acquire" ? await control.acquire(request, "race-session") : await control.dispatch(request);
       console.log(JSON.stringify(response));
     } catch (error) {
-      console.log(JSON.stringify({ ok: false, error: error.asDict ? error.asDict() : { code: "internal_error" } }));
+      const detail = error && typeof error.asDict === "function"
+        ? error.asDict()
+        : { code: "internal_error", name: error?.name, message: error?.message };
+      console.log(JSON.stringify({ ok: false, error: detail }));
       process.exitCode = 2;
     } finally {
       if (mode === "expire") await Bun.write(process.env.EXPIRY_DONE, "1");

@@ -462,6 +462,33 @@ class AdmissionTests(Fixture):
         self.assertFalse(result["resource_state"]["verified"])
         self.assertEqual(result["resource_state"]["error"]["code"], "resource_unverified")
 
+    def test_absent_partial_task_blocks_admission_until_reconciled(self):
+        active = self.acquire()
+        self.call("release")
+        self.runner.instances.pop(active["instance_name"])
+        self.store.update_task(active["task_id"], state="absent", resources_json="{}", resource_reservation_json="{}")
+
+        doctor = self.call("doctor")
+        self.assertFalse(doctor["resources"]["verified"])
+        self.assertEqual(doctor["resources"]["error"]["code"], "resource_unverified")
+
+        preview = self.call("admin-reconcile", apply=False)
+        self.assertEqual(preview["actions"], [{
+            "task_id": active["task_id"],
+            "generation": active["generation"],
+            "action": "verify-absent-resources",
+        }])
+
+        applied = self.call("admin-reconcile", apply=True)
+        self.assertEqual(applied["actions"], [{
+            "task_id": active["task_id"],
+            "generation": active["generation"],
+            "action": "verify-absent-resources",
+        }])
+        repaired = self.store.get_task(task_id=active["task_id"])
+        self.assertEqual(json.loads(repaired["resources_json"]), {"cpu": 0, "memory_mib": 0, "disk_gib": 0})
+        self.assertTrue(self.call("doctor")["resources"]["verified"])
+
     def test_status_corrupt_last_error_is_structured(self):
         active = self.acquire()
         self.store.update_task(active["task_id"], last_error="{")

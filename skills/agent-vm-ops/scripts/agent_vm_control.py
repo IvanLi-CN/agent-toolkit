@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 import datetime as dt
 from decimal import Decimal
 import fcntl
@@ -2548,6 +2548,18 @@ class Control:
     def _running_inventory_guard(self) -> None:
         instances = self.incus.list_instances()
         records = {item["instance_name"]: item for item in self.store.list_tasks()}
+        for record in records.values():
+            if record["state"] != "absent":
+                continue
+            try:
+                parse_resource_mapping(record.get("resources_json"), "resources", allow_empty=False)
+                parse_resource_mapping(record.get("resource_reservation_json"), "reservation", allow_empty=True)
+            except (TypeError, ValueError) as exc:
+                raise ControlError(
+                    "resource_unverified",
+                    "absent task resource state cannot be verified; reconciliation is required",
+                    {"task_id": record.get("task_id")},
+                ) from exc
         for instance in instances:
             record = records.get(instance.get("name"))
             stopped = str(instance.get("status", "")).lower() == "stopped"
@@ -2563,7 +2575,7 @@ class Control:
                 raise ControlError("resource_unverified", "transitional native instance blocks admission")
             self._verify_native_allocation(record)
 
-    def _resource_diagnostics(self) -> dict[str, Any]:
+    def _resource_diagnostics(self, *, global_locked: bool = False) -> dict[str, Any]:
         memory = None
         memory_error = None
         try:
@@ -2575,8 +2587,9 @@ class Control:
             if memory_error is not None:
                 raise memory_error
             policy = self._resource_policy(memory_observation=memory)
-            self._running_inventory_guard()
-            with self._global_lock(), self.store.transaction():
+            lock = nullcontext() if global_locked else self._global_lock()
+            with lock, self.store.transaction():
+                self._running_inventory_guard()
                 breakdown = self._allocation_breakdown()
                 disk = self._disk_admission_diagnostics(self._storage_headroom(0))
             if not disk.get("verified"):
@@ -2692,8 +2705,14 @@ class Control:
         except ControlError as exc:
             return {"verified": False, "error": exc.as_dict()}
 
-    def _default_admission_diagnostics(self, resources: Mapping[str, Any], capacity: Mapping[str, Any],
-                                       instances: Mapping[str, Any]) -> dict[str, Any]:
+    def _default_admission_diagnostics(
+        self,
+        resources: Mapping[str, Any],
+        capacity: Mapping[str, Any],
+        instances: Mapping[str, Any],
+        *,
+        global_locked: bool = False,
+    ) -> dict[str, Any]:
         """Read-only advisory for a default new guest, not an admission reservation."""
         requested = {"cpu": 2, "memory_mib": 4096, "disk_gib": 20}
         reasons = []
@@ -2717,7 +2736,8 @@ class Control:
         if "error" in capacity:
             reasons.append(capacity["error"])
         elif resources.get("verified"):
-            with self._global_lock(), self.store.transaction():
+            lock = nullcontext() if global_locked else self._global_lock()
+            with lock, self.store.transaction():
                 reclaim_required = not self._space_sufficient(capacity, self.config["create_cost_bytes"], "low")
             if reclaim_required:
                 reasons.append({"code": "disk_reclaim_required", "message": "default creation needs capacity reclamation"})
@@ -3621,7 +3641,13 @@ class Control:
         if not isinstance(image, Mapping) or image.get("fingerprint") != fingerprint or image.get("type") != "virtual-machine":
             raise ControlError("image_unverified", "pinned image identity or VM type does not match")
 
-    def doctor(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:
+    def doctor(
+        self,
+        request: Mapping[str, Any],
+        session_id: str | None,
+        *,
+        global_locked: bool = False,
+    ) -> dict[str, Any]:
         issues = []
         try:
             version = self.runner.run(["incus", "version"], timeout=15).stdout.decode().strip()
@@ -3674,9 +3700,11 @@ class Control:
                     valid_timer = False
                 if not valid_timer:
                     issues.append("timer_unverified:" + str(task.get("task_id")))
-        resources = self._resource_diagnostics()
+        resources = self._resource_diagnostics(global_locked=global_locked)
         instance_policy = self._instance_diagnostics()
-        admission = self._default_admission_diagnostics(resources, capacity, instance_policy)
+        admission = self._default_admission_diagnostics(
+            resources, capacity, instance_policy, global_locked=global_locked
+        )
         return {"ready": not issues, "issues": issues, "incus_version": version, "capacity": capacity,
                 "resources": resources, "instances": instance_policy, "default_admission": admission,
                 "admission_ready": not issues and admission["ready"],
@@ -3685,12 +3713,13 @@ class Control:
 
     def status(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:
         assert session_id is not None
-        task = self.store.get_task(session_id=session_id)
-        result = self._runtime_summary(task) if task else {"state": "absent", "generation": 0, "effective_lease": False,
-                                                         "native_status": "absent", "guest_available": False}
-        admission = self._resource_diagnostics()
-        admission["instances"] = self._instance_diagnostics()
-        return {**result, "admission": admission}
+        with self._global_lock():
+            task = self.store.get_task(session_id=session_id)
+            result = self._runtime_summary(task) if task else {"state": "absent", "generation": 0, "effective_lease": False,
+                                                             "native_status": "absent", "guest_available": False}
+            admission = self._resource_diagnostics(global_locked=True)
+            admission["instances"] = self._instance_diagnostics()
+            return {**result, "admission": admission}
 
 
     def acquire(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:
@@ -3860,9 +3889,10 @@ class Control:
                 return self._state_summary(task)
             expiry = parse_time(task.get("lease_expires_at"))
             inactive = parse_time(task.get("inactive_since")) or min(self.now(), expiry or self.now())
-            task = self.store.update_task(task["task_id"], state="closing", lease_expires_at=None,
-                                         inactive_since=iso_time(inactive),
-                                         cleanup_after=iso_time(inactive + dt.timedelta(seconds=self.config["cache_seconds"])))
+            with self._global_lock(), self.store.transaction():
+                task = self.store.update_task(task["task_id"], state="closing", lease_expires_at=None,
+                                             inactive_since=iso_time(inactive),
+                                             cleanup_after=iso_time(inactive + dt.timedelta(seconds=self.config["cache_seconds"])))
             errors, completed = self._cleanup_task(task)
             if errors:
                 self.store.update_task(task["task_id"], last_error=json.dumps({"errors": errors, "completed": completed}))
@@ -4354,44 +4384,46 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
 
 
     def admin_status(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:
-        return {"draining": self.store.get_meta("draining") == "1",
-                "tasks": [self._runtime_summary(task) for task in self.store.list_tasks()],
-                "doctor": self.doctor(request, session_id)}
+        with self._global_lock():
+            return {"draining": self.store.get_meta("draining") == "1",
+                    "tasks": [self._runtime_summary(task) for task in self.store.list_tasks()],
+                    "doctor": self.doctor(request, session_id, global_locked=True)}
 
     def admin_metrics(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:
-        doctor = self.doctor(request, session_id)
-        tasks = self.store.list_tasks()
-        task_states = Counter(str(task["state"]) for task in tasks)
-        resources = doctor.get("resources", {})
-        memory = resources.get("memory") or {} if isinstance(resources, Mapping) else {}
-        warnings = list(doctor.get("default_admission", {}).get("warnings", []))
-        audit = self.store.audit_summary()
-        return {
-            "observed_at": iso_time(self.now()),
-            "up": True,
-            "draining": self.store.get_meta("draining") == "1",
-            "admission_ready": bool(doctor.get("admission_ready")),
-            "reclaim_required": doctor.get("default_admission", {}).get("reclaim_required"),
-            "resources": resources,
-            "capacity": doctor.get("capacity"),
-            "disk_admission": self._disk_admission_diagnostics(doctor.get("capacity")),
-            "ct_memory": {
-                "capacity_bytes": memory.get("limit_bytes"),
-                "current_bytes": memory.get("current_bytes"),
-                "available_bytes": memory.get("available_bytes"),
-                "pressure_threshold_bytes": memory.get("threshold_bytes"),
-                "pressure": resources.get("memory_pressure") if isinstance(resources, Mapping) else None,
-                "oom_events": memory.get("oom_events"),
-            },
-            "instances": doctor.get("instances"),
-            "task_states": dict(task_states),
-            "operations": audit["operations"],
-            "pending_operations": self.store.pending_operations(),
-            "image_unpack_failures": audit["image_unpack_failures"],
-            "warnings": warnings,
-            "warning_counts": audit["warnings"],
-            "doctor": {"ready": doctor.get("ready"), "issues": doctor.get("issues", [])},
-        }
+        with self._global_lock():
+            doctor = self.doctor(request, session_id, global_locked=True)
+            tasks = self.store.list_tasks()
+            task_states = Counter(str(task["state"]) for task in tasks)
+            resources = doctor.get("resources", {})
+            memory = resources.get("memory") or {} if isinstance(resources, Mapping) else {}
+            warnings = list(doctor.get("default_admission", {}).get("warnings", []))
+            audit = self.store.audit_summary()
+            return {
+                "observed_at": iso_time(self.now()),
+                "up": True,
+                "draining": self.store.get_meta("draining") == "1",
+                "admission_ready": bool(doctor.get("admission_ready")),
+                "reclaim_required": doctor.get("default_admission", {}).get("reclaim_required"),
+                "resources": resources,
+                "capacity": doctor.get("capacity"),
+                "disk_admission": self._disk_admission_diagnostics(doctor.get("capacity")),
+                "ct_memory": {
+                    "capacity_bytes": memory.get("limit_bytes"),
+                    "current_bytes": memory.get("current_bytes"),
+                    "available_bytes": memory.get("available_bytes"),
+                    "pressure_threshold_bytes": memory.get("threshold_bytes"),
+                    "pressure": resources.get("memory_pressure") if isinstance(resources, Mapping) else None,
+                    "oom_events": memory.get("oom_events"),
+                },
+                "instances": doctor.get("instances"),
+                "task_states": dict(task_states),
+                "operations": audit["operations"],
+                "pending_operations": self.store.pending_operations(),
+                "image_unpack_failures": audit["image_unpack_failures"],
+                "warnings": warnings,
+                "warning_counts": audit["warnings"],
+                "doctor": {"ready": doctor.get("ready"), "issues": doctor.get("issues", [])},
+            }
 
 
     def drain_status(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:
@@ -4506,10 +4538,33 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
             try:
                 with self._object_lock("session:" + snapshot["session_id"], blocking=False):
                     task = self.store.get_task(task_id=snapshot["task_id"])
-                    if task["state"] == "absent": continue
                     if isinstance(task.get("generation"), bool) or not isinstance(task.get("generation"), int):
                         raise ControlError("resource_unverified", "task generation cannot be verified")
                     item = {"task_id": task["task_id"], "generation": task["generation"], "action": "inspect"}
+                    if task["state"] == "absent":
+                        try:
+                            parse_resource_mapping(task.get("resources_json"), "resources", allow_empty=False)
+                            parse_resource_mapping(task.get("resource_reservation_json"), "reservation", allow_empty=True)
+                        except (TypeError, ValueError) as exc:
+                            item["action"] = "verify-absent-resources"
+                            if apply:
+                                if any(native.get("name") == task["instance_name"] for native in self.incus.list_instances()):
+                                    raise ControlError("resource_unverified", "absent task still has a native instance")
+                                if self.store.get_ports(task["task_id"]):
+                                    raise ControlError("cleanup_incomplete", "absent task still has port mappings")
+                                with self._global_lock(), self.store.transaction():
+                                    current = self.store.get_task(task_id=task["task_id"])
+                                    if current is None or current["state"] != "absent":
+                                        raise ControlError("generation_mismatch", "absent task changed during reconciliation")
+                                    self.store.update_task(
+                                        task["task_id"],
+                                        resources_json=json.dumps({"cpu": 0, "memory_mib": 0, "disk_gib": 0}),
+                                        resource_reservation_json="{}",
+                                        reservation_bytes=0,
+                                        last_error=None,
+                                    )
+                        actions.append(item)
+                        continue
                     if task["state"] == "deleting":
                         item["action"] = "finish-delete"
                         if apply:

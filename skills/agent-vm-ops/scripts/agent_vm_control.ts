@@ -2533,7 +2533,6 @@ export class StateStore {
   }
 
   setMeta(key: string, value: string): void {
-    if (!META_KEYS.has(key)) throw new ControlError("state_invalid", "unsupported metadata key: " + key);
     if (key === "draining" && value !== "0" && value !== "1") throw new ControlError("state_invalid", "draining must be exactly 0 or 1");
     this.transaction(() => (this.db as any).run("INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", key, value));
   }

@@ -527,6 +527,7 @@ linuxTest("waits for an independent SQLite writer and preserves durable failure 
     const { existsSync } = await import("node:fs");
     const { StateStore } = await import(process.env.CONTROL_PATH);
     const root = process.env.PROBE_ROOT;
+    if (process.env.PROBE_MODE === "writer") await Bun.write(root + "/writer-start", "1");
     const store = StateStore.bootstrap(root + "/state.sqlite3");
     try {
       if (process.env.PROBE_MODE === "hold") {
@@ -536,7 +537,8 @@ linuxTest("waits for an independent SQLite writer and preserves durable failure 
         store.db.run("ROLLBACK");
         console.log("holder-released");
       } else {
-        await Bun.write(root + "/writer-start", "1");
+        await Bun.write(root + "/writer-ready", "1");
+        while (!existsSync(root + "/writer-go")) await Bun.sleep(10);
         const started = Date.now();
         store.recordOperation("op-sqlite-competition", "acquire", "session-sqlite", 1, { outcome: "error", error: { code: "synthetic_failure", message: "synthetic failure" }, _request_digest: "0".repeat(64) });
         store.audit("acquire", "error", { code: "synthetic_failure" }, undefined, "session-sqlite", 1);
@@ -547,10 +549,12 @@ linuxTest("waits for an independent SQLite writer and preserves durable failure 
     } finally { store.close(); }
   `;
   const env = { PROBE_ROOT: probeRoot };
-  const holder = spawnWorker(worker, { ...env, PROBE_MODE: "hold" });
-  expect(await waitFor(join(probeRoot, "held"))).toBe(true);
   const writer = spawnWorker(worker, { ...env, PROBE_MODE: "writer" });
   expect(await waitFor(join(probeRoot, "writer-start"))).toBe(true);
+  expect(await waitFor(join(probeRoot, "writer-ready"))).toBe(true);
+  const holder = spawnWorker(worker, { ...env, PROBE_MODE: "hold" });
+  expect(await waitFor(join(probeRoot, "held"))).toBe(true);
+  await Bun.write(join(probeRoot, "writer-go"), "1");
   await Bun.sleep(250);
   expect(existsSync(join(probeRoot, "writer-done"))).toBe(false);
   await Bun.sleep(500);

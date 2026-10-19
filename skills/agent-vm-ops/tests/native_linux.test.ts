@@ -187,7 +187,7 @@ async function runSessionExpiryRace(mode: "status" | "acquire"): Promise<void> {
     }
     const expiry = new Date(process.env.LEASE_EXPIRES);
     const clock = () => new Date(existsSync(process.env.EXPIRED) ? expiry.getTime() : expiry.getTime() - 1000);
-    const store = new StateStore(process.env.DB_PATH);
+    const store = StateStore.bootstrap(process.env.DB_PATH);
     const config = {
       project: "agents", profile: "agent-vm", state_db: process.env.DB_PATH, timer_dir: process.env.PROBE_ROOT,
       storage_path: process.env.PROBE_ROOT, cache_seconds: 86400, image_fingerprint: "a".repeat(64),
@@ -249,7 +249,7 @@ async function runSessionExpiryRace(mode: "status" | "acquire"): Promise<void> {
   await requireWorkerMarker(expiry, expiryStartedPath, "expire");
   if (mode === "acquire") await requireWorkerMarker(expiry, expiryDonePath, "expire");
   else await Bun.sleep(50);
-  const beforeRelease = new StateStore(dbPath);
+  const beforeRelease = StateStore.bootstrap(dbPath);
   expect(beforeRelease.getTask({ taskId: "avm-race" })?.state).toBe(mode === "acquire" ? "absent" : "active");
   beforeRelease.close();
   await Bun.write(releasePath, "1");

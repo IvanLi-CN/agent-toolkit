@@ -828,6 +828,19 @@ class AdmissionTests(Fixture):
         replay = self.control.dispatch(request)
         self.assertEqual(replay["outcome"], "replayed")
         self.assertEqual(replay["result"], response["result"])
+        self.store.put_port({
+            "task_id": active["task_id"], "generation": active["generation"],
+            "port_name": "app", "protocol": "tcp", "host_port": 20000,
+            "vm_port": 8080, "device_name": "proxy-app", "state": "active",
+            "created_at": self.now.isoformat(),
+        })
+        self.error("operation_unverified", self.control.dispatch, request)
+        self.store.remove_port(active["task_id"], "app", "tcp")
+        self.store.update_task(
+            active["task_id"],
+            resources_json=json.dumps({"cpu": 1, "memory_mib": 0, "disk_gib": 0}),
+        )
+        self.error("operation_unverified", self.control.dispatch, request)
 
     def test_reconcile_action_error_replays_as_the_committed_result(self):
         active = self.acquire()

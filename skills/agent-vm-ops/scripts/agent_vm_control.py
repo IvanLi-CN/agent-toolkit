@@ -2060,6 +2060,44 @@ class Control:
                         except (KeyError, TypeError, ValueError) as exc:
                             raise ControlError("operation_unverified", "reconciled cache state cannot be verified",
                                                {"operation_id": operation_id}) from exc
+                elif action_name == "verify-absent-resources":
+                    try:
+                        exists = any(
+                            native.get("name") == task.get("instance_name")
+                            for native in self.incus.list_instances()
+                        )
+                        if exists or self.store.get_ports(task["task_id"]):
+                            raise ControlError(
+                                "operation_unverified",
+                                "absent resource cleanup is no longer verified",
+                                {"operation_id": operation_id},
+                            )
+                        resources = parse_resource_mapping(
+                            task.get("resources_json"), "resources", allow_empty=False
+                        )
+                        reservation = parse_resource_mapping(
+                            task.get("resource_reservation_json"), "reservation", allow_empty=True
+                        )
+                    except ControlError as exc:
+                        if exc.code == "operation_unverified":
+                            raise
+                        raise ControlError(
+                            "operation_unverified",
+                            "absent resource cleanup cannot be verified",
+                            {"operation_id": operation_id},
+                        ) from exc
+                    except (TypeError, ValueError) as exc:
+                        raise ControlError(
+                            "operation_unverified",
+                            "absent resource records cannot be verified",
+                            {"operation_id": operation_id},
+                        ) from exc
+                    if resources != {"cpu": 0, "memory_mib": 0, "disk_gib": 0} or reservation:
+                        raise ControlError(
+                            "operation_unverified",
+                            "absent resource repair is not reflected in durable state",
+                            {"operation_id": operation_id},
+                        )
                 elif action_name == "finish-delete" or task.get("state") == "absent":
                     try:
                         exists = any(native.get("name") == task.get("instance_name") for native in self.incus.list_instances())

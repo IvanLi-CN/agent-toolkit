@@ -549,6 +549,20 @@ class AdmissionTests(Fixture):
             doctor = self.control.doctor(self.request("doctor"), None)
         self.assertIn("unit_unverified:incus.service", doctor["issues"])
 
+    def test_doctor_does_not_hold_global_lock_during_native_probe(self):
+        import fcntl
+        Path(self.control.lock_path).touch()
+
+        def probe_lock():
+            fd = os.open(self.control.lock_path, os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+
+        self.runner.on_version = probe_lock
+        self.control.doctor(self.request("doctor"), None)
+
     def test_status_corrupt_last_error_is_structured(self):
         active = self.acquire()
         self.store.update_task(active["task_id"], last_error="{")

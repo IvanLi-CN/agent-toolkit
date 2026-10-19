@@ -3690,12 +3690,7 @@ class Control:
         self,
         request: Mapping[str, Any],
         session_id: str | None,
-        *,
-        global_locked: bool = False,
     ) -> dict[str, Any]:
-        if not global_locked:
-            with self._global_lock():
-                return self.doctor(request, session_id, global_locked=True)
         issues = []
         try:
             version = self.runner.run(["incus", "version"], timeout=15).stdout.decode().strip()
@@ -3753,12 +3748,11 @@ class Control:
                 if not valid_timer:
                     issues.append("timer_unverified:" + str(task.get("task_id")))
         resources = self._resource_diagnostics(
-            global_locked=global_locked,
             capacity_observation=capacity if "error" not in capacity else None,
         )
         instance_policy = self._instance_diagnostics()
         admission = self._default_admission_diagnostics(
-            resources, capacity, instance_policy, global_locked=global_locked
+            resources, capacity, instance_policy
         )
         return {"ready": not issues, "issues": issues, "incus_version": version, "capacity": capacity,
                 "resources": resources, "instances": instance_policy, "default_admission": admission,
@@ -4441,13 +4435,13 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
 
     def admin_status(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:
         with self._global_lock():
-            return {"draining": self.store.get_meta("draining") == "1",
-                    "tasks": [self._runtime_summary(task) for task in self.store.list_tasks()],
-                    "doctor": self.doctor(request, session_id, global_locked=True)}
+            draining = self.store.get_meta("draining") == "1"
+            tasks = [self._runtime_summary(task) for task in self.store.list_tasks()]
+        return {"draining": draining, "tasks": tasks, "doctor": self.doctor(request, session_id)}
 
     def admin_metrics(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:
+        doctor = self.doctor(request, session_id)
         with self._global_lock():
-            doctor = self.doctor(request, session_id, global_locked=True)
             tasks = self.store.list_tasks()
             task_states = Counter(str(task["state"]) for task in tasks)
             resources = doctor.get("resources", {})

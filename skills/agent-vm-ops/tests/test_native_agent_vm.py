@@ -69,6 +69,7 @@ class NativeCommands(CONTROL.CommandRunner):
         self.forwards = []
         self.failure = None
         self.on_start = None
+        self.on_version = None
         self.image_available = True
         self.image_type = "virtual-machine"
         self.on_wait = None
@@ -84,7 +85,9 @@ class NativeCommands(CONTROL.CommandRunner):
             raise CONTROL.ControlError("command_failed", "injected native failure")
         body = b""
         if args[0] in {"conntrack", "ss", "systemctl"}: pass
-        elif args[:2] == ["incus", "version"]: body = b"7.5.1"
+        elif args[:2] == ["incus", "version"]:
+            if self.on_version: self.on_version()
+            body = b"7.5.1"
         elif args[:3] == ["incus", "--project", "agents"] or args[:2] == ["incus", "query"]:
             command = args[1:] if args[1] == "query" else args[3:]
             verb = command[0]

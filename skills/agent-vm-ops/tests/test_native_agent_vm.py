@@ -70,6 +70,7 @@ class NativeCommands(CONTROL.CommandRunner):
         self.failure = None
         self.on_start = None
         self.on_version = None
+        self.on_list_instances = None
         self.image_available = True
         self.image_type = "virtual-machine"
         self.on_wait = None
@@ -116,7 +117,9 @@ class NativeCommands(CONTROL.CommandRunner):
                     value = {"status": item["status"], "network": {"eth0": {"addresses": [{"family": "inet", "address": item["expanded_devices"]["eth0"].get("ipv4.address")} ]}}} if path.endswith("/state") else item
                 else: raise AssertionError(path)
                 body = json.dumps(value).encode()
-            elif verb == "list": body = json.dumps(list(self.instances.values())).encode()
+            elif verb == "list":
+                if self.on_list_instances: self.on_list_instances()
+                body = json.dumps(list(self.instances.values())).encode()
             elif verb == "init":
                 image, name = command[1:3]
                 if name in self.instances: raise AssertionError("duplicate init")

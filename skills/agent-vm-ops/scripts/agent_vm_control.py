@@ -72,7 +72,9 @@ TASK_STATES = frozenset(("absent", "cached", "preparing", "active", "closing", "
 
 
 def parse_resource_mapping(raw: str | None, label: str, *, allow_empty: bool) -> dict[str, int]:
-    value = json.loads(raw or "{}")
+    if not isinstance(raw, str):
+        raise ValueError(label)
+    value = json.loads(raw)
     keys = frozenset(value) if isinstance(value, Mapping) else None
     allowed = ({frozenset(), RESOURCE_KEYS} if allow_empty else {RESOURCE_KEYS})
     if not isinstance(value, Mapping) or keys not in allowed:
@@ -2630,9 +2632,12 @@ class Control:
             if memory_error is not None:
                 raise memory_error
             policy = self._resource_policy(memory_observation=memory)
+            # Native inventory calls can block on the Incus socket. Keep them
+            # outside the admission transaction; only the durable accounting
+            # read and disk projection need the short global lock.
+            self._running_inventory_guard()
             lock = nullcontext() if global_locked else self._global_lock()
             with lock, self.store.transaction():
-                self._running_inventory_guard()
                 breakdown = self._allocation_breakdown()
                 disk = self._disk_admission_diagnostics(
                     capacity_observation if capacity_observation is not None else self._storage_headroom(0)
@@ -3764,11 +3769,11 @@ class Control:
         assert session_id is not None
         with self._global_lock():
             task = self.store.get_task(session_id=session_id)
-            result = self._runtime_summary(task) if task else {"state": "absent", "generation": 0, "effective_lease": False,
-                                                             "native_status": "absent", "guest_available": False}
-            admission = self._resource_diagnostics(global_locked=True)
-            admission["instances"] = self._instance_diagnostics()
-            return {**result, "admission": admission}
+        result = self._runtime_summary(task) if task else {"state": "absent", "generation": 0, "effective_lease": False,
+                                                           "native_status": "absent", "guest_available": False}
+        admission = self._resource_diagnostics()
+        admission["instances"] = self._instance_diagnostics()
+        return {**result, "admission": admission}
 
 
     def acquire(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:
@@ -4491,6 +4496,17 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
     def drain_exit(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:
         if self.store.get_meta("draining") != "1":
             return {"draining": False}
+        operation_id = request.get("operation_id")
+        pending = [
+            item for item in self.store.pending_operations()
+            if item.get("operation_id") != operation_id
+        ]
+        if pending:
+            raise ControlError(
+                "reconciliation_required",
+                "drain exit requires all pending operations to be reconciled",
+                {"pending_operations": pending},
+            )
         snapshots = sorted(self.store.list_tasks(), key=lambda task: str(task.get("session_id", "")))
         # Session operations acquire their session lock before admission.lock.
         # Keep that order here too; taking admission.lock first can deadlock an

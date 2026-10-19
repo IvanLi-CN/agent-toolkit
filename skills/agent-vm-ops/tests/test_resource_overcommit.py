@@ -469,6 +469,15 @@ class AdmissionTests(Fixture):
         self.store.update_task(active["task_id"], resource_reservation_json="{")
         self.error("resource_unverified", self.call, "status")
 
+    def test_falsy_non_string_resource_reservation_is_not_empty(self):
+        active = self.acquire()
+        for value in (0, False):
+            with self.subTest(value=value):
+                self.store.update_task(active["task_id"], resource_reservation_json=value)
+                doctor = self.call("doctor")
+                self.assertFalse(doctor["resources"]["verified"])
+                self.assertEqual(doctor["resources"]["error"]["code"], "resource_unverified")
+
     def test_absent_partial_task_status_preserves_unknown_resource_state(self):
         active = self.acquire()
         self.call("release")
@@ -561,7 +570,20 @@ class AdmissionTests(Fixture):
                 os.close(fd)
 
         self.runner.on_version = probe_lock
+        self.runner.on_list_instances = probe_lock
         self.control.doctor(self.request("doctor"), None)
+
+    def test_drain_exit_keeps_admission_closed_with_pending_operation(self):
+        self.store.set_meta("draining", "1")
+        self.store.record_operation(
+            "pending-drain",
+            "acquire",
+            "thread-a",
+            0,
+            {"outcome": "pending"},
+        )
+        self.error("reconciliation_required", self.control.drain_exit, {}, None)
+        self.assertEqual(self.store.get_meta("draining"), "1")
 
     def test_status_corrupt_last_error_is_structured(self):
         active = self.acquire()
@@ -857,7 +879,11 @@ class AdmissionTests(Fixture):
             thread.start()
             self.assertTrue(started.wait(timeout=5))
             self.control.dispatch(self.request("drain-enter", operation="race-drain-enter"))
-            self.control.dispatch(self.request("drain-exit", operation="race-drain-exit"))
+            self.error(
+                "reconciliation_required",
+                self.control.dispatch,
+                self.request("drain-exit", operation="race-drain-exit"),
+            )
             proceed.set()
             thread.join(timeout=5)
         self.assertFalse(thread.is_alive())

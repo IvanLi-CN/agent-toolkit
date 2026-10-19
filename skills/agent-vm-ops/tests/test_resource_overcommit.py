@@ -330,6 +330,14 @@ class AdmissionTests(Fixture):
         self.assertEqual(pending[0]["operation_id"], request["operation_id"])
         self.assertEqual(pending[0]["action"], "acquire")
 
+    def test_unknown_task_state_blocks_status_release_and_destroy(self):
+        active = self.acquire("corrupt")
+        self.store.update_task(active["task_id"], state="mystery")
+        for action in ("status", "release", "destroy"):
+            with self.subTest(action=action):
+                self.error("resource_unverified", self.call, action, "corrupt")
+                self.assertEqual(self.store.get_task(task_id=active["task_id"])["state"], "mystery")
+
     def test_resource_failure_preserves_verified_memory_pressure(self):
         self.resources.memory.return_value["available_bytes"] = 0
         with mock.patch.object(self.control, "_disk_admission_diagnostics", return_value={
@@ -341,6 +349,14 @@ class AdmissionTests(Fixture):
         self.assertTrue(result["memory_pressure"])
         self.assertEqual(result["memory"]["available_bytes"], 0)
         self.assertIsNone(result["remaining"])
+
+    def test_admin_metrics_keeps_reclaim_unknown_when_disk_observation_is_unverified(self):
+        with mock.patch.object(self.control, "_disk_admission_diagnostics", return_value={
+            "verified": False,
+            "error": {"code": "resource_unverified", "message": "disk observation failed"},
+        }):
+            result = self.call("admin-metrics")
+        self.assertIsNone(result["reclaim_required"])
 
     def test_native_resource_drift_fails_closed_for_new_admission(self):
         active = self.acquire()

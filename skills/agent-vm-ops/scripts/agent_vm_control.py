@@ -68,6 +68,7 @@ SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.:@/-]{1,160}$")
 PORT_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
 TASK_TIMER_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}-g[0-9]+$")
 RESOURCE_KEYS = frozenset(("cpu", "memory_mib", "disk_gib"))
+TASK_STATES = frozenset(("absent", "cached", "preparing", "active", "closing", "deleting", "failed"))
 
 
 def parse_resource_mapping(raw: str | None, label: str, *, allow_empty: bool) -> dict[str, int]:
@@ -2205,7 +2206,18 @@ class Control:
         task = self.store.get_task(session_id=session_id)
         if task is None or task["state"] == "absent":
             raise ControlError("task_missing", "no VM lease exists for this session")
+        self._validate_task_state(task)
         return task
+
+    @staticmethod
+    def _validate_task_state(task: Mapping[str, Any]) -> None:
+        state = task.get("state")
+        if state not in TASK_STATES:
+            raise ControlError(
+                "resource_unverified",
+                "task state cannot be verified; reconciliation is required",
+                {"task_id": task.get("task_id"), "state": state},
+            )
 
     def _check_generation(self, task: Mapping[str, Any], request: Mapping[str, Any]) -> None:
         generation = require_int(request.get("generation"), "generation", 0)
@@ -2289,6 +2301,7 @@ class Control:
             self.incus.stop(current["instance_name"], force=True)
 
     def _state_summary(self, task: Mapping[str, Any]) -> dict[str, Any]:
+        self._validate_task_state(task)
         result = {
             "task_id": task["task_id"],
             "session_id": task["session_id"],
@@ -3967,6 +3980,7 @@ class Control:
         assert session_id is not None
         task = self.store.get_task(session_id=session_id)
         if task is None: raise ControlError("task_missing", "no owned instance exists")
+        self._validate_task_state(task)
         self._check_generation(task, request)
         if task["state"] == "absent": return self._state_summary(task)
         if task["state"] == "deleting":

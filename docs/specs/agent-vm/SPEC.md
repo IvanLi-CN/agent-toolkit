@@ -12,13 +12,15 @@ The deployment topology is layered: the local Codex client reaches a configured 
 
 Every request carries a generic `session_id`. The CLI selects it from explicit `--session-id` first and `AGENT_VM_SESSION_ID` second. A missing value returns `missing_session` before any remote write. Session identity is ownership metadata and is not an authentication mechanism. The client sends one versioned JSON request over the configured SSH control path and emits one JSON response; diagnostics go to stderr.
 
-Protocol 4 is required by both client and control. Mutations include an operation ID and lease generation. The control persists requests and outcomes, rejects incompatible or conflicting retries, and never replays an uncertain native mutation automatically.
+Protocol 4 is required by both client and control. Mutations include an operation ID and lease generation, including drain entry and exit. Every successful response carries a validated non-negative generation or an explicit `null` for non-session actions and an `outcome` of `success` or `replayed`. The control persists requests and outcomes, rejects incompatible or conflicting retries, and never replays an uncertain native mutation automatically. Runtime state opening is fail-closed: missing, empty, malformed, or unknown SQLite state is an error and cannot create a new lease. The one recognized Python baseline schema is upgraded atomically to the Bun canonical schema with row-count checks, an audit record and post-copy verification; migration failure rolls back the database.
+
+Local config, state and operation-journal roots are fail-closed: relative roots, symlinked user-controlled ancestors or files, non-directory ancestors, unexpected ownership, and group/other-writable ancestors are rejected. Session directories and files are created with private permissions, and persisted error/audit details apply field projection, secret redaction, depth, collection, string and document-size bounds before durable write or replay.
 
 ## Lifecycle
 
-Each session owns at most one VM slot, including preparing, stopping, deleting and cached states. Acquire creates or reuses a stopped cache, records a new generation and waits for guest agent and IPv4 readiness within one bounded monotonic budget. Lease expiry and release revoke access, remove only owned mappings and stop the guest before making the slot reusable. A stopped disk may remain as a disposable cache; no recovery guarantee is made.
+Each session owns at most one VM slot, including preparing, stopping, deleting and cached states. Acquire creates or reuses a stopped cache, records a new generation and waits for guest agent and IPv4 readiness within one bounded monotonic budget. Lease expiry and release revoke access, remove only owned mappings and stop the guest before making the slot reusable. A stopped disk may remain as a disposable cache; no recovery guarantee is made. A cache is reusable only when its pinned image fingerprint and `user.agent-vm.guest-tools` capability marker match the current controller contract; legacy caches without that marker fail closed and require disposal.
 
-Renewal is explicit and bounded. Acquire, status, SSH, execution and transfer do not renew a lease. A changed generation or expired lease rejects late readiness and native results. Durable state, locks and timers make repeated requests idempotent without hiding partial cleanup.
+Renewal is explicit and bounded. Acquire, status, SSH, execution and transfer do not renew a lease. A changed generation or expired lease rejects late readiness and native results; expiry and drain transitions coordinate with per-session native locks and the native effect barrier before permitting state changes. Durable state, locks and timers make repeated requests idempotent without hiding partial cleanup. The durable verifier rejects unknown drain values, missing active VM/SSH/resource identity, cached or absent residual reservations and ports, and malformed transition reservations; active resize/restart recovery reservations are accepted only when their resource vectors remain exact and measurable.
 
 ## Access and isolation
 
@@ -26,9 +28,9 @@ The deployment configuration supplies the control address and host port range. P
 
 ## Capacity and resizing
 
-Capacity observations are limited to the configured Incus pool filesystem and visible control-environment CPU and memory boundaries. External storage probes and infrastructure-manager inspection are unsupported. CPU and memory allocation ceilings use separately configurable overselling ratios; stopped caches consume disk only. New demand is refused when local measurements are missing, invalid or below the configured pressure threshold. Existing lease queries, retrieval, renewal and release remain available during pressure.
+Capacity observations are limited to the configured Incus pool filesystem and visible control-environment CPU and memory boundaries. External storage probes and infrastructure-manager inspection are unsupported. CPU and memory allocation ceilings use separately configurable overselling ratios; stopped caches consume disk only. Admission diagnostics serialize configured ratios as exact decimal or scientific strings so large values are not rounded or converted to non-finite JSON. New demand is refused when local measurements are missing, invalid or below the configured pressure threshold. Existing lease queries, retrieval, renewal and release remain available during pressure.
 
-Disk changes require an explicit restart allowance and grow only. Memory-only live changes require a running owned guest, unchanged boot identity and native acknowledgement. The old reservation remains until verification succeeds. A single bounded convergence retry is allowed for the documented native balloon timeout; no polling loop or third attempt exists. Partial native changes retain conservative reservations and a structured recovery state.
+Disk changes require an explicit restart allowance and grow only. Memory-only live changes require a running owned guest, unchanged boot identity and native acknowledgement. The old reservation remains until verification succeeds. The documented native balloon-timeout path settles for 45 seconds, then permits exactly one bounded convergence retry only after rereading lease, reservation, native-resource and guest-boot guards; there is no polling loop or third attempt. Partial native changes retain conservative reservations and a structured recovery state.
 
 ## Reclamation and operations
 
@@ -54,7 +56,7 @@ Operational dashboards MUST distinguish CT filesystem capacity, transient image 
 
 ## Synchronization and retrieval
 
-The synchronization helper transfers tracked, unignored worktree files to its own guest source directory and atomically replaces only helper-owned content. It rejects submodules and unsafe names. Export streams a tar archive directly to the caller and does not create a server-side archive.
+The synchronization helper transfers tracked, unignored worktree files to its own guest source directory and atomically replaces only helper-owned content. The guest workspace root and named worktree directory must be owned by the guest control user and not group- or world-writable; the helper fails closed before destructive replacement when that boundary is not verified. It rejects submodules and unsafe names. Export streams a tar archive directly to the caller and does not create a server-side archive.
 
 ## Verification
 

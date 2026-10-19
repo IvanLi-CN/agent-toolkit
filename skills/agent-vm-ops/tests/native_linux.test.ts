@@ -159,7 +159,6 @@ async function runSessionExpiryRace(mode: "status" | "acquire"): Promise<void> {
   });
   store.putPort({ task_id: "avm-race", generation: 1, port_name: "ssh", protocol: "tcp", host_port: 20000, vm_port: 22, device_name: "agent-vm-avm-race-ssh-tcp", state: "active", created_at: leaseExpiresAt });
   store.close();
-  await Bun.write(expiredPath, "1");
 
   const worker = `
     const { appendFileSync, existsSync } = await import("node:fs");
@@ -228,6 +227,7 @@ async function runSessionExpiryRace(mode: "status" | "acquire"): Promise<void> {
         return original(task);
       };
     } else if (mode === "expire") {
+      await Bun.write(process.env.EXPIRED, "1");
       control.cleanupTask = async () => [[], []];
       await Bun.write(process.env.EXPIRY_STARTED, "1");
     }

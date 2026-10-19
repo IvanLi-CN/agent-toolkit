@@ -130,6 +130,13 @@ async function waitFor(path: string, timeoutMs = 3000): Promise<boolean> {
   return existsSync(path);
 }
 
+async function requireWorkerMarker(child: any, path: string, label: string): Promise<void> {
+  if (await waitFor(path)) return;
+  child.kill();
+  const result = await collect(child);
+  throw new Error(`${label} worker exited before synchronization marker: ${JSON.stringify(result)}`);
+}
+
 async function runSessionExpiryRace(mode: "status" | "acquire"): Promise<void> {
   const probeRoot = root("agent-vm-session-race-" + mode);
   const dbPath = join(probeRoot, "state.sqlite3");
@@ -237,10 +244,10 @@ async function runSessionExpiryRace(mode: "status" | "acquire"): Promise<void> {
     EXPIRY_STARTED: expiryStartedPath, EXPIRY_DONE: expiryDonePath, LEASE_EXPIRES: leaseExpiresAt, RACE_MODE: mode, CONTROL_PATH,
   };
   const primary = spawnWorker(worker, baseEnv);
-  expect(await waitFor(enteredPath)).toBe(true);
+  await requireWorkerMarker(primary, enteredPath, mode);
   const expiry = spawnWorker(worker, { ...baseEnv, RACE_MODE: "expire" });
-  expect(await waitFor(expiryStartedPath)).toBe(true);
-  if (mode === "acquire") expect(await waitFor(expiryDonePath)).toBe(true);
+  await requireWorkerMarker(expiry, expiryStartedPath, "expire");
+  if (mode === "acquire") await requireWorkerMarker(expiry, expiryDonePath, "expire");
   else await Bun.sleep(50);
   const beforeRelease = new StateStore(dbPath);
   expect(beforeRelease.getTask({ taskId: "avm-race" })?.state).toBe(mode === "acquire" ? "absent" : "active");

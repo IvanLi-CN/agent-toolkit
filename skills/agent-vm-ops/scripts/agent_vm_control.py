@@ -2587,7 +2587,8 @@ class Control:
         with self._global_lock():
             self.store.update_task(task["task_id"], state="absent", vm_ip=None, ssh_host_port=None,
                                    lease_expires_at=None, inactive_since=None, cleanup_after=None,
-                                   reservation_bytes=0, last_error=None)
+                                   resources_json=json.dumps({"cpu": 0, "memory_mib": 0, "disk_gib": 0}),
+                                   resource_reservation_json="{}", reservation_bytes=0, last_error=None)
 
 
     def _reclaim_capacity(self, request_cost: int, exclude_task_id: str | None = None) -> list[str]:
@@ -2699,14 +2700,25 @@ class Control:
                     {"task_id": record.get("task_id")},
                 )
             try:
-                parse_resource_mapping(record.get("resources_json"), "resources", allow_empty=False)
-                parse_resource_mapping(record.get("resource_reservation_json"), "reservation", allow_empty=True)
+                resources = parse_resource_mapping(record.get("resources_json"), "resources", allow_empty=False)
+                reservation = parse_resource_mapping(record.get("resource_reservation_json"), "reservation", allow_empty=True)
+                reservation_bytes = self._durable_reservation_bytes(record.get("reservation_bytes"))
             except (TypeError, ValueError) as exc:
                 raise ControlError(
                     "resource_unverified",
                     "absent task resource state cannot be verified; reconciliation is required",
                     {"task_id": record.get("task_id")},
                 ) from exc
+            if (
+                resources != {"cpu": 0, "memory_mib": 0, "disk_gib": 0}
+                or reservation
+                or reservation_bytes != 0
+            ):
+                raise ControlError(
+                    "resource_unverified",
+                    "absent task resource state is not reconciled; reconciliation is required",
+                    {"task_id": record.get("task_id")},
+                )
         for instance in instances:
             record = records.get(instance.get("name"))
             stopped = str(instance.get("status", "")).lower() == "stopped"

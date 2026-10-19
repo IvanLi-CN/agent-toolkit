@@ -850,6 +850,15 @@ class AdmissionTests(Fixture):
         )
         self.error("operation_unverified", self.control.dispatch, request)
 
+        self.store.update_task(active["task_id"], reservation_bytes=0)
+        self.store.update_task(
+            active["task_id"],
+            resource_reservation_json=json.dumps({"memory_mib": 1}),
+        )
+        self.assertFalse(self.control._resource_diagnostics()["verified"])
+        self.store.update_task(active["task_id"], resource_reservation_json="{}")
+        self.assertTrue(self.control._resource_diagnostics()["verified"])
+
     def test_absent_resource_dry_run_replay_and_reservation_repair(self):
         active = self.acquire("dry-run-absent")
         self.call("release", "dry-run-absent")

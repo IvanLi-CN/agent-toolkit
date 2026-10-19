@@ -828,6 +828,8 @@ class AdmissionTests(Fixture):
         replay = self.control.dispatch(request)
         self.assertEqual(replay["outcome"], "replayed")
         self.assertEqual(replay["result"], response["result"])
+        with self.control._object_lock("session:" + active["session_id"]):
+            self.error("object_busy", self.control.dispatch, request)
         self.store.put_port({
             "task_id": active["task_id"], "generation": active["generation"],
             "port_name": "app", "protocol": "tcp", "host_port": 20000,
@@ -839,6 +841,12 @@ class AdmissionTests(Fixture):
         self.store.update_task(
             active["task_id"],
             resources_json=json.dumps({"cpu": 1, "memory_mib": 0, "disk_gib": 0}),
+        )
+        self.error("operation_unverified", self.control.dispatch, request)
+        self.store.update_task(
+            active["task_id"],
+            resources_json=json.dumps({"cpu": 0, "memory_mib": 0, "disk_gib": 0}),
+            reservation_bytes=1,
         )
         self.error("operation_unverified", self.control.dispatch, request)
 

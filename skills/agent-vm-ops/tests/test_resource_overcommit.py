@@ -850,6 +850,34 @@ class AdmissionTests(Fixture):
         )
         self.error("operation_unverified", self.control.dispatch, request)
 
+    def test_absent_resource_dry_run_replay_and_reservation_repair(self):
+        active = self.acquire("dry-run-absent")
+        self.call("release", "dry-run-absent")
+        self.runner.instances.pop(active["instance_name"])
+        self.store.update_task(
+            active["task_id"],
+            state="absent",
+            resources_json=json.dumps({"cpu": 0, "memory_mib": 0, "disk_gib": 0}),
+            resource_reservation_json="{}",
+        )
+        request = self.request(
+            "admin-reconcile", session="dry-run-absent", operation="reconcile-absent-dry", apply=False
+        )
+        response = self.control.dispatch(request)
+        replay = self.control.dispatch(request)
+        self.assertEqual(replay["outcome"], "replayed")
+        self.assertEqual(replay["result"], response["result"])
+
+        self.store.update_task(active["task_id"], reservation_bytes=1)
+        apply_request = self.request(
+            "admin-reconcile", session="dry-run-absent", operation="reconcile-absent-reservation", apply=True
+        )
+        applied = self.control.dispatch(apply_request)
+        self.assertEqual(self.store.get_task(task_id=active["task_id"])["reservation_bytes"], 0)
+        replayed = self.control.dispatch(apply_request)
+        self.assertEqual(replayed["outcome"], "replayed")
+        self.assertEqual(replayed["result"], applied["result"])
+
     def test_reconcile_action_error_replays_as_the_committed_result(self):
         active = self.acquire()
         request = self.request("admin-reconcile", operation="reconcile-error", apply=False)

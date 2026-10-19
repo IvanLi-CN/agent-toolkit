@@ -1972,8 +1972,9 @@ class Control:
                 "absent resource owner cannot be verified",
                 {"operation_id": operation_id},
             )
+        task_id = task.get("task_id")
         with self._object_lock("session:" + owner, blocking=False):
-            current = self.store.get_task(task_id=task.get("task_id"))
+            current = self.store.get_task(task_id=task_id)
             if (
                 current is None
                 or current.get("state") != "absent"
@@ -1984,17 +1985,37 @@ class Control:
                     "absent resource task changed during replay",
                     {"operation_id": operation_id},
                 )
-            try:
-                exists = any(
-                    native.get("name") == current.get("instance_name")
-                    for native in self.incus.list_instances()
+            instance_name = current.get("instance_name")
+        try:
+            exists = any(
+                native.get("name") == instance_name
+                for native in self.incus.list_instances()
+            )
+        except ControlError as exc:
+            raise ControlError(
+                "operation_unverified",
+                "absent resource cleanup cannot be verified",
+                {"operation_id": operation_id},
+            ) from exc
+        with self._object_lock("session:" + owner, blocking=False):
+            current = self.store.get_task(task_id=task_id)
+            if (
+                current is None
+                or current.get("state") != "absent"
+                or current.get("generation") != generation
+            ):
+                raise ControlError(
+                    "operation_unverified",
+                    "absent resource task changed during replay",
+                    {"operation_id": operation_id},
                 )
-                if exists or self.store.get_ports(current["task_id"]):
-                    raise ControlError(
-                        "operation_unverified",
-                        "absent resource cleanup is no longer verified",
-                        {"operation_id": operation_id},
-                    )
+            if exists or self.store.get_ports(current["task_id"]):
+                raise ControlError(
+                    "operation_unverified",
+                    "absent resource cleanup is no longer verified",
+                    {"operation_id": operation_id},
+                )
+            try:
                 resource_error = reservation_error = False
                 try:
                     resources = parse_resource_mapping(
@@ -2019,12 +2040,6 @@ class Control:
                     {"operation_id": operation_id},
                 ) from exc
             if dry_run:
-                if not resource_error and not reservation_error:
-                    raise ControlError(
-                        "operation_unverified",
-                        "absent resource repair is no longer pending",
-                        {"operation_id": operation_id},
-                    )
                 return
             if (
                 resource_error
@@ -4719,22 +4734,30 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
                             raise ControlError("resource_unverified", "absent task still has a native instance")
                         if self.store.get_ports(task["task_id"]):
                             raise ControlError("cleanup_incomplete", "absent task still has port mappings")
+                        repair_required = False
                         try:
                             parse_resource_mapping(task.get("resources_json"), "resources", allow_empty=False)
                             parse_resource_mapping(task.get("resource_reservation_json"), "reservation", allow_empty=True)
                         except (TypeError, ValueError):
-                            if apply:
-                                with self._global_lock(), self.store.transaction():
-                                    current = self.store.get_task(task_id=task["task_id"])
-                                    if current is None or current["state"] != "absent":
-                                        raise ControlError("generation_mismatch", "absent task changed during reconciliation")
-                                    self.store.update_task(
-                                        task["task_id"],
-                                        resources_json=json.dumps({"cpu": 0, "memory_mib": 0, "disk_gib": 0}),
-                                        resource_reservation_json="{}",
-                                        reservation_bytes=0,
-                                        last_error=None,
-                                    )
+                            repair_required = True
+                        if (
+                            isinstance(task.get("reservation_bytes"), bool)
+                            or not isinstance(task.get("reservation_bytes"), int)
+                            or task.get("reservation_bytes") != 0
+                        ):
+                            repair_required = True
+                        if apply and repair_required:
+                            with self._global_lock(), self.store.transaction():
+                                current = self.store.get_task(task_id=task["task_id"])
+                                if current is None or current["state"] != "absent":
+                                    raise ControlError("generation_mismatch", "absent task changed during reconciliation")
+                                self.store.update_task(
+                                    task["task_id"],
+                                    resources_json=json.dumps({"cpu": 0, "memory_mib": 0, "disk_gib": 0}),
+                                    resource_reservation_json="{}",
+                                    reservation_bytes=0,
+                                    last_error=None,
+                                )
                         actions.append(item)
                         continue
                     if task["state"] == "deleting":

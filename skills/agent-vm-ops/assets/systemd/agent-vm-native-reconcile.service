@@ -6,6 +6,7 @@ Wants=incus.service
 [Service]
 Type=oneshot
 UnsetEnvironment=AGENT_VM_CONFIG_PATH
+ExecStartPre=/bin/sh -c 'set -eu; for path in /usr/bin/bun /opt/agent-vm-native/agent_vm_control.ts; do test -f "$path"; test ! -L "$path"; test "$(readlink -f -- "$path")" = "$path"; test "$(stat -c %%u -- "$path")" = 0; mode=$(stat -c %%a -- "$path"); test $((0$mode & 022)) -eq 0; done'
 ExecStart=/usr/bin/bun /opt/agent-vm-native/agent_vm_control.ts --timer-reconcile
 NoNewPrivileges=yes
 PrivateTmp=yes

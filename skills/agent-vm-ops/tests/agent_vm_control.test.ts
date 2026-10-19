@@ -1,6 +1,6 @@
 import { afterEach, expect, setDefaultTimeout, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -19,6 +19,7 @@ import {
   SystemdManager,
   loadConfig,
   validateProtectedDirectory,
+  validateSystemdRuntime,
 } from "../scripts/agent_vm_control.ts";
 
 const GIB = 1024 ** 3;
@@ -449,6 +450,20 @@ test("requires protected canonical config and timer paths", () => {
     writeFileSync(aliasedPath, JSON.stringify(aliased));
     expectSyncCode(() => loadConfig(aliasedPath), "config_invalid");
     expectSyncCode(() => StateStore.bootstrap(join(alias, "aliased-state.sqlite3")), "state_path_unsafe");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("validates systemd runtime and control script boundaries", () => {
+  const root = mkdtempSync("/tmp/agent-vm-systemd-runtime-test-");
+  const canonicalRoot = realpathSync(root);
+  const bunPath = join(canonicalRoot, "bun");
+  const controlPath = join(canonicalRoot, "agent_vm_control.ts");
+  try {
+    writeFileSync(bunPath, "#!/bin/sh\n", { mode: 0o755 });
+    writeFileSync(controlPath, "// isolated test entrypoint\n", { mode: 0o644 });
+    validateSystemdRuntime({ bunPath, controlPath });
+    chmodSync(controlPath, 0o666);
+    expectSyncCode(() => validateSystemdRuntime({ bunPath, controlPath }), "config_invalid");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -1771,7 +1786,10 @@ test("GC previews and deletes only eligible stopped caches", async () => {
   const active = await f.call("acquire", { public_key: KEY }, "op-gc-active");
   const preview = await f.control.dispatch(f.request("admin-gc", {}, "op-gc-preview"));
   expect(preview.result.dry_run).toBe(true);
+  expect(preview.result.minimum_idle_seconds).toBe(0);
   expect(preview.result.candidates.map((item: Dict) => item.task_id)).toContain(old.task_id);
+  const previewReplay = await f.control.dispatch(f.request("admin-gc", {}, "op-gc-preview"));
+  expect(previewReplay.result.minimum_idle_seconds).toBe(0);
   await f.control.dispatch(f.request("admin-gc", { apply: true }, "op-gc-apply"));
   expect(f.store.getTask({ taskId: String(old.task_id) })?.state).toBe("absent");
   expect(f.store.getTask({ taskId: String(active.task_id) })?.state).toBe("active");

@@ -1008,7 +1008,11 @@ systemdTest("systemd assets validate against the Bun runtime path", async () => 
   const managedBun = lstatSync("/usr/bin/bun");
   expect(managedBun.isFile()).toBe(true);
   expect((managedBun.mode & 0o111) !== 0).toBe(true);
-  for (const unit of UNIT_PATHS) expect(readFileSync(unit, "utf8")).toContain("ExecStart=/usr/bin/bun ");
+  for (const unit of UNIT_PATHS) {
+    const content = readFileSync(unit, "utf8");
+    expect(content).toContain("ExecStartPre=/bin/sh -c");
+    expect(content).toContain("ExecStart=/usr/bin/bun ");
+  }
   const processHandle = Bun.spawn(["systemd-analyze", "verify", ...UNIT_PATHS], { stdout: "pipe", stderr: "pipe" });
   const result = await collect(processHandle);
   if (result.exit !== 0) throw new Error(`systemd verify failed: ${JSON.stringify(result)}`);

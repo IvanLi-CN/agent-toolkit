@@ -28,6 +28,8 @@ const RAW_DIAGNOSTIC_CAPTURE_LIMIT = 1024 * 1024;
 export const DEFAULT_CONFIG_PATH = "/etc/agent-vm-native/config.json";
 export const CONFIG_PATH_ENV = "AGENT_VM_CONFIG_PATH";
 export const DEFAULT_TIMER_DIR = "/etc/systemd/system";
+export const DEFAULT_SYSTEMD_BUN_PATH = "/usr/bin/bun";
+export const DEFAULT_SYSTEMD_CONTROL_PATH = "/opt/agent-vm-native/agent_vm_control.ts";
 export const REQUIRED_ENVIRONMENT_FIELDS = [
   "project", "profile", "image_alias", "image_fingerprint", "network", "network_acl", "pool",
   "host_address", "port_start", "port_end", "vm_ip_start", "vm_ip_end", "gateway_ip", "storage_path",
@@ -261,7 +263,7 @@ const PERSISTED_PAYLOAD_FIELDS = new Set([
   "outcome", "payload", "phase", "phases", "pid", "plan", "policy", "policy_compliant", "pool", "port", "port_name", "ports", "post_check_seconds", "previous_generation",
   "process_group_cleanup_error", "process_group_killed", "profile", "project", "protocol", "proxy", "qemu_schedstat", "ratios", "ready", "reason", "reasons",
   "reclaim_required", "reclaimed", "record", "remaining", "removed", "request_cost_bytes", "requested", "reservation_bytes",
-  "resource_reservation", "resource_reservation_json", "resources", "resources_json", "result", "returncode", "runtime_seconds", "scope", "selection", "server_time",
+  "resource_reservation", "resource_reservation_json", "resources", "resources_json", "result", "returncode", "runtime_seconds", "scope", "selection", "server_time", "minimum_idle_seconds",
   "session_id", "sources", "ssh_host_port", "stage_timings", "startup_log", "state", "stderr", "task_id", "tasks", "threshold_bytes",
   "total", "total_elapsed_seconds", "transport_timeout", "truncated", "type", "updated_at", "user", "verification", "verified", "version", "free", "reported",
   "runqueue_wait_seconds", "source", "status", "storage_path", "text", "timer_dir", "virtual_bytes", "vm_ip", "vm_port", "readiness", "emitted", "native_start_seconds",
@@ -893,6 +895,41 @@ function validateProtectedAncestor(path: string, stats: ProtectedStats): void {
   if (!stats.isDirectory()) throw new ControlError("config_invalid", "protected path has a non-directory ancestor");
   if (isTrustedSharedRoot(path, stats)) return;
   if ((Number(stats.mode) & 0o022) !== 0) throw new ControlError("config_invalid", "protected path has a writable ancestor");
+  const owner = currentOwnerUid();
+  if (owner !== undefined && stats.uid !== owner && stats.uid !== 0) throw new ControlError("config_invalid", "protected path has an untrusted ancestor owner");
+}
+
+export type SystemdRuntimePaths = { bunPath: string; controlPath: string };
+
+function validateSystemdRuntimeFile(path: string, label: string, executable: boolean): void {
+  if (!path.startsWith("/")) throw new ControlError("config_invalid", `${label} path must be absolute`);
+  const resolved = resolve(path);
+  if (resolved !== path) throw new ControlError("config_invalid", `${label} path must be canonical`);
+  const stats = lstatSync(path) as ProtectedStats & { isSymbolicLink?: () => boolean };
+  if (stats.isSymbolicLink?.() || !stats.isFile()) throw new ControlError("config_invalid", `${label} must be a regular file`);
+  const mode = Number(stats.mode);
+  if ((mode & 0o022) !== 0 || (executable && (mode & 0o111) === 0)) throw new ControlError("config_invalid", `${label} has unsafe permissions`);
+  const owner = currentOwnerUid();
+  if (owner !== undefined && stats.uid !== owner && stats.uid !== 0) throw new ControlError("config_invalid", `${label} has an untrusted owner`);
+  if (realpathSync(path) !== path) throw new ControlError("config_invalid", `${label} path contains a symbolic-link ancestor`);
+  let parent = dirname(path);
+  while (true) {
+    const parentStats = lstatSync(parent) as ProtectedStats & { isSymbolicLink?: () => boolean };
+    if (parentStats.isSymbolicLink?.()) throw new ControlError("config_invalid", `${label} path contains a symbolic-link ancestor`);
+    validateProtectedAncestor(parent, parentStats);
+    if (parent === "/") break;
+    parent = dirname(parent);
+  }
+}
+
+export function validateSystemdRuntime(paths: SystemdRuntimePaths = { bunPath: DEFAULT_SYSTEMD_BUN_PATH, controlPath: DEFAULT_SYSTEMD_CONTROL_PATH }): void {
+  try {
+    validateSystemdRuntimeFile(paths.bunPath, "systemd Bun runtime", true);
+    validateSystemdRuntimeFile(paths.controlPath, "systemd control script", false);
+  } catch (error) {
+    if (error instanceof ControlError) throw error;
+    throw new ControlError("config_invalid", "systemd runtime paths cannot be verified");
+  }
 }
 
 function protectedPath(path: string, allowMissingLeaf: boolean): string {
@@ -2779,14 +2816,7 @@ export function hasWriterIntent(directory: string): boolean {
 export class SystemdManager {
   constructor(readonly runner: CommandRunner, readonly config: Dict, readonly enabled = true) {
     if (enabled) {
-      if (process.platform === "linux") {
-        try {
-          const bun = lstatSync("/usr/bin/bun");
-          if (!bun.isFile() || (bun.mode & 0o111) === 0) throw new Error("bun");
-        } catch {
-          throw new ControlError("config_invalid", "systemd deployment requires an executable regular file at /usr/bin/bun");
-        }
-      }
+      if (process.platform === "linux" && resolve(process.argv[1] ?? "") === DEFAULT_SYSTEMD_CONTROL_PATH) validateSystemdRuntime();
       try { validateProtectedDirectory(String(config.timer_dir)); } catch (error) {
         if (error instanceof ControlError) throw error;
         throw new ControlError("config_invalid", "timer directory cannot be verified");
@@ -4705,6 +4735,7 @@ export function writeProcessOutput(value: string): Promise<void> {
 
 export async function runMain(argv: readonly string[] = Bun.argv.slice(2)): Promise<number> {
   try {
+    if (process.platform === "linux" && resolve(process.argv[1] ?? "") === DEFAULT_SYSTEMD_CONTROL_PATH) validateSystemdRuntime();
     const config = loadConfig(process.env[CONFIG_PATH_ENV] ?? DEFAULT_CONFIG_PATH);
     const timerRequest = parseTimerArgs(argv);
     if (!timerRequest && argv.length) throw new ControlError("invalid_request", "unknown command-line arguments");

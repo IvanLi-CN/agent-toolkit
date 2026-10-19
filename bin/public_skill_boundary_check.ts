@@ -134,6 +134,11 @@ export function check(repoRoot: string = REPO_ROOT, manifest: string = PUBLIC_MA
     findings.push(`UNLISTED_PUBLIC_SKILL ${name}`);
   }
   for (const entry of readdirSync(skillsRoot, { withFileTypes: true }).sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0)) {
+    // Finder metadata is local workspace noise, but a tracked copy must still
+    // remain visible to the boundary check.
+    if (entry.name === ".DS_Store" && !tracked.paths.includes(join(skillsRoot, entry.name))) {
+      continue;
+    }
     if (entry.name === "README.md") {
       const readme = join(skillsRoot, entry.name);
       if (!isDirectRegularFile(readme) || !isPathInside(repoRoot, readme)) {

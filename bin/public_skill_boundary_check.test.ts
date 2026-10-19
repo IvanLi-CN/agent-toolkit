@@ -94,6 +94,16 @@ test("rejects unlisted files directly under the public Skills root", () => {
   }
 });
 
+test("ignores untracked macOS metadata directly under the public Skills root", () => {
+  const { root, manifest } = fixture("# standalone\n");
+  try {
+    writeFileSync(join(root, "skills", ".DS_Store"), "Finder metadata\n");
+    expect(check(root, manifest)).toEqual([]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("rejects a symlinked public Skill directory", () => {
   const { root, manifest } = fixture("# standalone\n");
   try {

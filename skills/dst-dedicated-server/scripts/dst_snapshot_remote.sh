@@ -5,9 +5,9 @@ have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 echo "### Identity"
 echo
-echo "- hostname: $(hostname)"
-echo "- whoami: $(whoami)"
-echo "- kernel: $(uname -a)"
+echo "- hostname: <remote-host>"
+echo "- whoami: <remote-user>"
+echo "- kernel: $(uname -srm)"
 if [[ -f /etc/os-release ]]; then
   echo "- os-release:"
   sed -n '1,10p' /etc/os-release | sed 's/^/  - /'
@@ -17,14 +17,18 @@ echo
 echo "### Resources"
 echo
 if have_cmd uptime; then echo "- uptime: $(uptime)"; fi
-if have_cmd df; then df -h "$HOME" 2>/dev/null || df -h; fi
+if have_cmd df; then
+  df -h "$HOME" 2>/dev/null | awk 'NR == 1 { print; next } { print $1, $2, $3, $4, $5 }' || df -h | awk 'NR == 1 { print; next } { print $1, $2, $3, $4, $5 }'
+fi
 if have_cmd free; then free -h || true; fi
 echo
 
 echo "### systemd (best-effort)"
 echo
 if have_cmd systemctl; then
-  systemctl status dst-master dst-caves --no-pager 2>/dev/null | sed -n '1,120p' || true
+  for unit in dst-master dst-caves; do
+    printf '%s: %s\n' "$unit" "$(systemctl is-active "$unit" 2>/dev/null || echo unknown)"
+  done
 else
   echo "> systemctl not found."
 fi
@@ -42,7 +46,7 @@ echo
 echo "### Processes (dontstarve/steamcmd/screen/tmux)"
 echo
 if have_cmd ps; then
-  ps -eo pid,user,cmd | grep -Ei 'dontstarve|steamcmd|screen|tmux' | head -n 120 || true
+  ps -eo pid=,comm= 2>/dev/null | grep -Ei 'dontstarve|steamcmd|screen|tmux' | head -n 120 || true
 fi
 echo
 
@@ -54,7 +58,7 @@ for f in \
   "$HOME/steamcmd/steamcmd.sh"
 do
   if [[ -f "$f" ]]; then
-    echo "- $f"
+    echo "- $(basename "$f"): present"
   fi
 done
 echo
@@ -62,7 +66,7 @@ echo
 echo "### Backups (paths only)"
 echo
 if [[ -d "$HOME/backups" ]]; then
-  ls -la "$HOME/backups" | sed -n '1,120p'
+  echo "- backups: present"
 else
   echo "> $HOME/backups not found."
 fi
@@ -72,18 +76,16 @@ echo "### Klei data (paths only; secrets redacted)"
 echo
 KLEI_DIR="$HOME/.klei/DoNotStarveTogether"
 if [[ ! -d "$HOME/.klei" || -L "$HOME/.klei" || ! -d "$KLEI_DIR" || -L "$KLEI_DIR" ]]; then
-  echo "> $KLEI_DIR not found."
+  echo "> <remote-home>/.klei/DoNotStarveTogether not found."
   exit 0
 fi
 
-echo "- klei_dir: $KLEI_DIR"
-echo
-ls -la "$KLEI_DIR" | sed -n '1,200p'
+echo "- klei_dir: <remote-home>/.klei/DoNotStarveTogether"
 echo
 
 for cluster in "$KLEI_DIR"/*; do
   [[ -d "$cluster" && ! -L "$cluster" ]] || continue
-  echo "#### Cluster: $(basename "$cluster")"
+  echo "#### Cluster: <cluster>"
   if [[ -f "$cluster/cluster.ini" ]]; then
     echo "- cluster.ini: present (contains cluster_password; do not paste)"
   fi
@@ -125,7 +127,7 @@ for p in \
   "$HOME/dstserver"
 do
   if [[ -d "$p" ]]; then
-    echo "- candidate_dir: $p"
+    echo "- candidate_dir: present"
     if [[ -f "$p/bin64/dontstarve_dedicated_server_nullrenderer_x64" ]]; then
       echo "  - bin64/dontstarve_dedicated_server_nullrenderer_x64: present"
       found="1"
@@ -151,8 +153,9 @@ done
 
 if [[ "$found" == "0" ]] && have_cmd find; then
   if find "$HOME" -maxdepth 0 -type d -print >/dev/null 2>&1; then
-    echo "- find (maxdepth 6 under ~):"
-    find "$HOME" -maxdepth 6 -type f -name 'dontstarve_dedicated_server_nullrenderer*' -print 2>/dev/null | sed -n '1,10p'
+    if [[ -n "$(find "$HOME" -maxdepth 6 -type f -name 'dontstarve_dedicated_server_nullrenderer*' -print 2>/dev/null | sed -n '1p')" ]]; then
+      echo "- binary: present"
+    fi
   else
     echo "> find does not support -maxdepth; skipped recursive binary search."
   fi

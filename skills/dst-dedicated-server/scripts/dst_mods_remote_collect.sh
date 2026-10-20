@@ -25,26 +25,26 @@ if [[ ! -d "$klei_base" || -L "$klei_base" || ! -d "$klei_root" || -L "$klei_roo
 fi
 
 if [[ ! -d "$shard_dir" || -L "$shard_dir" ]]; then
-  printf 'MISSING %s/modoverrides.lua\n' "$shard_dir"
+  printf 'MISSING\n'
   exit 0
 fi
 
 file="$shard_dir/modoverrides.lua"
 if [[ ! -f "$file" || -L "$file" ]]; then
-  printf 'MISSING %s\n' "$file"
+  printf 'MISSING\n'
   exit 0
 fi
 
-file_stat="$(stat -Lc '%d:%i:%s' "$file" 2>/dev/null || stat -f '%d:%i:%z' "$file" 2>/dev/null || true)"
+file_stat="$(stat -Lc '%i:%s' "$file" 2>/dev/null || stat -f '%i:%z' "$file" 2>/dev/null || true)"
 if [[ -z "$file_stat" ]]; then
-  printf 'MISSING %s\n' "$file"
+  printf 'MISSING\n'
   exit 0
 fi
-exec 9<"$file" || { printf 'MISSING %s\n' "$file"; exit 0; }
-fd_stat="$(stat -Lc '%d:%i:%s' /proc/self/fd/9 2>/dev/null || stat -f '%d:%i:%z' /dev/fd/9 2>/dev/null || true)"
+exec 9<"$file" || { printf 'MISSING\n'; exit 0; }
+fd_stat="$(stat -Lc '%i:%s' /proc/self/fd/9 2>/dev/null || stat -f '%i:%z' /dev/fd/9 2>/dev/null || true)"
 if [[ "$fd_stat" != "$file_stat" || -L "$klei_base" || -L "$klei_root" || -L "$cluster_dir" || -L "$shard_dir" || -L "$file" ]]; then
   exec 9<&-
-  printf 'MISSING %s\n' "$file"
+  printf 'MISSING\n'
   exit 0
 fi
 

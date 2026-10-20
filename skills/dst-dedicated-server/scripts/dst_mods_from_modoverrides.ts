@@ -183,10 +183,8 @@ async function terminateAndReap(child: Bun.Subprocess, exitPromise: Promise<numb
   const observedExit = exitPromise.then(() => { settled = true; }, () => { settled = true; });
   killProcessTree(child, "SIGTERM");
   await Promise.race([observedExit, new Promise<void>((resolve) => setTimeout(resolve, 1_000))]);
-  if (!settled) {
-    killProcessTree(child, "SIGKILL");
-    await Promise.race([observedExit, new Promise<void>((resolve) => setTimeout(resolve, 1_000))]);
-  }
+  killProcessTree(child, "SIGKILL");
+  await Promise.race([observedExit, new Promise<void>((resolve) => setTimeout(resolve, 1_000))]);
 }
 
 async function readText(stream: ReadableStream<Uint8Array>, maxBytes = 64 * 1024, timeoutMs = REMOTE_COMMAND_TIMEOUT_MS): Promise<string> {
@@ -297,7 +295,7 @@ export async function parseRemoteResponseStream(
     if (header === undefined) throw new Error("remote mod collection returned an invalid response");
     if (header === "MISSING" || header.startsWith("MISSING ")) {
       if (trailingBytes) throw new Error("remote mod collection returned an invalid response");
-      return { shard, present: false, filePath: header.startsWith("MISSING ") ? header.slice("MISSING ".length) : filePath, mods: [] };
+      return { shard, present: false, filePath: "modoverrides.lua", mods: [] };
     }
     if (bodyRemaining !== 0) throw new Error("remote mod collection returned a truncated file");
     if (parser === undefined || bodyDecoder === undefined || trailingBytes) throw new Error("remote mod collection returned an invalid response");
@@ -383,7 +381,7 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     const summaries: ShardSummary[] = [];
     for (const shard of shards) {
       const child = startRemote(parsed, shard);
-      const filePath = `~/.klei/DoNotStarveTogether/${parsed.cluster}/${shard}/modoverrides.lua`;
+      const filePath = "modoverrides.lua";
       const stderrPromise = readText(child.stderr);
       const exitPromise = child.exited;
       let timedOut = false;

@@ -122,8 +122,9 @@ describe("DST local Bun tooling", () => {
       expect(report).not.toContain("fixture-secret");
       expect(report).toContain("api_key=[REDACTED]");
       expect(report).not.toContain("entry-239.txt");
-      expect(report).toContain("Cluster_fixture");
-      expect(report).toContain("Cluster_direct");
+      expect(report).toContain("<cluster-1>");
+      expect(report).toContain("<cluster-2>");
+      expect(report).not.toContain(local);
       expect(report).not.toContain("secret-fixture");
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -183,6 +184,27 @@ describe("DST local Bun tooling", () => {
         env: { ...process.env, HOME: home }, stdout: "pipe", stderr: "pipe",
       });
       expect(await traversal.exited).toBe(2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("remote mod collection keeps a valid file bound across macOS and Linux stat layouts", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-valid-"));
+    try {
+      const home = join(root, "home");
+      const shard = join(home, ".klei", "DoNotStarveTogether", "fixture", "Master");
+      await mkdir(shard, { recursive: true });
+      await writeFile(join(shard, "modoverrides.lua"), '["workshop-123"] = { enabled = true }\n');
+      const child = Bun.spawn(["bash", join(import.meta.dir, "..", "scripts", "dst_mods_remote_collect.sh"), "fixture", "Master"], {
+        env: { ...process.env, HOME: home }, stdout: "pipe", stderr: "pipe",
+      });
+      const [status, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      expect(status).toBe(0);
+      expect(stderr).toBe("");
+      expect(stdout).toContain("PRESENT ");
+      expect(stdout).toContain("workshop-123");
+      expect(stdout).not.toContain(home);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -307,7 +329,8 @@ esac
       expect(result.status).toBe(0);
       const report = await readFile(output, "utf8");
       expect(report).toContain("Remote SSH failed");
-      expect(report).toContain("ssh fixture-user@fixture-host");
+      expect(report).toContain("configured SSH target");
+      expect(report).not.toContain("fixture-user@fixture-host");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

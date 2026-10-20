@@ -10,6 +10,7 @@ import {
   main,
   parseScore,
   parseArgs,
+  readPublishedPair,
   type ScoreConfig,
   type ScoreEvent,
 } from "../scripts/buzzer_preview.ts";
@@ -243,6 +244,40 @@ describe("buzzer MIDI and WAV helper", () => {
     }
   });
 
+  test("does not delete user directories that resemble internal state", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-internal-collision-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      const transaction = join(output, ".buzzer-preview-txn-fixture-user");
+      const sentinel = join(transaction, "sentinel.txt");
+      await mkdir(transaction, { recursive: true });
+      await writeFile(sentinel, "keep");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      expect(await main(["--in", input, "--out-dir", output])).toBe(0);
+      expect(await readFile(sentinel, "utf8")).toBe("keep");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not reclaim a lock directory with unknown contents", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-lock-collision-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      const lock = join(output, ".buzzer-preview-fixture.lock");
+      const sentinel = join(lock, "sentinel.txt");
+      await mkdir(lock, { recursive: true });
+      await writeFile(sentinel, "keep");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      expect(await main(["--in", input, "--out-dir", output])).toBe(1);
+      expect(await readFile(sentinel, "utf8")).toBe("keep");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("serializes concurrent pair publication", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-concurrent-"));
     try {
@@ -255,6 +290,9 @@ describe("buzzer MIDI and WAV helper", () => {
       ])).toEqual([0, 0]);
       expect((await readFile(join(output, "fixture.mid"))).slice(0, 4).toString()).toBe("MThd");
       expect((await readFile(join(output, "fixture.wav"))).slice(0, 4).toString()).toBe("RIFF");
+      const pair = await readPublishedPair(output, "fixture");
+      expect(pair.midi.slice(0, 4).toString()).toBe("MThd");
+      expect(pair.wav.slice(0, 4).toString()).toBe("RIFF");
       expect((await readdir(output)).filter((entry) => entry.includes("buzzer-preview")).length).toBe(0);
     } finally {
       await rm(root, { recursive: true, force: true });

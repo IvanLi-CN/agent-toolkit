@@ -3,7 +3,7 @@
 import { constants, type Dirent } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { lstat, mkdtemp, open, opendir, rename, rm, unlink } from "node:fs/promises";
-import { homedir, hostname } from "node:os";
+import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
 interface SnapshotOptions {
@@ -105,6 +105,9 @@ async function runWithStdin(
       requestStop();
     }, timeoutMs);
     const exitCode = await exitPromise;
+    // The leader can exit while a descendant still owns stdout or stderr. Stop the
+    // process group before awaiting those streams so cleanup cannot hang forever.
+    requestStop();
     const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
     return {
       exitCode,
@@ -135,6 +138,19 @@ function fileTimestamp(): string {
   return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}-${millis}-${randomUUID().slice(0, 8)}`;
 }
 
+async function syncDirectory(path: string): Promise<void> {
+  try {
+    const handle = await open(path, "r");
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    // Directory fsync is not available on every supported platform.
+  }
+}
+
 const SENSITIVE_NAME = "(?:password|passwd|passphrase|pwd|secret|token|credential|private[_ -]?key|api[_ -]?key|access[_ -]?key|authorization|bearer)";
 const SENSITIVE_KEY = `(?:[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*|"[^"\\r\\n]*${SENSITIVE_NAME}[^"\\r\\n]*"|'[^'\\r\\n]*${SENSITIVE_NAME}[^'\\r\\n]*')`;
 const SENSITIVE_ASSIGNMENT = new RegExp(
@@ -154,6 +170,14 @@ export function redactSensitiveText(text: string): string {
     .replace(SENSITIVE_QUOTED_ASSIGNMENT, "$1[REDACTED]")
     .replace(SENSITIVE_BARE_VALUE, "$1 [REDACTED]");
   return redacted.split(/\r?\n/).map((line) => UNREDACTED_SENSITIVE_ASSIGNMENT.test(line) ? "[REDACTED]" : line).join("\n");
+}
+
+function redactOperationalText(text: string, values: string[] = []): string {
+  let redacted = text;
+  for (const value of values.filter((candidate) => candidate.length > 0).sort((left, right) => right.length - left.length)) {
+    redacted = redacted.split(value).join("<redacted-path>");
+  }
+  return redactSensitiveText(redacted);
 }
 
 export function validateSshToken(value: string, label: string): void {
@@ -186,12 +210,12 @@ export async function safeTail(file: string, lines: number): Promise<string> {
   }
 }
 
-async function commandFirstLines(args: string[], lines: number): Promise<string> {
+async function commandFirstLines(args: string[], lines: number, redactions: string[] = []): Promise<string> {
   try {
     const result = await runWithStdin(args, "", LOCAL_COMMAND_TIMEOUT_MS, MAX_LOCAL_COMMAND_OUTPUT_BYTES);
     const selected = result.stdout.split(/\r?\n/).slice(0, lines).join("\n").trimEnd();
     const marker = result.timedOut ? "[command timed out]" : result.outputTruncated ? "[output truncated]" : "";
-    return redactSensitiveText([selected, marker].filter(Boolean).join("\n"));
+    return redactOperationalText([selected, marker].filter(Boolean).join("\n"), redactions);
   } catch {
     return "[command unavailable]";
   }
@@ -216,14 +240,13 @@ async function boundedDirectoryEntries(path: string): Promise<{ entries: Dirent[
 }
 
 async function localCollect(options: SnapshotOptions): Promise<string> {
-  const displayDir = options.localDir || "<unset>";
   const localDir = expandUser(options.localDir);
   const lines: string[] = [
     "## Local",
     "",
-    `- Host: ${hostname()}`,
+    "- Host: <local-host>",
     `- Collected at: ${isoTimestamp()}`,
-    `- Client data dir: \`${redactSensitiveText(displayDir)}\``,
+    `- Client data dir: \`${options.localDir.length > 0 ? "<configured-local-dir>" : "<unset>"}\``,
     "",
   ];
   let directory;
@@ -237,7 +260,8 @@ async function localCollect(options: SnapshotOptions): Promise<string> {
     return lines.join("\n");
   }
 
-  lines.push("### Directory overview", "", await commandFirstLines(["ls", "-la", localDir], 200), "");
+  const pathRedactions = [localDir, process.env.HOME ?? homedir(), homedir()];
+  lines.push("### Directory overview", "", await commandFirstLines(["ls", "-la", localDir], 200, pathRedactions), "");
   let entryListing: { entries: Dirent[]; truncated: boolean };
   try {
     entryListing = await boundedDirectoryEntries(localDir);
@@ -252,13 +276,13 @@ async function localCollect(options: SnapshotOptions): Promise<string> {
     .map((entry) => join(localDir, entry.name))
     .sort();
   lines.push("### Known log files (first 200 lines of listing)", "");
-  if (logFiles.length > 0) lines.push(await commandFirstLines(["ls", "-la", ...logFiles], 200));
+  if (logFiles.length > 0) lines.push(await commandFirstLines(["ls", "-la", ...logFiles], 200, pathRedactions));
   lines.push("");
 
   const clientLog = join(localDir, "client_log.txt");
   try {
     if ((await lstat(clientLog)).isFile()) {
-      lines.push("### client_log.txt (tail 80)", "", (await safeTail(clientLog, 80)).trimEnd(), "");
+      lines.push("### client_log.txt (tail 80)", "", redactOperationalText((await safeTail(clientLog, 80)).trimEnd(), pathRedactions), "");
     }
   } catch {
     // The file is optional.
@@ -295,8 +319,8 @@ async function localCollect(options: SnapshotOptions): Promise<string> {
   if (clusterScanTruncated) lines.push(`> Cluster path scan truncated at ${MAX_LOCAL_CLUSTER_PATHS} entries.`, "");
   if (clusters.length > 0) {
     lines.push("### Local clusters (paths only; secrets redacted)", "");
-    for (const cluster of clusters.sort()) {
-      lines.push(`- ${redactSensitiveText(cluster)}`);
+    for (const [index, cluster] of clusters.sort().entries()) {
+      lines.push(`- <cluster-${index + 1}>`);
       try {
         if ((await lstat(join(cluster, "cluster_token.txt"))).isFile()) lines.push("  - cluster_token.txt: present (redacted)");
       } catch {
@@ -314,7 +338,7 @@ async function localCollect(options: SnapshotOptions): Promise<string> {
 }
 
 async function remoteCollect(options: SnapshotOptions, script: string): Promise<{ text: string; failed: boolean }> {
-  const lines = ["## Remote", "", `- Target: \`${options.user}@${options.host}\``, ""];
+  const lines = ["## Remote", "", "- Target: `<configured-remote>`", ""];
   const target = `${options.user}@${options.host}`;
   let connectivity: CommandResult;
   try {
@@ -329,9 +353,9 @@ async function remoteCollect(options: SnapshotOptions, script: string): Promise<
   }
   if (connectivity.exitCode !== 0) {
     lines.push("> Remote SSH failed (host down, wrong IP/port, or missing SSH key).");
-    const detail = redactSensitiveText(connectivity.stderr.trim());
+    const detail = redactOperationalText(connectivity.stderr.trim(), [options.host, options.user]);
     if (detail.length > 0) lines.push(`> Reason: ${detail}`);
-    lines.push(`> Next step: verify reachability and run \`ssh ${target}\` interactively, then re-run this script.`, "");
+    lines.push("> Next step: verify reachability and run the configured SSH target interactively, then re-run this script.", "");
     return { text: lines.join("\n"), failed: false };
   }
 
@@ -346,12 +370,12 @@ async function remoteCollect(options: SnapshotOptions, script: string): Promise<
   }
   if (result.exitCode !== 0) {
     lines.push("> Remote collection command failed.");
-    const detail = redactSensitiveText(result.stderr.trim());
+    const detail = redactOperationalText(result.stderr.trim(), [options.host, options.user]);
     if (detail.length > 0) lines.push(`> Reason: ${detail}`);
     lines.push("");
     return { text: lines.join("\n"), failed: true };
   }
-  lines.push(redactSensitiveText(result.stdout.trimEnd()), "");
+  lines.push(redactOperationalText(result.stdout.trimEnd(), [options.host, options.user, homedir()]), "");
   return { text: lines.join("\n"), failed: false };
 }
 
@@ -437,8 +461,8 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     "# DST snapshot",
     "",
     `- Generated: ${isoTimestamp()}`,
-    `- Remote: ${parsed.user}@${parsed.host}`,
-    `- Local dir: ${parsed.localDir || "<unset>"}`,
+    "- Remote: <configured-remote>",
+    `- Local dir: ${parsed.localDir ? "<configured-local-dir>" : "<unset>"}`,
     "",
   ];
   if (parsed.noLocal) report.push("## Local", "", "> Skipped (--no-local).", "");
@@ -467,11 +491,12 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
       await unlink(tempPath).catch(() => undefined);
       await rm(tempDir, { recursive: true, force: true });
     }
+    await syncDirectory(parent);
   } catch (error) {
-    console.error(`error: cannot publish snapshot at ${outputPath}: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`error: cannot publish snapshot at <configured-output>: ${error instanceof Error ? error.message : String(error)}`);
     return 2;
   }
-  console.log(outputPath);
+  console.log("<configured-output>");
   return failed ? 1 : 0;
 }
 

@@ -507,6 +507,8 @@ async function writeSyncedFile(path: string, data: Uint8Array): Promise<void> {
 
 const LOCK_STALE_MS = 5 * 60 * 1000;
 type PublishState = "prepared" | "midi-backed-up" | "backups-complete" | "midi-published" | "complete";
+const TRANSACTION_ENTRY_NAMES = new Set([".state", ".state.tmp", "midi.new", "wav.new", "midi.backup", "wav.backup"]);
+const LOCK_ENTRY_NAMES = new Set(["pid", "owner"]);
 
 async function pathExists(path: string): Promise<boolean> {
   try {
@@ -559,14 +561,14 @@ async function removeTransactionDirectory(directory: string): Promise<void> {
   } catch {
     return;
   }
-  if (entries.some((entry) => entry.isDirectory())) return;
+  if (entries.some((entry) => entry.isDirectory() || !TRANSACTION_ENTRY_NAMES.has(entry.name))) return;
   for (const entry of entries) await unlink(join(directory, entry.name)).catch(() => undefined);
   await rmdir(directory).catch(() => undefined);
 }
 
 async function writePublishState(directory: string, state: PublishState): Promise<void> {
   const temporary = join(directory, ".state.tmp");
-  await writeFile(temporary, `${state}\n`, { mode: 0o600 });
+  await writeSyncedFile(temporary, new TextEncoder().encode(`${state}\n`));
   await rename(temporary, join(directory, ".state"));
   await syncDirectory(directory);
 }
@@ -583,6 +585,7 @@ async function readPublishState(directory: string): Promise<PublishState | undef
 
 async function restoreTransaction(directory: string, midiPath: string, wavPath: string): Promise<void> {
   const state = await readPublishState(directory);
+  if (state === undefined) return;
   if (state === "complete") {
     await removeTransactionDirectory(directory);
     return;
@@ -600,7 +603,7 @@ async function restoreTransaction(directory: string, midiPath: string, wavPath: 
     await removeFile(wavPath);
     await moveIfPresent(wavBackup, wavPath);
   }
-  if (state === "midi-published" && !hasMidiBackup) await removeFile(midiPath);
+  if ((state === "backups-complete" || state === "midi-published") && !hasMidiBackup) await removeFile(midiPath);
   await syncDirectory(dirname(midiPath));
   await removeTransactionDirectory(directory);
 }
@@ -629,29 +632,48 @@ async function isProcessAlive(pid: number): Promise<boolean> {
   }
 }
 
+async function removeLockDirectory(directory: string): Promise<void> {
+  let entries;
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  if (entries.some((entry) => entry.isDirectory() || !LOCK_ENTRY_NAMES.has(entry.name))) return;
+  for (const entry of entries) await unlink(join(directory, entry.name)).catch(() => undefined);
+  await rmdir(directory).catch(() => undefined);
+}
+
 async function acquirePublishLock(outDir: string, stem: string): Promise<() => Promise<void>> {
   const lockDirectory = join(outDir, `.buzzer-preview-${stem}.lock`);
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       await mkdir(lockDirectory);
+      const owner = randomUUID();
       await writeFile(join(lockDirectory, "pid"), `${process.pid}\n`, { mode: 0o600 });
-      return async () => { await rm(lockDirectory, { recursive: true, force: true }); };
+      await writeFile(join(lockDirectory, "owner"), `${owner}\n`, { mode: 0o600 });
+      return async () => {
+        try {
+          const currentOwner = (await readFile(join(lockDirectory, "owner"), "utf8")).trim();
+          if (currentOwner === owner) await removeLockDirectory(lockDirectory);
+        } catch {
+          // A replacement owner must never be removed by an old releaser.
+        }
+      };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       let stale = false;
       try {
         const metadata = await lstat(lockDirectory);
+        if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error("lock path is not a private directory");
+        const entries = await readdir(lockDirectory, { withFileTypes: true });
+        if (entries.some((entry) => entry.isDirectory() || !LOCK_ENTRY_NAMES.has(entry.name))) throw new Error("lock directory contains unknown entries");
         const age = Date.now() - metadata.mtimeMs;
         const ownerText = await readFile(join(lockDirectory, "pid"), "utf8");
         const owner = Number.parseInt(ownerText.trim(), 10);
         stale = !await isProcessAlive(owner) && age > LOCK_STALE_MS;
       } catch {
-        try {
-          const metadata = await lstat(lockDirectory);
-          stale = Date.now() - metadata.mtimeMs > LOCK_STALE_MS;
-        } catch {
-          stale = false;
-        }
+        stale = false;
       }
       if (!stale) throw new Error("output publication is already in progress");
       const quarantine = join(outDir, `.buzzer-preview-reclaim-${stem}-${randomUUID()}`);
@@ -660,7 +682,7 @@ async function acquirePublishLock(outDir: string, stem: string): Promise<() => P
       } catch {
         continue;
       }
-      await rm(quarantine, { recursive: true, force: true });
+      await removeLockDirectory(quarantine);
     }
   }
   throw new Error("could not acquire output publication lock");
@@ -715,6 +737,28 @@ async function publishOutputs(outDir: string, stem: string, midi: Uint8Array, wa
     releaseQueue();
     if (publishQueues.get(key) === current) publishQueues.delete(key);
   }
+}
+
+export async function readPublishedPair(outDir: string, stem: string): Promise<{ midi: Uint8Array; wav: Uint8Array }> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    try {
+      const release = await acquirePublishLock(outDir, stem);
+      try {
+        return {
+          midi: await readFile(resolve(outDir, `${stem}.mid`)),
+          wav: await readFile(resolve(outDir, `${stem}.wav`)),
+        };
+      } finally {
+        await release();
+      }
+    } catch (error) {
+      lastError = error;
+      if (!(error instanceof Error) || !/already in progress|could not acquire/.test(error.message)) throw error;
+      await Bun.sleep(20);
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("could not read published output pair");
 }
 
 export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> {

@@ -3,7 +3,7 @@ import { mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/pro
 import { homedir } from "node:os";
 import { inflateSync } from "node:zlib";
 import { join } from "node:path";
-import { convertFramebuffer, encodePng, expandUser, main, type ConvertOptions } from "../scripts/fb_to_png.ts";
+import { convertFramebuffer, encodePng, expandUser, main, MAX_FRAMEBUFFER_PIXELS, type ConvertOptions } from "../scripts/fb_to_png.ts";
 
 function crc32(data: Uint8Array): number {
   let value = 0xffffffff;
@@ -107,6 +107,7 @@ describe("framebuffer to PNG helper", () => {
     expect(() => convertFramebuffer(new Uint8Array(), "gray8", { ...defaults, width: 0, height: 1 })).toThrow(/width\/height/);
     expect(() => convertFramebuffer(new Uint8Array(), "gray8", { ...defaults, width: 2, height: 1, strideBytes: 1 })).toThrow(/stride_bytes too small/);
     expect(() => convertFramebuffer(Uint8Array.from([1]), "rgb888", { ...defaults, width: 1, height: 1 })).toThrow(/input too short/);
+    expect(() => convertFramebuffer(new Uint8Array(), "gray8", { ...defaults, width: MAX_FRAMEBUFFER_PIXELS + 1, height: 1 })).toThrow(/pixel limit/);
   });
 
   test("keeps native renderer resources present and executable entrypoint direct", async () => {

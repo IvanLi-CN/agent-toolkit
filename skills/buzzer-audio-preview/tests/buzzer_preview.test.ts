@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   encodeMidi,
   encodeWav,
+  MAX_RENDERED_AUDIO_BYTES,
+  MAX_SCORE_EVENTS,
   main,
   parseScore,
   parseArgs,
@@ -143,6 +145,7 @@ describe("buzzer MIDI and WAV helper", () => {
     expect(() => parseScore({ events: [{ note: "H4", beats: 1 }] })).toThrow(/invalid note name/);
     expect(() => parseScore({ events: [{ note: "C4" }] })).toThrow(/missing duration/);
     expect(() => parseScore({ events: [{ note: "C4", beats: 1, ms: 10 }] })).toThrow(/ambiguous duration/);
+    expect(() => parseScore({ events: Array.from({ length: MAX_SCORE_EVENTS + 1 }, () => ({ note: "C4", ms: 1 })) })).toThrow(/at most/);
   });
 
   test("preserves explicit null rejection and Python-compatible numeric conversions", () => {
@@ -167,6 +170,10 @@ describe("buzzer MIDI and WAV helper", () => {
       { ...config, audio: { ...config.audio, sampleRateHz: 0x8000_0000 } },
       [{ kind: "rest", durationS: 0 }],
     )).toThrow(/byte rate/);
+    expect(() => encodeWav(
+      config,
+      [{ kind: "rest", durationS: (MAX_RENDERED_AUDIO_BYTES + 2) / config.audio.sampleRateHz / 2 }],
+    )).toThrow(/rendering limit/);
   });
 
   test("writes the direct Bun CLI outputs", async () => {
@@ -214,6 +221,24 @@ describe("buzzer MIDI and WAV helper", () => {
       expect(await main(["--in", input, "--out-dir", output])).toBe(0);
       expect(await Bun.file(outside).text()).toBe("sentinel");
       expect((await readFile(join(output, "fixture.mid"))).slice(0, 4).toString()).toBe("MThd");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("serializes concurrent pair publication", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-concurrent-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      expect(await Promise.all([
+        main(["--in", input, "--out-dir", output]),
+        main(["--in", input, "--out-dir", output]),
+      ])).toEqual([0, 0]);
+      expect((await readFile(join(output, "fixture.mid"))).slice(0, 4).toString()).toBe("MThd");
+      expect((await readFile(join(output, "fixture.wav"))).slice(0, 4).toString()).toBe("RIFF");
+      expect((await readdir(output)).filter((entry) => entry.includes("buzzer-preview")).length).toBe(0);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

@@ -8,6 +8,17 @@ import { basename, dirname, join, resolve } from "node:path";
 export type FramebufferFormat = "ssd1306" | "mono1" | "gray8" | "rgb565" | "rgb888";
 export type PngMode = "L" | "RGB";
 
+export const MAX_FRAMEBUFFER_PIXELS = 16_777_216;
+
+function validateDimensions(width: number, height: number): void {
+  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0) {
+    throw new Error("width/height must be > 0");
+  }
+  if (width > 0xffff_ffff || height > 0xffff_ffff || width * height > MAX_FRAMEBUFFER_PIXELS) {
+    throw new Error(`framebuffer dimensions exceed the ${MAX_FRAMEBUFFER_PIXELS}-pixel limit`);
+  }
+}
+
 export interface ConvertOptions {
   width: number;
   height: number;
@@ -53,9 +64,7 @@ function pngChunk(kind: string, data: Uint8Array): Uint8Array {
 }
 
 export function encodePng(width: number, height: number, mode: PngMode, rows: Uint8Array[]): Uint8Array {
-  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0) {
-    throw new Error("width/height must be > 0");
-  }
+  validateDimensions(width, height);
   const channels = mode === "L" ? 1 : 3;
   if (rows.length !== height) throw new Error(`expected ${height} rows, got ${rows.length}`);
   for (const [index, row] of rows.entries()) {
@@ -179,9 +188,7 @@ function rowsSsd1306(data: Uint8Array, options: ConvertOptions): Uint8Array[] {
 }
 
 export function convertFramebuffer(data: Uint8Array, format: FramebufferFormat, options: ConvertOptions): { mode: PngMode; rows: Uint8Array[] } {
-  if (options.width <= 0 || options.height <= 0 || !Number.isSafeInteger(options.width) || !Number.isSafeInteger(options.height)) {
-    throw new Error("width/height must be > 0");
-  }
+  validateDimensions(options.width, options.height);
   switch (format) {
     case "gray8": return { mode: "L", rows: rowsGray8(data, options) };
     case "rgb888": return { mode: "RGB", rows: rowsRgb888(data, options) };
@@ -304,6 +311,7 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
       console.log("Convert raw embedded framebuffers to a preview PNG.\n\nUsage: fb_to_png.ts --format <format> --width <n> --height <n> --in <file> --out <file>");
       return 0;
     }
+    validateDimensions(parsed.width, parsed.height);
     const data = new Uint8Array(await readFile(resolve(expandUser(parsed.input))));
     const converted = convertFramebuffer(data, parsed.format, {
       width: parsed.width,

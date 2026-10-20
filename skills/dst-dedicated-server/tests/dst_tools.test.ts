@@ -11,7 +11,7 @@ import {
   renderSummary,
   type ShardSummary,
 } from "../scripts/dst_mods_from_modoverrides.ts";
-import { main as snapshotMain, MAX_LOCAL_DIRECTORY_ENTRIES, MAX_REMOTE_OUTPUT_BYTES, redactSensitiveText } from "../scripts/dst_snapshot.ts";
+import { main as snapshotMain, MAX_LOCAL_DIRECTORY_ENTRIES, MAX_REMOTE_OUTPUT_BYTES, redactSensitiveText, safeTail } from "../scripts/dst_snapshot.ts";
 
 async function runTool(script: string, args: string[], env: Record<string, string>): Promise<{ status: number; stdout: string; stderr: string }> {
   const child = Bun.spawn([process.execPath, script, ...args], { env, stdout: "pipe", stderr: "pipe" });
@@ -33,11 +33,25 @@ describe("DST local Bun tooling", () => {
     expect(redactSensitiveText("Authorization: Bearer fixture-secret")).toBe("Authorization: [REDACTED]");
     expect(redactSensitiveText("Authorization: Basic fixture-secret")).toBe("Authorization: [REDACTED]");
     expect(redactSensitiveText('api_key="prefix\\"LEAK"')).toBe("api_key=[REDACTED]");
+    expect(redactSensitiveText('{"token":"json-secret", "api_key": "other-secret"}')).not.toMatch(/json-secret|other-secret/);
     const multilineToken = ["token", "=", '"', "first-line\nsecond-line", '"'].join("");
     expect(redactSensitiveText(multilineToken)).toBe("token=[REDACTED]");
     expect(redactSensitiveText("api_key=[REDACTED] token raw-secret")).toBe("api_key=[REDACTED] token [REDACTED]");
     const mixedSecrets = ["passphrase", "=", "fixture-secret", " pwd ", "fixture-secret"].join("");
     expect(redactSensitiveText(mixedSecrets)).toBe("passphrase=[REDACTED] pwd [REDACTED]");
+  });
+
+  test("does not expose a secret that crosses the bounded log tail", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-tail-boundary-"));
+    try {
+      const log = join(root, "client_log.txt");
+      await writeFile(log, `api_key=${"x".repeat(300_000)}fixture-secret\nvisible-line\n`);
+      const tail = await safeTail(log, 80);
+      expect(tail).not.toContain("fixture-secret");
+      expect(tail).toContain("visible-line");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test("rejects cluster path traversal before opening SSH", () => {
@@ -213,8 +227,7 @@ case "$*" in
 esac
 `);
       await chmod(fakeSsh, 0o755);
-      process.env.PATH = `${root}:${previousPath ?? ""}`;
-      const env = { ...process.env, PATH: process.env.PATH } as Record<string, string>;
+      const env = { ...process.env, PATH: `${root}:${previousPath ?? ""}` } as Record<string, string>;
       const result = await runTool(join(import.meta.dir, "..", "scripts", "dst_mods_from_modoverrides.ts"), ["--host", "fixture-host", "--user", "fixture-user", "--cluster", "fixture-cluster", "--shard", "both"], env);
       expect(result.status).toBe(0);
       expect(result.stdout).toContain("## fixture-cluster / Master");
@@ -244,8 +257,35 @@ esac
       expect(snapshot).toContain("api_key=[REDACTED]");
       expect(snapshot).not.toContain("fixture-secret");
     } finally {
-      if (previousPath === undefined) delete process.env.PATH;
-      else process.env.PATH = previousPath;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps a completed shard summary when the next shard fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-partial-"));
+    const previousPath = process.env.PATH;
+    try {
+      const fakeSsh = join(root, "ssh");
+      await writeFile(fakeSsh, `#!/bin/sh
+case "$*" in
+  *"echo ok"*) exit 0 ;;
+  *Master*) cat >/dev/null; data='["workshop-100"] = { enabled = true }'; printf 'PRESENT %s\\n%s' "\${#data}" "$data" ;;
+  *Caves*) cat >/dev/null; echo 'caves unavailable' >&2; exit 1 ;;
+  *) cat >/dev/null; exit 1 ;;
+esac
+`);
+      await chmod(fakeSsh, 0o755);
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_mods_from_modoverrides.ts"),
+        ["--host", "fixture-host", "--user", "fixture-user", "--cluster", "fixture-cluster", "--shard", "both"],
+        { ...process.env, PATH: `${root}:${previousPath ?? ""}` } as Record<string, string>,
+      );
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("## fixture-cluster / Master");
+      expect(result.stdout).toContain("enabled_ids: 100");
+      expect(result.stdout).not.toContain("## fixture-cluster / Caves");
+      expect(result.stderr).toContain("caves unavailable");
+    } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -257,20 +297,17 @@ esac
       const fakeSsh = join(root, "ssh");
       await writeFile(fakeSsh, "#!/bin/sh\necho denied >&2\nexit 1\n");
       await chmod(fakeSsh, 0o755);
-      process.env.PATH = `${root}:${previousPath ?? ""}`;
       const output = join(root, "snapshot.md");
       const result = await runTool(
         join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
         ["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", output],
-        { ...process.env, PATH: process.env.PATH } as Record<string, string>,
+        { ...process.env, PATH: `${root}:${previousPath ?? ""}` } as Record<string, string>,
       );
       expect(result.status).toBe(0);
       const report = await readFile(output, "utf8");
       expect(report).toContain("Remote SSH failed");
       expect(report).toContain("ssh fixture-user@fixture-host");
     } finally {
-      if (previousPath === undefined) delete process.env.PATH;
-      else process.env.PATH = previousPath;
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -287,20 +324,17 @@ case "$*" in
 esac
 `);
       await chmod(fakeSsh, 0o755);
-      process.env.PATH = `${root}:${previousPath ?? ""}`;
       const output = join(root, "snapshot.md");
       const result = await runTool(
         join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
         ["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", output],
-        { ...process.env, PATH: process.env.PATH } as Record<string, string>,
+        { ...process.env, PATH: `${root}:${previousPath ?? ""}` } as Record<string, string>,
       );
       expect(result.status).toBe(0);
       const report = await readFile(output, "utf8");
       expect(report).toContain("api_key=[REDACTED]");
       expect(report).not.toContain("fixture-secret");
     } finally {
-      if (previousPath === undefined) delete process.env.PATH;
-      else process.env.PATH = previousPath;
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -317,18 +351,15 @@ case "$*" in
 esac
 `);
       await chmod(fakeSsh, 0o755);
-      process.env.PATH = `${root}:${previousPath ?? ""}`;
       const output = join(root, "snapshot.md");
       const result = await runTool(
         join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
         ["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", output],
-        { ...process.env, PATH: process.env.PATH } as Record<string, string>,
+        { ...process.env, PATH: `${root}:${previousPath ?? ""}` } as Record<string, string>,
       );
       expect(result.status).toBe(1);
       expect(await readFile(output, "utf8")).toContain("output limit");
     } finally {
-      if (previousPath === undefined) delete process.env.PATH;
-      else process.env.PATH = previousPath;
       await rm(root, { recursive: true, force: true });
     }
   });

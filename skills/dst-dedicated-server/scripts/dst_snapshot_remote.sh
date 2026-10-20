@@ -150,6 +150,10 @@ do
 done
 
 if [[ "$found" == "0" ]] && have_cmd find; then
-  echo "- find (maxdepth 6 under ~):"
-  find "$HOME" -maxdepth 6 -type f -name 'dontstarve_dedicated_server_nullrenderer*' -print 2>/dev/null | sed -n '1,10p'
+  if find "$HOME" -maxdepth 0 -type d -print >/dev/null 2>&1; then
+    echo "- find (maxdepth 6 under ~):"
+    find "$HOME" -maxdepth 6 -type f -name 'dontstarve_dedicated_server_nullrenderer*' -print 2>/dev/null | sed -n '1,10p'
+  else
+    echo "> find does not support -maxdepth; skipped recursive binary search."
+  fi
 fi

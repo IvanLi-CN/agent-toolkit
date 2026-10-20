@@ -388,7 +388,6 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
       const exitPromise = child.exited;
       let timedOut = false;
       let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
-      let completed = false;
       const timeout = setTimeout(() => {
         timedOut = true;
         killProcessTree(child, "SIGTERM");
@@ -416,17 +415,15 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
           const detail = redactSensitiveText(stderr.trim());
           throw new Error(detail || `SSH collection failed for ${shard}`);
         }
-        completed = true;
       } finally {
         clearTimeout(timeout);
         if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
-        if (!completed) await terminateAndReap(child, exitPromise);
+        await terminateAndReap(child, exitPromise);
       }
       summaries.push(summary);
+      process.stdout.write(renderSummary(parsed.cluster, summary));
     }
-    const output = summaries.map((summary) => renderSummary(parsed.cluster, summary)).join("\n");
-    const diff = parsed.shard === "both" ? renderDiff(parsed.cluster, summaries[0]!, summaries[1]!) : "";
-    process.stdout.write(output + diff);
+    if (parsed.shard === "both") process.stdout.write(renderDiff(parsed.cluster, summaries[0]!, summaries[1]!));
     return 0;
   } catch (error) {
     console.error(`error: ${error instanceof Error ? error.message : String(error)}`);

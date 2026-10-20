@@ -1,8 +1,9 @@
 #!/usr/bin/env bun
 
-import { lstat, mkdir, mkdtemp, open, readFile, rename, rm, unlink } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { lstat, mkdir, mkdtemp, open, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, extname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 
 const NOTE_OFFSETS: Record<string, number> = {
   C: 0,
@@ -51,6 +52,9 @@ export interface RestEvent {
 }
 
 export type ScoreEvent = NoteEvent | RestEvent;
+
+export const MAX_SCORE_EVENTS = 4_096;
+export const MAX_RENDERED_AUDIO_BYTES = 64 * 1024 * 1024;
 
 export function clamp01(value: number): number {
   return Math.max(0, Math.min(1, value));
@@ -217,6 +221,7 @@ export function parseScore(raw: unknown): { config: ScoreConfig; events: ScoreEv
 
   const eventsRaw = raw.events;
   if (!Array.isArray(eventsRaw) || eventsRaw.length === 0) throw new Error("events must be a non-empty array");
+  if (eventsRaw.length > MAX_SCORE_EVENTS) throw new Error(`events must contain at most ${MAX_SCORE_EVENTS} items`);
   const events: ScoreEvent[] = [];
   for (const [index, eventValue] of eventsRaw.entries()) {
     if (!isRecord(eventValue)) throw new Error(`events[${index}] must be an object`);
@@ -348,9 +353,10 @@ function envelope(index: number, total: number, fade: number): number {
   return Math.max(0, Math.min(1, start, end));
 }
 
-function pushInt16LE(output: number[], sample: number): void {
+function writeInt16LE(output: Uint8Array, offset: number, sample: number): void {
   const value = Math.trunc(Math.max(-1, Math.min(1, sample)) * 32_767);
-  output.push(value & 0xff, (value >> 8) & 0xff);
+  output[offset] = value & 0xff;
+  output[offset + 1] = (value >> 8) & 0xff;
 }
 
 export function encodeWav(config: ScoreConfig, events: ScoreEvent[]): Uint8Array {
@@ -372,11 +378,15 @@ export function encodeWav(config: ScoreConfig, events: ScoreEvent[]): Uint8Array
     if (!Number.isSafeInteger(totalFrames) || totalFrames > UINT32_MAX / 2) {
       throw new Error("WAV data length is outside the representable range");
     }
+    if (totalFrames * 2 > MAX_RENDERED_AUDIO_BYTES) {
+      throw new Error(`WAV data exceeds the ${MAX_RENDERED_AUDIO_BYTES}-byte rendering limit`);
+    }
     frameCounts.push(count);
   }
   const dataByteLength = uint32Value(totalFrames * 2, "WAV data length");
   const riffChunkLength = uint32Value(36 + dataByteLength, "WAV RIFF chunk length");
-  const frames: number[] = [];
+  const data = new Uint8Array(totalFrames * 2);
+  let frameOffset = 0;
   const twoPi = 2 * Math.PI;
   let phase = 0;
 
@@ -384,18 +394,25 @@ export function encodeWav(config: ScoreConfig, events: ScoreEvent[]): Uint8Array
     const count = frameCounts[eventIndex]!;
     if (count <= 0) continue;
     if (event.kind === "rest") {
-      for (let i = 0; i < count; i += 1) pushInt16LE(frames, 0);
+      for (let i = 0; i < count; i += 1) {
+        writeInt16LE(data, frameOffset * 2, 0);
+        frameOffset += 1;
+      }
       continue;
     }
     const freq = event.freqHz;
     if (freq <= 0) {
-      for (let i = 0; i < count; i += 1) pushInt16LE(frames, 0);
+      for (let i = 0; i < count; i += 1) {
+        writeInt16LE(data, frameOffset * 2, 0);
+        frameOffset += 1;
+      }
       continue;
     }
     if (config.audio.waveform === "sine") {
       const increment = twoPi * freq / sampleRate;
       for (let i = 0; i < count; i += 1) {
-        pushInt16LE(frames, Math.sin(phase) * envelope(i, count, fadeSamples) * volume);
+        writeInt16LE(data, frameOffset * 2, Math.sin(phase) * envelope(i, count, fadeSamples) * volume);
+        frameOffset += 1;
         phase += increment;
         if (phase > twoPi) phase -= twoPi;
       }
@@ -403,14 +420,15 @@ export function encodeWav(config: ScoreConfig, events: ScoreEvent[]): Uint8Array
       const increment = freq / sampleRate;
       const duty = clamp01(config.audio.dutyCycle);
       for (let i = 0; i < count; i += 1) {
-        pushInt16LE(frames, (phase < duty ? 1 : -1) * envelope(i, count, fadeSamples) * volume);
+        writeInt16LE(data, frameOffset * 2, (phase < duty ? 1 : -1) * envelope(i, count, fadeSamples) * volume);
+        frameOffset += 1;
         phase += increment;
         if (phase >= 1) phase -= 1;
       }
     }
   }
 
-  const data = Uint8Array.from(frames);
+  if (frameOffset !== totalFrames) throw new Error("internal WAV frame count mismatch");
   const header = new Uint8Array(44);
   const view = new DataView(header.buffer);
   header.set(new TextEncoder().encode("RIFF"), 0);
@@ -487,22 +505,193 @@ async function writeSyncedFile(path: string, data: Uint8Array): Promise<void> {
   }
 }
 
-async function publishOutputs(outDir: string, stem: string, midi: Uint8Array, wav: Uint8Array): Promise<[string, string]> {
+const LOCK_STALE_MS = 5 * 60 * 1000;
+type PublishState = "prepared" | "midi-backed-up" | "backups-complete" | "midi-published" | "complete";
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function moveIfPresent(source: string, destination: string): Promise<boolean> {
+  try {
+    await rename(source, destination);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function removeFile(path: string): Promise<void> {
+  try {
+    await unlink(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
+async function syncDirectory(path: string): Promise<void> {
+  try {
+    const handle = await open(path, "r");
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    // Directory fsync is not available on every supported platform.
+  }
+}
+
+async function writePublishState(directory: string, state: PublishState): Promise<void> {
+  const temporary = join(directory, ".state.tmp");
+  await writeFile(temporary, `${state}\n`, { mode: 0o600 });
+  await rename(temporary, join(directory, ".state"));
+  await syncDirectory(directory);
+}
+
+async function readPublishState(directory: string): Promise<PublishState | undefined> {
+  try {
+    const state = (await readFile(join(directory, ".state"), "utf8")).trim();
+    if (state === "prepared" || state === "midi-backed-up" || state === "backups-complete" || state === "midi-published" || state === "complete") return state;
+  } catch {
+    // An incomplete transaction is safe to discard before its first state commit.
+  }
+  return undefined;
+}
+
+async function restoreTransaction(directory: string, midiPath: string, wavPath: string): Promise<void> {
+  const state = await readPublishState(directory);
+  if (state === "complete") {
+    await rm(directory, { recursive: true, force: true });
+    return;
+  }
+
+  const midiBackup = join(directory, "midi.backup");
+  const wavBackup = join(directory, "wav.backup");
+  const hasMidiBackup = await pathExists(midiBackup);
+  const hasWavBackup = await pathExists(wavBackup);
+  if (hasMidiBackup) {
+    await removeFile(midiPath);
+    await moveIfPresent(midiBackup, midiPath);
+  }
+  if (hasWavBackup) {
+    await removeFile(wavPath);
+    await moveIfPresent(wavBackup, wavPath);
+  }
+  if (state === "midi-published" && !hasMidiBackup) await removeFile(midiPath);
+  await syncDirectory(dirname(midiPath));
+  await rm(directory, { recursive: true, force: true });
+}
+
+async function recoverPublishTransactions(outDir: string, stem: string, midiPath: string, wavPath: string): Promise<void> {
+  const prefix = `.buzzer-preview-txn-${stem}-`;
+  let entries;
+  try {
+    entries = await readdir(outDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith(prefix)) continue;
+    await restoreTransaction(join(outDir, entry.name), midiPath, wavPath);
+  }
+}
+
+async function isProcessAlive(pid: number): Promise<boolean> {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function acquirePublishLock(outDir: string, stem: string): Promise<() => Promise<void>> {
+  const lockDirectory = join(outDir, `.buzzer-preview-${stem}.lock`);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await mkdir(lockDirectory);
+      await writeFile(join(lockDirectory, "pid"), `${process.pid}\n`, { mode: 0o600 });
+      return async () => { await rm(lockDirectory, { recursive: true, force: true }); };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      let stale = false;
+      try {
+        const metadata = await lstat(lockDirectory);
+        const age = Date.now() - metadata.mtimeMs;
+        const ownerText = await readFile(join(lockDirectory, "pid"), "utf8");
+        const owner = Number.parseInt(ownerText.trim(), 10);
+        stale = !await isProcessAlive(owner) && age > LOCK_STALE_MS;
+      } catch {
+        try {
+          const metadata = await lstat(lockDirectory);
+          stale = Date.now() - metadata.mtimeMs > LOCK_STALE_MS;
+        } catch {
+          stale = false;
+        }
+      }
+      if (!stale) throw new Error("output publication is already in progress");
+      await rm(lockDirectory, { recursive: true, force: true });
+    }
+  }
+  throw new Error("could not acquire output publication lock");
+}
+
+const publishQueues = new Map<string, Promise<void>>();
+
+async function publishOutputsLocked(outDir: string, stem: string, midi: Uint8Array, wav: Uint8Array): Promise<[string, string]> {
   const midiPath = resolve(outDir, `${stem}.mid`);
   const wavPath = resolve(outDir, `${stem}.wav`);
-  const tempDir = await mkdtemp(join(outDir, ".buzzer-preview-tmp-"));
-  const tempMidiPath = join(tempDir, `${stem}.mid`);
-  const tempWavPath = join(tempDir, `${stem}.wav`);
+  await recoverPublishTransactions(outDir, stem, midiPath, wavPath);
+  const transaction = await mkdtemp(join(outDir, `.buzzer-preview-txn-${stem}-`));
+  const tempMidiPath = join(transaction, "midi.new");
+  const tempWavPath = join(transaction, "wav.new");
   try {
     await writeSyncedFile(tempMidiPath, midi);
     await writeSyncedFile(tempWavPath, wav);
+    await writePublishState(transaction, "prepared");
+    await moveIfPresent(midiPath, join(transaction, "midi.backup"));
+    await writePublishState(transaction, "midi-backed-up");
+    await moveIfPresent(wavPath, join(transaction, "wav.backup"));
+    await writePublishState(transaction, "backups-complete");
     await rename(tempMidiPath, midiPath);
+    await writePublishState(transaction, "midi-published");
     await rename(tempWavPath, wavPath);
+    await writePublishState(transaction, "complete");
+    await syncDirectory(outDir);
     return [midiPath, wavPath];
+  } catch (error) {
+    await restoreTransaction(transaction, midiPath, wavPath).catch(() => undefined);
+    throw error;
   } finally {
     await unlink(tempMidiPath).catch(() => undefined);
     await unlink(tempWavPath).catch(() => undefined);
-    await rm(tempDir, { recursive: true, force: true });
+    await rm(transaction, { recursive: true, force: true });
+  }
+}
+
+async function publishOutputs(outDir: string, stem: string, midi: Uint8Array, wav: Uint8Array): Promise<[string, string]> {
+  const key = `${outDir}\0${stem}`;
+  const previous = publishQueues.get(key) ?? Promise.resolve();
+  let releaseQueue!: () => void;
+  const current = new Promise<void>((resolve) => { releaseQueue = resolve; });
+  publishQueues.set(key, current);
+  await previous;
+  let releaseLock: (() => Promise<void>) | undefined;
+  try {
+    releaseLock = await acquirePublishLock(outDir, stem);
+    return await publishOutputsLocked(outDir, stem, midi, wav);
+  } finally {
+    if (releaseLock !== undefined) await releaseLock();
+    releaseQueue();
+    if (publishQueues.get(key) === current) publishQueues.delete(key);
   }
 }
 

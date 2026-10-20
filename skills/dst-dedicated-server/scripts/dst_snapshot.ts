@@ -3,7 +3,7 @@
 import { constants, type Dirent } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { lstat, mkdtemp, open, opendir, rename, rm, unlink } from "node:fs/promises";
-import { hostname } from "node:os";
+import { homedir, hostname } from "node:os";
 import { basename, dirname, join } from "node:path";
 
 interface SnapshotOptions {
@@ -30,7 +30,7 @@ class CliError extends Error {
 }
 
 function expandUser(path: string): string {
-  const home = process.env.HOME ?? "";
+  const home = process.env.HOME ?? homedir();
   return path === "~" ? home : path.startsWith("~/") ? `${home}/${path.slice(2)}` : path;
 }
 
@@ -46,6 +46,7 @@ export const REMOTE_COMMAND_TIMEOUT_MS = 30_000;
 export const MAX_LOCAL_COMMAND_OUTPUT_BYTES = 64 * 1024;
 export const LOCAL_COMMAND_TIMEOUT_MS = 5_000;
 export const MAX_LOCAL_DIRECTORY_ENTRIES = 4_096;
+export const MAX_LOCAL_CLUSTER_PATHS = 4_096;
 
 async function readBounded(stream: ReadableStream<Uint8Array>, maxBytes: number, onLimit: () => void): Promise<{ text: string; truncated: boolean }> {
   const reader = stream.getReader();
@@ -85,7 +86,6 @@ async function runWithStdin(
   let timedOut = false;
   let outputTruncated = false;
   let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
-  let completed = false;
   const requestStop = () => {
     killProcessTree(child, "SIGTERM");
     if (forceKillTimer === undefined) forceKillTimer = setTimeout(() => killProcessTree(child, "SIGKILL"), 1_000);
@@ -106,7 +106,6 @@ async function runWithStdin(
     }, timeoutMs);
     const exitCode = await exitPromise;
     const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
-    completed = true;
     return {
       exitCode,
       stdout: stdout.text,
@@ -117,13 +116,11 @@ async function runWithStdin(
   } finally {
     if (timeout !== undefined) clearTimeout(timeout);
     if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
-    if (!completed) {
-      requestStop();
-      await Promise.race([exitPromise.then(() => undefined, () => undefined), new Promise<void>((resolve) => setTimeout(resolve, 1_000))]);
-      killProcessTree(child, "SIGKILL");
-      await Promise.race([exitPromise.then(() => undefined, () => undefined), new Promise<void>((resolve) => setTimeout(resolve, 1_000))]);
-      if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
-    }
+    requestStop();
+    await Promise.race([exitPromise.then(() => undefined, () => undefined), new Promise<void>((resolve) => setTimeout(resolve, 1_000))]);
+    killProcessTree(child, "SIGKILL");
+    await Promise.race([exitPromise.then(() => undefined, () => undefined), new Promise<void>((resolve) => setTimeout(resolve, 1_000))]);
+    if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
   }
 }
 
@@ -139,15 +136,23 @@ function fileTimestamp(): string {
 }
 
 const SENSITIVE_NAME = "(?:password|passwd|passphrase|pwd|secret|token|credential|private[_ -]?key|api[_ -]?key|access[_ -]?key|authorization|bearer)";
+const SENSITIVE_KEY = `(?:[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*|"[^"\\r\\n]*${SENSITIVE_NAME}[^"\\r\\n]*"|'[^'\\r\\n]*${SENSITIVE_NAME}[^'\\r\\n]*')`;
 const SENSITIVE_ASSIGNMENT = new RegExp(
   `((?:[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*)\\s*[:=]\\s*)("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|(?:Bearer|Basic)\\s+[^\\s,;]+|[^\\s,;]+)`,
   "gi",
 );
+const SENSITIVE_QUOTED_ASSIGNMENT = new RegExp(
+  `(${SENSITIVE_KEY}\\s*[:=]\\s*)("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|(?:Bearer|Basic)\\s+[^\\s,;]+|[^\\s,;]+)`,
+  "gi",
+);
 const SENSITIVE_BARE_VALUE = new RegExp(`\\b(${SENSITIVE_NAME})\\s+(?!\\[REDACTED\\])([^\\s,;]+)`, "gi");
-const UNREDACTED_SENSITIVE_ASSIGNMENT = new RegExp(`\\b${SENSITIVE_NAME}\\s*[:=](?!\\s*\\[REDACTED\\])`, "i");
+const UNREDACTED_SENSITIVE_ASSIGNMENT = new RegExp(`(?:\\b${SENSITIVE_NAME}|${SENSITIVE_KEY})\\s*[:=](?!\\s*\\[REDACTED\\])`, "i");
 
 export function redactSensitiveText(text: string): string {
-  const redacted = text.replace(SENSITIVE_ASSIGNMENT, "$1[REDACTED]").replace(SENSITIVE_BARE_VALUE, "$1 [REDACTED]");
+  const redacted = text
+    .replace(SENSITIVE_ASSIGNMENT, "$1[REDACTED]")
+    .replace(SENSITIVE_QUOTED_ASSIGNMENT, "$1[REDACTED]")
+    .replace(SENSITIVE_BARE_VALUE, "$1 [REDACTED]");
   return redacted.split(/\r?\n/).map((line) => UNREDACTED_SENSITIVE_ASSIGNMENT.test(line) ? "[REDACTED]" : line).join("\n");
 }
 
@@ -168,7 +173,11 @@ export async function safeTail(file: string, lines: number): Promise<string> {
       const buffer = new Uint8Array(bytesToRead);
       const result = await handle.read(buffer, 0, bytesToRead, metadata.size - bytesToRead);
       const text = new TextDecoder().decode(buffer.subarray(0, result.bytesRead));
-      return redactSensitiveText(text.split(/\r?\n/).slice(-lines).join("\n"));
+      const partialLine = metadata.size > bytesToRead;
+      const firstLineEnd = text.search(/\r?\n/);
+      if (partialLine && firstLineEnd < 0) return "";
+      const completeText = partialLine ? text.slice(firstLineEnd + 1) : text;
+      return redactSensitiveText(completeText.split(/\r?\n/).slice(-lines).join("\n"));
     } finally {
       await handle.close();
     }
@@ -256,7 +265,12 @@ async function localCollect(options: SnapshotOptions): Promise<string> {
   }
 
   const clusters: string[] = [];
+  let clusterScanTruncated = false;
   for (const entry of entries) {
+    if (clusters.length >= MAX_LOCAL_CLUSTER_PATHS) {
+      clusterScanTruncated = true;
+      break;
+    }
     if (!entry.isDirectory()) continue;
     if (entry.name.startsWith("Cluster_")) {
       clusters.push(join(localDir, entry.name));
@@ -269,11 +283,16 @@ async function localCollect(options: SnapshotOptions): Promise<string> {
       profileEntries = [];
     }
     for (const profileEntry of profileEntries) {
+      if (clusters.length >= MAX_LOCAL_CLUSTER_PATHS) {
+        clusterScanTruncated = true;
+        break;
+      }
       if (profileEntry.isDirectory() && profileEntry.name.startsWith("Cluster_")) {
         clusters.push(join(localDir, entry.name, profileEntry.name));
       }
     }
   }
+  if (clusterScanTruncated) lines.push(`> Cluster path scan truncated at ${MAX_LOCAL_CLUSTER_PATHS} entries.`, "");
   if (clusters.length > 0) {
     lines.push("### Local clusters (paths only; secrets redacted)", "");
     for (const cluster of clusters.sort()) {

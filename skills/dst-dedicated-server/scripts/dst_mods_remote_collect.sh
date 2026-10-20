@@ -35,12 +35,35 @@ if [[ ! -f "$file" || -L "$file" ]]; then
   exit 0
 fi
 
-size="$(wc -c < "$file")"
-size="${size//[[:space:]]/}"
+file_stat="$(stat -Lc '%d:%i:%s' "$file" 2>/dev/null || stat -f '%d:%i:%z' "$file" 2>/dev/null || true)"
+if [[ -z "$file_stat" ]]; then
+  printf 'MISSING %s\n' "$file"
+  exit 0
+fi
+exec {file_fd}<"$file" || { printf 'MISSING %s\n' "$file"; exit 0; }
+fd_stat="$(stat -Lc '%d:%i:%s' "/proc/self/fd/$file_fd" 2>/dev/null || stat -f '%d:%i:%z' "/dev/fd/$file_fd" 2>/dev/null || true)"
+if [[ "$fd_stat" != "$file_stat" || -L "$klei_base" || -L "$klei_root" || -L "$cluster_dir" || -L "$shard_dir" || -L "$file" ]]; then
+  exec {file_fd}<&-
+  printf 'MISSING %s\n' "$file"
+  exit 0
+fi
+
+size="${file_stat##*:}"
 max_bytes=$((1024 * 1024))
 if (( size > max_bytes )); then
+  exec {file_fd}<&-
   printf 'modoverrides.lua exceeds %s bytes\n' "$max_bytes" >&2
   exit 1
 fi
+temporary="$(mktemp)"
+trap 'rm -f "$temporary"' EXIT
+head -c $((max_bytes + 1)) <&"$file_fd" >"$temporary"
+exec {file_fd}<&-
+actual="$(wc -c < "$temporary")"
+actual="${actual//[[:space:]]/}"
+if (( actual != size )); then
+  printf 'modoverrides.lua changed during collection\n' >&2
+  exit 1
+fi
 printf 'PRESENT %s\n' "$size"
-cat "$file"
+cat "$temporary"

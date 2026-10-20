@@ -63,6 +63,7 @@ export class ModOverrideParser {
   private state: ModState = "unknown";
   private inConfig = false;
   private configDepth = 0;
+  private pendingConfig = false;
   private remainder = "";
 
   private finishCurrent(): void {
@@ -77,6 +78,7 @@ export class ModOverrideParser {
       this.state = "unknown";
       this.inConfig = false;
       this.configDepth = 0;
+      this.pendingConfig = false;
     }
     if (this.current === undefined) return;
 
@@ -86,12 +88,24 @@ export class ModOverrideParser {
       this.configDepth = segment.depth;
       this.inConfig = this.configDepth > 0;
       outsideLine = segment.outside;
+    } else if (this.pendingConfig) {
+      const openingBrace = line.indexOf("{");
+      if (openingBrace >= 0) {
+        const segment = stripConfigurationSegment(line, openingBrace, 0);
+        this.configDepth = segment.depth;
+        this.inConfig = this.configDepth > 0;
+        this.pendingConfig = false;
+        outsideLine = segment.outside;
+      } else {
+        outsideLine = "";
+      }
     } else {
       const marker = line.indexOf("configuration_options");
       if (marker >= 0) {
         const segment = stripConfigurationSegment(line, marker, 0);
         this.configDepth = segment.depth;
         this.inConfig = this.configDepth > 0;
+        this.pendingConfig = !this.inConfig && line.slice(marker).indexOf("{") < 0;
         outsideLine = segment.outside;
       }
     }
@@ -333,7 +347,7 @@ export async function parseRemoteResponseStream(
     if (header === undefined) throw new Error("remote mod collection returned an invalid response");
     if (header === "MISSING" || header.startsWith("MISSING ")) {
       if (trailingBytes) throw new Error("remote mod collection returned an invalid response");
-      return { shard, present: false, filePath: "modoverrides.lua", mods: [] };
+      return { shard, present: false, filePath, mods: [] };
     }
     if (bodyRemaining !== 0) throw new Error("remote mod collection returned a truncated file");
     if (parser === undefined || bodyDecoder === undefined || trailingBytes) throw new Error("remote mod collection returned an invalid response");

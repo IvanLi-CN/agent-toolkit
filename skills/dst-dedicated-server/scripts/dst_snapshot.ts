@@ -217,7 +217,9 @@ export function redactOperationalText(text: string, values: string[] = []): stri
     redacted = redacted.split(value).join("<redacted-path>");
   }
   return redactSensitiveText(redacted)
-    .replace(/(?:\/Users|\/home|\/root|\/private|\/tmp|\/var|\/opt|\/srv|\/etc|\/mnt|\/data|\/Volumes|\/dev|\/run)\/[^\s"'<>`]+/g, "<redacted-path>")
+    .replace(/\/(?:[^\s"'<>`]|\\ )+/g, "<redacted-path>")
+    .replace(/\b[A-Za-z]:[\\/](?:[^\s"'<>`]|\\ )+/g, "<redacted-path>")
+    .replace(/(?<![A-Za-z0-9])(?:(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}(?:%[A-Za-z0-9._-]+)?)(?![A-Za-z0-9])/g, "<redacted-address>")
     .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "<redacted-address>");
 }
 

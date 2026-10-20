@@ -11,7 +11,7 @@ import {
   renderSummary,
   type ShardSummary,
 } from "../scripts/dst_mods_from_modoverrides.ts";
-import { main as snapshotMain, MAX_LOCAL_DIRECTORY_ENTRIES, MAX_REMOTE_OUTPUT_BYTES, redactSensitiveText, safeTail } from "../scripts/dst_snapshot.ts";
+import { main as snapshotMain, MAX_LOCAL_DIRECTORY_ENTRIES, MAX_REMOTE_OUTPUT_BYTES, redactOperationalText, redactSensitiveText, safeTail } from "../scripts/dst_snapshot.ts";
 
 async function runTool(script: string, args: string[], env: Record<string, string>): Promise<{ status: number; stdout: string; stderr: string }> {
   const child = Bun.spawn([process.execPath, script, ...args], { env, stdout: "pipe", stderr: "pipe" });
@@ -97,6 +97,15 @@ describe("DST local Bun tooling", () => {
     expect(parseModOverrides('return { ["workshop-400"] = { configuration_options = { enabled = true }, enabled = false } }')).toEqual([
       { id: "400", state: "false" },
     ]);
+    expect(parseModOverrides(`return {
+  ["workshop-500"] = {
+    configuration_options =
+    {
+      enabled = false,
+    },
+    enabled = true,
+  },
+}`)).toEqual([{ id: "500", state: "true" }]);
   });
 
   test("collects a bounded local snapshot without printing secret contents", async () => {
@@ -260,7 +269,7 @@ esac
       expect(result.stdout).toContain("## fixture-cluster / Master");
       expect(result.stdout).toContain("enabled_ids: 100");
       expect(result.stdout).toContain("## fixture-cluster / Caves");
-      expect(result.stdout).toContain("modoverrides.lua: missing");
+      expect(result.stdout).toContain("modoverrides.lua: missing (modoverrides.lua)");
       expect(result.stdout).not.toContain("configuration_options");
 
       const leakedPath = ["/home", "fixture-user", "private"].join("/");
@@ -369,6 +378,16 @@ esac
     }
   });
 
+  test("redacts arbitrary paths and IPv4/IPv6 addresses from operational diagnostics", () => {
+    const diagnostic = "denied /workspace/private/key via 192.0.2.8 and [2001:db8::7]";
+    const redacted = redactOperationalText(diagnostic);
+    expect(redacted).not.toContain("/workspace/private/key");
+    expect(redacted).not.toContain("192.0.2.8");
+    expect(redacted).not.toContain("2001:db8::7");
+    expect(redacted).toContain("<redacted-path>");
+    expect(redacted).toContain("<redacted-address>");
+  });
+
   test("rejects an oversized remote snapshot before writing unbounded output", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-limit-"));
     const previousPath = process.env.PATH;
@@ -448,6 +467,12 @@ esac
 
     const oversized = new TextEncoder().encode(`PRESENT ${MAX_MOD_OVERRIDE_BYTES + 1}\n`);
     await expect(parseRemoteResponseStream("fixture-cluster", "Master", "fixture", byteStream([oversized]))).rejects.toThrow(/exceeds/);
+
+    const missing = new TextEncoder().encode("MISSING\n");
+    await expect(parseRemoteResponseStream("fixture-cluster", "Master", "fixture/Master/modoverrides.lua", byteStream([missing]))).resolves.toMatchObject({
+      present: false,
+      filePath: "fixture/Master/modoverrides.lua",
+    });
   });
 
   test("times out a remote response stream that never produces bytes", async () => {

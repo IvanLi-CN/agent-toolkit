@@ -88,7 +88,7 @@ describe("DST local Bun tooling", () => {
       const directCluster = join(local, "Cluster_direct");
       await mkdir(cluster, { recursive: true });
       await mkdir(directCluster, { recursive: true });
-      await Promise.all(Array.from({ length: MAX_LOCAL_DIRECTORY_ENTRIES + 10 }, (_, index) => writeFile(join(local, `entry-${String(index).padStart(4, "0")}.txt`), "")));
+      await Promise.all(Array.from({ length: 240 }, (_, index) => writeFile(join(local, `entry-${String(index).padStart(3, "0")}.txt`), "")));
       const logLines = Array.from({ length: 10_000 }, (_, index) => `line-${String(index).padStart(5, "0")}`);
       logLines[0] = "early-log-marker";
       logLines.push("api_key=fixture-secret");
@@ -103,7 +103,6 @@ describe("DST local Bun tooling", () => {
       expect(report).toContain("cluster.ini: present (contains cluster_password; do not paste)");
       expect(report).toContain("cluster_token.txt: present (redacted)");
       expect(report).toContain("line-09999");
-      expect(report).toContain(`Directory entry scan truncated at ${MAX_LOCAL_DIRECTORY_ENTRIES} entries.`);
       expect(report).not.toContain("early-log-marker");
       expect(report).not.toContain("fixture-secret");
       expect(report).toContain("api_key=[REDACTED]");
@@ -111,6 +110,20 @@ describe("DST local Bun tooling", () => {
       expect(report).toContain("Cluster_fixture");
       expect(report).toContain("Cluster_direct");
       expect(report).not.toContain("secret-fixture");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("bounds local directory entry scanning", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-local-limit-"));
+    try {
+      const local = join(root, "client");
+      await mkdir(local, { recursive: true });
+      await Promise.all(Array.from({ length: MAX_LOCAL_DIRECTORY_ENTRIES + 10 }, (_, index) => writeFile(join(local, `entry-${String(index).padStart(4, "0")}.txt`), "")));
+      const output = join(root, "snapshot.md");
+      expect(await snapshotMain(["--local-dir", local, "--no-remote", "--out", output])).toBe(0);
+      expect(await readFile(output, "utf8")).toContain(`Directory entry scan truncated at ${MAX_LOCAL_DIRECTORY_ENTRIES} entries.`);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

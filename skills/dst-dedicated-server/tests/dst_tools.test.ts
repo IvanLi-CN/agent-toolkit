@@ -3,6 +3,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  MAX_MOD_OVERRIDE_BYTES,
   parseRemoteResponseStream,
   parseModOverrides,
   renderDiff,
@@ -158,10 +159,45 @@ esac
       await chmod(fakeSsh, 0o755);
       process.env.PATH = `${root}:${previousPath ?? ""}`;
       const output = join(root, "snapshot.md");
-      expect(await snapshotMain(["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", output])).toBe(0);
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
+        ["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", output],
+        { ...process.env, PATH: process.env.PATH } as Record<string, string>,
+      );
+      expect(result.status).toBe(0);
       const report = await readFile(output, "utf8");
       expect(report).toContain("Remote SSH failed");
       expect(report).toContain("ssh fixture-user@fixture-host");
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("redacts sensitive values from successful remote snapshot output", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-redaction-"));
+    const previousPath = process.env.PATH;
+    try {
+      const fakeSsh = join(root, "ssh");
+      await writeFile(fakeSsh, `#!/bin/sh
+case "$*" in
+  *"echo ok"*) exit 0 ;;
+  *) printf '### Remote fixture\\napi_key=fixture-secret\\n' ;;
+esac
+`);
+      await chmod(fakeSsh, 0o755);
+      process.env.PATH = `${root}:${previousPath ?? ""}`;
+      const output = join(root, "snapshot.md");
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
+        ["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", output],
+        { ...process.env, PATH: process.env.PATH } as Record<string, string>,
+      );
+      expect(result.status).toBe(0);
+      const report = await readFile(output, "utf8");
+      expect(report).toContain("api_key=[REDACTED]");
+      expect(report).not.toContain("fixture-secret");
     } finally {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
@@ -203,5 +239,8 @@ esac
     trailing.set(body, declared.byteLength);
     trailing[trailing.length - 1] = 0x00;
     await expect(parseRemoteResponseStream("fixture-cluster", "Master", "fixture", byteStream([trailing]))).rejects.toThrow(/invalid response/);
+
+    const oversized = new TextEncoder().encode(`PRESENT ${MAX_MOD_OVERRIDE_BYTES + 1}\n`);
+    await expect(parseRemoteResponseStream("fixture-cluster", "Master", "fixture", byteStream([oversized]))).rejects.toThrow(/exceeds/);
   });
 });

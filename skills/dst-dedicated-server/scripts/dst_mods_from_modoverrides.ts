@@ -3,6 +3,8 @@
 import { join } from "node:path";
 import { redactSensitiveText } from "./dst_snapshot.ts";
 
+export const MAX_MOD_OVERRIDE_BYTES = 1024 * 1024;
+
 export type ModState = "true" | "false" | "unknown";
 
 export interface ModRecord {
@@ -253,7 +255,7 @@ export async function parseRemoteResponseStream(
           const match = /^PRESENT (\d+)$/.exec(header);
           if (match === null) throw new Error("remote mod collection returned an invalid response");
           const length = Number(match[1]);
-          if (!Number.isSafeInteger(length) || length < 0) throw new Error("remote mod collection returned an invalid response");
+          if (!Number.isSafeInteger(length) || length < 0 || length > MAX_MOD_OVERRIDE_BYTES) throw new Error(`remote mod collection exceeds ${MAX_MOD_OVERRIDE_BYTES} bytes`);
           bodyRemaining = length;
           parser = new ModOverrideParser();
           bodyDecoder = new TextDecoder();

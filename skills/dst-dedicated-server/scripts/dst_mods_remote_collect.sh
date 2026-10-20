@@ -18,5 +18,10 @@ fi
 
 size="$(wc -c < "$file")"
 size="${size//[[:space:]]/}"
+max_bytes=$((1024 * 1024))
+if (( size > max_bytes )); then
+  printf 'modoverrides.lua exceeds %s bytes\n' "$max_bytes" >&2
+  exit 1
+fi
 printf 'PRESENT %s\n' "$size"
 cat "$file"

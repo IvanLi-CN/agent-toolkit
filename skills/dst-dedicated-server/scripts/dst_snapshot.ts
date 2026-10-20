@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { createReadStream, type Dirent } from "node:fs";
+import { type Dirent } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import { hostname } from "node:os";
 import { join } from "node:path";
@@ -78,21 +78,9 @@ export function redactSensitiveText(text: string): string {
 
 export async function safeTail(file: string, lines: number): Promise<string> {
   if (lines <= 0) return "";
-  const selected: string[] = [];
   try {
-    const stream = createReadStream(file, { encoding: "utf8" });
-    let remainder = "";
-    const keep = (line: string) => {
-      selected.push(redactSensitiveText(line));
-      if (selected.length > lines) selected.shift();
-    };
-    for await (const chunk of stream) {
-      const parts = `${remainder}${chunk}`.split(/\r?\n/);
-      remainder = parts.pop() ?? "";
-      for (const line of parts) keep(line);
-    }
-    if (remainder.length > 0) keep(remainder);
-    return selected.length === 0 ? "" : `${selected.join("\n")}\n`;
+    const result = runSync(["tail", "-n", String(lines), file]);
+    return result.exitCode === 0 ? redactSensitiveText(result.stdout) : "";
   } catch {
     return "";
   }
@@ -228,7 +216,7 @@ async function remoteCollect(options: SnapshotOptions, script: string): Promise<
     lines.push("");
     return { text: lines.join("\n"), failed: true };
   }
-  lines.push(result.stdout.trimEnd(), "");
+  lines.push(redactSensitiveText(result.stdout.trimEnd()), "");
   return { text: lines.join("\n"), failed: false };
 }
 

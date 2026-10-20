@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { link, lstat, mkdir, mkdtemp, open, readFile, rm, unlink } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, readFile, rename, rm, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, extname, isAbsolute, join, resolve } from "node:path";
 
@@ -493,20 +493,12 @@ async function publishOutputs(outDir: string, stem: string, midi: Uint8Array, wa
   const tempDir = await mkdtemp(join(outDir, ".buzzer-preview-tmp-"));
   const tempMidiPath = join(tempDir, `${stem}.mid`);
   const tempWavPath = join(tempDir, `${stem}.wav`);
-  let midiPublished = false;
-  let wavPublished = false;
   try {
     await writeSyncedFile(tempMidiPath, midi);
     await writeSyncedFile(tempWavPath, wav);
-    await link(tempMidiPath, midiPath);
-    midiPublished = true;
-    await link(tempWavPath, wavPath);
-    wavPublished = true;
+    await rename(tempMidiPath, midiPath);
+    await rename(tempWavPath, wavPath);
     return [midiPath, wavPath];
-  } catch (error) {
-    if (wavPublished) await unlink(wavPath).catch(() => undefined);
-    if (midiPublished) await unlink(midiPath).catch(() => undefined);
-    throw error;
   } finally {
     await unlink(tempMidiPath).catch(() => undefined);
     await unlink(tempWavPath).catch(() => undefined);

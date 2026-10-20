@@ -2,7 +2,7 @@
 
 import { constants, type Dirent } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { link, lstat, mkdtemp, open, readdir, rm, unlink } from "node:fs/promises";
+import { lstat, mkdtemp, open, opendir, rename, rm, unlink } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename, dirname, join } from "node:path";
 
@@ -43,6 +43,9 @@ function killProcessTree(child: Bun.Subprocess, signal: "SIGTERM" | "SIGKILL"): 
 
 export const MAX_REMOTE_OUTPUT_BYTES = 256 * 1024;
 export const REMOTE_COMMAND_TIMEOUT_MS = 30_000;
+export const MAX_LOCAL_COMMAND_OUTPUT_BYTES = 64 * 1024;
+export const LOCAL_COMMAND_TIMEOUT_MS = 5_000;
+export const MAX_LOCAL_DIRECTORY_ENTRIES = 4_096;
 
 async function readBounded(stream: ReadableStream<Uint8Array>, maxBytes: number, onLimit: () => void): Promise<{ text: string; truncated: boolean }> {
   const reader = stream.getReader();
@@ -71,36 +74,57 @@ async function readBounded(stream: ReadableStream<Uint8Array>, maxBytes: number,
   }
 }
 
-async function runWithStdin(args: string[], input: string, timeoutMs = REMOTE_COMMAND_TIMEOUT_MS): Promise<CommandResult> {
+async function runWithStdin(
+  args: string[],
+  input: string,
+  timeoutMs = REMOTE_COMMAND_TIMEOUT_MS,
+  maxOutputBytes = MAX_REMOTE_OUTPUT_BYTES,
+): Promise<CommandResult> {
   const child = Bun.spawn(args, { detached: true, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
-  child.stdin.write(input);
-  child.stdin.end();
+  const exitPromise = child.exited;
   let timedOut = false;
   let outputTruncated = false;
   let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
+  let completed = false;
+  const requestStop = () => {
+    killProcessTree(child, "SIGTERM");
+    if (forceKillTimer === undefined) forceKillTimer = setTimeout(() => killProcessTree(child, "SIGKILL"), 1_000);
+  };
   const stopForLimit = () => {
     outputTruncated = true;
-    killProcessTree(child, "SIGTERM");
-    forceKillTimer = setTimeout(() => killProcessTree(child, "SIGKILL"), 1_000);
+    requestStop();
   };
-  const stdoutPromise = readBounded(child.stdout, MAX_REMOTE_OUTPUT_BYTES, stopForLimit);
-  const stderrPromise = readBounded(child.stderr, MAX_REMOTE_OUTPUT_BYTES, stopForLimit);
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    killProcessTree(child, "SIGTERM");
-    forceKillTimer = setTimeout(() => killProcessTree(child, "SIGKILL"), 1_000);
-  }, timeoutMs);
-  const exitCode = await child.exited;
-  const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
-  clearTimeout(timeout);
-  if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
-  return {
-    exitCode,
-    stdout: stdout.text,
-    stderr: stderr.text,
-    outputTruncated: outputTruncated || stdout.truncated || stderr.truncated,
-    timedOut,
-  };
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    child.stdin.write(input);
+    child.stdin.end();
+    const stdoutPromise = readBounded(child.stdout, maxOutputBytes, stopForLimit);
+    const stderrPromise = readBounded(child.stderr, maxOutputBytes, stopForLimit);
+    timeout = setTimeout(() => {
+      timedOut = true;
+      requestStop();
+    }, timeoutMs);
+    const exitCode = await exitPromise;
+    const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
+    completed = true;
+    return {
+      exitCode,
+      stdout: stdout.text,
+      stderr: stderr.text,
+      outputTruncated: outputTruncated || stdout.truncated || stderr.truncated,
+      timedOut,
+    };
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+    if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
+    if (!completed) {
+      requestStop();
+      await Promise.race([exitPromise.then(() => undefined, () => undefined), new Promise<void>((resolve) => setTimeout(resolve, 1_000))]);
+      killProcessTree(child, "SIGKILL");
+      await Promise.race([exitPromise.then(() => undefined, () => undefined), new Promise<void>((resolve) => setTimeout(resolve, 1_000))]);
+      if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
+    }
+  }
 }
 
 function isoTimestamp(): string {
@@ -114,16 +138,23 @@ function fileTimestamp(): string {
   return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}-${millis}-${randomUUID().slice(0, 8)}`;
 }
 
-const SENSITIVE_NAME = "(?:password|passwd|secret|token|credential|private[_ -]?key|api[_ -]?key|access[_ -]?key|authorization|bearer)";
-const SENSITIVE_MARKER = new RegExp(SENSITIVE_NAME, "i");
+const SENSITIVE_NAME = "(?:password|passwd|passphrase|pwd|secret|token|credential|private[_ -]?key|api[_ -]?key|access[_ -]?key|authorization|bearer)";
 const SENSITIVE_ASSIGNMENT = new RegExp(
   `((?:[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*)\\s*[:=]\\s*)("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|(?:Bearer|Basic)\\s+[^\\s,;]+|[^\\s,;]+)`,
   "gi",
 );
+const SENSITIVE_BARE_VALUE = new RegExp(`\\b(${SENSITIVE_NAME})\\s+(?!\\[REDACTED\\])([^\\s,;]+)`, "gi");
+const UNREDACTED_SENSITIVE_ASSIGNMENT = new RegExp(`\\b${SENSITIVE_NAME}\\s*[:=](?!\\s*\\[REDACTED\\])`, "i");
 
 export function redactSensitiveText(text: string): string {
-  const redacted = text.replace(SENSITIVE_ASSIGNMENT, "$1[REDACTED]");
-  return redacted.split(/\r?\n/).map((line) => line.includes("[REDACTED]") || !SENSITIVE_MARKER.test(line) ? line : "[REDACTED]").join("\n");
+  const redacted = text.replace(SENSITIVE_ASSIGNMENT, "$1[REDACTED]").replace(SENSITIVE_BARE_VALUE, "$1 [REDACTED]");
+  return redacted.split(/\r?\n/).map((line) => UNREDACTED_SENSITIVE_ASSIGNMENT.test(line) ? "[REDACTED]" : line).join("\n");
+}
+
+export function validateSshToken(value: string, label: string): void {
+  if (value.length === 0 || value.startsWith("-") || /[\u0000\r\n\t\s@/\\]/.test(value)) {
+    throw new CliError(`error: --${label} contains an invalid SSH token`);
+  }
 }
 
 export async function safeTail(file: string, lines: number): Promise<string> {
@@ -147,27 +178,32 @@ export async function safeTail(file: string, lines: number): Promise<string> {
 }
 
 async function commandFirstLines(args: string[], lines: number): Promise<string> {
-  const child = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
-  const reader = child.stdout.getReader();
-  const decoder = new TextDecoder();
-  const selected: string[] = [];
-  let remainder = "";
   try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const parts = `${remainder}${decoder.decode(value ?? new Uint8Array(), { stream: true })}`.split(/\r?\n/);
-      remainder = parts.pop() ?? "";
-      if (selected.length < lines) selected.push(...parts.slice(0, lines - selected.length));
-    }
-    const finalText = `${remainder}${decoder.decode()}`;
-    if (selected.length < lines && finalText.length > 0) selected.push(finalText);
-  } finally {
-    reader.releaseLock();
+    const result = await runWithStdin(args, "", LOCAL_COMMAND_TIMEOUT_MS, MAX_LOCAL_COMMAND_OUTPUT_BYTES);
+    const selected = result.stdout.split(/\r?\n/).slice(0, lines).join("\n").trimEnd();
+    const marker = result.timedOut ? "[command timed out]" : result.outputTruncated ? "[output truncated]" : "";
+    return redactSensitiveText([selected, marker].filter(Boolean).join("\n"));
+  } catch {
+    return "[command unavailable]";
   }
-  await child.exited;
-  await new Response(child.stderr).text();
-  return redactSensitiveText(selected.slice(0, lines).join("\n").trimEnd());
+}
+
+async function boundedDirectoryEntries(path: string): Promise<{ entries: Dirent[]; truncated: boolean }> {
+  const directory = await opendir(path);
+  const entries: Dirent[] = [];
+  let truncated = false;
+  try {
+    for await (const entry of directory) {
+      if (entries.length >= MAX_LOCAL_DIRECTORY_ENTRIES) {
+        truncated = true;
+        break;
+      }
+      entries.push(entry);
+    }
+  } finally {
+    await directory.close().catch(() => undefined);
+  }
+  return { entries, truncated };
 }
 
 async function localCollect(options: SnapshotOptions): Promise<string> {
@@ -193,7 +229,15 @@ async function localCollect(options: SnapshotOptions): Promise<string> {
   }
 
   lines.push("### Directory overview", "", await commandFirstLines(["ls", "-la", localDir], 200), "");
-  const entries = await readdir(localDir, { withFileTypes: true });
+  let entryListing: { entries: Dirent[]; truncated: boolean };
+  try {
+    entryListing = await boundedDirectoryEntries(localDir);
+  } catch {
+    lines.push("> Directory entries unavailable; skipping filesystem-derived details.", "");
+    return lines.join("\n");
+  }
+  const entries = entryListing.entries;
+  if (entryListing.truncated) lines.push(`> Directory entry scan truncated at ${MAX_LOCAL_DIRECTORY_ENTRIES} entries.`, "");
   const logFiles = entries
     .filter((entry) => entry.isFile() && entry.name.includes("log") && entry.name.endsWith(".txt"))
     .map((entry) => join(localDir, entry.name))
@@ -220,7 +264,7 @@ async function localCollect(options: SnapshotOptions): Promise<string> {
     }
     let profileEntries: Dirent[];
     try {
-      profileEntries = await readdir(join(localDir, entry.name), { withFileTypes: true });
+      profileEntries = (await boundedDirectoryEntries(join(localDir, entry.name))).entries;
     } catch {
       profileEntries = [];
     }
@@ -346,7 +390,12 @@ export function parseArgs(args: string[], env: Record<string, string | undefined
     }
     throw new CliError(`Unknown arg: ${arg}`);
   }
-  if (!noRemote && host.length === 0) throw new CliError("error: --host or DST_HOST is required unless --no-remote is used");
+  if (!noRemote) {
+    if (host.length === 0) throw new CliError("error: --host or DST_HOST is required unless --no-remote is used");
+    if (user.length === 0) throw new CliError("error: --user or DST_USER is required unless --no-remote is used");
+    validateSshToken(host, "host");
+    validateSshToken(user, "user");
+  }
   return { host, user, out, localDir, noLocal, noRemote };
 }
 
@@ -394,7 +443,7 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
       } finally {
         await handle.close();
       }
-      await link(tempPath, outputPath);
+      await rename(tempPath, outputPath);
     } finally {
       await unlink(tempPath).catch(() => undefined);
       await rm(tempDir, { recursive: true, force: true });

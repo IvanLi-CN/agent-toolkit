@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { join } from "node:path";
-import { REMOTE_COMMAND_TIMEOUT_MS, redactSensitiveText } from "./dst_snapshot.ts";
+import { REMOTE_COMMAND_TIMEOUT_MS, redactSensitiveText, validateSshToken } from "./dst_snapshot.ts";
 
 export const MAX_MOD_OVERRIDE_BYTES = 1024 * 1024;
 
@@ -162,16 +162,13 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\"'\"'")}'`;
 }
 
-function startRemote(script: string, options: ModOptions, shard: "Master" | "Caves") {
+function startRemote(options: ModOptions, shard: "Master" | "Caves") {
   const target = `${options.user}@${options.host}`;
   const remoteCommand = `bash -s -- ${shellQuote(options.cluster)} ${shellQuote(shard)}`;
-  const child = Bun.spawn(
+  return Bun.spawn(
     ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", target, remoteCommand],
     { detached: true, stdin: "pipe", stdout: "pipe", stderr: "pipe" },
   );
-  child.stdin.write(script);
-  child.stdin.end();
-  return child;
 }
 
 function killProcessTree(child: Bun.Subprocess, signal: "SIGTERM" | "SIGKILL"): void {
@@ -179,6 +176,17 @@ function killProcessTree(child: Bun.Subprocess, signal: "SIGTERM" | "SIGKILL"): 
     try { process.kill(-child.pid, signal); } catch { /* The process may already be gone. */ }
   }
   try { child.kill(signal); } catch { /* The process may already be gone. */ }
+}
+
+async function terminateAndReap(child: Bun.Subprocess, exitPromise: Promise<number>): Promise<void> {
+  let settled = false;
+  const observedExit = exitPromise.then(() => { settled = true; }, () => { settled = true; });
+  killProcessTree(child, "SIGTERM");
+  await Promise.race([observedExit, new Promise<void>((resolve) => setTimeout(resolve, 1_000))]);
+  if (!settled) {
+    killProcessTree(child, "SIGKILL");
+    await Promise.race([observedExit, new Promise<void>((resolve) => setTimeout(resolve, 1_000))]);
+  }
 }
 
 async function readText(stream: ReadableStream<Uint8Array>, maxBytes = 64 * 1024, timeoutMs = REMOTE_COMMAND_TIMEOUT_MS): Promise<string> {
@@ -351,6 +359,8 @@ export function parseArgs(args: string[], env: Record<string, string | undefined
   if (cluster === "." || cluster === ".." || cluster.includes("/") || cluster.includes("\\") || cluster.includes("\0")) {
     throw new CliError("error: --cluster must be a single path segment");
   }
+  validateSshToken(host, "host");
+  validateSshToken(user, "user");
   return { host, user, cluster, shard };
 }
 
@@ -372,39 +382,45 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     const shards: Array<"Master" | "Caves"> = parsed.shard === "both" ? ["Master", "Caves"] : [parsed.shard];
     const summaries: ShardSummary[] = [];
     for (const shard of shards) {
-      const child = startRemote(script, parsed, shard);
+      const child = startRemote(parsed, shard);
       const filePath = `~/.klei/DoNotStarveTogether/${parsed.cluster}/${shard}/modoverrides.lua`;
       const stderrPromise = readText(child.stderr);
+      const exitPromise = child.exited;
       let timedOut = false;
       let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
+      let completed = false;
       const timeout = setTimeout(() => {
         timedOut = true;
         killProcessTree(child, "SIGTERM");
-        forceKillTimer = setTimeout(() => killProcessTree(child, "SIGKILL"), 1_000);
+        if (forceKillTimer === undefined) forceKillTimer = setTimeout(() => killProcessTree(child, "SIGKILL"), 1_000);
       }, REMOTE_COMMAND_TIMEOUT_MS);
       let summary: ShardSummary;
       try {
+        child.stdin.write(script);
+        child.stdin.end();
         try {
           summary = await parseRemoteResponseStream(parsed.cluster, shard, filePath, child.stdout);
         } catch (error) {
           killProcessTree(child, "SIGTERM");
-          forceKillTimer = setTimeout(() => killProcessTree(child, "SIGKILL"), 1_000);
+          if (forceKillTimer === undefined) forceKillTimer = setTimeout(() => killProcessTree(child, "SIGKILL"), 1_000);
           await readText(child.stdout, 64 * 1024, 1_000);
-          const [exitCode, stderr] = await Promise.all([child.exited, stderrPromise]);
+          const [exitCode, stderr] = await Promise.all([exitPromise, stderrPromise]);
           const detail = redactSensitiveText(stderr.trim());
           if (timedOut) throw new Error(`SSH collection timed out after ${REMOTE_COMMAND_TIMEOUT_MS / 1000}s`);
           if (exitCode !== 0 && detail.length > 0) throw new Error(detail);
           throw error;
         }
-        const [exitCode, stderr] = await Promise.all([child.exited, stderrPromise]);
+        const [exitCode, stderr] = await Promise.all([exitPromise, stderrPromise]);
         if (timedOut) throw new Error(`SSH collection timed out after ${REMOTE_COMMAND_TIMEOUT_MS / 1000}s`);
         if (exitCode !== 0) {
           const detail = redactSensitiveText(stderr.trim());
           throw new Error(detail || `SSH collection failed for ${shard}`);
         }
+        completed = true;
       } finally {
         clearTimeout(timeout);
         if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
+        if (!completed) await terminateAndReap(child, exitPromise);
       }
       summaries.push(summary);
     }

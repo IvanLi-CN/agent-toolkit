@@ -11,7 +11,7 @@ import {
   renderSummary,
   type ShardSummary,
 } from "../scripts/dst_mods_from_modoverrides.ts";
-import { main as snapshotMain, MAX_REMOTE_OUTPUT_BYTES, redactSensitiveText } from "../scripts/dst_snapshot.ts";
+import { main as snapshotMain, MAX_LOCAL_DIRECTORY_ENTRIES, MAX_REMOTE_OUTPUT_BYTES, redactSensitiveText } from "../scripts/dst_snapshot.ts";
 
 async function runTool(script: string, args: string[], env: Record<string, string>): Promise<{ status: number; stdout: string; stderr: string }> {
   const child = Bun.spawn([process.execPath, script, ...args], { env, stdout: "pipe", stderr: "pipe" });
@@ -35,11 +35,16 @@ describe("DST local Bun tooling", () => {
     expect(redactSensitiveText('api_key="prefix\\"LEAK"')).toBe("api_key=[REDACTED]");
     const multilineToken = ["token", "=", '"', "first-line\nsecond-line", '"'].join("");
     expect(redactSensitiveText(multilineToken)).toBe("token=[REDACTED]");
+    expect(redactSensitiveText("api_key=[REDACTED] token raw-secret")).toBe("api_key=[REDACTED] token [REDACTED]");
+    const mixedSecrets = ["passphrase", "=", "fixture-secret", " pwd ", "fixture-secret"].join("");
+    expect(redactSensitiveText(mixedSecrets)).toBe("passphrase=[REDACTED] pwd [REDACTED]");
   });
 
   test("rejects cluster path traversal before opening SSH", () => {
     expect(() => parseArgs(["--host", "fixture-host", "--user", "fixture-user", "--cluster", "../escape"], {})).toThrow(/single path segment/);
     expect(() => parseArgs(["--host", "fixture-host", "--user", "fixture-user", "--cluster", "fixture\\escape"], {})).toThrow(/single path segment/);
+    expect(() => parseArgs(["--host", "-oProxyCommand=touch /tmp/pwned", "--user", "fixture-user", "--cluster", "fixture"], {})).toThrow(/invalid SSH token/);
+    expect(() => parseArgs(["--host", "fixture-host", "--user", "-oProxyCommand=touch /tmp/pwned", "--cluster", "fixture"], {})).toThrow(/invalid SSH token/);
   });
 
   test("parses nested mod configuration without executing Lua and renders shard differences", () => {
@@ -83,7 +88,7 @@ describe("DST local Bun tooling", () => {
       const directCluster = join(local, "Cluster_direct");
       await mkdir(cluster, { recursive: true });
       await mkdir(directCluster, { recursive: true });
-      await Promise.all(Array.from({ length: 240 }, (_, index) => writeFile(join(local, `entry-${String(index).padStart(3, "0")}.txt`), "")));
+      await Promise.all(Array.from({ length: MAX_LOCAL_DIRECTORY_ENTRIES + 10 }, (_, index) => writeFile(join(local, `entry-${String(index).padStart(4, "0")}.txt`), "")));
       const logLines = Array.from({ length: 10_000 }, (_, index) => `line-${String(index).padStart(5, "0")}`);
       logLines[0] = "early-log-marker";
       logLines.push("api_key=fixture-secret");
@@ -98,6 +103,7 @@ describe("DST local Bun tooling", () => {
       expect(report).toContain("cluster.ini: present (contains cluster_password; do not paste)");
       expect(report).toContain("cluster_token.txt: present (redacted)");
       expect(report).toContain("line-09999");
+      expect(report).toContain(`Directory entry scan truncated at ${MAX_LOCAL_DIRECTORY_ENTRIES} entries.`);
       expect(report).not.toContain("early-log-marker");
       expect(report).not.toContain("fixture-secret");
       expect(report).toContain("api_key=[REDACTED]");
@@ -144,6 +150,33 @@ describe("DST local Bun tooling", () => {
       expect(status).toBe(0);
       expect(stdout).toContain("MISSING");
       expect(stdout).not.toContain("workshop-999");
+
+      const traversal = Bun.spawn(["bash", join(import.meta.dir, "..", "scripts", "dst_mods_remote_collect.sh"), "../../outside", "Master"], {
+        env: { ...process.env, HOME: home }, stdout: "pipe", stderr: "pipe",
+      });
+      expect(await traversal.exited).toBe(2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("remote snapshot refuses a symlinked Klei root", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-root-"));
+    try {
+      const home = join(root, "home");
+      const outside = join(root, "outside");
+      await mkdir(home, { recursive: true });
+      await mkdir(join(outside, "DoNotStarveTogether", "Cluster_secret", "Master"), { recursive: true });
+      await writeFile(join(outside, "DoNotStarveTogether", "Cluster_secret", "cluster.ini"), "cluster_password=must-not-appear\n");
+      await symlink(outside, join(home, ".klei"));
+      const child = Bun.spawn(["bash", join(import.meta.dir, "..", "scripts", "dst_snapshot_remote.sh")], {
+        env: { ...process.env, HOME: home }, stdout: "pipe", stderr: "pipe",
+      });
+      const [status, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+      expect(status).toBe(0);
+      expect(stdout).toContain("Klei data");
+      expect(stdout).not.toContain("Cluster_secret");
+      expect(stdout).not.toContain("must-not-appear");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -294,7 +327,7 @@ esac
         snapshotMain(["--no-local", "--no-remote", "--out", output]),
         snapshotMain(["--no-local", "--no-remote", "--out", output]),
       ]);
-      expect(results.sort()).toEqual([0, 2]);
+      expect(results.sort()).toEqual([0, 0]);
       const report = await readFile(output, "utf8");
       expect(report).toContain("# DST snapshot");
       expect((await readdir(root)).filter((entry) => entry.startsWith(".dst-snapshot-tmp-")).length).toBe(0);

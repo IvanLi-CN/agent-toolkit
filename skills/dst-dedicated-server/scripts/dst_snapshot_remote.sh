@@ -71,7 +71,7 @@ echo
 echo "### Klei data (paths only; secrets redacted)"
 echo
 KLEI_DIR="$HOME/.klei/DoNotStarveTogether"
-if [[ ! -d "$KLEI_DIR" ]]; then
+if [[ ! -d "$HOME/.klei" || -L "$HOME/.klei" || ! -d "$KLEI_DIR" || -L "$KLEI_DIR" ]]; then
   echo "> $KLEI_DIR not found."
   exit 0
 fi
@@ -82,7 +82,7 @@ ls -la "$KLEI_DIR" | sed -n '1,200p'
 echo
 
 for cluster in "$KLEI_DIR"/*; do
-  [[ -d "$cluster" ]] || continue
+  [[ -d "$cluster" && ! -L "$cluster" ]] || continue
   echo "#### Cluster: $(basename "$cluster")"
   if [[ -f "$cluster/cluster.ini" ]]; then
     echo "- cluster.ini: present (contains cluster_password; do not paste)"
@@ -91,7 +91,7 @@ for cluster in "$KLEI_DIR"/*; do
     echo "- cluster_token.txt: present (redacted)"
   fi
   for shard in Master Caves; do
-    if [[ -d "$cluster/$shard" ]]; then
+    if [[ -d "$cluster/$shard" && ! -L "$cluster/$shard" ]]; then
       echo "- $shard/: present"
       for f in server.ini modoverrides.lua server_log.txt server_chat_log.txt; do
         if [[ -f "$cluster/$shard/$f" ]]; then

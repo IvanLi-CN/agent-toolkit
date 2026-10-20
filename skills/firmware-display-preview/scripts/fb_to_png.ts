@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 
-import { readFile } from "node:fs/promises";
+import { lstat, mkdtemp, open, readFile, rename, rm, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { deflateSync } from "node:zlib";
-import { resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 export type FramebufferFormat = "ssd1306" | "mono1" | "gray8" | "rgb565" | "rgb888";
 export type PngMode = "L" | "RGB";
@@ -278,6 +278,25 @@ export function parseArgs(args: string[]): CliOptions | "help" {
   return { format, width, height, input, output, strideBytes, endian, bitOrder, ssd1306BitOrder, invert };
 }
 
+async function writePngAtomically(outputPath: string, data: Uint8Array): Promise<void> {
+  const parent = dirname(outputPath);
+  const temporaryDirectory = await mkdtemp(join(parent, ".fb-to-png-tmp-"));
+  const temporaryPath = join(temporaryDirectory, basename(outputPath));
+  try {
+    const handle = await open(temporaryPath, "w", 0o600);
+    try {
+      await handle.writeFile(data);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await rename(temporaryPath, outputPath);
+  } finally {
+    await unlink(temporaryPath).catch(() => undefined);
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+}
+
 export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> {
   try {
     const parsed = parseArgs(args);
@@ -295,7 +314,10 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
       ssd1306BitOrder: parsed.ssd1306BitOrder,
       invert: parsed.invert,
     });
-    await Bun.write(resolve(expandUser(parsed.output)), encodePng(parsed.width, parsed.height, converted.mode, converted.rows));
+    const outputPath = resolve(expandUser(parsed.output));
+    const parentStat = await lstat(dirname(outputPath));
+    if (!parentStat.isDirectory()) throw new CliError("--out parent must be a directory");
+    await writePngAtomically(outputPath, encodePng(parsed.width, parsed.height, converted.mode, converted.rows));
     console.log(`[OK] Wrote: ${parsed.output}`);
     return 0;
   } catch (error) {

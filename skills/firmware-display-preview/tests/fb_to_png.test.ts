@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { inflateSync } from "node:zlib";
 import { join } from "node:path";
@@ -137,5 +137,23 @@ describe("framebuffer to PNG helper", () => {
     expect(await main(["--unknown"])).toBe(2);
     expect(await main(["--width"])).toBe(2);
     expect(await main(["--format", "invalid", "--width", "1", "--height", "1", "--in", "fixture", "--out", "fixture"])).toBe(2);
+  });
+
+  test("replaces an output symlink without touching its target", async () => {
+    const root = await mkdtemp(join(process.env.TMPDIR ?? "/tmp", "agent-toolkit-fb-output-"));
+    try {
+      const input = join(root, "frame.raw");
+      const output = join(root, "preview.png");
+      const outside = join(root, "outside.bin");
+      await writeFile(input, Uint8Array.from([255]));
+      await writeFile(outside, "sentinel");
+      await symlink(outside, output);
+      expect(await main(["--format", "gray8", "--width", "1", "--height", "1", "--in", input, "--out", output])).toBe(0);
+      expect(await readFile(outside, "utf8")).toBe("sentinel");
+      expect([...((await readFile(output)).slice(0, 8))]).toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+      await expect(readlink(output)).rejects.toThrow();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

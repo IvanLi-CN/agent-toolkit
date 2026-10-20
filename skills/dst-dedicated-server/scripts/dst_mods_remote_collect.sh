@@ -3,10 +3,23 @@ set -euo pipefail
 
 cluster="${1:?missing cluster}"
 shard="${2:?missing shard}"
-cluster_dir="$HOME/.klei/DoNotStarveTogether/$cluster"
+case "$cluster" in
+  ""|.|..|*/*|*\\*)
+    printf 'INVALID_CLUSTER\n' >&2
+    exit 2
+    ;;
+esac
+case "$shard" in
+  Master|Caves) ;;
+  *) printf 'INVALID_SHARD\n' >&2; exit 2 ;;
+esac
+
+klei_base="$HOME/.klei"
+klei_root="$klei_base/DoNotStarveTogether"
+cluster_dir="$klei_root/$cluster"
 shard_dir="$cluster_dir/$shard"
 
-if [[ ! -d "$HOME/.klei/DoNotStarveTogether" || -L "$HOME/.klei/DoNotStarveTogether" || ! -d "$cluster_dir" || -L "$cluster_dir" ]]; then
+if [[ ! -d "$klei_base" || -L "$klei_base" || ! -d "$klei_root" || -L "$klei_root" || ! -d "$cluster_dir" || -L "$cluster_dir" ]]; then
   printf 'CLUSTER_MISSING\n'
   exit 1
 fi

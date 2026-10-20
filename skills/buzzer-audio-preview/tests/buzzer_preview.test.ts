@@ -201,7 +201,7 @@ describe("buzzer MIDI and WAV helper", () => {
     expect(() => parseArgs(["--in", "fixture.json", "--stem", "/tmp/outside"])).toThrow(/without path separators/);
   });
 
-  test("does not follow preexisting output symlinks", async () => {
+  test("replaces preexisting output symlinks without touching their targets", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-symlink-"));
     try {
       const input = join(root, "fixture.json");
@@ -209,9 +209,11 @@ describe("buzzer MIDI and WAV helper", () => {
       const outside = join(root, "outside.bin");
       await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
       await mkdir(output, { recursive: true });
+      await writeFile(outside, "sentinel");
       await symlink(outside, join(output, "fixture.mid"));
-      expect(await main(["--in", input, "--out-dir", output])).toBe(1);
-      expect(await Bun.file(outside).exists()).toBe(false);
+      expect(await main(["--in", input, "--out-dir", output])).toBe(0);
+      expect(await Bun.file(outside).text()).toBe("sentinel");
+      expect((await readFile(join(output, "fixture.mid"))).slice(0, 4).toString()).toBe("MThd");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

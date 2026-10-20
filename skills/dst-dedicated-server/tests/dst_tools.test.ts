@@ -204,10 +204,11 @@ describe("DST local Bun tooling", () => {
 case "$*" in
   *"echo ok"*) exit 0 ;;
   *Master*)
+    cat >/dev/null
     data='["workshop-100"] = { enabled = true, configuration_options = { enabled = false } }'
     printf 'PRESENT %s\\n%s' "\${#data}" "$data"
     ;;
-  *Caves*) printf 'MISSING\\n' ;;
+  *Caves*) cat >/dev/null; printf 'MISSING\\n' ;;
   *) cat >/dev/null; exit 1 ;;
 esac
 `);

@@ -1030,7 +1030,8 @@ systemdTest("systemd assets validate against the Bun runtime path", async () => 
   const processHandle = Bun.spawn(["systemd-analyze", "verify", ...UNIT_PATHS], { stdout: "pipe", stderr: "pipe" });
   const result = await collect(processHandle);
   if (result.exit !== 0) throw new Error(`systemd verify failed: ${JSON.stringify(result)}`);
-  if (result.stderr !== "") throw new Error(`systemd verify stderr: ${result.stderr}`);
+  const unexpectedDiagnostics = result.stderr.split(/\r?\n/).filter(Boolean).filter((line) => !/^\/usr\/lib\/systemd\/system\/[^:]+:\d+: Support for option CPUAccounting= has been removed and it is ignored$/.test(line));
+  if (unexpectedDiagnostics.length > 0) throw new Error(`systemd verify stderr: ${unexpectedDiagnostics.join("\n")}`);
 });
 
 linuxTest("the real Bun controller entrypoint accepts an isolated protected config override", async () => {

@@ -6,7 +6,9 @@ StartLimitBurst=3
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py --timer-expire %i
+UnsetEnvironment=AGENT_VM_CONFIG_PATH
+ExecStartPre=/bin/sh -c 'set -eu; for path in /usr/bin/bun /opt/agent-vm-native/agent_vm_control.ts; do test -f "$path"; test ! -L "$path"; test "$(readlink -f -- "$path")" = "$path"; test "$(stat -c %%u -- "$path")" = 0; mode=$(stat -c %%a -- "$path"); test $((0$mode & 022)) -eq 0; parent=$(dirname -- "$path"); while :; do test -d "$parent"; test ! -L "$parent"; test "$(readlink -f -- "$parent")" = "$parent"; test "$(stat -c %%u -- "$parent")" = 0; mode=$(stat -c %%a -- "$parent"); test $((0$mode & 022)) -eq 0; [ "$parent" = "/" ] && break; parent=$(dirname -- "$parent"); done; done'
+ExecStart=/usr/bin/bun /opt/agent-vm-native/agent_vm_control.ts --timer-expire %i
 NoNewPrivileges=yes
 PrivateTmp=yes
 Restart=on-failure

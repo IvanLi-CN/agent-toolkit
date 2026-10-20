@@ -1,0 +1,132 @@
+"""Contract checks for the public Agent VM topology and recovery documents."""
+
+from __future__ import annotations
+
+import re
+import subprocess
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = ROOT / "docs/specs/agent-vm/SPEC.md"
+RUNBOOK = ROOT / "docs/specs/agent-vm/OPERATIONS.md"
+CLI_CONTRACT = ROOT / "docs/specs/agent-vm/contracts/cli.md"
+ADR = ROOT / "docs/adr/0028-agent-vm-topology-recovery-boundary.md"
+OPS_SKILL = ROOT / "skills/agent-vm-ops/SKILL.md"
+DEPLOYMENT = ROOT / "skills/agent-vm-ops/references/deployment.md"
+OBSERVABILITY = ROOT / "docs/specs/agent-vm/contracts/observability.md"
+OBSERVABILITY_SOLUTION = ROOT / "docs/solutions/agent-vm/observability-dashboard.md"
+
+
+def check_spec(path: Path, root: Path) -> list[str]:
+    try:
+        result = subprocess.run(
+            [
+                "bun",
+                "run",
+                str(root / "bin/spec_contract_check.ts"),
+                "--path",
+                str(path),
+                "--repo-root",
+                str(root),
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as error:
+        return [str(error)]
+    if result.returncode == 0:
+        return []
+    return [line for line in (result.stdout + result.stderr).splitlines() if line]
+
+
+class AgentVmDocumentationTests(unittest.TestCase):
+    def test_canonical_spec_is_traceable(self) -> None:
+        self.assertEqual(check_spec(SPEC, ROOT), [])
+
+    def test_public_documents_define_the_layered_topology(self) -> None:
+        runbook = RUNBOOK.read_text(encoding="utf-8")
+        for phrase in (
+            "Codex client",
+            "Agent VM control endpoint",
+            "CT109 LXC",
+            "Incus VM inside CT109",
+            "Underlying hosting source",
+            "not proof of the underlying host",
+            "Unknown underlying hosting source",
+        ):
+            self.assertIn(phrase, runbook)
+
+    def test_recovery_contract_preserves_identity_and_stops_on_missing_state(self) -> None:
+        runbook = RUNBOOK.read_text(encoding="utf-8")
+        for phrase in (
+            "state database",
+            "WAL/journal",
+            "operation_id",
+            "generation",
+            "outcome: pending",
+            "admin reconcile --apply",
+            "admin drain exit",
+            "Missing state is a hard stop",
+            "Do not guess ownership",
+            "Do not delete an Incus instance",
+        ):
+            self.assertIn(phrase, runbook)
+
+    def test_disk_contract_separates_sparse_capacity_from_control_state(self) -> None:
+        runbook = RUNBOOK.read_text(encoding="utf-8")
+        for phrase in (
+            "does not reserve the full requested virtual disk",
+            "configured CT-local Incus pool filesystem",
+            "separate logical failure domains",
+            "ENOSPC",
+            "existing effective lease must not be evicted",
+            "Guest-level ENOSPC is a separate observation",
+        ):
+            self.assertIn(phrase, runbook)
+
+    def test_contract_links_are_present_and_public_values_stay_redacted(self) -> None:
+        spec = SPEC.read_text(encoding="utf-8")
+        cli_contract = CLI_CONTRACT.read_text(encoding="utf-8")
+        adr = ADR.read_text(encoding="utf-8")
+        ops_skill = OPS_SKILL.read_text(encoding="utf-8")
+        deployment = DEPLOYMENT.read_text(encoding="utf-8")
+        self.assertIn("OPERATIONS.md", spec)
+        self.assertIn("../OPERATIONS.md", cli_contract)
+        self.assertIn("0028-agent-vm-topology-recovery-boundary.md", spec)
+        self.assertIn("../../docs/specs/agent-vm/OPERATIONS.md", ops_skill)
+        self.assertIn("../../../docs/specs/agent-vm/OPERATIONS.md", deployment)
+        self.assertIn("protected operator records", adr)
+        for document in (spec, cli_contract, adr, ops_skill, deployment):
+            self.assertNotRegex(document, re.compile(r"/(?:Users|home)/[A-Za-z0-9._-]+"))
+            self.assertNotRegex(document, re.compile(r"\b(?:10|172|192\.168)\.\d+\.\d+\.\d+\b"))
+
+    def test_observability_contract_separates_capacity_layers(self) -> None:
+        contract = OBSERVABILITY.read_text(encoding="utf-8")
+        solution = OBSERVABILITY_SOLUTION.read_text(encoding="utf-8")
+        for phrase in (
+            "incus_storage_pool_size_bytes",
+            "agent_vm_admission_limit",
+            "agent_vm_filesystem_available_bytes",
+            "incus_project_limit",
+            "refresh: \"auto\"",
+            "next VM",
+            "horizontal dashed line",
+            "image-unpack failures",
+            "must not multiply a `pps` query by `8`",
+            "provisioning source",
+            "grafana/dashboards/incus/incus-agent-vm.json",
+            "grafana/provisioning/dashboards/incus.yml",
+        ):
+            self.assertIn(phrase, contract)
+        self.assertIn("32 GiB", solution)
+        self.assertIn("64 GiB", solution)
+        self.assertIn("2x", solution)
+        self.assertIn("observability contract", solution)
+
+
+if __name__ == "__main__":
+    unittest.main()

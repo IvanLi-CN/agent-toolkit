@@ -41,6 +41,8 @@ ruby -e 'require "yaml"'
 bun run test:skills
 ```
 
+Linux CI installs a regular executable at `/usr/bin/bun` for systemd unit verification and sets `AGENT_VM_ISOLATED_TRANSPORT_EVIDENCE=1` only for the temporary fake-SSH transport test; real native transport tests remain root-gated. The Incus/systemd controller deployment contract is Linux-only; macOS evidence covers the client/SSH transport smoke and platform-neutral control logic, not a native controller deployment.
+
 The test runner discovers maintained TypeScript, Python, and Shell test files automatically. It rejects empty or non-declarative Bun/Python test files before execution. Shell assertion counting covers `test` builtins executed in the suite shell, including sourced helpers, and reports `TESTS_RUN=<count>`; zero counted assertions fail. Assert a child helper's result in the suite shell: assertions executed only in a separate helper process do not contribute to this count. Skill tests that exercise the XP policy require Ruby with its standard YAML library; Python-facing tests use the dependencies declared by the repository.
 
 During a source migration, compare the public allowlist with the source snapshot and verify that private consumer Skills remain in the private source tree:

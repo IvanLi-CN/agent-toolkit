@@ -51,6 +51,52 @@ class SyncTests(unittest.TestCase):
     def request(self, action, tx="a" * 32, name="repo", **kw):
         return self.remote(dict(action=action, name=name, tx=tx, **kw))
 
+    def test_stderr_redaction_covers_assignments_and_json_fields(self):
+        jwt = b".".join((b"eyJhbGciOiJIUzI1NiJ9", b"eyJzdWIiOiJhZ2VudCJ9", b"jwt-signature"))
+        value = MOD.redact_stderr(b'{"password":"secret-value", "private_key": "private-value"} secretValue=camel-secret-value tokenValue: camel-token-value token=token-value Authorization: Bearer auth-canary-01 Authorization: Bearer "quoted-sync-auth-canary" Authorization: Basic dXNlcjpzZWNyZXQ= Cookie: sessionid=cookie-secret Set-Cookie: sessionid=set-cookie-secret Authorization: Digest response=digest-secret jwt=' + jwt)
+        self.assertNotIn(b"secret-value", value)
+        self.assertNotIn(b"private-value", value)
+        self.assertNotIn(b"camel-secret-value", value)
+        self.assertNotIn(b"camel-token-value", value)
+        self.assertNotIn(b"token-value", value)
+        self.assertNotIn(b"auth-canary-01", value)
+        self.assertNotIn(b"quoted-sync-auth-canary", value)
+        self.assertNotIn(b"dXNlcjpzZWNyZXQ=", value)
+        for secret in (b"cookie-secret", b"set-cookie-secret", b"digest-secret", b"jwt-signature"):
+            self.assertNotIn(secret, value)
+
+    def test_child_diagnostics_are_redacted_before_bounding(self):
+        result = MOD.run([sys.executable, "-c", "import sys; sys.stderr.write('Authorization: Bearer ' + 'x' * 20000)"], capture_output=True)
+        self.assertLessEqual(len(result.stderr), MOD.DIAGNOSTIC_OUTPUT_LIMIT)
+        self.assertNotIn(b"x" * 100, result.stderr)
+
+    def test_unterminated_pem_is_redacted_before_bounding(self):
+        value = b"-----BEGIN OPENSSH PRIVATE KEY-----\n" + (b"pem-canary-" * 2000)
+        redacted = MOD.redact_and_bound_stderr(value)
+        self.assertLessEqual(len(redacted), MOD.DIAGNOSTIC_OUTPUT_LIMIT)
+        self.assertNotIn(b"pem-canary", redacted)
+
+    def test_quoted_secret_redaction_handles_unterminated_and_escaped_quotes(self):
+        values = [
+            "password" + '="unterminated-secret-canary',
+            "password" + r'="escaped\"-secret-canary',
+            "token" + "='unterminated-token-canary",
+            "token" + r"='escaped\'-token-canary",
+            "password" + "=" + "\"terminal-secret-canary\\",
+            "token" + "=" + "'terminal-token-canary\\",
+            "password" + "=" + '"line-one-secret-canary\nline-two-secret-canary"',
+            "token" + r'="escaped\"-multiline-token-canary',
+        ]
+        for value in values:
+            self.assertNotIn("canary", MOD.redact_stderr(value.encode()).decode())
+
+    def test_truncated_git_inventory_fails_closed(self):
+        complete = MOD.subprocess.CompletedProcess([], 0, b"", b"")
+        truncated = MOD.subprocess.CompletedProcess([], 0, b"tracked-without-nul", b"")
+        with patch.object(MOD, "run", side_effect=[complete, truncated]):
+            with self.assertRaisesRegex(MOD.SyncFailure, "truncated or malformed"):
+                MOD.selected_files(self.git)
+
     def populate(self, tx, files):
         p = self.workspace / "repo" / (".agent-vm-src-stage." + tx)
         manifest = {}
@@ -133,6 +179,15 @@ class SyncTests(unittest.TestCase):
         with self.assertRaisesRegex(MOD.SyncFailure, "symlink"):
             self.request("begin")
         self.assertEqual(list(outside.iterdir()), [])
+
+    def test_private_boundary_is_required_before_replacing_a_source(self):
+        source = self.workspace / "repo/src"
+        source.mkdir(parents=True)
+        (source / "keep").write_text("not ours")
+        source.chmod(0o777)
+        with self.assertRaisesRegex(MOD.SyncFailure, "ownership or mode"):
+            self.request("begin")
+        self.assertEqual((source / "keep").read_text(), "not ours")
 
     def test_invalid_stage_manifest_and_exchange_failure_preserve_old_source(self):
         a, b = "a" * 32, "b" * 32
@@ -231,6 +286,80 @@ class SyncTests(unittest.TestCase):
         self.assertFalse(self.config_seen.exists())
         self.assertTrue(list((self.workspace / "repo").glob(".agent-vm-sync-*.json")))
         self.assertEqual((self.workspace / "repo/src/file").read_text(), "data")
+
+    def test_terminate_process_group_kills_descendant_after_leader_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            child_pid = Path(directory) / "child.pid"
+            child_code = "import pathlib, signal, sys, time; pathlib.Path(sys.argv[1]).write_text(str(__import__('os').getpid())); signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"
+            wrapper_code = f"import signal, subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {child_code!r}, sys.argv[1]]); signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); time.sleep(30)"
+            process = MOD.subprocess.Popen([sys.executable, "-c", wrapper_code, str(child_pid)], start_new_session=True)
+            deadline = MOD.time.monotonic() + 1.0
+            while not child_pid.exists() and MOD.time.monotonic() < deadline:
+                MOD.time.sleep(0.01)
+            self.assertTrue(child_pid.exists())
+            child = int(child_pid.read_text())
+            MOD._terminate_process_group(process)
+            deadline = MOD.time.monotonic() + 1.0
+            while MOD.time.monotonic() < deadline:
+                try:
+                    MOD.os.kill(child, 0)
+                except ProcessLookupError:
+                    break
+                MOD.time.sleep(0.01)
+            else:
+                self.fail("TERM-ignoring descendant survived leader-exit cleanup")
+
+    def test_run_bounded_timeout_closes_stdin_after_leader_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            child_pid = root / "child.pid"
+            driver = root / "driver.py"
+            driver.write_text(
+                "import importlib.util, pathlib, subprocess, sys\n"
+                "module_path, pid_path = sys.argv[1:3]\n"
+                "spec = importlib.util.spec_from_file_location('sync_worktree_probe', module_path)\n"
+                "module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)\n"
+                "child_code = \"import pathlib, signal, sys, time; pathlib.Path(sys.argv[1]).write_text(str(__import__('os').getpid())); signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)\"\n"
+                "wrapper_code = f\"import signal, subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {child_code!r}, sys.argv[1]]); signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); time.sleep(30)\"\n"
+                "try:\n"
+                "    module._run_bounded([sys.executable, '-c', wrapper_code, pid_path], input_data=b'x' * (4 * 1024 * 1024), timeout=0.1)\n"
+                "except subprocess.TimeoutExpired:\n"
+                "    raise SystemExit(0)\n"
+                "raise SystemExit(9)\n",
+                encoding="utf-8",
+            )
+            probe = MOD.subprocess.Popen([sys.executable, str(driver), str(MOD.__file__), str(child_pid)], start_new_session=True)
+            try:
+                result = probe.wait(timeout=3)
+            except MOD.subprocess.TimeoutExpired:
+                if child_pid.exists():
+                    try:
+                        MOD.os.kill(int(child_pid.read_text()), MOD.signal.SIGKILL)
+                    except (ProcessLookupError, ValueError):
+                        pass
+                try:
+                    MOD.os.killpg(probe.pid, MOD.signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                probe.wait(timeout=1)
+                self.fail("_run_bounded retained a closed leader's stdin registration")
+            self.assertEqual(result, 0)
+
+    def test_main_redacts_unexpected_exception_text(self):
+        with patch.object(MOD, "sync", side_effect=RuntimeError("password" + '="unexpected-secret"')):
+            with patch.object(MOD.sys, "argv", ["sync_worktree", "--name", "repo"]), patch.object(MOD.sys, "stderr", new_callable=io.StringIO) as stderr:
+                self.assertEqual(MOD.main(), 1)
+        self.assertNotIn("unexpected-secret", stderr.getvalue())
+
+    def test_main_redacts_and_bounds_sync_failure_text(self):
+        message = "Bearer sync-secret secretValue=camel-secret " + ("x" * (MOD.DIAGNOSTIC_OUTPUT_LIMIT * 2))
+        with patch.object(MOD, "sync", side_effect=MOD.SyncFailure(message, 75)):
+            with patch.object(MOD.sys, "argv", ["sync_worktree", "--name", "repo"]), patch.object(MOD.sys, "stderr", new_callable=io.StringIO) as stderr:
+                self.assertEqual(MOD.main(), 75)
+        output = stderr.getvalue()
+        self.assertNotIn("sync-secret", output)
+        self.assertNotIn("camel-secret", output)
+        self.assertLessEqual(len(output.encode("utf-8")), MOD.DIAGNOSTIC_OUTPUT_LIMIT)
 
     def test_invalid_name_fails_before_remote_and_missing_cli_preserves_exit(self):
         with patch.object(MOD, "run") as runner:

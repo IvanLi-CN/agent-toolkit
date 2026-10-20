@@ -1,22 +1,26 @@
 # Native Incus Agent VM
 
-## Scope
+## Context and Scope
 
 This topic defines a one-shot client and control process for session-owned Linux VMs on a configured Incus host. The public repository documents the lifecycle contract and ships the implementation; deployments provide their own project, image, network, address pool, storage path, state database and control address through explicit configuration.
 
 The design intentionally excludes resident brokers, HTTP APIs, polling loops, implicit keepalives, shared host workspaces, exported archives and guarantees that survive lease expiry.
 
+The deployment topology is layered: the local Codex client reaches a configured Agent VM control endpoint; the control environment runs inside the observed CT109 LXC; the control environment owns session-scoped Incus VMs; and the physical or virtual source below CT109 is outside the verified public boundary. A control endpoint is an entry path, not evidence of the underlying host or its rebuild authority. The concrete address and live inventory remain in protected deployment records.
+
 ## Session and transport
 
 Every request carries a generic `session_id`. The CLI selects it from explicit `--session-id` first and `AGENT_VM_SESSION_ID` second. A missing value returns `missing_session` before any remote write. Session identity is ownership metadata and is not an authentication mechanism. The client sends one versioned JSON request over the configured SSH control path and emits one JSON response; diagnostics go to stderr.
 
-Protocol 4 is required by both client and control. Mutations include an operation ID and lease generation. The control persists requests and outcomes, rejects incompatible or conflicting retries, and never replays an uncertain native mutation automatically.
+Protocol 4 is required by both client and control. Mutations include an operation ID and lease generation, including drain entry and exit. Every successful response carries a validated non-negative generation or an explicit `null` for non-session actions and an `outcome` of `success` or `replayed`. The control persists requests and outcomes, rejects incompatible or conflicting retries, and never replays an uncertain native mutation automatically. Runtime state opening is fail-closed: missing, empty, malformed, or unknown SQLite state is an error and cannot create a new lease. The one recognized Python baseline schema is upgraded atomically to the Bun canonical schema with row-count checks, an audit record and post-copy verification; migration failure rolls back the database.
+
+Local config, state and operation-journal roots are fail-closed: relative roots, symlinked user-controlled ancestors or files, non-directory ancestors, unexpected ownership, and group/other-writable ancestors are rejected. Session directories and files are created with private permissions, and persisted error/audit details apply field projection, secret redaction, depth, collection, string and document-size bounds before durable write or replay.
 
 ## Lifecycle
 
-Each session owns at most one VM slot, including preparing, stopping, deleting and cached states. Acquire creates or reuses a stopped cache, records a new generation and waits for guest agent and IPv4 readiness within one bounded monotonic budget. Lease expiry and release revoke access, remove only owned mappings and stop the guest before making the slot reusable. A stopped disk may remain as a disposable cache; no recovery guarantee is made.
+Each session owns at most one VM slot, including preparing, stopping, deleting and cached states. Acquire creates or reuses a stopped cache, records a new generation and waits for guest agent and IPv4 readiness within one bounded monotonic budget. Lease expiry and release revoke access, remove only owned mappings and stop the guest before making the slot reusable. A stopped disk may remain as a disposable cache; no recovery guarantee is made. A cache is reusable only when its pinned image fingerprint and `user.agent-vm.guest-tools` capability marker match the current controller contract; legacy caches without that marker fail closed and require disposal.
 
-Renewal is explicit and bounded. Acquire, status, SSH, execution and transfer do not renew a lease. A changed generation or expired lease rejects late readiness and native results. Durable state, locks and timers make repeated requests idempotent without hiding partial cleanup.
+Renewal is explicit and bounded. Acquire, status, SSH, execution and transfer do not renew a lease. A changed generation or expired lease rejects late readiness and native results; expiry and drain transitions coordinate with per-session native locks and the native effect barrier before permitting state changes. Durable state, locks and timers make repeated requests idempotent without hiding partial cleanup. The durable verifier rejects unknown drain values, missing active VM/SSH/resource identity, cached or absent residual reservations and ports, and malformed transition reservations; active resize/restart recovery reservations are accepted only when their resource vectors remain exact and measurable.
 
 ## Access and isolation
 
@@ -24,20 +28,52 @@ The deployment configuration supplies the control address and host port range. P
 
 ## Capacity and resizing
 
-Capacity observations are limited to the configured Incus pool filesystem and visible control-environment CPU and memory boundaries. External storage probes and infrastructure-manager inspection are unsupported. CPU and memory allocation ceilings use separately configurable overselling ratios; stopped caches consume disk only. New demand is refused when local measurements are missing, invalid or below the configured pressure threshold. Existing lease queries, retrieval, renewal and release remain available during pressure.
+Capacity observations are limited to the configured Incus pool filesystem and visible control-environment CPU and memory boundaries. External storage probes and infrastructure-manager inspection are unsupported. CPU and memory allocation ceilings use separately configurable overselling ratios; stopped caches consume disk only. Admission diagnostics serialize configured ratios as exact decimal or scientific strings so large values are not rounded or converted to non-finite JSON. New demand is refused when local measurements are missing, invalid or below the configured pressure threshold. Existing lease queries, retrieval, renewal and release remain available during pressure.
 
-Disk changes require an explicit restart allowance and grow only. Memory-only live changes require a running owned guest, unchanged boot identity and native acknowledgement. The old reservation remains until verification succeeds. A single bounded convergence retry is allowed for the documented native balloon timeout; no polling loop or third attempt exists. Partial native changes retain conservative reservations and a structured recovery state.
+Disk changes require an explicit restart allowance and grow only. Memory-only live changes require a running owned guest, unchanged boot identity and native acknowledgement. The old reservation remains until verification succeeds. The documented native balloon-timeout path settles for 45 seconds, then permits exactly one bounded convergence retry only after rereading lease, reservation, native-resource and guest-boot guards; there is no polling loop or third attempt. Partial native changes retain conservative reservations and a structured recovery state.
 
 ## Reclamation and operations
 
 Manual garbage collection is dry-run by default and selects only stopped managed caches with no effective lease and confirmed access cleanup. The age timer and capacity admission may use different bounded selection policies, but neither can delete a valid lease, transition, resize target or unknown resource. Infrastructure operations require a separate explicit authorization and use the same configured paths and identity checks.
 
+## Requirements
+
+### REQ-AGENT-VM-010 - Layered provenance
+
+The public contract MUST distinguish the Codex client, configured control endpoint, CT109 LXC, Incus VM, and unknown underlying hosting source. It MUST NOT turn a configured address, CT identifier, or Incus identity into a claim about the next lower layer, and it MUST keep private deployment addresses and inventories outside the repository.
+
+### REQ-AGENT-VM-011 - Rebuild and recovery fencing
+
+Recovery MUST preserve the state database and WAL/journals, operation and audit records, generations, configuration, protected recovery copies, native timer assets, and Incus VM data. It MUST restore matching components under drain, reconcile durable records against native ownership and generations, and keep admission closed when state, provenance, capacity, or native identity is missing or inconsistent. It MUST NOT invent operation IDs, reset generations, replay uncertain native effects, or perform broad cleanup.
+
+### REQ-AGENT-VM-012 - Sparse disk failure boundary
+
+Disk admission MUST account for the configured CT-local Incus pool filesystem, request cost, watermarks, and durable reservations without claiming a full physical reservation for every virtual disk. Control-plane state and VM data MUST be treated as separate logical failure domains; ENOSPC or I/O failure MUST preserve conservative state and refuse unsafe new admission without evicting an effective lease.
+
+### REQ-AGENT-VM-013 - Observability provenance
+
+Operational dashboards MUST distinguish CT filesystem capacity, transient image staging, physical Incus pool usage, guest rootfs allocation, and native admission state. They MUST NOT infer an authoritative native limit from an unset Incus project quota or draw a limit line for a missing or `-1` source. The dashboard contract MUST expose failure phase, image-unpack failures, admission state and scrape freshness so an ENOSPC boundary can be identified without host-manager access.
+
 ## Synchronization and retrieval
 
-The synchronization helper transfers tracked, unignored worktree files to its own guest source directory and atomically replaces only helper-owned content. It rejects submodules and unsafe names. Export streams a tar archive directly to the caller and does not create a server-side archive.
+The synchronization helper transfers tracked, unignored worktree files to its own guest source directory and atomically replaces only helper-owned content. The guest workspace root and named worktree directory must be owned by the guest control user and not group- or world-writable; the helper fails closed before destructive replacement when that boundary is not verified. It rejects submodules and unsafe names. Export streams a tar archive directly to the caller and does not create a server-side archive.
+
+## Verification
+
+- `VER-AGENT-VM-010` covers: `REQ-AGENT-VM-010` through the topology/provenance sections of [the operations runbook](OPERATIONS.md), the accepted [topology and recovery ADR](../../adr/0028-agent-vm-topology-recovery-boundary.md), and `bin/test_agent_vm_documentation.py`.
+- `VER-AGENT-VM-011` covers: `REQ-AGENT-VM-011` through the recovery procedure in [the operations runbook](OPERATIONS.md), the existing native reconciliation and operation-journal behavior tests, and `bin/test_agent_vm_documentation.py`.
+- `VER-AGENT-VM-012` covers: `REQ-AGENT-VM-012` through the sparse-disk and failure-domain sections in [the operations runbook](OPERATIONS.md), the existing capacity/reclamation tests, and `bin/test_agent_vm_documentation.py`.
+- `VER-AGENT-VM-013` covers: `REQ-AGENT-VM-013` through [the observability contract](contracts/observability.md), [the capacity and failure dashboard solution](../../solutions/agent-vm/observability-dashboard.md), and `bin/test_agent_vm_documentation.py`.
+
+## Related ADRs
+
+- [Native Incus Agent VM lifecycle](../../adr/0025-native-incus-agent-vm-lifecycle.md)
+- [Agent VM CPU and memory overselling](../../adr/0026-agent-vm-cpu-memory-overselling.md)
+- [Agent VM topology and recovery boundary](../../adr/0028-agent-vm-topology-recovery-boundary.md)
 
 ## Related material
 
 - [CLI contract](contracts/cli.md)
 - [Reclamation design](RECLAMATION-DESIGN.md)
 - [Retention design](RETENTION-DESIGN.md)
+- [Observability contract](contracts/observability.md)

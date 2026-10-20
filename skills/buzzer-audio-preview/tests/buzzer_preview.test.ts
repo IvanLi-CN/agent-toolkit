@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -199,5 +199,21 @@ describe("buzzer MIDI and WAV helper", () => {
   test("rejects output stems that escape the selected directory", () => {
     expect(() => parseArgs(["--in", "fixture.json", "--stem", "../outside"])).toThrow(/without path separators/);
     expect(() => parseArgs(["--in", "fixture.json", "--stem", "/tmp/outside"])).toThrow(/without path separators/);
+  });
+
+  test("does not follow preexisting output symlinks", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-symlink-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      const outside = join(root, "outside.bin");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      await mkdir(output, { recursive: true });
+      await symlink(outside, join(output, "fixture.mid"));
+      expect(await main(["--in", input, "--out-dir", output])).toBe(1);
+      expect(await Bun.file(outside).exists()).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

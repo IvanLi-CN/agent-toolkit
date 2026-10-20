@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 
-import { type Dirent } from "node:fs";
+import { constants, type Dirent } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { link, mkdtemp, open, readdir, rm, stat, unlink } from "node:fs/promises";
+import { link, lstat, mkdtemp, open, readdir, rm, unlink } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename, dirname, join } from "node:path";
 
@@ -34,13 +34,11 @@ function expandUser(path: string): string {
   return path === "~" ? home : path.startsWith("~/") ? `${home}/${path.slice(2)}` : path;
 }
 
-function decode(value: Uint8Array | undefined): string {
-  return value === undefined ? "" : new TextDecoder().decode(value);
-}
-
-function runSync(args: string[]): CommandResult {
-  const result = Bun.spawnSync(args, { stdout: "pipe", stderr: "pipe" });
-  return { exitCode: result.exitCode, stdout: decode(result.stdout), stderr: decode(result.stderr) };
+function killProcessTree(child: Bun.Subprocess, signal: "SIGTERM" | "SIGKILL"): void {
+  if (process.platform !== "win32") {
+    try { process.kill(-child.pid, signal); } catch { /* The process may already be gone. */ }
+  }
+  try { child.kill(signal); } catch { /* The process may already be gone. */ }
 }
 
 export const MAX_REMOTE_OUTPUT_BYTES = 256 * 1024;
@@ -74,24 +72,28 @@ async function readBounded(stream: ReadableStream<Uint8Array>, maxBytes: number,
 }
 
 async function runWithStdin(args: string[], input: string, timeoutMs = REMOTE_COMMAND_TIMEOUT_MS): Promise<CommandResult> {
-  const child = Bun.spawn(args, { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+  const child = Bun.spawn(args, { detached: true, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
   child.stdin.write(input);
   child.stdin.end();
   let timedOut = false;
   let outputTruncated = false;
+  let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
   const stopForLimit = () => {
     outputTruncated = true;
-    child.kill();
+    killProcessTree(child, "SIGTERM");
+    forceKillTimer = setTimeout(() => killProcessTree(child, "SIGKILL"), 1_000);
   };
   const stdoutPromise = readBounded(child.stdout, MAX_REMOTE_OUTPUT_BYTES, stopForLimit);
   const stderrPromise = readBounded(child.stderr, MAX_REMOTE_OUTPUT_BYTES, stopForLimit);
   const timeout = setTimeout(() => {
     timedOut = true;
-    child.kill();
+    killProcessTree(child, "SIGTERM");
+    forceKillTimer = setTimeout(() => killProcessTree(child, "SIGKILL"), 1_000);
   }, timeoutMs);
   const exitCode = await child.exited;
   const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
   clearTimeout(timeout);
+  if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
   return {
     exitCode,
     stdout: stdout.text,
@@ -120,17 +122,25 @@ const SENSITIVE_ASSIGNMENT = new RegExp(
 );
 
 export function redactSensitiveText(text: string): string {
-  return text.split(/\r?\n/).map((line) => {
-    const redacted = line.replace(SENSITIVE_ASSIGNMENT, "$1[REDACTED]");
-    return redacted === line && SENSITIVE_MARKER.test(line) ? "[REDACTED]" : redacted;
-  }).join("\n");
+  const redacted = text.replace(SENSITIVE_ASSIGNMENT, "$1[REDACTED]");
+  return redacted.split(/\r?\n/).map((line) => line.includes("[REDACTED]") || !SENSITIVE_MARKER.test(line) ? line : "[REDACTED]").join("\n");
 }
 
 export async function safeTail(file: string, lines: number): Promise<string> {
   if (lines <= 0) return "";
   try {
-    const result = runSync(["tail", "-n", String(lines), file]);
-    return result.exitCode === 0 ? redactSensitiveText(result.stdout) : "";
+    const handle = await open(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    try {
+      const metadata = await handle.stat();
+      if (!metadata.isFile()) return "";
+      const bytesToRead = Math.min(metadata.size, 256 * 1024);
+      const buffer = new Uint8Array(bytesToRead);
+      const result = await handle.read(buffer, 0, bytesToRead, metadata.size - bytesToRead);
+      const text = new TextDecoder().decode(buffer.subarray(0, result.bytesRead));
+      return redactSensitiveText(text.split(/\r?\n/).slice(-lines).join("\n"));
+    } finally {
+      await handle.close();
+    }
   } catch {
     return "";
   }
@@ -157,7 +167,7 @@ async function commandFirstLines(args: string[], lines: number): Promise<string>
   }
   await child.exited;
   await new Response(child.stderr).text();
-  return selected.slice(0, lines).join("\n").trimEnd();
+  return redactSensitiveText(selected.slice(0, lines).join("\n").trimEnd());
 }
 
 async function localCollect(options: SnapshotOptions): Promise<string> {
@@ -168,12 +178,12 @@ async function localCollect(options: SnapshotOptions): Promise<string> {
     "",
     `- Host: ${hostname()}`,
     `- Collected at: ${isoTimestamp()}`,
-    `- Client data dir: \`${displayDir}\``,
+    `- Client data dir: \`${redactSensitiveText(displayDir)}\``,
     "",
   ];
   let directory;
   try {
-    directory = await stat(localDir);
+    directory = await lstat(localDir);
   } catch {
     directory = undefined;
   }
@@ -194,7 +204,7 @@ async function localCollect(options: SnapshotOptions): Promise<string> {
 
   const clientLog = join(localDir, "client_log.txt");
   try {
-    if ((await stat(clientLog)).isFile()) {
+    if ((await lstat(clientLog)).isFile()) {
       lines.push("### client_log.txt (tail 80)", "", (await safeTail(clientLog, 80)).trimEnd(), "");
     }
   } catch {
@@ -223,14 +233,14 @@ async function localCollect(options: SnapshotOptions): Promise<string> {
   if (clusters.length > 0) {
     lines.push("### Local clusters (paths only; secrets redacted)", "");
     for (const cluster of clusters.sort()) {
-      lines.push(`- ${cluster}`);
+      lines.push(`- ${redactSensitiveText(cluster)}`);
       try {
-        if ((await stat(join(cluster, "cluster_token.txt"))).isFile()) lines.push("  - cluster_token.txt: present (redacted)");
+        if ((await lstat(join(cluster, "cluster_token.txt"))).isFile()) lines.push("  - cluster_token.txt: present (redacted)");
       } catch {
         // Optional secret marker.
       }
       try {
-        if ((await stat(join(cluster, "cluster.ini"))).isFile()) lines.push("  - cluster.ini: present (contains cluster_password; do not paste)");
+        if ((await lstat(join(cluster, "cluster.ini"))).isFile()) lines.push("  - cluster.ini: present (contains cluster_password; do not paste)");
       } catch {
         // Optional secret marker.
       }

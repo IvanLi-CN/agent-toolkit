@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -33,6 +33,8 @@ describe("DST local Bun tooling", () => {
     expect(redactSensitiveText("Authorization: Bearer fixture-secret")).toBe("Authorization: [REDACTED]");
     expect(redactSensitiveText("Authorization: Basic fixture-secret")).toBe("Authorization: [REDACTED]");
     expect(redactSensitiveText('api_key="prefix\\"LEAK"')).toBe("api_key=[REDACTED]");
+    const multilineToken = ["token", "=", '"', "first-line\nsecond-line", '"'].join("");
+    expect(redactSensitiveText(multilineToken)).toBe("token=[REDACTED]");
   });
 
   test("rejects cluster path traversal before opening SSH", () => {
@@ -103,6 +105,45 @@ describe("DST local Bun tooling", () => {
       expect(report).toContain("Cluster_fixture");
       expect(report).toContain("Cluster_direct");
       expect(report).not.toContain("secret-fixture");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not follow a symlinked client log", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-symlink-"));
+    try {
+      const local = join(root, "client");
+      await mkdir(local, { recursive: true });
+      const secret = join(root, "private-key.txt");
+      await writeFile(secret, "PRIVATE_KEY_MUST_NOT_APPEAR\n");
+      await symlink(secret, join(local, "client_log.txt"));
+      const output = join(root, "snapshot.md");
+      expect(await snapshotMain(["--local-dir", local, "--no-remote", "--out", output])).toBe(0);
+      const report = await readFile(output, "utf8");
+      expect(report).not.toContain("PRIVATE_KEY_MUST_NOT_APPEAR");
+      expect(report).not.toContain("client_log.txt (tail 80)");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("remote mod collection refuses symlinked shard files", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-symlink-"));
+    try {
+      const home = join(root, "home");
+      const cluster = join(home, ".klei", "DoNotStarveTogether", "fixture", "Master");
+      await mkdir(cluster, { recursive: true });
+      const outside = join(root, "outside.lua");
+      await writeFile(outside, '["workshop-999"] = { enabled = true }\n');
+      await symlink(outside, join(cluster, "modoverrides.lua"));
+      const child = Bun.spawn(["bash", join(import.meta.dir, "..", "scripts", "dst_mods_remote_collect.sh"), "fixture", "Master"], {
+        env: { ...process.env, HOME: home }, stdout: "pipe", stderr: "pipe",
+      });
+      const [status, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+      expect(status).toBe(0);
+      expect(stdout).toContain("MISSING");
+      expect(stdout).not.toContain("workshop-999");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

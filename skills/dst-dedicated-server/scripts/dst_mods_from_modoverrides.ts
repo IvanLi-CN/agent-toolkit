@@ -167,11 +167,18 @@ function startRemote(script: string, options: ModOptions, shard: "Master" | "Cav
   const remoteCommand = `bash -s -- ${shellQuote(options.cluster)} ${shellQuote(shard)}`;
   const child = Bun.spawn(
     ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", target, remoteCommand],
-    { stdin: "pipe", stdout: "pipe", stderr: "pipe" },
+    { detached: true, stdin: "pipe", stdout: "pipe", stderr: "pipe" },
   );
   child.stdin.write(script);
   child.stdin.end();
   return child;
+}
+
+function killProcessTree(child: Bun.Subprocess, signal: "SIGTERM" | "SIGKILL"): void {
+  if (process.platform !== "win32") {
+    try { process.kill(-child.pid, signal); } catch { /* The process may already be gone. */ }
+  }
+  try { child.kill(signal); } catch { /* The process may already be gone. */ }
 }
 
 async function readText(stream: ReadableStream<Uint8Array>, maxBytes = 64 * 1024, timeoutMs = REMOTE_COMMAND_TIMEOUT_MS): Promise<string> {
@@ -369,16 +376,19 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
       const filePath = `~/.klei/DoNotStarveTogether/${parsed.cluster}/${shard}/modoverrides.lua`;
       const stderrPromise = readText(child.stderr);
       let timedOut = false;
+      let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
       const timeout = setTimeout(() => {
         timedOut = true;
-        child.kill();
+        killProcessTree(child, "SIGTERM");
+        forceKillTimer = setTimeout(() => killProcessTree(child, "SIGKILL"), 1_000);
       }, REMOTE_COMMAND_TIMEOUT_MS);
       let summary: ShardSummary;
       try {
         try {
           summary = await parseRemoteResponseStream(parsed.cluster, shard, filePath, child.stdout);
         } catch (error) {
-          child.kill();
+          killProcessTree(child, "SIGTERM");
+          forceKillTimer = setTimeout(() => killProcessTree(child, "SIGKILL"), 1_000);
           await readText(child.stdout, 64 * 1024, 1_000);
           const [exitCode, stderr] = await Promise.all([child.exited, stderrPromise]);
           const detail = redactSensitiveText(stderr.trim());
@@ -394,6 +404,7 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
         }
       } finally {
         clearTimeout(timeout);
+        if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
       }
       summaries.push(summary);
     }

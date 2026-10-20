@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 
-import { mkdir, readFile } from "node:fs/promises";
+import { link, lstat, mkdir, mkdtemp, open, readFile, rm, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, extname, isAbsolute, resolve } from "node:path";
+import { basename, extname, isAbsolute, join, resolve } from "node:path";
 
 const NOTE_OFFSETS: Record<string, number> = {
   C: 0,
@@ -471,10 +471,47 @@ export function parseArgs(args: string[]): { input: string; outDir: string; stem
 }
 
 function validateStem(stem: string): string {
-  if (stem.length === 0 || stem === "." || stem === ".." || isAbsolute(stem) || stem.includes("/") || stem.includes("\\")) {
+  if (stem.length === 0 || stem === "." || stem === ".." || stem.includes("\0") || isAbsolute(stem) || stem.includes("/") || stem.includes("\\")) {
     throw new CliError("--stem must be a non-empty filename without path separators");
   }
   return stem;
+}
+
+async function writeSyncedFile(path: string, data: Uint8Array): Promise<void> {
+  const handle = await open(path, "w", 0o600);
+  try {
+    await handle.writeFile(data);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function publishOutputs(outDir: string, stem: string, midi: Uint8Array, wav: Uint8Array): Promise<[string, string]> {
+  const midiPath = resolve(outDir, `${stem}.mid`);
+  const wavPath = resolve(outDir, `${stem}.wav`);
+  const tempDir = await mkdtemp(join(outDir, ".buzzer-preview-tmp-"));
+  const tempMidiPath = join(tempDir, `${stem}.mid`);
+  const tempWavPath = join(tempDir, `${stem}.wav`);
+  let midiPublished = false;
+  let wavPublished = false;
+  try {
+    await writeSyncedFile(tempMidiPath, midi);
+    await writeSyncedFile(tempWavPath, wav);
+    await link(tempMidiPath, midiPath);
+    midiPublished = true;
+    await link(tempWavPath, wavPath);
+    wavPublished = true;
+    return [midiPath, wavPath];
+  } catch (error) {
+    if (wavPublished) await unlink(wavPath).catch(() => undefined);
+    if (midiPublished) await unlink(midiPath).catch(() => undefined);
+    throw error;
+  } finally {
+    await unlink(tempMidiPath).catch(() => undefined);
+    await unlink(tempWavPath).catch(() => undefined);
+    await rm(tempDir, { recursive: true, force: true });
+  }
 }
 
 export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> {
@@ -487,12 +524,11 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     const inputPath = resolve(expandUser(parsed.input));
     const outDir = resolve(expandUser(parsed.outDir));
     await mkdir(outDir, { recursive: true });
+    const outDirStat = await lstat(outDir);
+    if (!outDirStat.isDirectory() || outDirStat.isSymbolicLink()) throw new CliError("--out-dir must resolve to a real directory");
     const { config, events } = parseScore(JSON.parse(await readFile(inputPath, "utf8")));
     const stem = validateStem(parsed.stem ?? basename(inputPath, extname(inputPath)));
-    const midiPath = resolve(outDir, `${stem}.mid`);
-    const wavPath = resolve(outDir, `${stem}.wav`);
-    await Bun.write(midiPath, encodeMidi(config, events));
-    await Bun.write(wavPath, encodeWav(config, events));
+    const [midiPath, wavPath] = await publishOutputs(outDir, stem, encodeMidi(config, events), encodeWav(config, events));
     const totalSeconds = events.reduce((total, event) => total + event.durationS, 0);
     console.log(`[OK] Wrote: ${midiPath}`);
     console.log(`[OK] Wrote: ${wavPath}`);

@@ -174,33 +174,46 @@ function startRemote(script: string, options: ModOptions, shard: "Master" | "Cav
   return child;
 }
 
-async function readText(stream: ReadableStream<Uint8Array>, maxBytes = 64 * 1024): Promise<string> {
+async function readText(stream: ReadableStream<Uint8Array>, maxBytes = 64 * 1024, timeoutMs = REMOTE_COMMAND_TIMEOUT_MS): Promise<string> {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let text = "";
   let remaining = maxBytes;
+  const readWithDeadline = async () => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    type ReadResult = Awaited<ReturnType<typeof reader.read>>;
+    try {
+      return await Promise.race([
+        reader.read(),
+        new Promise<ReadResult>((resolve) => {
+          timer = setTimeout(() => {
+            void reader.cancel();
+            resolve({ done: true } as ReadResult);
+          }, timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  };
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readWithDeadline();
       if (done) break;
-      if (remaining <= 0) continue;
+      if (remaining <= 0) {
+        await reader.cancel();
+        break;
+      }
       const chunk = value ?? new Uint8Array();
       const portion = chunk.byteLength > remaining ? chunk.slice(0, remaining) : chunk;
       text += decoder.decode(portion, { stream: true });
       remaining -= portion.byteLength;
+      if (chunk.byteLength > portion.byteLength) {
+        await reader.cancel();
+        break;
+      }
     }
     return text + decoder.decode();
-  } finally {
-    reader.releaseLock();
-  }
-}
-
-async function drain(stream: ReadableStream<Uint8Array>): Promise<void> {
-  const reader = stream.getReader();
-  try {
-    while (!(await reader.read()).done) {
-      // Keep consuming a failed child process so its pipe cannot remain blocked.
-    }
   } finally {
     reader.releaseLock();
   }
@@ -366,7 +379,7 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
           summary = await parseRemoteResponseStream(parsed.cluster, shard, filePath, child.stdout);
         } catch (error) {
           child.kill();
-          await drain(child.stdout);
+          await readText(child.stdout, 64 * 1024, 1_000);
           const [exitCode, stderr] = await Promise.all([child.exited, stderrPromise]);
           const detail = redactSensitiveText(stderr.trim());
           if (timedOut) throw new Error(`SSH collection timed out after ${REMOTE_COMMAND_TIMEOUT_MS / 1000}s`);

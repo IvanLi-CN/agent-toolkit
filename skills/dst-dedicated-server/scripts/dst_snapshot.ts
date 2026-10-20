@@ -1,9 +1,10 @@
 #!/usr/bin/env bun
 
 import { type Dirent } from "node:fs";
-import { readdir, stat } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { link, mkdtemp, open, readdir, rm, stat, unlink } from "node:fs/promises";
 import { hostname } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 interface SnapshotOptions {
   host: string;
@@ -72,7 +73,7 @@ async function readBounded(stream: ReadableStream<Uint8Array>, maxBytes: number,
   }
 }
 
-async function runWithStdin(args: string[], input: string): Promise<CommandResult> {
+async function runWithStdin(args: string[], input: string, timeoutMs = REMOTE_COMMAND_TIMEOUT_MS): Promise<CommandResult> {
   const child = Bun.spawn(args, { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
   child.stdin.write(input);
   child.stdin.end();
@@ -87,10 +88,10 @@ async function runWithStdin(args: string[], input: string): Promise<CommandResul
   const timeout = setTimeout(() => {
     timedOut = true;
     child.kill();
-  }, REMOTE_COMMAND_TIMEOUT_MS);
+  }, timeoutMs);
   const exitCode = await child.exited;
-  clearTimeout(timeout);
   const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
+  clearTimeout(timeout);
   return {
     exitCode,
     stdout: stdout.text,
@@ -107,13 +108,14 @@ function isoTimestamp(): string {
 function fileTimestamp(): string {
   const now = new Date();
   const pad = (value: number) => String(value).padStart(2, "0");
-  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+  const millis = String(now.getMilliseconds()).padStart(3, "0");
+  return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}-${millis}-${randomUUID().slice(0, 8)}`;
 }
 
 const SENSITIVE_NAME = "(?:password|passwd|secret|token|credential|private[_ -]?key|api[_ -]?key|access[_ -]?key|authorization|bearer)";
 const SENSITIVE_MARKER = new RegExp(SENSITIVE_NAME, "i");
 const SENSITIVE_ASSIGNMENT = new RegExp(
-  `((?:[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*)\\s*[:=]\\s*)("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|Bearer\\s+[^\\s,;]+|[^\\s,;]+)`,
+  `((?:[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*)\\s*[:=]\\s*)("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|(?:Bearer|Basic)\\s+[^\\s,;]+|[^\\s,;]+)`,
   "gi",
 );
 
@@ -243,9 +245,13 @@ async function remoteCollect(options: SnapshotOptions, script: string): Promise<
   const target = `${options.user}@${options.host}`;
   let connectivity: CommandResult;
   try {
-    connectivity = runSync(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", target, "echo", "ok"]);
+    connectivity = await runWithStdin(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", target, "echo", "ok"], "", 5_000);
   } catch {
     lines.push("> ssh not found on this machine. Skipping remote collection.", "");
+    return { text: lines.join("\n"), failed: false };
+  }
+  if (connectivity.timedOut) {
+    lines.push("> Remote SSH connectivity check timed out after 5s. Verify reachability and run the command interactively, then re-run this script.", "");
     return { text: lines.join("\n"), failed: false };
   }
   if (connectivity.exitCode !== 0) {
@@ -366,7 +372,27 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     report.push(remote.text, "");
     failed = remote.failed;
   }
-  await Bun.write(outputPath, report.join("\n"));
+  try {
+    const parent = dirname(outputPath);
+    const tempDir = await mkdtemp(join(parent, ".dst-snapshot-tmp-"));
+    const tempPath = join(tempDir, basename(outputPath));
+    try {
+      const handle = await open(tempPath, "w", 0o600);
+      try {
+        await handle.writeFile(report.join("\n"), "utf8");
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      await link(tempPath, outputPath);
+    } finally {
+      await unlink(tempPath).catch(() => undefined);
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  } catch (error) {
+    console.error(`error: cannot publish snapshot at ${outputPath}: ${error instanceof Error ? error.message : String(error)}`);
+    return 2;
+  }
   console.log(outputPath);
   return failed ? 1 : 0;
 }

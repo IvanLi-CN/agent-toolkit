@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -29,8 +29,9 @@ function byteStream(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
 }
 
 describe("DST local Bun tooling", () => {
-  test("redacts bearer and escaped quoted secrets completely", () => {
+  test("redacts bearer, basic, and escaped quoted secrets completely", () => {
     expect(redactSensitiveText("Authorization: Bearer fixture-secret")).toBe("Authorization: [REDACTED]");
+    expect(redactSensitiveText("Authorization: Basic fixture-secret")).toBe("Authorization: [REDACTED]");
     expect(redactSensitiveText('api_key="prefix\\"LEAK"')).toBe("api_key=[REDACTED]");
   });
 
@@ -240,6 +241,23 @@ esac
     } finally {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("publishes concurrent reports without partial writes or overwrites", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-publish-"));
+    try {
+      const output = join(root, "snapshot.md");
+      const results = await Promise.all([
+        snapshotMain(["--no-local", "--no-remote", "--out", output]),
+        snapshotMain(["--no-local", "--no-remote", "--out", output]),
+      ]);
+      expect(results.sort()).toEqual([0, 2]);
+      const report = await readFile(output, "utf8");
+      expect(report).toContain("# DST snapshot");
+      expect((await readdir(root)).filter((entry) => entry.startsWith(".dst-snapshot-tmp-")).length).toBe(0);
+    } finally {
       await rm(root, { recursive: true, force: true });
     }
   });

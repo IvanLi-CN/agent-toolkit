@@ -2,7 +2,7 @@
 
 import { mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, extname, resolve } from "node:path";
+import { basename, extname, isAbsolute, resolve } from "node:path";
 
 const NOTE_OFFSETS: Record<string, number> = {
   C: 0,
@@ -466,7 +466,15 @@ export function parseArgs(args: string[]): { input: string; outDir: string; stem
     throw new CliError(`Unknown arg: ${arg}`);
   }
   if (input === undefined) throw new CliError("--in is required");
+  if (stem !== undefined) validateStem(stem);
   return { input, outDir, stem };
+}
+
+function validateStem(stem: string): string {
+  if (stem.length === 0 || stem === "." || stem === ".." || isAbsolute(stem) || stem.includes("/") || stem.includes("\\")) {
+    throw new CliError("--stem must be a non-empty filename without path separators");
+  }
+  return stem;
 }
 
 export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> {
@@ -480,7 +488,7 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     const outDir = resolve(expandUser(parsed.outDir));
     await mkdir(outDir, { recursive: true });
     const { config, events } = parseScore(JSON.parse(await readFile(inputPath, "utf8")));
-    const stem = parsed.stem ?? basename(inputPath, extname(inputPath));
+    const stem = validateStem(parsed.stem ?? basename(inputPath, extname(inputPath)));
     const midiPath = resolve(outDir, `${stem}.mid`);
     const wavPath = resolve(outDir, `${stem}.wav`);
     await Bun.write(midiPath, encodeMidi(config, events));

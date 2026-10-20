@@ -195,4 +195,9 @@ describe("buzzer MIDI and WAV helper", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  test("rejects output stems that escape the selected directory", () => {
+    expect(() => parseArgs(["--in", "fixture.json", "--stem", "../outside"])).toThrow(/without path separators/);
+    expect(() => parseArgs(["--in", "fixture.json", "--stem", "/tmp/outside"])).toThrow(/without path separators/);
+  });
 });

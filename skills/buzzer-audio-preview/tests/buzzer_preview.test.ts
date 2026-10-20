@@ -295,6 +295,26 @@ describe("buzzer MIDI and WAV helper", () => {
     }
   });
 
+  test("reclaims a dead-owner lock immediately for readers", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-dead-lock-"));
+    try {
+      const output = join(root, "out");
+      const lock = join(output, ".buzzer-preview-fixture.lock");
+      await mkdir(output, { recursive: true });
+      await writeFile(join(output, "fixture.mid"), "midi");
+      await writeFile(join(output, "fixture.wav"), "wav");
+      await mkdir(lock);
+      await writeFile(join(lock, "pid"), "2147483647\n");
+      await writeFile(join(lock, "owner"), "dead-owner\n");
+      const pair = await readPublishedPair(output, "fixture");
+      expect(pair.midi.toString()).toBe("midi");
+      expect(pair.wav.toString()).toBe("wav");
+      expect(await readdir(output)).not.toContain(".buzzer-preview-fixture.lock");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("recovers an interrupted publication before reading a pair", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-recovery-"));
     try {
@@ -310,6 +330,46 @@ describe("buzzer MIDI and WAV helper", () => {
       expect(decoder.decode(pair.midi)).toBe("old-midi");
       expect(decoder.decode(pair.wav)).toBe("old-wav");
       expect(await readdir(output)).not.toContain(".buzzer-preview-txn-fixture-recovery");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not follow a transaction backup symlink during recovery", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-backup-symlink-"));
+    try {
+      const output = join(root, "out");
+      const transaction = join(output, ".buzzer-preview-txn-fixture-symlink");
+      const outside = join(root, "outside-secret");
+      await mkdir(transaction, { recursive: true });
+      await writeFile(join(output, "fixture.mid"), "new-midi");
+      await writeFile(join(output, "fixture.wav"), "old-wav");
+      await writeFile(outside, "PRIVATE_BYTES");
+      await symlink(outside, join(transaction, "midi.backup"));
+      await writeFile(join(transaction, ".state"), "midi-published\n");
+      await expect(readPublishedPair(output, "fixture")).rejects.toThrow(/regular file/);
+      expect(await readFile(outside, "utf8")).toBe("PRIVATE_BYTES");
+      expect(await readFile(join(output, "fixture.mid"), "utf8")).toBe("new-midi");
+      expect(await readdir(output)).toContain(".buzzer-preview-txn-fixture-symlink");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves an output after a restore crash marker is left behind", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-restore-marker-"));
+    try {
+      const output = join(root, "out");
+      const transaction = join(output, ".buzzer-preview-txn-fixture-marker");
+      await mkdir(transaction, { recursive: true });
+      await writeFile(join(output, "fixture.mid"), "restored-midi");
+      await writeFile(join(output, "fixture.wav"), "old-wav");
+      await writeFile(join(transaction, "midi.restoring"), "");
+      await writeFile(join(transaction, ".state"), "midi-published\n");
+      const pair = await readPublishedPair(output, "fixture");
+      expect(pair.midi.toString()).toBe("restored-midi");
+      expect(pair.wav.toString()).toBe("old-wav");
+      expect(await readdir(output)).not.toContain(".buzzer-preview-txn-fixture-marker");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

@@ -18,7 +18,7 @@ echo "### Resources"
 echo
 if have_cmd uptime; then echo "- uptime: $(uptime)"; fi
 if have_cmd df; then
-  df -h "$HOME" 2>/dev/null | awk 'NR == 1 { print; next } { print $1, $2, $3, $4, $5 }' || df -h | awk 'NR == 1 { print; next } { print $1, $2, $3, $4, $5 }'
+  df -h "$HOME" 2>/dev/null | awk 'NR == 2 { print "- home_fs: size=" $2 " used=" $3 " available=" $4 " capacity=" $5; found=1 } END { if (!found) print "> home filesystem metrics unavailable." }'
 fi
 if have_cmd free; then free -h || true; fi
 echo
@@ -37,7 +37,7 @@ echo
 echo "### Listening ports (best-effort)"
 echo
 if have_cmd ss; then
-  ss -ltnup 2>/dev/null | (grep -E ':(22|10999|11000|27018|27019|8768|8769)\\b' || true)
+  ss -ltnup 2>/dev/null | awk 'NR > 1 && $0 ~ /:(22|10999|11000|27018|27019|8768|8769)([^0-9]|$)/ { found=1 } END { if (found) print "- configured-listener: present"; else print "> configured listeners not observed." }'
 else
   echo "> ss not found."
 fi

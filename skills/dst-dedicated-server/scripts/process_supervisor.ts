@@ -12,10 +12,7 @@ wait "$target_pid"
 target_status=$?
 printf '%s\\n' "$target_status" > "$status_path"
 exec 0<&- 1>&- 2>&-
-while :; do
-  sleep 3600 &
-  wait $!
-done
+exec sleep 3600
 `;
 
 export interface SupervisedChild {

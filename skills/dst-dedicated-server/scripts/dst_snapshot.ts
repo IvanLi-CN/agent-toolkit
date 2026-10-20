@@ -49,15 +49,47 @@ export const LOCAL_COMMAND_TIMEOUT_MS = 5_000;
 export const MAX_LOCAL_DIRECTORY_ENTRIES = 4_096;
 export const MAX_LOCAL_CLUSTER_PATHS = 4_096;
 
-async function readBounded(stream: ReadableStream<Uint8Array>, maxBytes: number, onLimit: () => void): Promise<{ text: string; truncated: boolean }> {
+async function readBounded(
+  stream: ReadableStream<Uint8Array>,
+  maxBytes: number,
+  onLimit: () => void,
+  onTimeout: () => void,
+  timeoutMs: number,
+): Promise<{ text: string; truncated: boolean }> {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let text = "";
   let remaining = maxBytes;
   let truncated = false;
+  const deadline = Date.now() + timeoutMs;
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        onTimeout();
+        void reader.cancel();
+        break;
+      }
+      type ReadResult = Awaited<ReturnType<typeof reader.read>>;
+      const result = await new Promise<{ kind: "data"; value: ReadResult } | { kind: "timeout" }>((resolve, reject) => {
+        const timer = setTimeout(() => resolve({ kind: "timeout" }), remainingMs);
+        reader.read().then(
+          (value) => {
+            clearTimeout(timer);
+            resolve({ kind: "data", value });
+          },
+          (error) => {
+            clearTimeout(timer);
+            reject(error);
+          },
+        );
+      });
+      if (result.kind === "timeout") {
+        onTimeout();
+        void reader.cancel();
+        break;
+      }
+      const { done, value } = result.value;
       if (done) break;
       const chunk = value ?? new Uint8Array();
       if (chunk.byteLength > remaining) {
@@ -100,8 +132,12 @@ async function runWithStdin(
   try {
     child.stdin.write(input);
     child.stdin.end();
-    const stdoutPromise = readBounded(child.stdout, maxOutputBytes, stopForLimit);
-    const stderrPromise = readBounded(child.stderr, maxOutputBytes, stopForLimit);
+    const stopForReadTimeout = () => {
+      timedOut = true;
+      requestStop();
+    };
+    const stdoutPromise = readBounded(child.stdout, maxOutputBytes, stopForLimit, stopForReadTimeout, timeoutMs);
+    const stderrPromise = readBounded(child.stderr, maxOutputBytes, stopForLimit, stopForReadTimeout, timeoutMs);
     timeout = setTimeout(() => {
       timedOut = true;
       requestStop();
@@ -148,8 +184,9 @@ async function syncDirectory(path: string): Promise<void> {
     } finally {
       await handle.close();
     }
-  } catch {
-    // Directory fsync is not available on every supported platform.
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "EINVAL" && code !== "ENOTSUP" && code !== "EOPNOTSUPP" && code !== "EBADF" && code !== "EISDIR") throw error;
   }
 }
 
@@ -179,7 +216,9 @@ export function redactOperationalText(text: string, values: string[] = []): stri
   for (const value of values.filter((candidate) => candidate.length > 0).sort((left, right) => right.length - left.length)) {
     redacted = redacted.split(value).join("<redacted-path>");
   }
-  return redactSensitiveText(redacted).replace(/(?:\/Users|\/home|\/root|\/private|\/tmp|\/var|\/opt|\/srv|\/etc)\/[^\s"'<>`]+/g, "<redacted-path>");
+  return redactSensitiveText(redacted)
+    .replace(/(?:\/Users|\/home|\/root|\/private|\/tmp|\/var|\/opt|\/srv|\/etc|\/mnt|\/data|\/Volumes|\/dev|\/run)\/[^\s"'<>`]+/g, "<redacted-path>")
+    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "<redacted-address>");
 }
 
 export function validateSshToken(value: string, label: string): void {

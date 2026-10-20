@@ -93,6 +93,10 @@ describe("DST local Bun tooling", () => {
     expect(renderDiff("cluster", master, caves)).toContain("enabled_only_in_caves: 400");
     expect(renderDiff("cluster", master, caves)).toContain("disabled_only_in_master: 200");
     expect(renderDiff("cluster", master, caves)).toContain("disabled_only_in_caves: 100");
+
+    expect(parseModOverrides('return { ["workshop-400"] = { configuration_options = { enabled = true }, enabled = false } }')).toEqual([
+      { id: "400", state: "false" },
+    ]);
   });
 
   test("collects a bounded local snapshot without printing secret contents", async () => {
@@ -444,5 +448,10 @@ esac
 
     const oversized = new TextEncoder().encode(`PRESENT ${MAX_MOD_OVERRIDE_BYTES + 1}\n`);
     await expect(parseRemoteResponseStream("fixture-cluster", "Master", "fixture", byteStream([oversized]))).rejects.toThrow(/exceeds/);
+  });
+
+  test("times out a remote response stream that never produces bytes", async () => {
+    const hanging = new ReadableStream<Uint8Array>({ start() {} });
+    await expect(parseRemoteResponseStream("fixture-cluster", "Master", "fixture", hanging, 10)).rejects.toThrow(/timed out/);
   });
 });

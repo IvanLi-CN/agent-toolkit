@@ -37,14 +37,24 @@ function isRecordStart(line: string): RegExpExecArray | null {
   return /\["workshop-(\d+)"\]/.exec(line);
 }
 
-function braceDelta(line: string): number {
-  let opens = 0;
-  let closes = 0;
-  for (const character of line) {
-    if (character === "{") opens += 1;
-    if (character === "}") closes += 1;
+function stripConfigurationSegment(line: string, start: number, initialDepth: number): { outside: string; depth: number } {
+  let depth = initialDepth;
+  let opened = initialDepth > 0;
+  let end = -1;
+  for (let index = start; index < line.length; index += 1) {
+    const character = line[index];
+    if (character === "{") {
+      depth += 1;
+      opened = true;
+    } else if (character === "}" && opened) {
+      depth -= 1;
+      if (depth === 0) {
+        end = index;
+        break;
+      }
+    }
   }
-  return opens - closes;
+  return { outside: end >= 0 ? `${line.slice(0, start)}${line.slice(end + 1)}` : line.slice(0, start), depth };
 }
 
 export class ModOverrideParser {
@@ -70,19 +80,24 @@ export class ModOverrideParser {
     }
     if (this.current === undefined) return;
 
-    if (!this.inConfig && line.includes("configuration_options")) {
-      this.configDepth += braceDelta(line);
-      if (this.configDepth > 0) this.inConfig = true;
-    } else if (this.inConfig) {
-      this.configDepth += braceDelta(line);
-      if (this.configDepth <= 0) {
-        this.inConfig = false;
-        this.configDepth = 0;
+    let outsideLine = line;
+    if (this.inConfig) {
+      const segment = stripConfigurationSegment(line, 0, this.configDepth);
+      this.configDepth = segment.depth;
+      this.inConfig = this.configDepth > 0;
+      outsideLine = segment.outside;
+    } else {
+      const marker = line.indexOf("configuration_options");
+      if (marker >= 0) {
+        const segment = stripConfigurationSegment(line, marker, 0);
+        this.configDepth = segment.depth;
+        this.inConfig = this.configDepth > 0;
+        outsideLine = segment.outside;
       }
     }
 
-    if (this.state === "unknown" && !this.inConfig && /enabled\s*=\s*true/.test(line)) this.state = "true";
-    if (this.state === "unknown" && !this.inConfig && /enabled\s*=\s*false/.test(line)) this.state = "false";
+    if (this.state === "unknown" && !this.inConfig && /enabled\s*=\s*true/.test(outsideLine)) this.state = "true";
+    if (this.state === "unknown" && !this.inConfig && /enabled\s*=\s*false/.test(outsideLine)) this.state = "false";
   }
 
   consume(text: string): void {
@@ -235,6 +250,7 @@ export async function parseRemoteResponseStream(
   shard: "Master" | "Caves",
   filePath: string,
   stream: ReadableStream<Uint8Array>,
+  timeoutMs = REMOTE_COMMAND_TIMEOUT_MS,
 ): Promise<ShardSummary> {
   const reader = stream.getReader();
   const headerBytes: number[] = [];
@@ -243,6 +259,7 @@ export async function parseRemoteResponseStream(
   let parser: ModOverrideParser | undefined;
   let bodyDecoder: TextDecoder | undefined;
   let trailingBytes = false;
+  const deadline = Date.now() + timeoutMs;
 
   const consumeBody = (bytes: Uint8Array): void => {
     if (bytes.byteLength === 0) return;
@@ -258,7 +275,30 @@ export async function parseRemoteResponseStream(
 
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        void reader.cancel();
+        throw new Error(`remote mod collection timed out after ${timeoutMs / 1000}s`);
+      }
+      type ReadResult = Awaited<ReturnType<typeof reader.read>>;
+      const result = await new Promise<{ kind: "data"; value: ReadResult } | { kind: "timeout" }>((resolve, reject) => {
+        const timer = setTimeout(() => resolve({ kind: "timeout" }), remainingMs);
+        reader.read().then(
+          (value) => {
+            clearTimeout(timer);
+            resolve({ kind: "data", value });
+          },
+          (error) => {
+            clearTimeout(timer);
+            reject(error);
+          },
+        );
+      });
+      if (result.kind === "timeout") {
+        void reader.cancel();
+        throw new Error(`remote mod collection timed out after ${timeoutMs / 1000}s`);
+      }
+      const { done, value } = result.value;
       if (done) break;
       const bytes = value ?? new Uint8Array();
       if (header === undefined) {

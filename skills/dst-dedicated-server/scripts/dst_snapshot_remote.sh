@@ -68,7 +68,7 @@ echo
 if [[ -d "$HOME/backups" ]]; then
   echo "- backups: present"
 else
-  echo "> $HOME/backups not found."
+  echo "> <remote-home>/backups not found."
 fi
 echo
 

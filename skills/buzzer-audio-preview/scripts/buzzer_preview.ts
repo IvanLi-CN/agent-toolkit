@@ -447,7 +447,8 @@ export function encodeWav(config: ScoreConfig, events: ScoreEvent[]): Uint8Array
 }
 
 function expandUser(path: string): string {
-  return path === "~" ? homedir() : path.startsWith("~/") ? `${homedir()}/${path.slice(2)}` : path;
+  const home = process.env.HOME ?? homedir();
+  return path === "~" ? home : path.startsWith("~/") ? `${home}/${path.slice(2)}` : path;
 }
 
 class CliError extends Error {
@@ -585,7 +586,10 @@ async function readPublishState(directory: string): Promise<PublishState | undef
 
 async function restoreTransaction(directory: string, midiPath: string, wavPath: string): Promise<void> {
   const state = await readPublishState(directory);
-  if (state === undefined) return;
+  if (state === undefined) {
+    await removeTransactionDirectory(directory);
+    return;
+  }
   if (state === "complete") {
     await removeTransactionDirectory(directory);
     return;
@@ -669,9 +673,13 @@ async function acquirePublishLock(outDir: string, stem: string): Promise<() => P
         const entries = await readdir(lockDirectory, { withFileTypes: true });
         if (entries.some((entry) => entry.isDirectory() || !LOCK_ENTRY_NAMES.has(entry.name))) throw new Error("lock directory contains unknown entries");
         const age = Date.now() - metadata.mtimeMs;
-        const ownerText = await readFile(join(lockDirectory, "pid"), "utf8");
-        const owner = Number.parseInt(ownerText.trim(), 10);
-        stale = !await isProcessAlive(owner) && age > LOCK_STALE_MS;
+        if (entries.length === 0) {
+          stale = age > LOCK_STALE_MS;
+        } else {
+          const ownerText = await readFile(join(lockDirectory, "pid"), "utf8");
+          const owner = Number.parseInt(ownerText.trim(), 10);
+          stale = !await isProcessAlive(owner) && age > LOCK_STALE_MS;
+        }
       } catch {
         stale = false;
       }
@@ -740,14 +748,19 @@ async function publishOutputs(outDir: string, stem: string, midi: Uint8Array, wa
 }
 
 export async function readPublishedPair(outDir: string, stem: string): Promise<{ midi: Uint8Array; wav: Uint8Array }> {
+  validateStem(stem);
+  const midiPath = resolve(outDir, `${stem}.mid`);
+  const wavPath = resolve(outDir, `${stem}.wav`);
   let lastError: unknown;
-  for (let attempt = 0; attempt < 50; attempt += 1) {
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
     try {
       const release = await acquirePublishLock(outDir, stem);
       try {
+        await recoverPublishTransactions(outDir, stem, midiPath, wavPath);
         return {
-          midi: await readFile(resolve(outDir, `${stem}.mid`)),
-          wav: await readFile(resolve(outDir, `${stem}.wav`)),
+          midi: await readFile(midiPath),
+          wav: await readFile(wavPath),
         };
       } finally {
         await release();

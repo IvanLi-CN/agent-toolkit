@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -273,6 +273,52 @@ describe("buzzer MIDI and WAV helper", () => {
       await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
       expect(await main(["--in", input, "--out-dir", output])).toBe(1);
       expect(await readFile(sentinel, "utf8")).toBe("keep");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("reclaims an aged empty lock directory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-empty-lock-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      const lock = join(output, ".buzzer-preview-fixture.lock");
+      await mkdir(lock, { recursive: true });
+      const old = new Date(Date.now() - 10 * 60 * 1000);
+      await utimes(lock, old, old);
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      expect(await main(["--in", input, "--out-dir", output])).toBe(0);
+      expect(await readdir(output)).not.toContain(".buzzer-preview-fixture.lock");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("recovers an interrupted publication before reading a pair", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-recovery-"));
+    try {
+      const output = join(root, "out");
+      const transaction = join(output, ".buzzer-preview-txn-fixture-recovery");
+      await mkdir(transaction, { recursive: true });
+      await writeFile(join(output, "fixture.mid"), "new-midi");
+      await writeFile(join(output, "fixture.wav"), "old-wav");
+      await writeFile(join(transaction, "midi.backup"), "old-midi");
+      await writeFile(join(transaction, ".state"), "midi-published\n");
+      const pair = await readPublishedPair(output, "fixture");
+      const decoder = new TextDecoder();
+      expect(decoder.decode(pair.midi)).toBe("old-midi");
+      expect(decoder.decode(pair.wav)).toBe("old-wav");
+      expect(await readdir(output)).not.toContain(".buzzer-preview-txn-fixture-recovery");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects path traversal through the published pair API", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-pair-boundary-"));
+    try {
+      await expect(readPublishedPair(root, "../outside")).rejects.toThrow(/without path separators/);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

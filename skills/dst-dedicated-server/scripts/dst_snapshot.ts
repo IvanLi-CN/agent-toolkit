@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { lstat, mkdtemp, open, opendir, rename, rm, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { spawnSupervised, type SupervisedChild } from "./process_supervisor.ts";
 
 interface SnapshotOptions {
   host: string;
@@ -34,11 +35,11 @@ function expandUser(path: string): string {
   return path === "~" ? home : path.startsWith("~/") ? `${home}/${path.slice(2)}` : path;
 }
 
-function killProcessTree(child: Bun.Subprocess, signal: "SIGTERM" | "SIGKILL"): void {
+function killProcessTree(supervised: SupervisedChild, signal: "SIGTERM" | "SIGKILL"): void {
   if (process.platform !== "win32") {
-    try { process.kill(-child.pid, signal); } catch { /* The process may already be gone. */ }
+    try { process.kill(-supervised.child.pid, signal); } catch { /* The supervisor may already be gone. */ }
   }
-  try { child.kill(signal); } catch { /* The process may already be gone. */ }
+  try { supervised.child.kill(signal); } catch { /* The supervisor may already be gone. */ }
 }
 
 export const MAX_REMOTE_OUTPUT_BYTES = 256 * 1024;
@@ -81,14 +82,15 @@ async function runWithStdin(
   timeoutMs = REMOTE_COMMAND_TIMEOUT_MS,
   maxOutputBytes = MAX_REMOTE_OUTPUT_BYTES,
 ): Promise<CommandResult> {
-  const child = Bun.spawn(args, { detached: true, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
-  const exitPromise = child.exited;
+  const supervised = await spawnSupervised(args);
+  const child = supervised.child;
+  const exitPromise = supervised.exited;
   let timedOut = false;
   let outputTruncated = false;
   let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
   const requestStop = () => {
-    killProcessTree(child, "SIGTERM");
-    if (forceKillTimer === undefined) forceKillTimer = setTimeout(() => killProcessTree(child, "SIGKILL"), 1_000);
+    killProcessTree(supervised, "SIGTERM");
+    if (forceKillTimer === undefined) forceKillTimer = setTimeout(() => killProcessTree(supervised, "SIGKILL"), 1_000);
   };
   const stopForLimit = () => {
     outputTruncated = true;
@@ -105,8 +107,7 @@ async function runWithStdin(
       requestStop();
     }, timeoutMs);
     const exitCode = await exitPromise;
-    // The leader can exit while a descendant still owns stdout or stderr. Stop the
-    // process group before awaiting those streams so cleanup cannot hang forever.
+    // The supervisor remains as the verified process-group anchor while descendants drain.
     requestStop();
     const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
     return {
@@ -120,10 +121,11 @@ async function runWithStdin(
     if (timeout !== undefined) clearTimeout(timeout);
     if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
     requestStop();
-    await Promise.race([exitPromise.then(() => undefined, () => undefined), new Promise<void>((resolve) => setTimeout(resolve, 1_000))]);
-    killProcessTree(child, "SIGKILL");
-    await Promise.race([exitPromise.then(() => undefined, () => undefined), new Promise<void>((resolve) => setTimeout(resolve, 1_000))]);
+    await Promise.race([supervised.wrapperExited.then(() => undefined, () => undefined), new Promise<void>((resolve) => setTimeout(resolve, 1_000))]);
+    killProcessTree(supervised, "SIGKILL");
+    await Promise.race([supervised.wrapperExited.then(() => undefined, () => undefined), new Promise<void>((resolve) => setTimeout(resolve, 1_000))]);
     if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
+    await supervised.cleanup();
   }
 }
 
@@ -172,12 +174,12 @@ export function redactSensitiveText(text: string): string {
   return redacted.split(/\r?\n/).map((line) => UNREDACTED_SENSITIVE_ASSIGNMENT.test(line) ? "[REDACTED]" : line).join("\n");
 }
 
-function redactOperationalText(text: string, values: string[] = []): string {
+export function redactOperationalText(text: string, values: string[] = []): string {
   let redacted = text;
   for (const value of values.filter((candidate) => candidate.length > 0).sort((left, right) => right.length - left.length)) {
     redacted = redacted.split(value).join("<redacted-path>");
   }
-  return redactSensitiveText(redacted);
+  return redactSensitiveText(redacted).replace(/(?:\/Users|\/home|\/root|\/private|\/tmp|\/var|\/opt|\/srv|\/etc)\/[^\s"'<>`]+/g, "<redacted-path>");
 }
 
 export function validateSshToken(value: string, label: string): void {

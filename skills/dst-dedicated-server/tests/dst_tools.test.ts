@@ -259,13 +259,15 @@ esac
       expect(result.stdout).toContain("modoverrides.lua: missing");
       expect(result.stdout).not.toContain("configuration_options");
 
-      await writeFile(fakeSsh, "#!/bin/sh\ncase \"$*\" in\n  *\"echo ok\"*) exit 0 ;;\n  *) cat >/dev/null; echo 'denied api_key=fixture-secret' >&2; exit 1 ;;\nesac\n");
+      const leakedPath = ["/home", "fixture-user", "private"].join("/");
+      await writeFile(fakeSsh, `#!/bin/sh\ncase "$*" in\n  *"echo ok"*) exit 0 ;;\n  *) cat >/dev/null; echo 'denied ${leakedPath} api_key=fixture-secret' >&2; exit 1 ;;\nesac\n`);
       await chmod(fakeSsh, 0o755);
       const failed = await runTool(join(import.meta.dir, "..", "scripts", "dst_mods_from_modoverrides.ts"), ["--host", "fixture-host", "--user", "fixture-user", "--cluster", "fixture-cluster"], env);
       expect(failed.status).toBe(1);
       expect(failed.stderr).toContain("denied");
       expect(failed.stderr).toContain("api_key=[REDACTED]");
       expect(failed.stderr).not.toContain("fixture-secret");
+      expect(failed.stderr).not.toContain(leakedPath);
 
       const snapshotOutput = join(root, "remote-failure-snapshot.md");
       const snapshotResult = await runTool(

@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { join } from "node:path";
-import { redactSensitiveText } from "./dst_snapshot.ts";
+import { REMOTE_COMMAND_TIMEOUT_MS, redactSensitiveText } from "./dst_snapshot.ts";
 
 export const MAX_MOD_OVERRIDE_BYTES = 1024 * 1024;
 
@@ -328,6 +328,9 @@ export function parseArgs(args: string[], env: Record<string, string | undefined
   if (host.length === 0) throw new CliError("error: --host or DST_HOST is required");
   if (user.length === 0) throw new CliError("error: --user or DST_USER is required");
   if (cluster.length === 0) throw new CliError("error: --cluster or DST_CLUSTER is required");
+  if (cluster === "." || cluster === ".." || cluster.includes("/") || cluster.includes("\\") || cluster.includes("\0")) {
+    throw new CliError("error: --cluster must be a single path segment");
+  }
   return { host, user, cluster, shard };
 }
 
@@ -352,20 +355,32 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
       const child = startRemote(script, parsed, shard);
       const filePath = `~/.klei/DoNotStarveTogether/${parsed.cluster}/${shard}/modoverrides.lua`;
       const stderrPromise = readText(child.stderr);
+      let timedOut = false;
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        child.kill();
+      }, REMOTE_COMMAND_TIMEOUT_MS);
       let summary: ShardSummary;
       try {
-        summary = await parseRemoteResponseStream(parsed.cluster, shard, filePath, child.stdout);
-      } catch (error) {
-        await drain(child.stdout);
+        try {
+          summary = await parseRemoteResponseStream(parsed.cluster, shard, filePath, child.stdout);
+        } catch (error) {
+          child.kill();
+          await drain(child.stdout);
+          const [exitCode, stderr] = await Promise.all([child.exited, stderrPromise]);
+          const detail = redactSensitiveText(stderr.trim());
+          if (timedOut) throw new Error(`SSH collection timed out after ${REMOTE_COMMAND_TIMEOUT_MS / 1000}s`);
+          if (exitCode !== 0 && detail.length > 0) throw new Error(detail);
+          throw error;
+        }
         const [exitCode, stderr] = await Promise.all([child.exited, stderrPromise]);
-        const detail = redactSensitiveText(stderr.trim());
-        if (exitCode !== 0 && detail.length > 0) throw new Error(detail);
-        throw error;
-      }
-      const [exitCode, stderr] = await Promise.all([child.exited, stderrPromise]);
-      if (exitCode !== 0) {
-        const detail = redactSensitiveText(stderr.trim());
-        throw new Error(detail || `SSH collection failed for ${shard}`);
+        if (timedOut) throw new Error(`SSH collection timed out after ${REMOTE_COMMAND_TIMEOUT_MS / 1000}s`);
+        if (exitCode !== 0) {
+          const detail = redactSensitiveText(stderr.trim());
+          throw new Error(detail || `SSH collection failed for ${shard}`);
+        }
+      } finally {
+        clearTimeout(timeout);
       }
       summaries.push(summary);
     }

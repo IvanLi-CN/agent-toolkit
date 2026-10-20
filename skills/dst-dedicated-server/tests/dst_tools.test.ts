@@ -6,11 +6,12 @@ import {
   MAX_MOD_OVERRIDE_BYTES,
   parseRemoteResponseStream,
   parseModOverrides,
+  parseArgs,
   renderDiff,
   renderSummary,
   type ShardSummary,
 } from "../scripts/dst_mods_from_modoverrides.ts";
-import { main as snapshotMain } from "../scripts/dst_snapshot.ts";
+import { main as snapshotMain, MAX_REMOTE_OUTPUT_BYTES, redactSensitiveText } from "../scripts/dst_snapshot.ts";
 
 async function runTool(script: string, args: string[], env: Record<string, string>): Promise<{ status: number; stdout: string; stderr: string }> {
   const child = Bun.spawn([process.execPath, script, ...args], { env, stdout: "pipe", stderr: "pipe" });
@@ -28,6 +29,16 @@ function byteStream(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
 }
 
 describe("DST local Bun tooling", () => {
+  test("redacts bearer and escaped quoted secrets completely", () => {
+    expect(redactSensitiveText("Authorization: Bearer fixture-secret")).toBe("Authorization: [REDACTED]");
+    expect(redactSensitiveText('api_key="prefix\\"LEAK"')).toBe("api_key=[REDACTED]");
+  });
+
+  test("rejects cluster path traversal before opening SSH", () => {
+    expect(() => parseArgs(["--host", "fixture-host", "--user", "fixture-user", "--cluster", "../escape"], {})).toThrow(/single path segment/);
+    expect(() => parseArgs(["--host", "fixture-host", "--user", "fixture-user", "--cluster", "fixture\\escape"], {})).toThrow(/single path segment/);
+  });
+
   test("parses nested mod configuration without executing Lua and renders shard differences", () => {
     const source = `return {
   ["workshop-200"] = {
@@ -198,6 +209,34 @@ esac
       const report = await readFile(output, "utf8");
       expect(report).toContain("api_key=[REDACTED]");
       expect(report).not.toContain("fixture-secret");
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects an oversized remote snapshot before writing unbounded output", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-limit-"));
+    const previousPath = process.env.PATH;
+    try {
+      const fakeSsh = join(root, "ssh");
+      await writeFile(fakeSsh, `#!/bin/sh
+case "$*" in
+  *"echo ok"*) exit 0 ;;
+  *) head -c $(( ${MAX_REMOTE_OUTPUT_BYTES} + 1 )) /dev/zero ;;
+esac
+`);
+      await chmod(fakeSsh, 0o755);
+      process.env.PATH = `${root}:${previousPath ?? ""}`;
+      const output = join(root, "snapshot.md");
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
+        ["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", output],
+        { ...process.env, PATH: process.env.PATH } as Record<string, string>,
+      );
+      expect(result.status).toBe(1);
+      expect(await readFile(output, "utf8")).toContain("output limit");
     } finally {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;

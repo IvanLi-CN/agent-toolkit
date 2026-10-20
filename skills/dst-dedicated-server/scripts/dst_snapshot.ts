@@ -18,6 +18,8 @@ interface CommandResult {
   exitCode: number;
   stdout: string;
   stderr: string;
+  outputTruncated?: boolean;
+  timedOut?: boolean;
 }
 
 class CliError extends Error {
@@ -40,16 +42,62 @@ function runSync(args: string[]): CommandResult {
   return { exitCode: result.exitCode, stdout: decode(result.stdout), stderr: decode(result.stderr) };
 }
 
+export const MAX_REMOTE_OUTPUT_BYTES = 256 * 1024;
+export const REMOTE_COMMAND_TIMEOUT_MS = 30_000;
+
+async function readBounded(stream: ReadableStream<Uint8Array>, maxBytes: number, onLimit: () => void): Promise<{ text: string; truncated: boolean }> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  let remaining = maxBytes;
+  let truncated = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = value ?? new Uint8Array();
+      if (chunk.byteLength > remaining) {
+        text += decoder.decode(chunk.slice(0, remaining), { stream: true });
+        truncated = true;
+        onLimit();
+        await reader.cancel();
+        break;
+      }
+      text += decoder.decode(chunk, { stream: true });
+      remaining -= chunk.byteLength;
+    }
+    return { text: text + decoder.decode(), truncated };
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 async function runWithStdin(args: string[], input: string): Promise<CommandResult> {
   const child = Bun.spawn(args, { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
   child.stdin.write(input);
   child.stdin.end();
-  const [exitCode, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ]);
-  return { exitCode, stdout, stderr };
+  let timedOut = false;
+  let outputTruncated = false;
+  const stopForLimit = () => {
+    outputTruncated = true;
+    child.kill();
+  };
+  const stdoutPromise = readBounded(child.stdout, MAX_REMOTE_OUTPUT_BYTES, stopForLimit);
+  const stderrPromise = readBounded(child.stderr, MAX_REMOTE_OUTPUT_BYTES, stopForLimit);
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    child.kill();
+  }, REMOTE_COMMAND_TIMEOUT_MS);
+  const exitCode = await child.exited;
+  clearTimeout(timeout);
+  const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
+  return {
+    exitCode,
+    stdout: stdout.text,
+    stderr: stderr.text,
+    outputTruncated: outputTruncated || stdout.truncated || stderr.truncated,
+    timedOut,
+  };
 }
 
 function isoTimestamp(): string {
@@ -65,7 +113,7 @@ function fileTimestamp(): string {
 const SENSITIVE_NAME = "(?:password|passwd|secret|token|credential|private[_ -]?key|api[_ -]?key|access[_ -]?key|authorization|bearer)";
 const SENSITIVE_MARKER = new RegExp(SENSITIVE_NAME, "i");
 const SENSITIVE_ASSIGNMENT = new RegExp(
-  `((?:[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*)\\s*[:=]\\s*)(?:"[^"]*"|'[^']*'|[^\\s,;]+)`,
+  `((?:[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*)\\s*[:=]\\s*)("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|Bearer\\s+[^\\s,;]+|[^\\s,;]+)`,
   "gi",
 );
 
@@ -209,6 +257,14 @@ async function remoteCollect(options: SnapshotOptions, script: string): Promise<
   }
 
   const result = await runWithStdin(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", target, "bash", "-s"], script);
+  if (result.timedOut) {
+    lines.push(`> Remote collection timed out after ${REMOTE_COMMAND_TIMEOUT_MS / 1000}s.`, "");
+    return { text: lines.join("\n"), failed: true };
+  }
+  if (result.outputTruncated) {
+    lines.push(`> Remote collection exceeded the ${MAX_REMOTE_OUTPUT_BYTES}-byte output limit.`, "");
+    return { text: lines.join("\n"), failed: true };
+  }
   if (result.exitCode !== 0) {
     lines.push("> Remote collection command failed.");
     const detail = redactSensitiveText(result.stderr.trim());

@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, mkdtemp, open, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, readdir, readFile, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 
@@ -519,6 +519,10 @@ async function pathExists(path: string): Promise<boolean> {
 
 async function moveIfPresent(source: string, destination: string): Promise<boolean> {
   try {
+    const metadata = await lstat(source);
+    if (!metadata.isFile() && !metadata.isSymbolicLink()) {
+      throw new Error(`output path is not a regular file or symlink: ${source}`);
+    }
     await rename(source, destination);
     return true;
   } catch (error) {
@@ -548,6 +552,18 @@ async function syncDirectory(path: string): Promise<void> {
   }
 }
 
+async function removeTransactionDirectory(directory: string): Promise<void> {
+  let entries;
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  if (entries.some((entry) => entry.isDirectory())) return;
+  for (const entry of entries) await unlink(join(directory, entry.name)).catch(() => undefined);
+  await rmdir(directory).catch(() => undefined);
+}
+
 async function writePublishState(directory: string, state: PublishState): Promise<void> {
   const temporary = join(directory, ".state.tmp");
   await writeFile(temporary, `${state}\n`, { mode: 0o600 });
@@ -568,7 +584,7 @@ async function readPublishState(directory: string): Promise<PublishState | undef
 async function restoreTransaction(directory: string, midiPath: string, wavPath: string): Promise<void> {
   const state = await readPublishState(directory);
   if (state === "complete") {
-    await rm(directory, { recursive: true, force: true });
+    await removeTransactionDirectory(directory);
     return;
   }
 
@@ -586,7 +602,7 @@ async function restoreTransaction(directory: string, midiPath: string, wavPath: 
   }
   if (state === "midi-published" && !hasMidiBackup) await removeFile(midiPath);
   await syncDirectory(dirname(midiPath));
-  await rm(directory, { recursive: true, force: true });
+  await removeTransactionDirectory(directory);
 }
 
 async function recoverPublishTransactions(outDir: string, stem: string, midiPath: string, wavPath: string): Promise<void> {
@@ -638,7 +654,13 @@ async function acquirePublishLock(outDir: string, stem: string): Promise<() => P
         }
       }
       if (!stale) throw new Error("output publication is already in progress");
-      await rm(lockDirectory, { recursive: true, force: true });
+      const quarantine = join(outDir, `.buzzer-preview-reclaim-${stem}-${randomUUID()}`);
+      try {
+        await rename(lockDirectory, quarantine);
+      } catch {
+        continue;
+      }
+      await rm(quarantine, { recursive: true, force: true });
     }
   }
   throw new Error("could not acquire output publication lock");
@@ -664,8 +686,8 @@ async function publishOutputsLocked(outDir: string, stem: string, midi: Uint8Arr
     await rename(tempMidiPath, midiPath);
     await writePublishState(transaction, "midi-published");
     await rename(tempWavPath, wavPath);
-    await writePublishState(transaction, "complete");
     await syncDirectory(outDir);
+    await writePublishState(transaction, "complete");
     return [midiPath, wavPath];
   } catch (error) {
     await restoreTransaction(transaction, midiPath, wavPath).catch(() => undefined);
@@ -673,7 +695,7 @@ async function publishOutputsLocked(outDir: string, stem: string, midi: Uint8Arr
   } finally {
     await unlink(tempMidiPath).catch(() => undefined);
     await unlink(tempWavPath).catch(() => undefined);
-    await rm(transaction, { recursive: true, force: true });
+    await removeTransactionDirectory(transaction);
   }
 }
 

@@ -226,6 +226,23 @@ describe("buzzer MIDI and WAV helper", () => {
     }
   });
 
+  test("rejects output directories without deleting their contents", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-directory-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      const midiDirectory = join(output, "fixture.mid");
+      const sentinel = join(midiDirectory, "sentinel.txt");
+      await mkdir(midiDirectory, { recursive: true });
+      await writeFile(sentinel, "keep");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      expect(await main(["--in", input, "--out-dir", output])).toBe(1);
+      expect(await readFile(sentinel, "utf8")).toBe("keep");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("serializes concurrent pair publication", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-concurrent-"));
     try {

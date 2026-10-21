@@ -1129,4 +1129,53 @@ esac
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  test("fails closed when detached descendant enumeration is truncated", { timeout: 30_000 }, async () => {
+    if (process.platform === "win32") return;
+    const setsidCheck = Bun.spawnSync(["sh", "-c", "command -v setsid"], { stdout: "ignore", stderr: "ignore" });
+    if (setsidCheck.exitCode !== 0) return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-descendant-cap-"));
+    const pidFile = join(root, "descendants.pid");
+    const readyFile = join(root, "ready");
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    let descendantPids: number[] = [];
+    try {
+      supervised = await spawnSupervised([
+        "sh",
+        "-c",
+        "i=0; while [ \"$i\" -lt 1025 ]; do setsid sleep 30 & printf '%s\\n' \"$!\" >> \"$1\"; i=$((i + 1)); done; printf ready > \"$2\"; while :; do sleep 1; done",
+        "agent-toolkit-supervised-target",
+        pidFile,
+        readyFile,
+      ]);
+      for (let attempt = 0; attempt < 240; attempt += 1) {
+        try {
+          descendantPids = (await readFile(pidFile, "utf8")).split(/\s+/).filter(Boolean).map(Number).filter(Number.isInteger);
+          if (descendantPids.length >= 1025 && (await readFile(readyFile, "utf8")).trim() === "ready") break;
+        } catch {
+          // The target may still be spawning its detached children.
+        }
+        await Bun.sleep(25);
+      }
+      expect(descendantPids.length).toBeGreaterThanOrEqual(1025);
+      supervised.child.kill("SIGTERM");
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(false);
+      await supervised.wrapperExited;
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      try {
+        descendantPids = (await readFile(pidFile, "utf8")).split(/\s+/).filter(Boolean).map(Number).filter(Number.isInteger);
+      } catch {
+        // The target may have exited before writing its full PID list.
+      }
+      for (const pid of descendantPids) {
+        try { process.kill(pid, "SIGKILL"); } catch { /* The detached process may have exited. */ }
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });

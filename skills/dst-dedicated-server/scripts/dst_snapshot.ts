@@ -214,6 +214,7 @@ async function syncDirectory(path: string): Promise<void> {
 }
 
 const SENSITIVE_NAME = "(?:password|passwd|pass[ _-]?phrase|pwd|secret|token|credential(?:s)?|jwt|private[_ -]?key|api[_ -]?key|access[_ -]?key|signing[_ -]?key|encryption[_ -]?key|database[_ -]?url|mongo[_ -]?uri|authorization|bearer|cookie|set[ _-]?cookie|session(?:[_ -]?id)?)";
+const SENSITIVE_BARE_KEY = `(?:[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*)`;
 const SENSITIVE_KEY = `(?:[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*|"[^"\\r\\n]*${SENSITIVE_NAME}[^"\\r\\n]*"|'[^'\\r\\n]*${SENSITIVE_NAME}[^'\\r\\n]*')`;
 const SENSITIVE_KEY_TOKEN = `(?:[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*|\\[[^\\]\\r\\n]*${SENSITIVE_NAME}[^\\]\\r\\n]*\\])`;
 const SENSITIVE_ASSIGNMENT = new RegExp(
@@ -224,8 +225,8 @@ const SENSITIVE_QUOTED_ASSIGNMENT = new RegExp(
   `(${SENSITIVE_KEY}\\s*[:=]\\s*)(?!\\s*\\[REDACTED\\])("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|(?:Bearer|Basic)\\s+[^;\\r\\n]+?(?=[ \\t]+\\b${SENSITIVE_NAME}\\b(?:[ \\t]+|[:=])|\\r?\\n|$)|[^;\\r\\n]+?(?=[ \\t]+\\b${SENSITIVE_NAME}\\b(?:[ \\t]+|[:=])|\\r?\\n|$))`,
   "gi",
 );
-const SENSITIVE_BARE_VALUE = new RegExp(`\\b(${SENSITIVE_NAME})\\s+(?![A-Za-z0-9_.-]+\\s*[:=]|\\[REDACTED\\])([^,;\\r\\n]+?)(?=(?:\\s+(?:via|and)\\s+)|[,;\\r\\n]|$)`, "gi");
-const UNREDACTED_SENSITIVE_ASSIGNMENT = new RegExp(`(?:\\b${SENSITIVE_NAME}|${SENSITIVE_KEY})\\s*[:=](?!\\s*\\[REDACTED\\])`, "i");
+const SENSITIVE_BARE_VALUE = new RegExp(`(?<![A-Za-z0-9_.-])(${SENSITIVE_BARE_KEY})\\s+(?![A-Za-z0-9_.-]+\\s*[:=]|\\[REDACTED\\])([^,;\\r\\n]+?)(?=(?:\\s+(?:via|and)\\s+)|[,;\\r\\n]|$)`, "gi");
+const UNREDACTED_SENSITIVE_ASSIGNMENT = new RegExp(`(?:${SENSITIVE_BARE_KEY}|${SENSITIVE_KEY})\\s*[:=](?!\\s*\\[REDACTED\\])`, "i");
 const AUTHORIZATION_TOKEN = /\b(Bearer|Basic)(?:\s*[:=])?\s*([^\s,;]+)/gi;
 const JSON_AUTHORIZATION_ASSIGNMENT = /(["'])(Bearer|Basic)\1\s*:\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^,}\r\n]+)/gi;
 const BRACKETED_SENSITIVE_ASSIGNMENT = new RegExp(`(\\[[^\\]\\r\\n]*${SENSITIVE_NAME}[^\\]\\r\\n]*\\]\\s*[:=]\\s*)(?!\\s*\\[REDACTED\\])([^\\r\\n]+)`, "gi");
@@ -233,6 +234,7 @@ const ENCODED_SENSITIVE_ASSIGNMENT = new RegExp(`(\\b[A-Za-z0-9_.-]*${SENSITIVE_
 const SENSITIVE_BLOCK_HEADER = new RegExp(`^([ \\t]*${SENSITIVE_KEY_TOKEN}\\s*[:=]\\s*[|>][-+0-9]*)\\s*$`, "i");
 const PRIVATE_KEY_BLOCK = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/gi;
 const SENSITIVE_FILENAME = new RegExp("(?<![A-Za-z0-9])(?:[A-Za-z0-9_.-]*(?:" + SENSITIVE_NAME + "|env|id[_ -]?rsa|private[._-]?(?:key|pem)|api[._-]?key|auth[._-]?json)[A-Za-z0-9_.-]*)(?![A-Za-z0-9])", "gi");
+const RAW_JWT = /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+(?![A-Za-z0-9_-])/g;
 const ANSI_ESCAPE = /\u001B(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001B\\))/g;
 const CONTROL_CHARACTERS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g;
 const SENSITIVE_MULTILINE_ASSIGNMENT = new RegExp(`(${SENSITIVE_KEY_TOKEN}\\s*[:=])\\s*\\r?\\n(?:[ \\t]+[^\\r\\n]*(?:\\r?\\n|$))+`, "gi");
@@ -357,7 +359,8 @@ export function redactSensitiveText(text: string): string {
     .replace(ENCODED_SENSITIVE_ASSIGNMENT, "$1[REDACTED]")
     .replace(SENSITIVE_ASSIGNMENT, "$1[REDACTED]")
     .replace(SENSITIVE_QUOTED_ASSIGNMENT, "$1[REDACTED]")
-    .replace(SENSITIVE_BARE_VALUE, "$1 [REDACTED]");
+    .replace(SENSITIVE_BARE_VALUE, "$1 [REDACTED]")
+    .replace(RAW_JWT, "[REDACTED JWT]");
   return redacted.split(/\r?\n/).map((line) => UNREDACTED_SENSITIVE_ASSIGNMENT.test(line) ? "[REDACTED]" : line).join("\n");
 }
 
@@ -486,10 +489,7 @@ async function boundedDirectoryEntries(path: string, limit = MAX_LOCAL_DIRECTORY
 function renderBoundedDirectoryOverview(entries: Dirent[], truncated: boolean, redactions: string[]): string {
   const lines = entries.map((entry) => {
     const kind = entry.isDirectory() ? "dir" : entry.isSymbolicLink() ? "symlink" : entry.isFile() ? "file" : "other";
-    const displayName = JSON.stringify(entry.name)
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;");
+    const displayName = escapeReportName(entry.name);
     return `- ${kind}: <code>${displayName}</code>`;
   });
   if (truncated) lines.push(`> Directory entry scan truncated at ${MAX_LOCAL_DIRECTORY_ENTRIES} entries.`);
@@ -510,11 +510,15 @@ function escapeReportName(name: string): string {
   return JSON.stringify(name)
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;");
+    .replaceAll(">", "&gt;")
+    .replaceAll("[", "&#91;")
+    .replaceAll("]", "&#93;")
+    .replaceAll("(", "&#40;")
+    .replaceAll(")", "&#41;");
 }
 
 function redactReportName(name: string): string {
-  return escapeReportName(redactSensitiveText(name).replace(SENSITIVE_FILENAME, "<redacted-name>"));
+  return `<code>${escapeReportName(redactSensitiveText(name).replace(SENSITIVE_FILENAME, "<redacted-name>"))}</code>`;
 }
 
 async function renderKnownLogListing(localDir: string, entries: Dirent[], redactions: string[]): Promise<string> {
@@ -693,7 +697,7 @@ async function cleanupSnapshotTemporaryDirectories(root: string): Promise<void> 
       try {
         const metadata = await lstat(path);
         if (!metadata.isDirectory() || metadata.isSymbolicLink() || Date.now() - metadata.mtimeMs < SNAPSHOT_TEMP_STALE_MS) continue;
-        if (await readMarkerForCleanup(join(path, ".owner")) !== true) continue;
+        if (await readMarkerForCleanup(join(path, ".owner")) === false) continue;
         await rm(path, { recursive: true, force: true, maxRetries: 0 });
       } catch {
         // Preserve a concurrently changing directory for a later invocation.

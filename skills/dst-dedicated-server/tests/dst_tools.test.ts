@@ -86,7 +86,11 @@ describe("DST local Bun tooling", () => {
     expect(redactSensitiveText(mixedSecrets)).toBe("passphrase=[REDACTED] pwd [REDACTED]");
     expect(redactOperationalText("permission denied: foo\\..\\private\\fixture-secret")).toContain("<redacted-path>");
     expect(redactOperationalText("provider credentials fixture-secret")).not.toContain("fixture-secret");
+    expect(redactOperationalText("access_token fixture-access-token-secret")).not.toContain("fixture-access-token-secret");
+    expect(redactOperationalText("accessToken fixture-camel-token-secret")).not.toContain("fixture-camel-token-secret");
     expect(redactOperationalText("JWT fixture-jwt-secret")).not.toContain("fixture-jwt-secret");
+    const rawJwt = ["eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9", "eyJzdWIiOiJmaXh0dXJlIn0", "fixture-signature-secret"].join(".");
+    expect(redactOperationalText(`remote output ${rawJwt}`)).not.toContain(rawJwt);
   });
 
   test("does not expose a secret that crosses the bounded log tail", async () => {
@@ -296,6 +300,8 @@ describe("DST local Bun tooling", () => {
       expect(report).toContain("&lt;svg&gt;");
       expect(report).not.toContain("<svg>");
       expect(report).not.toContain("\n- forged [link]");
+      expect(report).not.toContain("[link](url)");
+      expect(report).toContain("&#91;link&#93;&#40;url&#41;");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -771,9 +777,14 @@ esac
       await writeFile(join(stale, ".owner"), "agent-toolkit-dst-snapshot-v1\n");
       const old = new Date(Date.now() - 20 * 60 * 1000);
       await utimes(stale, old, old);
+      const ownerless = join(tempRoot, ".dst-snapshot-tmp-ownerless");
+      await mkdir(ownerless);
+      await writeFile(join(ownerless, "partial.md"), "interrupted");
+      await utimes(ownerless, old, old);
       const output = join(root, "snapshot.md");
       expect(await snapshotMain(["--no-local", "--no-remote", "--out", output])).toBe(0);
       expect(await readdir(tempRoot)).not.toContain(".dst-snapshot-tmp-stale");
+      expect(await readdir(tempRoot)).not.toContain(".dst-snapshot-tmp-ownerless");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

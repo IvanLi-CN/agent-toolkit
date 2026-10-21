@@ -24,7 +24,7 @@ target_pgid=""
 if command -v setsid >/dev/null 2>&1; then
   target_pgid="pending"
   target_anchor_path="$status_dir/target"
-  setsid sh -c 'printf "%s\\n" "$$" > "$1"; shift; exec "$@"' agent-toolkit-target "$target_anchor_path" "$@" &
+  setsid -w sh -c 'printf "%s\\n" "$$" > "$1"; shift; exec "$@"' agent-toolkit-target "$target_anchor_path" "$@" &
 else
   set -m 2>/dev/null || true
   "$@" &
@@ -115,7 +115,7 @@ watch_parent() {
 }
 watch_parent &
 watchdog_pid=$!
-wait "$target_pid"
+wait "$target_launcher_pid"
 target_status=$?
 kill "$watchdog_pid" 2>/dev/null || true
 wait "$watchdog_pid" 2>/dev/null || true

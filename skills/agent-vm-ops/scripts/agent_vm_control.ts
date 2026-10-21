@@ -1672,10 +1672,15 @@ export class CommandRunner {
         addKnown(descendants.members);
         addBoundEnvironmentMembers();
         addKnown(processPipeMembers(leaderPipeTargets, pipeScope()).members);
+        let processTreeComplete = true;
+        if (leaderPgid !== undefined && leaderIdentity !== undefined) {
+          const leaderGroup = anchoredProcessGroupMembers(leaderPgid, [{ pid: processHandle.pid, starttime: leaderIdentity }]);
+          processTreeComplete &&= leaderGroup.complete;
+          addKnown(leaderGroup.members);
+        }
         const term = safeProcessSignal(processHandle.pid, leaderIdentity, 15, true, leaderPgid, leaderGroupAnchored);
         const leaderExitedAfterTerm = await Promise.race([exit.then(() => true), sleep(250).then(() => false)]);
         let processGroupCleanupError: string | null = identityMismatch ? "process_identity_mismatch" : term.error;
-        let processTreeComplete = true;
         let tree = { killed: true, error: null as string | null };
         let groupKill = { sent: false, error: null as string | null };
         let directKill = { sent: false, error: null as string | null };

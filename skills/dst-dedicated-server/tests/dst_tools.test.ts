@@ -89,8 +89,8 @@ describe("DST local Bun tooling", () => {
     expect(redactOperationalText("access_token fixture-access-token-secret")).not.toContain("fixture-access-token-secret");
     expect(redactOperationalText("accessToken fixture-camel-token-secret")).not.toContain("fixture-camel-token-secret");
     expect(redactOperationalText("JWT fixture-jwt-secret")).not.toContain("fixture-jwt-secret");
-    const rawJwt = ["eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9", "eyJzdWIiOiJmaXh0dXJlIn0", "fixture-signature-secret"].join(".");
-    expect(redactOperationalText(`remote output ${rawJwt}`)).not.toContain(rawJwt);
+    const rawJwt = ["eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9", "eyJzdWIiOiJmaXh0dXJlIn0", "fixture_signature-secret-01"].join(".");
+    expect(redactSensitiveText(rawJwt)).toBe("[REDACTED JWT]");
   });
 
   test("does not expose a secret that crosses the bounded log tail", async () => {

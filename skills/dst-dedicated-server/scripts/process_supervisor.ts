@@ -113,19 +113,20 @@ watch_parent() {
   sleep 1
   signal_tree KILL
 }
-watch_parent &
+watch_parent </dev/null >/dev/null 2>&1 &
 watchdog_pid=$!
 wait "$target_launcher_pid"
 target_status=$?
-kill "$watchdog_pid" 2>/dev/null || true
-wait "$watchdog_pid" 2>/dev/null || true
 if ! parent_is_alive; then
+  signal_tree TERM
+  sleep 1
+  signal_tree KILL
   cleanup
   exit 143
 fi
 printf '%s\\n' "$target_status" > "$status_path"
 exec 0<&- 1>&- 2>&-
-sleep 5
+wait "$watchdog_pid"
 cleanup
 `;
 

@@ -11,6 +11,7 @@ import {
   MAX_SCORE_EVENTS,
   main,
   parseScore,
+  parseScoreFile,
   parseArgs,
   readPublishedPair,
   type ScoreConfig,
@@ -164,6 +165,17 @@ describe("buzzer MIDI and WAV helper", () => {
     expect(() => parseScore({ events: [{ note: "C4", beats: 1, ms: 10 }] })).toThrow(/ambiguous duration/);
     expect(() => parseScore({ events: Array.from({ length: MAX_SCORE_EVENTS + 1 }, () => ({ note: "C4", ms: 1 })) })).toThrow(/at most/);
     expect(() => encodeMidi(config, [{ kind: "rest", durationS: 1_000_000_000 }])).toThrow(/VLQ/);
+  });
+
+  test("rejects invalid UTF-8 score input", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-invalid-utf8-"));
+    try {
+      const input = join(root, "invalid.json");
+      await writeFile(input, Uint8Array.from([0x7b, 0x22, 0x65, 0x76, 0x65, 0x6e, 0x74, 0x73, 0x22, 0x3a, 0x5b, 0xc3, 0x28, 0x5d, 0x7d]));
+      await expect(parseScoreFile(input)).rejects.toThrow(/valid.*UTF-8|encoding/i);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test("preserves explicit null rejection and Python-compatible numeric conversions", () => {

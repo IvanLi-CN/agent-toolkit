@@ -273,7 +273,7 @@ export function parseScore(raw: unknown): { config: ScoreConfig; events: ScoreEv
 
 export async function parseScoreFile(path: string): Promise<{ config: ScoreConfig; events: ScoreEvent[] }> {
   const inputPath = expandUser(path);
-  const input = JSON.parse(new TextDecoder().decode(await readBoundedRegularFile(inputPath, MAX_SCORE_INPUT_BYTES, "score input")));
+  const input = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(await readBoundedRegularFile(inputPath, MAX_SCORE_INPUT_BYTES, "score input")));
   return parseScore(input);
 }
 

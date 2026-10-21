@@ -319,6 +319,26 @@ describe("DST local Bun tooling", () => {
     }
   });
 
+  test("remote snapshot enumerates direct clusters with a bounded walk", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-clusters-"));
+    try {
+      const home = join(root, "home");
+      const cluster = join(home, ".klei", "DoNotStarveTogether", "Cluster_fixture");
+      await mkdir(join(cluster, "Master"), { recursive: true });
+      await writeFile(join(cluster, "cluster.ini"), "cluster_password=fixture-secret\n");
+      const child = Bun.spawn(["bash", join(import.meta.dir, "..", "scripts", "dst_snapshot_remote.sh")], {
+        env: { ...process.env, HOME: home }, stdout: "pipe", stderr: "pipe",
+      });
+      const [status, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+      expect(status).toBe(0);
+      expect(stdout).toContain("#### Cluster: <cluster>");
+      expect(stdout).toContain("- cluster.ini: present (contains cluster_password; do not paste)");
+      expect(stdout).not.toContain("fixture-secret");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("preserves remote selection, missing shard resources, and failed SSH diagnostics", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-"));
     const previousPath = process.env.PATH;

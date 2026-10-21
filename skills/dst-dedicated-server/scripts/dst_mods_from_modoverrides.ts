@@ -462,8 +462,12 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
       }, REMOTE_COMMAND_TIMEOUT_MS);
       let summary: ShardSummary;
       try {
-        child.stdin.write(script);
-        child.stdin.end();
+        try {
+          child.stdin.write(script);
+          child.stdin.end();
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EPIPE") throw error;
+        }
         try {
           summary = await parseRemoteResponseStream(parsed.cluster, shard, filePath, child.stdout);
         } catch (error) {

@@ -118,7 +118,7 @@ while IFS= read -r cluster; do
     fi
   done
   echo
-done < <(find "$KLEI_DIR" -type d -prune -print 2>/dev/null || true)
+done < <(find "$KLEI_DIR" -type d \( -path "$KLEI_DIR" -o -prune \) -print 2>/dev/null || true)
 
 echo "### Server binary (best-effort)"
 echo

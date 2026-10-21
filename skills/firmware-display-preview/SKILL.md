@@ -83,5 +83,5 @@ bun "$SKILL_DIR/scripts/fb_to_png.ts" \
 
 - `preview.png` is a working artifact. Consumers that display local images should use their own immutable-artifact or attachment mechanism before presenting it to an owner.
 - Keep the project output path separate from any consumer-specific presentation or chat attachment path.
-- The converter accepts at most 16,777,216 pixels per frame. Larger dimensions fail before reading the input or allocating output rows.
+- The converter accepts at most 16,777,216 pixels and 1,048,576 rows per frame. Larger dimensions fail before reading the input or allocating output rows, preventing an extreme aspect ratio from turning the pixel limit into an unbounded row-object allocation.
 - Row-major and page-layout captures may contain bounded trailing bytes from a legacy dump; the converter ignores bytes after the required frame while enforcing the 128 MiB input limit.

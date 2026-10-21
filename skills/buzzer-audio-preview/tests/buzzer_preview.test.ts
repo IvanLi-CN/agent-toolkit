@@ -316,7 +316,7 @@ describe("buzzer MIDI and WAV helper", () => {
     }
   });
 
-  test("reclaims an aged empty lock directory", async () => {
+  test("preserves an aged lock directory without a ready marker", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-empty-lock-"));
     try {
       const input = join(root, "fixture.json");
@@ -326,8 +326,39 @@ describe("buzzer MIDI and WAV helper", () => {
       const old = new Date(Date.now() - 10 * 60 * 1000);
       await utimes(lock, old, old);
       await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      expect(await main(["--in", input, "--out-dir", output])).toBe(1);
+      expect(await readdir(output)).toContain(".buzzer-preview-fixture.lock");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves an empty transaction-shaped directory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-empty-transaction-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      const collision = join(output, ".buzzer-preview-txn-fixture-user-owned");
+      await mkdir(collision, { recursive: true });
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
       expect(await main(["--in", input, "--out-dir", output])).toBe(0);
-      expect(await readdir(output)).not.toContain(".buzzer-preview-fixture.lock");
+      expect(await readdir(output)).toContain(".buzzer-preview-txn-fixture-user-owned");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("ignores unrelated output entries when bounding recovery scans", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-unrelated-entries-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      await mkdir(output, { recursive: true });
+      for (let index = 0; index < 257; index += 1) await writeFile(join(output, `unrelated-${index}`), "");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      expect(await main(["--in", input, "--out-dir", output])).toBe(0);
+      expect(await readdir(output)).toContain("fixture.mid");
+      expect(await readdir(output)).toContain("fixture.wav");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

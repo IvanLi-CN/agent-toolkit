@@ -200,7 +200,7 @@ async function syncDirectory(path: string): Promise<void> {
   }
 }
 
-const SENSITIVE_NAME = "(?:password|passwd|passphrase|pwd|secret|token|credential|private[_ -]?key|api[_ -]?key|access[_ -]?key|authorization|bearer)";
+const SENSITIVE_NAME = "(?:password|passwd|pass[ _-]?phrase|pwd|secret|token|credential|private[_ -]?key|api[_ -]?key|access[_ -]?key|authorization|bearer)";
 const SENSITIVE_KEY = `(?:[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*|"[^"\\r\\n]*${SENSITIVE_NAME}[^"\\r\\n]*"|'[^'\\r\\n]*${SENSITIVE_NAME}[^'\\r\\n]*')`;
 const SENSITIVE_KEY_TOKEN = `(?:[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*|\\[[^\\]\\r\\n]*${SENSITIVE_NAME}[^\\]\\r\\n]*\\])`;
 const SENSITIVE_ASSIGNMENT = new RegExp(
@@ -217,6 +217,7 @@ const AUTHORIZATION_TOKEN = /\b(Bearer|Basic)\s+[^\s,;]+/gi;
 const BRACKETED_SENSITIVE_ASSIGNMENT = new RegExp(`(\\[[^\\]\\r\\n]*${SENSITIVE_NAME}[^\\]\\r\\n]*\\]\\s*[:=]\\s*)(?!\\s*\\[REDACTED\\])([^,;\\r\\n]+)`, "gi");
 const ENCODED_SENSITIVE_ASSIGNMENT = new RegExp(`(\\b[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*\\s*%3[dD]\\s*)(?!\\s*\\[REDACTED\\])([^&\\s,;]+)`, "gi");
 const SENSITIVE_BLOCK_HEADER = new RegExp(`^([ \\t]*${SENSITIVE_KEY_TOKEN}\\s*[:=]\\s*[|>][-+0-9]*)\\s*$`, "i");
+const PRIVATE_KEY_BLOCK = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----/gi;
 
 function redactSensitiveBlocks(text: string): string {
   const lines = text.split(/\r?\n/);
@@ -245,6 +246,7 @@ function redactSensitiveBlocks(text: string): string {
 
 export function redactSensitiveText(text: string): string {
   const redacted = redactSensitiveBlocks(text)
+    .replace(PRIVATE_KEY_BLOCK, "[REDACTED]")
     .replace(AUTHORIZATION_TOKEN, "$1 [REDACTED]")
     .replace(BRACKETED_SENSITIVE_ASSIGNMENT, "$1[REDACTED]")
     .replace(ENCODED_SENSITIVE_ASSIGNMENT, "$1[REDACTED]")

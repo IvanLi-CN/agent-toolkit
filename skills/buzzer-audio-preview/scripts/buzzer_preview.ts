@@ -644,7 +644,7 @@ async function removeTransactionDirectory(directory: string): Promise<void> {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
     throw error;
   }
-  if (entries.some((entry) => entry.isDirectory() || entry.isSymbolicLink() || !TRANSACTION_ENTRY_NAMES.has(entry.name))) return;
+  if (entries.length === 0 || entries.some((entry) => entry.isDirectory() || entry.isSymbolicLink() || !TRANSACTION_ENTRY_NAMES.has(entry.name))) return;
   const tombstone = join(dirname(directory), `.buzzer-preview-delete-${randomUUID()}`);
   try {
     await rename(directory, tombstone);
@@ -744,8 +744,8 @@ async function restoreTransaction(directory: string, midiPath: string, wavPath: 
     if (await hasRecoveryArtifacts(directory)) {
       throw new Error(`transaction state is missing while recovery artifacts exist: ${directory}`);
     }
-    await removeTransactionDirectory(directory);
-    await syncDirectory(dirname(directory));
+    // A prefix-shaped directory without transaction evidence may be user-owned.
+    // Preserve it instead of treating its name as proof of runtime ownership.
     return;
   }
   if (state === "complete") {
@@ -775,10 +775,14 @@ async function recoverPublishTransactions(outDir: string, stem: string, midiPath
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
     throw error;
   }
-  if (entries.length > MAX_TRANSACTION_DIRECTORIES) {
+  const candidates = entries.filter((entry) => {
+    if (!entry.isDirectory()) return false;
+    return entry.name.startsWith(transactionPrefix) || entry.name.startsWith(recoveryPrefix);
+  });
+  if (candidates.length > MAX_TRANSACTION_DIRECTORIES) {
     throw new Error(`too many publication transactions in ${outDir}`);
   }
-  for (const entry of entries) {
+  for (const entry of candidates) {
     const isTransaction = entry.name.startsWith(transactionPrefix);
     const isRecovery = entry.name.startsWith(recoveryPrefix);
     if (!entry.isDirectory() || (!isTransaction && !isRecovery)) continue;
@@ -791,6 +795,8 @@ async function recoverPublishTransactions(outDir: string, stem: string, midiPath
       throw error;
     }
     if (transactionEntries.some((candidate) => candidate.isDirectory() || !TRANSACTION_ENTRY_NAMES.has(candidate.name))) continue;
+    const state = await readPublishState(transaction);
+    if (state === undefined && !await hasRecoveryArtifacts(transaction)) continue;
     const quarantine = isRecovery ? transaction : join(outDir, `.buzzer-preview-recovery-${stem}-${randomUUID()}`);
     if (isTransaction) {
       try {
@@ -834,7 +840,7 @@ async function removeLockDirectory(directory: string): Promise<boolean> {
   } catch {
     return false;
   }
-  if (entries.some((entry) => entry.isDirectory() || entry.isSymbolicLink() || !LOCK_ENTRY_NAMES.has(entry.name))) return false;
+  if (entries.length === 0 || entries.some((entry) => entry.isDirectory() || entry.isSymbolicLink() || !LOCK_ENTRY_NAMES.has(entry.name))) return false;
   const tombstone = join(dirname(directory), `.buzzer-preview-delete-${randomUUID()}`);
   try {
     await rename(directory, tombstone);
@@ -936,7 +942,9 @@ async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner
         const age = Date.now() - heartbeatMetadata.mtimeMs;
         const ready = entries.some((entry) => entry.name === "ready");
         if (!ready) {
-          stale = age > LOCK_STALE_MS;
+          // The ready marker fences the owner metadata. Age alone cannot prove
+          // that a process did not pause during lock initialization.
+          stale = false;
         } else {
           const ownerText = new TextDecoder().decode(await readRegularFile(join(lockDirectory, "pid"), 128));
           const owner = Number(ownerText.trim());

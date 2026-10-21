@@ -11,10 +11,14 @@ export type PngMode = "L" | "RGB";
 
 export const MAX_FRAMEBUFFER_PIXELS = 16_777_216;
 export const MAX_FRAMEBUFFER_INPUT_BYTES = 128 * 1024 * 1024;
+export const MAX_FRAMEBUFFER_ROWS = 1_048_576;
 
 function validateDimensions(width: number, height: number): void {
   if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0) {
     throw new Error("width/height must be > 0");
+  }
+  if (height > MAX_FRAMEBUFFER_ROWS) {
+    throw new Error(`framebuffer height exceeds the ${MAX_FRAMEBUFFER_ROWS}-row limit`);
   }
   if (width > 0xffff_ffff || height > 0xffff_ffff || width * height > MAX_FRAMEBUFFER_PIXELS) {
     throw new Error(`framebuffer dimensions exceed the ${MAX_FRAMEBUFFER_PIXELS}-pixel limit`);

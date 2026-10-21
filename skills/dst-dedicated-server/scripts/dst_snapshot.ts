@@ -177,8 +177,11 @@ async function runWithStdin(
     if (timeout !== undefined) clearTimeout(timeout);
     if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
     requestStop();
+    const cleanupReady = await supervised.cleanupAcknowledged;
     await Promise.race([supervised.wrapperExited.then(() => undefined, () => undefined), new Promise<void>((resolve) => setTimeout(resolve, SUPERVISOR_STOP_GRACE_MS))]);
-    killProcessTree(supervised, "SIGKILL");
+    if (!cleanupReady || !(await Promise.race([supervised.wrapperExited.then(() => true, () => true), Bun.sleep(0).then(() => false)]))) {
+      killProcessTree(supervised, "SIGKILL");
+    }
     await Promise.race([supervised.wrapperExited.then(() => undefined, () => undefined), new Promise<void>((resolve) => setTimeout(resolve, SUPERVISOR_STOP_GRACE_MS))]);
     if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
     await supervised.cleanup();
@@ -481,7 +484,8 @@ export async function safeTail(file: string, lines: number, allowedRoot?: string
       }
       const completeText = partialLine ? text.slice(firstLineEnd + 1) : text;
       if (partialLine) return "[REDACTED: bounded log tail begins mid-record]";
-      return redactSensitiveText(completeText.split(/\r?\n/).slice(-lines).join("\n"));
+      const redactedText = redactSensitiveText(completeText);
+      return redactedText.split(/\r?\n/).slice(-lines).join("\n");
     } finally {
       await handle?.close();
     }

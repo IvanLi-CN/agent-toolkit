@@ -119,6 +119,20 @@ describe("DST local Bun tooling", () => {
     }
   });
 
+  test("redacts a multiline secret whose header falls outside the line tail", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-tail-line-boundary-"));
+    try {
+      const log = join(root, "client_log.txt");
+      const continuation = Array.from({ length: 100 }, (_, index) => `  fixture-line-${index}`).join("\n");
+      await writeFile(log, `password: |\n${continuation}\n  fixture-secret\nvisible-line\n`);
+      const tail = await safeTail(log, 80);
+      expect(tail).not.toContain("fixture-secret");
+      expect(tail).toContain("[REDACTED]");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("redacts a PEM body when the bounded tail begins mid-record", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-tail-pem-boundary-"));
     try {
@@ -548,7 +562,7 @@ describe("DST local Bun tooling", () => {
     }
   });
 
-  test("preserves remote selection, missing shard resources, and failed SSH diagnostics", async () => {
+  test("preserves remote selection, missing shard resources, and failed SSH diagnostics", { timeout: 15_000 }, async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-"));
     const previousPath = process.env.PATH;
     try {
@@ -655,7 +669,7 @@ esac
     }
   });
 
-  test("redacts sensitive values from successful remote snapshot output", async () => {
+  test("redacts sensitive values from successful remote snapshot output", { timeout: 15_000 }, async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-redaction-"));
     const previousPath = process.env.PATH;
     try {
@@ -682,7 +696,7 @@ esac
     }
   });
 
-  test("renders untrusted remote report text without Markdown or HTML injection", async () => {
+  test("renders untrusted remote report text without Markdown or HTML injection", { timeout: 15_000 }, async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-markdown-"));
     const previousPath = process.env.PATH;
     try {

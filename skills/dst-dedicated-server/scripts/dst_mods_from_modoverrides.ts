@@ -259,8 +259,11 @@ function killProcessTree(supervised: SupervisedChild, signal: "SIGTERM" | "SIGKI
 async function terminateAndReap(supervised: SupervisedChild): Promise<void> {
   const observedExit = supervised.wrapperExited;
   killProcessTree(supervised, "SIGTERM");
+  const cleanupReady = await supervised.cleanupAcknowledged;
   await Promise.race([observedExit, new Promise<void>((resolve) => setTimeout(resolve, SUPERVISOR_STOP_GRACE_MS))]);
-  killProcessTree(supervised, "SIGKILL");
+  if (!cleanupReady || !(await Promise.race([observedExit.then(() => true, () => true), Bun.sleep(0).then(() => false)]))) {
+    killProcessTree(supervised, "SIGKILL");
+  }
   await Promise.race([observedExit, new Promise<void>((resolve) => setTimeout(resolve, SUPERVISOR_STOP_GRACE_MS))]);
   await supervised.cleanup();
 }

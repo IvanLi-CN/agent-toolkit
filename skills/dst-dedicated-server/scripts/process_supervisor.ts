@@ -15,9 +15,12 @@ captured_descendants_path="$status_dir/descendants"
 pending_descendants_path="$status_dir/descendant-pids"
 snapshot_started_path="$status_dir/snapshot-started"
 descendant_scan_truncated_path="$status_dir/descendant-scan-truncated"
+descendant_scan_failed_path="$status_dir/descendant-scan-failed"
+descendant_scan_input_path="$status_dir/descendant-scan-input"
+descendant_scan_status_path="$status_dir/descendant-scan-status"
 parent_dead_path="$status_dir/parent-dead"
 cleanup() {
-  if [ -e "$descendant_scan_truncated_path" ]; then cleanup_ack_enabled=0; fi
+  if [ -e "$descendant_scan_truncated_path" ] || [ -e "$descendant_scan_failed_path" ]; then cleanup_ack_enabled=0; fi
   cleanup_ack_created=0
   if [ "$cleanup_ack_enabled" = "1" ] && [ ! -e "$parent_dead_path" ]; then
     if mkdir "$cleanup_ack_path" 2>/dev/null; then cleanup_ack_created=1; fi
@@ -240,8 +243,17 @@ process_identity() {
   return 1
 }
 descendants() {
-  ps -eo pid=,ppid= 2>/dev/null | awk -v root="$target_pid" -v truncated_path="$descendant_scan_truncated_path" '
-    { parent[$1] = $2 }
+  if ! ps -eo pid=,ppid= > "$descendant_scan_input_path" 2>/dev/null; then
+    cleanup_ack_enabled=0
+    : > "$descendant_scan_failed_path" 2>/dev/null || true
+    return 1
+  fi
+  if ! awk -v root="$target_pid" -v truncated_path="$descendant_scan_truncated_path" -v status_path="$descendant_scan_status_path" -v max_rows=65536 '
+    {
+      total++
+      if (total > max_rows) { overflow = 1; exit 2 }
+      parent[$1] = $2
+    }
     function is_descendant(pid, current) {
       current = parent[pid]
       delete seen
@@ -256,12 +268,42 @@ descendants() {
       if (count < 1024) { print $1; count++ }
       else { truncated = 1 }
     }
-    END { if (truncated) { print "1" > truncated_path; close(truncated_path) } }
-  '
+    END {
+      if (overflow) exit 2
+      if (truncated) { print "1" > truncated_path; close(truncated_path) }
+      print (truncated ? "truncated" : "ok") > status_path
+      close(status_path)
+    }
+  ' < "$descendant_scan_input_path"; then
+    cleanup_ack_enabled=0
+    : > "$descendant_scan_failed_path" 2>/dev/null || true
+    return 1
+  fi
+  scan_status="$(cat "$descendant_scan_status_path" 2>/dev/null || true)"
+  case "$scan_status" in
+    ok) return 0 ;;
+    truncated)
+      if [ ! -e "$descendant_scan_truncated_path" ]; then
+        cleanup_ack_enabled=0
+        : > "$descendant_scan_failed_path" 2>/dev/null || true
+        return 1
+      fi
+      cleanup_ack_enabled=0
+      return 0
+      ;;
+    *)
+      cleanup_ack_enabled=0
+      : > "$descendant_scan_failed_path" 2>/dev/null || true
+      return 1
+      ;;
+  esac
 }
 snapshot_descendants() {
   : > "$snapshot_started_path" 2>/dev/null || true
-  descendants > "$pending_descendants_path" 2>/dev/null || true
+  if ! descendants > "$pending_descendants_path" 2>/dev/null; then
+    cleanup_ack_enabled=0
+    : > "$descendant_scan_failed_path" 2>/dev/null || true
+  fi
 }
 start_snapshot() {
   snapshot_pid=""
@@ -321,7 +363,7 @@ signal_tree() {
   esac
   if [ -n "$snapshot_pid" ]; then wait "$snapshot_pid" 2>/dev/null || true; snapshot_pid=""; fi
   if [ "$signal" = "TERM" ]; then record_descendants; fi
-  if [ -e "$descendant_scan_truncated_path" ]; then cleanup_ack_enabled=0; fi
+  if [ -e "$descendant_scan_truncated_path" ] || [ -e "$descendant_scan_failed_path" ]; then cleanup_ack_enabled=0; fi
   signal_captured_descendants
   if [ "$group_signal_succeeded" = "1" ] || ! target_identity_matches; then return; fi
   for pid in $(descendants); do
@@ -332,7 +374,7 @@ signal_tree() {
       kill -"$signal" "$pid" 2>/dev/null || true
     fi
   done
-  if [ -e "$descendant_scan_truncated_path" ]; then cleanup_ack_enabled=0; fi
+  if [ -e "$descendant_scan_truncated_path" ] || [ -e "$descendant_scan_failed_path" ]; then cleanup_ack_enabled=0; fi
 }
 watchdog_pid=""
 termination_started=0

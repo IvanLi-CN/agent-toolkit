@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -669,6 +669,23 @@ esac
     }
   });
 
+  test("redacts local setup paths from modoverrides failures", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-mods-path-redaction-"));
+    const privateTmp = join(root, "private-tmp");
+    try {
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_mods_from_modoverrides.ts"),
+        ["--host", "fixture-host", "--user", "fixture-user", "--cluster", "fixture-cluster", "--shard", "Master"],
+        { ...process.env, TMPDIR: privateTmp } as Record<string, string>,
+      );
+      expect(result.status).toBe(1);
+      expect(result.stderr).not.toContain(privateTmp);
+      expect(result.stderr).toContain("<redacted-path>");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("skips remote collection only when SSH is unavailable", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-no-ssh-"));
     try {
@@ -1175,6 +1192,43 @@ esac
       for (const pid of descendantPids) {
         try { process.kill(pid, "SIGKILL"); } catch { /* The detached process may have exited. */ }
       }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fails closed when detached descendant enumeration cannot scan processes", { timeout: 15_000 }, async () => {
+    if (process.platform === "win32") return;
+    const procRoot = await lstat("/proc").catch(() => undefined);
+    if (!procRoot?.isDirectory()) return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-descendant-scan-failure-"));
+    const ps = join(root, "ps");
+    const trigger = join(root, "trigger");
+    const previousPath = process.env.PATH;
+    const previousFailurePath = process.env.AGENT_TOOLKIT_TEST_PS_FAIL;
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    try {
+      await writeFile(ps, `#!/bin/sh
+if [ -e "$AGENT_TOOLKIT_TEST_PS_FAIL" ]; then exit 1; fi
+exec /bin/ps "$@"
+`);
+      await chmod(ps, 0o755);
+      process.env.PATH = `${root}:${previousPath ?? ""}`;
+      process.env.AGENT_TOOLKIT_TEST_PS_FAIL = trigger;
+      supervised = await spawnSupervised(["sh", "-c", "while [ ! -e \"$1\" ]; do sleep 0.01; done; sleep 30", "agent-toolkit-supervised-target", trigger]);
+      await writeFile(trigger, "fail scan\n");
+      supervised.child.kill("SIGTERM");
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(false);
+      await supervised.wrapperExited;
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      if (previousFailurePath === undefined) delete process.env.AGENT_TOOLKIT_TEST_PS_FAIL;
+      else process.env.AGENT_TOOLKIT_TEST_PS_FAIL = previousFailurePath;
       await rm(root, { recursive: true, force: true });
     }
   });

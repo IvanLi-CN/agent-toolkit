@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { REMOTE_COMMAND_TIMEOUT_MS, redactOperationalText, validateSshToken } from "./dst_snapshot.ts";
 import { spawnSupervised, type SupervisedChild } from "./process_supervisor.ts";
 
@@ -553,7 +554,8 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     if (parsed.shard === "both") process.stdout.write(renderDiff(parsed.cluster, summaries[0]!, summaries[1]!));
     return 0;
   } catch (error) {
-    console.error(`error: ${error instanceof Error ? error.message : String(error)}`);
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(formatCliError(redactOperationalText(message, [tmpdir(), process.cwd(), process.env.TMPDIR ?? ""])));
     return 1;
   }
 }

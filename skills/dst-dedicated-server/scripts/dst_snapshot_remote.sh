@@ -8,9 +8,32 @@ echo
 echo "- hostname: <remote-host>"
 echo "- whoami: <remote-user>"
 echo "- kernel: $(uname -srm)"
-if [[ -f /etc/os-release ]]; then
+OS_RELEASE_FILE="${AGENT_TOOLKIT_DST_OS_RELEASE_FILE:-/etc/os-release}"
+if [[ -f "$OS_RELEASE_FILE" && ! -L "$OS_RELEASE_FILE" ]]; then
   echo "- os-release:"
-  sed -n '1,10p' /etc/os-release | sed 's/^/  - /'
+  while IFS='=' read -r key value; do
+    value="${value#\"}"
+    value="${value%\"}"
+    case "$key" in
+      ID)
+        case "$value" in
+          alpine|amazon|arch|centos|debian|fedora|gentoo|kali|linuxmint|manjaro|nixos|opensuse*|oracle|raspbian|rhel|rocky|slackware|ubuntu|void)
+            printf '  - ID: %s\n' "$value"
+            ;;
+          *)
+            echo '  - ID: <redacted>'
+            ;;
+        esac
+        ;;
+      VERSION_ID)
+        if [[ "$value" =~ ^[0-9]+([.][0-9]+)*$ ]]; then
+          printf '  - VERSION_ID: %s\n' "$value"
+        else
+          echo '  - VERSION_ID: <redacted>'
+        fi
+        ;;
+    esac
+  done < "$OS_RELEASE_FILE"
 fi
 echo
 

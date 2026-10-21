@@ -165,6 +165,26 @@ describe("framebuffer to PNG helper", () => {
     }
   });
 
+  test("rejects FIFO inputs without blocking", async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-fb-fifo-"));
+    try {
+      const input = join(root, "frame.raw");
+      const output = join(root, "frame.png");
+      const mkfifo = Bun.spawn(["mkfifo", input], { stdout: "pipe", stderr: "pipe" });
+      expect(await mkfifo.exited).toBe(0);
+      const child = Bun.spawn([process.execPath, join(import.meta.dir, "..", "scripts", "fb_to_png.ts"), "--format", "gray8", "--width", "1", "--height", "1", "--in", input, "--out", output], {
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const status = await Promise.race([child.exited, Bun.sleep(1_000).then(() => -1)]);
+      if (status === -1) child.kill("SIGKILL");
+      expect(status).toBe(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("accepts bounded trailing framebuffer data for legacy captures", async () => {
     const root = await mkdtemp(join(process.env.TMPDIR ?? "/tmp", "agent-toolkit-fb-trailing-"));
     try {

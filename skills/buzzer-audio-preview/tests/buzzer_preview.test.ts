@@ -434,6 +434,22 @@ describe("buzzer MIDI and WAV helper", () => {
     }
   });
 
+  test("cleans internal deletion tombstones before recovery scanning", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-delete-tombstone-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      const tombstone = join(output, ".buzzer-preview-delete-stale");
+      await mkdir(tombstone, { recursive: true });
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      expect(await main(["--in", input, "--out-dir", output])).toBe(0);
+      expect(await readdir(output)).not.toContain(".buzzer-preview-delete-stale");
+      expect(await readdir(output)).toContain("fixture.mid");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("fails closed when the recovery scan reaches its entry bound", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-scan-bound-"));
     try {
@@ -761,6 +777,25 @@ describe("buzzer MIDI and WAV helper", () => {
       await writeFile(join(output, "fixture.mid"), "MThd");
       await writeFile(join(output, "fixture.wav"), new Uint8Array(MAX_PUBLISHED_WAV_BYTES + 1));
       await expect(readPublishedPair(output, "fixture")).rejects.toThrow(/exceeds/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects FIFO score inputs without blocking", async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-fifo-"));
+    try {
+      const input = join(root, "score.json");
+      const mkfifo = Bun.spawn(["mkfifo", input], { stdout: "pipe", stderr: "pipe" });
+      expect(await mkfifo.exited).toBe(0);
+      const child = Bun.spawn([process.execPath, join(import.meta.dir, "..", "scripts", "buzzer_preview.ts"), "--in", input, "--out-dir", join(root, "out")], {
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const status = await Promise.race([child.exited, Bun.sleep(1_000).then(() => -1)]);
+      if (status === -1) child.kill("SIGKILL");
+      expect(status).toBe(1);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

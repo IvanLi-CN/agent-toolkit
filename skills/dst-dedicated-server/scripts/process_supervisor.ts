@@ -6,13 +6,16 @@ const SUPERVISOR_SCRIPT = `
 set +e
 status_path="$1"
 shift
+status_dir="$(dirname -- "$status_path")"
+cleanup() { rm -rf -- "$status_dir"; }
+trap cleanup EXIT HUP INT TERM
 "$@" &
 target_pid=$!
 wait "$target_pid"
 target_status=$?
 printf '%s\\n' "$target_status" > "$status_path"
 exec 0<&- 1>&- 2>&-
-exec sleep 3600
+sleep 5
 `;
 
 export interface SupervisedChild {

@@ -63,6 +63,7 @@ describe("DST local Bun tooling", () => {
     const multilineToken = ["token", "=", '"', "first-line\nsecond-line", '"'].join("");
     expect(redactSensitiveText(multilineToken)).toBe("token=[REDACTED]");
     expect(redactSensitiveText("api_key=[REDACTED] token raw-secret")).toBe("api_key=[REDACTED] token [REDACTED]");
+    expect(redactSensitiveText("api_key=q7Kp9Zx4\nq7Kp9Zx4")).not.toContain("q7Kp9Zx4");
     expect(redactOperationalText("[api_key]=fixture-secret,SECRET_TAIL")).not.toContain("SECRET_TAIL");
     expect(redactOperationalText("api_key%3Dfixture-secret&SECRET_TAIL")).not.toContain("SECRET_TAIL");
     expect(redactSensitiveText("Cookie: sessionid=fixture-secret")).not.toContain("fixture-secret");
@@ -173,6 +174,9 @@ describe("DST local Bun tooling", () => {
       await writeFile(join(cluster, "cluster_token.txt"), "token-fixture\n");
       await writeFile(join(directCluster, "cluster_token.txt"), "token-fixture-direct\n");
       await writeFile(join(local, "aws-prod-secret-key-SECRET_CANARY.pem"), "private\n");
+      await writeFile(join(local, "password"), "private\n");
+      await writeFile(join(local, ".env"), "private\n");
+      await writeFile(join(local, "id_rsa"), "private\n");
       const output = join(root, "snapshot.md");
       expect(await snapshotMain(["--local-dir", local, "--no-remote", "--out", output])).toBe(0);
       const report = await readFile(output, "utf8");
@@ -183,6 +187,9 @@ describe("DST local Bun tooling", () => {
       expect(report).not.toContain("early-log-marker");
       expect(report).not.toContain("fixture-secret");
       expect(report).not.toContain("aws-prod-secret-key-SECRET_CANARY.pem");
+      expect(report).not.toMatch(/(^|\s)password(\s|$)/m);
+      expect(report).not.toMatch(/(^|\s)\.env(\s|$)/m);
+      expect(report).not.toMatch(/(^|\s)id_rsa(\s|$)/m);
       expect(report).toContain("api_key=[REDACTED]");
       expect(report).not.toContain("entry-239.txt");
       expect(report).toContain("<cluster-1>");
@@ -363,6 +370,29 @@ describe("DST local Bun tooling", () => {
       expect(stdout).toContain("#### Cluster: <cluster>");
       expect(stdout).toContain("- cluster.ini: present (contains cluster_password; do not paste)");
       expect(stdout).not.toContain("fixture-secret");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("remote snapshot keeps custom os-release metadata out of the report", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-os-release-"));
+    try {
+      const home = join(root, "home");
+      const osRelease = join(root, "os-release");
+      const privateHostname = ["prod-db", "internal"].join(".");
+      const secretHost = ["secret", "host"].join("-");
+      await mkdir(home, { recursive: true });
+      await writeFile(osRelease, `NAME=${privateHostname}\nID=${privateHostname}\nVERSION_ID=release-${privateHostname}\nBUILD_HOST=${secretHost}\n`);
+      const child = Bun.spawn(["bash", join(import.meta.dir, "..", "scripts", "dst_snapshot_remote.sh")], {
+        env: { ...process.env, HOME: home, AGENT_TOOLKIT_DST_OS_RELEASE_FILE: osRelease }, stdout: "pipe", stderr: "pipe",
+      });
+      const [status, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+      expect(status).toBe(0);
+      expect(stdout).toContain("ID: <redacted>");
+      expect(stdout).toContain("VERSION_ID: <redacted>");
+      expect(stdout).not.toContain(privateHostname);
+      expect(stdout).not.toContain(secretHost);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

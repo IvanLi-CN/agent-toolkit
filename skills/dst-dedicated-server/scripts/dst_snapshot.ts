@@ -224,7 +224,7 @@ const BRACKETED_SENSITIVE_ASSIGNMENT = new RegExp(`(\\[[^\\]\\r\\n]*${SENSITIVE_
 const ENCODED_SENSITIVE_ASSIGNMENT = new RegExp(`(\\b[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*\\s*%3[dD]\\s*)(?!\\s*\\[REDACTED\\])([^\\r\\n]+)`, "gi");
 const SENSITIVE_BLOCK_HEADER = new RegExp(`^([ \\t]*${SENSITIVE_KEY_TOKEN}\\s*[:=]\\s*[|>][-+0-9]*)\\s*$`, "i");
 const PRIVATE_KEY_BLOCK = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----/gi;
-const SENSITIVE_FILENAME = new RegExp("\\b(?=[A-Za-z0-9_.-]*" + SENSITIVE_NAME + "[A-Za-z0-9_.-]*\\b)(?=[A-Za-z0-9_.-]*[_.-])[A-Za-z0-9][A-Za-z0-9_.-]*\\b", "gi");
+const SENSITIVE_FILENAME = new RegExp("(?<![A-Za-z0-9])(?:[A-Za-z0-9_.-]*(?:" + SENSITIVE_NAME + "|env|id[_ -]?rsa)[A-Za-z0-9_.-]*)(?![A-Za-z0-9])", "gi");
 const ANSI_ESCAPE = /\u001B(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001B\\))/g;
 const CONTROL_CHARACTERS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g;
 const SENSITIVE_MULTILINE_ASSIGNMENT = new RegExp(`(${SENSITIVE_KEY_TOKEN}\\s*[:=])\\s*\\r?\\n(?:[ \\t]+[^\\r\\n]*(?:\\r?\\n|$))+`, "gi");
@@ -324,9 +324,23 @@ function redactSensitiveBlocks(text: string): string {
   return redacted.join("\n");
 }
 
+function redactSensitiveContinuations(text: string): string {
+  const lines = text.split(/\r?\n/);
+  for (let index = 0; index + 1 < lines.length; index += 1) {
+    const line = lines[index]!;
+    const match = UNREDACTED_SENSITIVE_ASSIGNMENT.exec(line);
+    if (match === null) continue;
+    const value = line.slice(match.index + match[0].length).trim();
+    if (value.length === 0 || value === "[REDACTED]" || value.startsWith("|") || value.startsWith(">")) continue;
+    const next = lines[index + 1]!;
+    if (next.trim() === value) lines[index + 1] = `${next.slice(0, next.length - next.trimStart().length)}[REDACTED]`;
+  }
+  return lines.join("\n");
+}
+
 export function redactSensitiveText(text: string): string {
   const normalized = text.replace(ANSI_ESCAPE, "").replace(CONTROL_CHARACTERS, "");
-  const redacted = redactSensitiveCollections(redactSensitiveBlocks(normalized))
+  const redacted = redactSensitiveCollections(redactSensitiveBlocks(redactSensitiveContinuations(normalized)))
     .replace(SENSITIVE_MULTILINE_ASSIGNMENT, "$1[REDACTED]")
     .replace(PRIVATE_KEY_BLOCK, "[REDACTED]")
     .replace(AUTHORIZATION_TOKEN, "$1 [REDACTED]")

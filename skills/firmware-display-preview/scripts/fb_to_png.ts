@@ -127,7 +127,9 @@ function inputBounds(format: FramebufferFormat, options: ConvertOptions): { mini
 }
 
 async function readFramebufferInput(path: string, bounds: { minimum: number; maximum: number }): Promise<Uint8Array> {
-  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  const initialMetadata = await lstat(path);
+  if (!initialMetadata.isFile() || initialMetadata.isSymbolicLink()) throw new Error("framebuffer input must be a regular file");
+  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
   try {
     const metadata = await handle.stat();
     if (!metadata.isFile()) throw new Error("framebuffer input must be a regular file");

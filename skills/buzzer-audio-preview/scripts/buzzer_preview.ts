@@ -528,6 +528,8 @@ const LOCK_HEARTBEAT_MS = 30 * 1000;
 const PROCESS_IDENTITY_TIMEOUT_MS = 1_000;
 const MAX_TRANSACTION_DIRECTORIES = 256;
 const MAX_RECOVERY_SCAN_ENTRIES = 4_096;
+const DELETE_TOMBSTONE_PREFIX = ".buzzer-preview-delete-";
+const LOCK_TEMPORARY_PREFIX = ".buzzer-preview-lock-";
 type PublishState = "prepared" | "midi-backed-up" | "backups-complete" | "midi-published" | "wav-publishing" | "wav-published" | "complete";
 const TRANSACTION_ENTRY_NAMES = new Set([
   ".owner",
@@ -545,6 +547,7 @@ const TRANSACTION_ENTRY_NAMES = new Set([
   "wav.symlink",
 ]);
 const LOCK_ENTRY_NAMES = new Set(["pid", "owner", "identity", "heartbeat", "ready"]);
+const DELETE_TOMBSTONE_ENTRY_NAMES = new Set([...TRANSACTION_ENTRY_NAMES, ...LOCK_ENTRY_NAMES]);
 const OWNER_NONCE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const OWNER_RECORD_PATTERN = /^([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.([0-9a-f]{64})$/i;
 const OWNER_KEY_FILE_ENV = "BUZZER_PREVIEW_OWNER_KEY_FILE";
@@ -693,7 +696,9 @@ async function readRegularFile(path: string, maxBytes = MAX_TRANSACTION_METADATA
 }
 
 async function readBoundedRegularFile(path: string, maxBytes: number, label: string): Promise<Uint8Array> {
-  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  const initialMetadata = await lstat(path);
+  if (!initialMetadata.isFile() || initialMetadata.isSymbolicLink()) throw new Error(`${label} is not a regular file: ${path}`);
+  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
   try {
     const metadata = await handle.stat();
     if (!metadata.isFile()) throw new Error(`${label} is not a regular file: ${path}`);
@@ -760,7 +765,7 @@ async function removeTransactionDirectory(directory: string): Promise<void> {
       return;
     }
   }
-  const tombstone = join(dirname(directory), `.buzzer-preview-delete-${randomUUID()}`);
+  const tombstone = join(dirname(directory), `${DELETE_TOMBSTONE_PREFIX}${randomUUID()}`);
   try {
     await rename(directory, tombstone);
   } catch (error) {
@@ -769,6 +774,32 @@ async function removeTransactionDirectory(directory: string): Promise<void> {
   }
   await rm(tombstone, { recursive: true, force: true, maxRetries: 0 });
   await syncDirectory(dirname(directory));
+}
+
+async function cleanupDeleteTombstones(outDir: string): Promise<void> {
+  let directory;
+  try {
+    directory = await opendir(outDir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  try {
+    for await (const entry of directory) {
+      if (!entry.isDirectory() || entry.isSymbolicLink() || !entry.name.startsWith(DELETE_TOMBSTONE_PREFIX)) continue;
+      const tombstone = join(outDir, entry.name);
+      try {
+        const listing = await readDirectoryEntriesBounded(tombstone, DELETE_TOMBSTONE_ENTRY_NAMES.size + 1);
+        if (listing.truncated || listing.entries.some((candidate) => candidate.isDirectory() || !DELETE_TOMBSTONE_ENTRY_NAMES.has(candidate.name))) continue;
+        await rm(tombstone, { recursive: true, force: true, maxRetries: 0 });
+      } catch {
+        // Preserve an unexpected or concurrently changing tombstone for a later retry.
+      }
+    }
+  } finally {
+    await directory.close().catch(() => undefined);
+  }
+  await syncDirectory(outDir);
 }
 
 async function writePublishState(directory: string, state: PublishState): Promise<void> {
@@ -898,6 +929,7 @@ async function restoreTransaction(directory: string, midiPath: string, wavPath: 
 }
 
 async function recoverPublishTransactions(outDir: string, stem: string, midiPath: string, wavPath: string): Promise<void> {
+  await cleanupDeleteTombstones(outDir);
   const transactionPrefix = `.buzzer-preview-txn-${stem}-`;
   const recoveryPrefix = `.buzzer-preview-recovery-${stem}-`;
   const candidates: Dirent[] = [];
@@ -1001,7 +1033,7 @@ async function removeLockDirectory(directory: string): Promise<boolean> {
     return false;
   }
   if (entries.length === 0 || entries.some((entry) => entry.isDirectory() || entry.isSymbolicLink() || !LOCK_ENTRY_NAMES.has(entry.name))) return false;
-  const tombstone = join(dirname(directory), `.buzzer-preview-delete-${randomUUID()}`);
+  const tombstone = join(dirname(directory), `${DELETE_TOMBSTONE_PREFIX}${randomUUID()}`);
   try {
     await rename(directory, tombstone);
   } catch {
@@ -1010,6 +1042,21 @@ async function removeLockDirectory(directory: string): Promise<boolean> {
   await rm(tombstone, { recursive: true, force: true, maxRetries: 0 });
   await syncDirectory(dirname(directory));
   return true;
+}
+
+async function discardTemporaryLockDirectory(directory: string): Promise<void> {
+  try {
+    const metadata = await lstat(directory);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) return;
+    const listing = await readDirectoryEntriesBounded(directory, LOCK_ENTRY_NAMES.size + 1);
+    if (listing.truncated || listing.entries.some((entry) => entry.isDirectory() || entry.isSymbolicLink() || !LOCK_ENTRY_NAMES.has(entry.name))) return;
+    const tombstone = join(dirname(directory), `${DELETE_TOMBSTONE_PREFIX}${randomUUID()}`);
+    await rename(directory, tombstone);
+    await rm(tombstone, { recursive: true, force: true, maxRetries: 0 });
+    await syncDirectory(dirname(directory));
+  } catch {
+    // An incomplete temporary lock is never the canonical lock; preserve it for a later retry.
+  }
 }
 
 async function processIdentity(pid: number): Promise<string | undefined> {
@@ -1053,20 +1100,32 @@ async function refreshLockHeartbeat(path: string): Promise<void> {
 
 async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner = false): Promise<() => Promise<void>> {
   const lockDirectory = join(outDir, `.buzzer-preview-${stem}.lock`);
+  await cleanupDeleteTombstones(outDir);
   for (let attempt = 0; attempt < 2; attempt += 1) {
+    let temporaryDirectory: string | undefined;
     try {
-      await mkdir(lockDirectory, { mode: 0o700 });
+      temporaryDirectory = await mkdtemp(join(outDir, `${LOCK_TEMPORARY_PREFIX}${stem}-`));
       const ownerToken = await createOwnerRecord();
       const identity = await processIdentity(process.pid);
+      await writeSyncedFile(join(temporaryDirectory, "pid"), new TextEncoder().encode(`${process.pid}\n`));
+      await writeSyncedFile(join(temporaryDirectory, "owner"), new TextEncoder().encode(`${ownerToken}\n`));
+      if (identity !== undefined) await writeSyncedFile(join(temporaryDirectory, "identity"), new TextEncoder().encode(`${identity}\n`));
+      await writeSyncedFile(join(temporaryDirectory, "heartbeat"), new TextEncoder().encode(`${Date.now()}\n`));
+      await syncDirectory(temporaryDirectory);
+      await writeSyncedFile(join(temporaryDirectory, "ready"), new Uint8Array());
+      await syncDirectory(temporaryDirectory);
+      try {
+        await lstat(lockDirectory);
+        const conflict = new Error("output publication is already in progress") as NodeJS.ErrnoException;
+        conflict.code = "EEXIST";
+        throw conflict;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      await rename(temporaryDirectory, lockDirectory);
+      temporaryDirectory = undefined;
       await syncDirectory(outDir);
-      await writeSyncedFile(join(lockDirectory, "pid"), new TextEncoder().encode(`${process.pid}\n`));
-      await writeSyncedFile(join(lockDirectory, "owner"), new TextEncoder().encode(`${ownerToken}\n`));
-      if (identity !== undefined) await writeSyncedFile(join(lockDirectory, "identity"), new TextEncoder().encode(`${identity}\n`));
       const heartbeatPath = join(lockDirectory, "heartbeat");
-      await writeSyncedFile(heartbeatPath, new TextEncoder().encode(`${Date.now()}\n`));
-      await syncDirectory(lockDirectory);
-      await writeSyncedFile(join(lockDirectory, "ready"), new Uint8Array());
-      await syncDirectory(lockDirectory);
       const heartbeat = setInterval(() => { void refreshLockHeartbeat(heartbeatPath); }, LOCK_HEARTBEAT_MS);
       return async () => {
         clearInterval(heartbeat);
@@ -1091,7 +1150,9 @@ async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner
         }
       };
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (temporaryDirectory !== undefined) await discardTemporaryLockDirectory(temporaryDirectory);
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST" && code !== "ENOTEMPTY") throw error;
       let stale = false;
       try {
         const metadata = await lstat(lockDirectory);
@@ -1160,6 +1221,7 @@ async function publishOutputsLocked(outDir: string, stem: string, midi: Uint8Arr
     await writeSyncedFile(tempMidiPath, midi);
     await writeSyncedFile(tempWavPath, wav);
     await writePublishState(transaction, "prepared");
+    await syncDirectory(outDir);
     await moveOutputToBackup(midiPath, join(transaction, "midi.backup"), join(transaction, "midi.symlink"));
     await syncDirectory(outDir);
     await syncDirectory(transaction);

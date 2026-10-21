@@ -2,9 +2,9 @@
 
 import { constants, type Dirent } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { lstat, mkdtemp, open, opendir, rename, rm, unlink } from "node:fs/promises";
+import { lstat, mkdtemp, open, opendir, realpath, rename, rm, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawnSupervised, type SupervisedChild } from "./process_supervisor.ts";
 
 interface SnapshotOptions {
@@ -48,6 +48,7 @@ export const MAX_LOCAL_COMMAND_OUTPUT_BYTES = 64 * 1024;
 export const LOCAL_COMMAND_TIMEOUT_MS = 5_000;
 export const MAX_LOCAL_DIRECTORY_ENTRIES = 4_096;
 export const MAX_LOCAL_CLUSTER_PATHS = 4_096;
+export const MAX_LOCAL_CLUSTER_SCAN_ENTRIES = 4_096;
 
 async function readBounded(
   stream: ReadableStream<Uint8Array>,
@@ -218,6 +219,9 @@ const BRACKETED_SENSITIVE_ASSIGNMENT = new RegExp(`(\\[[^\\]\\r\\n]*${SENSITIVE_
 const ENCODED_SENSITIVE_ASSIGNMENT = new RegExp(`(\\b[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*\\s*%3[dD]\\s*)(?!\\s*\\[REDACTED\\])([^&\\s,;]+)`, "gi");
 const SENSITIVE_BLOCK_HEADER = new RegExp(`^([ \\t]*${SENSITIVE_KEY_TOKEN}\\s*[:=]\\s*[|>][-+0-9]*)\\s*$`, "i");
 const PRIVATE_KEY_BLOCK = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----/gi;
+const ANSI_ESCAPE = /\u001B(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001B\\))/g;
+const CONTROL_CHARACTERS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g;
+const SENSITIVE_MULTILINE_ASSIGNMENT = new RegExp(`(${SENSITIVE_KEY_TOKEN}\\s*[:=])\\s*\\r?\\n(?:[ \\t]+[^\\r\\n]*(?:\\r?\\n|$))+`, "gi");
 
 function redactSensitiveBlocks(text: string): string {
   const lines = text.split(/\r?\n/);
@@ -245,7 +249,9 @@ function redactSensitiveBlocks(text: string): string {
 }
 
 export function redactSensitiveText(text: string): string {
-  const redacted = redactSensitiveBlocks(text)
+  const normalized = text.replace(ANSI_ESCAPE, "").replace(CONTROL_CHARACTERS, "");
+  const redacted = redactSensitiveBlocks(normalized)
+    .replace(SENSITIVE_MULTILINE_ASSIGNMENT, "$1[REDACTED]")
     .replace(PRIVATE_KEY_BLOCK, "[REDACTED]")
     .replace(AUTHORIZATION_TOKEN, "$1 [REDACTED]")
     .replace(BRACKETED_SENSITIVE_ASSIGNMENT, "$1[REDACTED]")
@@ -278,10 +284,26 @@ export function validateSshToken(value: string, label: string): void {
   }
 }
 
-export async function safeTail(file: string, lines: number): Promise<string> {
+function isContainedPath(root: string, candidate: string): boolean {
+  const relativePath = relative(root, candidate);
+  return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
+}
+
+async function containedPath(root: string, candidate: string): Promise<string | undefined> {
+  try {
+    const resolved = await realpath(candidate);
+    return isContainedPath(root, resolved) ? resolved : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function safeTail(file: string, lines: number, allowedRoot?: string): Promise<string> {
   if (lines <= 0) return "";
   try {
-    const handle = await open(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const safeFile = allowedRoot === undefined ? file : await containedPath(allowedRoot, file);
+    if (safeFile === undefined) return "";
+    const handle = await open(safeFile, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     try {
       const metadata = await handle.stat();
       if (!metadata.isFile()) return "";
@@ -313,13 +335,13 @@ async function commandFirstLines(args: string[], lines: number, redactions: stri
   }
 }
 
-async function boundedDirectoryEntries(path: string): Promise<{ entries: Dirent[]; truncated: boolean }> {
+async function boundedDirectoryEntries(path: string, limit = MAX_LOCAL_DIRECTORY_ENTRIES): Promise<{ entries: Dirent[]; truncated: boolean }> {
   const directory = await opendir(path);
   const entries: Dirent[] = [];
   let truncated = false;
   try {
     for await (const entry of directory) {
-      if (entries.length >= MAX_LOCAL_DIRECTORY_ENTRIES) {
+      if (entries.length >= limit) {
         truncated = true;
         break;
       }
@@ -332,7 +354,7 @@ async function boundedDirectoryEntries(path: string): Promise<{ entries: Dirent[
 }
 
 async function localCollect(options: SnapshotOptions): Promise<string> {
-  const localDir = resolve(expandUser(options.localDir));
+  const requestedLocalDir = resolve(expandUser(options.localDir));
   const lines: string[] = [
     "## Local",
     "",
@@ -342,12 +364,14 @@ async function localCollect(options: SnapshotOptions): Promise<string> {
     "",
   ];
   let directory;
+  let localDir: string | undefined;
   try {
-    directory = await lstat(localDir);
+    directory = await lstat(requestedLocalDir);
+    if (directory.isDirectory() && !directory.isSymbolicLink()) localDir = await realpath(requestedLocalDir);
   } catch {
     directory = undefined;
   }
-  if (options.localDir.length === 0 || directory?.isDirectory() !== true) {
+  if (options.localDir.length === 0 || directory?.isDirectory() !== true || localDir === undefined) {
     lines.push("> Local dir not found. Skipping local collection.", "");
     return lines.join("\n");
   }
@@ -373,8 +397,9 @@ async function localCollect(options: SnapshotOptions): Promise<string> {
 
   const clientLog = join(localDir, "client_log.txt");
   try {
-    if ((await lstat(clientLog)).isFile()) {
-      lines.push("### client_log.txt (tail 80)", "", redactOperationalText((await safeTail(clientLog, 80)).trimEnd(), pathRedactions), "");
+    const safeClientLog = await containedPath(localDir, clientLog);
+    if (safeClientLog !== undefined && (await lstat(safeClientLog)).isFile()) {
+      lines.push("### client_log.txt (tail 80)", "", redactOperationalText((await safeTail(safeClientLog, 80, localDir)).trimEnd(), pathRedactions), "");
     }
   } catch {
     // The file is optional.
@@ -382,6 +407,7 @@ async function localCollect(options: SnapshotOptions): Promise<string> {
 
   const clusters: string[] = [];
   let clusterScanTruncated = false;
+  let clusterEntriesScanned = 0;
   for (const entry of entries) {
     if (clusters.length >= MAX_LOCAL_CLUSTER_PATHS) {
       clusterScanTruncated = true;
@@ -389,37 +415,51 @@ async function localCollect(options: SnapshotOptions): Promise<string> {
     }
     if (!entry.isDirectory()) continue;
     if (entry.name.startsWith("Cluster_")) {
-      clusters.push(join(localDir, entry.name));
+      clusterEntriesScanned += 1;
+      const cluster = await containedPath(localDir, join(localDir, entry.name));
+      if (cluster !== undefined) clusters.push(cluster);
       continue;
     }
+    if (clusterEntriesScanned >= MAX_LOCAL_CLUSTER_SCAN_ENTRIES) {
+      clusterScanTruncated = true;
+      break;
+    }
     let profileEntries: Dirent[];
+    let profileTruncated = false;
     try {
-      profileEntries = (await boundedDirectoryEntries(join(localDir, entry.name))).entries;
+      const listing = await boundedDirectoryEntries(join(localDir, entry.name), Math.min(MAX_LOCAL_DIRECTORY_ENTRIES, MAX_LOCAL_CLUSTER_SCAN_ENTRIES - clusterEntriesScanned));
+      profileEntries = listing.entries;
+      profileTruncated = listing.truncated;
     } catch {
       profileEntries = [];
     }
+    clusterEntriesScanned += profileEntries.length;
+    if (profileTruncated) clusterScanTruncated = true;
     for (const profileEntry of profileEntries) {
       if (clusters.length >= MAX_LOCAL_CLUSTER_PATHS) {
         clusterScanTruncated = true;
         break;
       }
       if (profileEntry.isDirectory() && profileEntry.name.startsWith("Cluster_")) {
-        clusters.push(join(localDir, entry.name, profileEntry.name));
+        const cluster = await containedPath(localDir, join(localDir, entry.name, profileEntry.name));
+        if (cluster !== undefined) clusters.push(cluster);
       }
     }
   }
-  if (clusterScanTruncated) lines.push(`> Cluster path scan truncated at ${MAX_LOCAL_CLUSTER_PATHS} entries.`, "");
+  if (clusterScanTruncated) lines.push(`> Cluster path scan truncated at ${MAX_LOCAL_CLUSTER_SCAN_ENTRIES} entries.`, "");
   if (clusters.length > 0) {
     lines.push("### Local clusters (paths only; secrets redacted)", "");
     for (const [index, cluster] of clusters.sort().entries()) {
       lines.push(`- <cluster-${index + 1}>`);
       try {
-        if ((await lstat(join(cluster, "cluster_token.txt"))).isFile()) lines.push("  - cluster_token.txt: present (redacted)");
+        const tokenPath = await containedPath(localDir, join(cluster, "cluster_token.txt"));
+        if (tokenPath !== undefined && (await lstat(tokenPath)).isFile()) lines.push("  - cluster_token.txt: present (redacted)");
       } catch {
         // Optional secret marker.
       }
       try {
-        if ((await lstat(join(cluster, "cluster.ini"))).isFile()) lines.push("  - cluster.ini: present (contains cluster_password; do not paste)");
+        const iniPath = await containedPath(localDir, join(cluster, "cluster.ini"));
+        if (iniPath !== undefined && (await lstat(iniPath)).isFile()) lines.push("  - cluster.ini: present (contains cluster_password; do not paste)");
       } catch {
         // Optional secret marker.
       }
@@ -451,7 +491,16 @@ async function remoteCollect(options: SnapshotOptions, script: string): Promise<
     return { text: lines.join("\n"), failed: false };
   }
 
-  const result = await runWithStdin(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", target, "bash", "-s"], script);
+  let result: CommandResult;
+  try {
+    result = await runWithStdin(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", target, "bash", "-s"], script);
+  } catch (error) {
+    const detail = redactOperationalText(error instanceof Error ? error.message : String(error), [options.host, options.user, homedir()]);
+    lines.push("> Remote collection command could not be started.");
+    if (detail.length > 0) lines.push(`> Reason: ${detail}`);
+    lines.push("");
+    return { text: lines.join("\n"), failed: true };
+  }
   if (result.timedOut) {
     lines.push(`> Remote collection timed out after ${REMOTE_COMMAND_TIMEOUT_MS / 1000}s.`, "");
     return { text: lines.join("\n"), failed: true };
@@ -589,7 +638,7 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     console.error(`error: cannot publish snapshot at <configured-output>: ${detail || "publication failed"}`);
     return 2;
   }
-  console.log("<configured-output>");
+  console.log(outputPath);
   return failed ? 1 : 0;
 }
 

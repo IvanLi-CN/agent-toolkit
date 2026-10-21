@@ -17,6 +17,19 @@ import {
   type ScoreEvent,
 } from "../scripts/buzzer_preview.ts";
 
+const FIXTURE_TRANSACTION_OWNER = "00000000-0000-4000-8000-000000000000\n";
+
+async function captureStdout<T>(callback: () => Promise<T>): Promise<{ value: T; stdout: string[] }> {
+  const originalLog = console.log;
+  const stdout: string[] = [];
+  console.log = (...args: unknown[]) => stdout.push(args.map(String).join(" "));
+  try {
+    return { value: await callback(), stdout };
+  } finally {
+    console.log = originalLog;
+  }
+}
+
 function readU16BE(data: Uint8Array, offset: number): number {
   return (data[offset]! << 8) | data[offset + 1]!;
 }
@@ -186,7 +199,10 @@ describe("buzzer MIDI and WAV helper", () => {
       const input = join(root, "fixture.json");
       const output = join(root, "out");
       await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
-      expect(await main(["--in", input, "--out-dir", output])).toBe(0);
+      const captured = await captureStdout(() => main(["--in", input, "--out-dir", output]));
+      expect(captured.value).toBe(0);
+      expect(captured.stdout).toContain(`[OK] Wrote: ${join(output, "fixture.mid")}`);
+      expect(captured.stdout).toContain(`[OK] Wrote: ${join(output, "fixture.wav")}`);
       expect((await readFile(join(output, "fixture.mid"))).slice(0, 4).toString()).toBe("MThd");
       expect((await readFile(join(output, "fixture.wav"))).slice(0, 4).toString()).toBe("RIFF");
     } finally {
@@ -333,6 +349,26 @@ describe("buzzer MIDI and WAV helper", () => {
     }
   });
 
+  test("reclaims a dead partially initialized lock for readers", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-dead-partial-lock-"));
+    try {
+      const output = join(root, "out");
+      const lock = join(output, ".buzzer-preview-fixture.lock");
+      await mkdir(output, { recursive: true });
+      await writeFile(join(output, "fixture.mid"), "midi");
+      await writeFile(join(output, "fixture.wav"), "wav");
+      await mkdir(lock);
+      await writeFile(join(lock, "pid"), "2147483647\n");
+      await writeFile(join(lock, "owner"), "dead-owner\n");
+      const pair = await readPublishedPair(output, "fixture");
+      expect(pair.midi.toString()).toBe("midi");
+      expect(pair.wav.toString()).toBe("wav");
+      expect(await readdir(output)).not.toContain(".buzzer-preview-fixture.lock");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("preserves an empty transaction-shaped directory", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-empty-transaction-"));
     try {
@@ -416,6 +452,7 @@ describe("buzzer MIDI and WAV helper", () => {
       const output = join(root, "out");
       const transaction = join(output, ".buzzer-preview-txn-fixture-recovery");
       await mkdir(transaction, { recursive: true });
+      await writeFile(join(transaction, ".owner"), FIXTURE_TRANSACTION_OWNER);
       await writeFile(join(output, "fixture.mid"), "new-midi");
       await writeFile(join(output, "fixture.wav"), "old-wav");
       await writeFile(join(transaction, "midi.backup"), "old-midi");
@@ -430,6 +467,44 @@ describe("buzzer MIDI and WAV helper", () => {
     }
   });
 
+  test("cleans a durable owner transaction that crashed before publication state", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-prejournal-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      const transaction = join(output, ".buzzer-preview-txn-fixture-prejournal");
+      await mkdir(transaction, { recursive: true });
+      await writeFile(join(transaction, ".owner"), FIXTURE_TRANSACTION_OWNER);
+      await writeFile(join(transaction, "midi.new"), "partial-midi");
+      await writeFile(join(transaction, "wav.new"), "partial-wav");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      expect(await main(["--in", input, "--out-dir", output])).toBe(0);
+      expect(await readdir(output)).not.toContain(".buzzer-preview-txn-fixture-prejournal");
+      expect((await readFile(join(output, "fixture.mid"))).length).toBeGreaterThan(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not restore a transaction without an owner nonce", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-unowned-recovery-"));
+    try {
+      const output = join(root, "out");
+      const transaction = join(output, ".buzzer-preview-txn-fixture-unowned");
+      await mkdir(transaction, { recursive: true });
+      await writeFile(join(output, "fixture.mid"), "current-midi");
+      await writeFile(join(output, "fixture.wav"), "current-wav");
+      await writeFile(join(transaction, "midi.backup"), "attacker-midi");
+      await writeFile(join(transaction, ".state"), "midi-published\n");
+      const pair = await readPublishedPair(output, "fixture");
+      expect(pair.midi.toString()).toBe("current-midi");
+      expect(pair.wav.toString()).toBe("current-wav");
+      expect(await readdir(output)).toContain(".buzzer-preview-txn-fixture-unowned");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("does not follow a transaction backup symlink during recovery", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-backup-symlink-"));
     try {
@@ -437,6 +512,7 @@ describe("buzzer MIDI and WAV helper", () => {
       const transaction = join(output, ".buzzer-preview-txn-fixture-symlink");
       const outside = join(root, "outside-secret");
       await mkdir(transaction, { recursive: true });
+      await writeFile(join(transaction, ".owner"), FIXTURE_TRANSACTION_OWNER);
       await writeFile(join(output, "fixture.mid"), "new-midi");
       await writeFile(join(output, "fixture.wav"), "old-wav");
       await writeFile(outside, "PRIVATE_BYTES");
@@ -457,6 +533,7 @@ describe("buzzer MIDI and WAV helper", () => {
       const output = join(root, "out");
       const transaction = join(output, ".buzzer-preview-txn-fixture-invalid-state");
       await mkdir(transaction, { recursive: true });
+      await writeFile(join(transaction, ".owner"), FIXTURE_TRANSACTION_OWNER);
       await writeFile(join(output, "fixture.mid"), "new-midi");
       await writeFile(join(output, "fixture.wav"), "old-wav");
       await writeFile(join(transaction, "midi.backup"), "old-midi");
@@ -477,6 +554,7 @@ describe("buzzer MIDI and WAV helper", () => {
       const transaction = join(output, ".buzzer-preview-txn-fixture-state-symlink");
       const outside = join(root, "outside-state");
       await mkdir(transaction, { recursive: true });
+      await writeFile(join(transaction, ".owner"), FIXTURE_TRANSACTION_OWNER);
       await writeFile(join(output, "fixture.mid"), "new-midi");
       await writeFile(join(output, "fixture.wav"), "old-wav");
       await writeFile(join(transaction, "midi.backup"), "old-midi");
@@ -497,6 +575,7 @@ describe("buzzer MIDI and WAV helper", () => {
       const output = join(root, "out");
       const transaction = join(output, ".buzzer-preview-txn-fixture-marker");
       await mkdir(transaction, { recursive: true });
+      await writeFile(join(transaction, ".owner"), FIXTURE_TRANSACTION_OWNER);
       await writeFile(join(output, "fixture.mid"), "restored-midi");
       await writeFile(join(output, "fixture.wav"), "old-wav");
       await writeFile(join(transaction, "midi.restoring"), "");
@@ -516,6 +595,7 @@ describe("buzzer MIDI and WAV helper", () => {
       const output = join(root, "out");
       const transaction = join(output, ".buzzer-preview-txn-fixture-wav-recovery");
       await mkdir(transaction, { recursive: true });
+      await writeFile(join(transaction, ".owner"), FIXTURE_TRANSACTION_OWNER);
       await writeFile(join(output, "fixture.mid"), "new-midi");
       await writeFile(join(output, "fixture.wav"), "new-wav");
       await writeFile(join(transaction, "midi.backup"), "old-midi");

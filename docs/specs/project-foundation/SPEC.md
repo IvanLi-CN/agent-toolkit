@@ -128,6 +128,8 @@ The project MUST keep real inventory, credentials, deployment addresses, persona
 
 The project MUST preserve the defined CLI, outputs, error behavior, authorization boundaries, configuration semantics, protocol, and durable-state behavior. Intentional contract changes require an explicit decision before implementation.
 
+For the migrated helper CLIs, successful Buzzer and framebuffer runs MUST print each generated output path as `[OK] Wrote: <path>`; diagnostic failures MUST retain the underlying error message after the `error:` prefix; DST snapshot runs MUST print the actual report path after a successful atomic publish, while publish-failure paths remain represented as `<configured-output>` and their diagnostic detail remains redacted. Snapshot file contents remain subject to the public redaction boundary.
+
 ### REQ-FOUNDATION-COMMON-05
 
 The project MUST change implementation, tests, invocation sites, links, CI discovery, and prerequisite documentation together. Retire replaced production implementations rather than maintaining both as active code. Keep unrelated user/private-source content intact.

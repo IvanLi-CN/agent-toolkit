@@ -5,6 +5,17 @@ import { inflateSync } from "node:zlib";
 import { join } from "node:path";
 import { convertFramebuffer, encodePng, expandUser, main, MAX_FRAMEBUFFER_INPUT_BYTES, MAX_FRAMEBUFFER_PIXELS, MAX_FRAMEBUFFER_ROWS, type ConvertOptions } from "../scripts/fb_to_png.ts";
 
+async function captureStdout<T>(callback: () => Promise<T>): Promise<{ value: T; stdout: string[] }> {
+  const originalLog = console.log;
+  const stdout: string[] = [];
+  console.log = (...args: unknown[]) => stdout.push(args.map(String).join(" "));
+  try {
+    return { value: await callback(), stdout };
+  } finally {
+    console.log = originalLog;
+  }
+}
+
 function crc32(data: Uint8Array): number {
   let value = 0xffffffff;
   for (const byte of data) {
@@ -160,7 +171,9 @@ describe("framebuffer to PNG helper", () => {
       const input = join(root, "frame.raw");
       const output = join(root, "frame.png");
       await writeFile(input, Uint8Array.from([255, 7, 8, 9, 10, 11]));
-      expect(await main(["--format", "gray8", "--width", "1", "--height", "1", "--in", input, "--out", output])).toBe(0);
+      const captured = await captureStdout(() => main(["--format", "gray8", "--width", "1", "--height", "1", "--in", input, "--out", output]));
+      expect(captured.value).toBe(0);
+      expect(captured.stdout).toContain(`[OK] Wrote: ${output}`);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

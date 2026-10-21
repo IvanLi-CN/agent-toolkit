@@ -39,6 +39,8 @@ describe("DST local Bun tooling", () => {
     expect(redactSensitiveText("[api_key]=fixture-secret")).not.toContain("fixture-secret");
     expect(redactSensitiveText("api_key%3Dfixture-secret")).not.toContain("fixture-secret");
     expect(redactSensitiveText("password: |\n  fixture-secret\nnext: visible")).not.toContain("fixture-secret");
+    expect(redactSensitiveText("api_\u001b[31mkey=fixture-secret")).not.toContain("fixture-secret");
+    expect(redactSensitiveText("api_key=\n  fixture-secret\nvisible=ok")).not.toContain("fixture-secret");
     expect(redactSensitiveText('api_key="prefix\\"LEAK"')).toBe("api_key=[REDACTED]");
     expect(redactSensitiveText('{"token":"json-secret", "api_key": "other-secret"}')).not.toMatch(/json-secret|other-secret/);
     expect(redactSensitiveText("api_token=abc,SECRET_TAIL")).toBe("api_token=[REDACTED]");

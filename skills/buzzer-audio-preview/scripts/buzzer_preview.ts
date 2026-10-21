@@ -2,7 +2,8 @@
 
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, rename, rm, unlink, utimes } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, opendir, readFile, readlink, rename, rm, unlink, utimes } from "node:fs/promises";
+import type { Dirent } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 
@@ -526,8 +527,10 @@ const LOCK_STALE_MS = 5 * 60 * 1000;
 const LOCK_HEARTBEAT_MS = 30 * 1000;
 const PROCESS_IDENTITY_TIMEOUT_MS = 1_000;
 const MAX_TRANSACTION_DIRECTORIES = 256;
+const MAX_RECOVERY_SCAN_ENTRIES = 4_096;
 type PublishState = "prepared" | "midi-backed-up" | "backups-complete" | "midi-published" | "wav-publishing" | "wav-published" | "complete";
 const TRANSACTION_ENTRY_NAMES = new Set([
+  ".owner",
   ".state",
   ".state.tmp",
   "midi.new",
@@ -542,6 +545,24 @@ const TRANSACTION_ENTRY_NAMES = new Set([
   "wav.symlink",
 ]);
 const LOCK_ENTRY_NAMES = new Set(["pid", "owner", "identity", "heartbeat", "ready"]);
+
+async function readDirectoryEntriesBounded(path: string, maxEntries: number): Promise<{ entries: Dirent[]; truncated: boolean }> {
+  const directory = await opendir(path);
+  const entries: Dirent[] = [];
+  let truncated = false;
+  try {
+    for await (const entry of directory) {
+      if (entries.length >= maxEntries) {
+        truncated = true;
+        break;
+      }
+      entries.push(entry);
+    }
+  } finally {
+    await directory.close().catch(() => undefined);
+  }
+  return { entries, truncated };
+}
 
 async function pathExists(path: string): Promise<boolean> {
   try {
@@ -639,7 +660,9 @@ async function removeTransactionDirectory(directory: string): Promise<void> {
   try {
     const metadata = await lstat(directory);
     if (!metadata.isDirectory() || metadata.isSymbolicLink()) return;
-    entries = await readdir(directory, { withFileTypes: true });
+    const listing = await readDirectoryEntriesBounded(directory, TRANSACTION_ENTRY_NAMES.size + 1);
+    if (listing.truncated) return;
+    entries = listing.entries;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
     throw error;
@@ -677,6 +700,8 @@ async function readPublishState(directory: string): Promise<PublishState | undef
 
 async function hasRecoveryArtifacts(directory: string): Promise<boolean> {
   for (const name of [
+    "midi.new",
+    "wav.new",
     "midi.backup",
     "wav.backup",
     "midi.restoring",
@@ -689,6 +714,15 @@ async function hasRecoveryArtifacts(directory: string): Promise<boolean> {
     if (await pathExists(join(directory, name))) return true;
   }
   return false;
+}
+
+async function hasValidTransactionOwner(directory: string): Promise<boolean> {
+  try {
+    const owner = new TextDecoder().decode(await readRegularFile(join(directory, ".owner"), 128)).trim();
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(owner);
+  } catch {
+    return false;
+  }
 }
 
 async function restoreOutput(
@@ -741,6 +775,12 @@ async function restoreTransaction(directory: string, midiPath: string, wavPath: 
   }
   const state = await readPublishState(directory);
   if (state === undefined) {
+    const hasInitialArtifacts = await pathExists(join(directory, "midi.new")) || await pathExists(join(directory, "wav.new"));
+    if (hasInitialArtifacts && await hasValidTransactionOwner(directory)) {
+      await removeTransactionDirectory(directory);
+      await syncDirectory(dirname(directory));
+      return;
+    }
     if (await hasRecoveryArtifacts(directory)) {
       throw new Error(`transaction state is missing while recovery artifacts exist: ${directory}`);
     }
@@ -768,19 +808,25 @@ async function restoreTransaction(directory: string, midiPath: string, wavPath: 
 async function recoverPublishTransactions(outDir: string, stem: string, midiPath: string, wavPath: string): Promise<void> {
   const transactionPrefix = `.buzzer-preview-txn-${stem}-`;
   const recoveryPrefix = `.buzzer-preview-recovery-${stem}-`;
-  let entries;
+  const candidates: Dirent[] = [];
   try {
-    entries = await readdir(outDir, { withFileTypes: true });
+    const directory = await opendir(outDir);
+    try {
+      let scanned = 0;
+      for await (const entry of directory) {
+        scanned += 1;
+        if (entry.isDirectory() && (entry.name.startsWith(transactionPrefix) || entry.name.startsWith(recoveryPrefix))) {
+          candidates.push(entry);
+          if (candidates.length > MAX_TRANSACTION_DIRECTORIES) throw new Error(`too many publication transactions in ${outDir}`);
+        }
+        if (scanned >= MAX_RECOVERY_SCAN_ENTRIES) break;
+      }
+    } finally {
+      await directory.close().catch(() => undefined);
+    }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
     throw error;
-  }
-  const candidates = entries.filter((entry) => {
-    if (!entry.isDirectory()) return false;
-    return entry.name.startsWith(transactionPrefix) || entry.name.startsWith(recoveryPrefix);
-  });
-  if (candidates.length > MAX_TRANSACTION_DIRECTORIES) {
-    throw new Error(`too many publication transactions in ${outDir}`);
   }
   for (const entry of candidates) {
     const isTransaction = entry.name.startsWith(transactionPrefix);
@@ -789,12 +835,15 @@ async function recoverPublishTransactions(outDir: string, stem: string, midiPath
     const transaction = join(outDir, entry.name);
     let transactionEntries;
     try {
-      transactionEntries = await readdir(transaction, { withFileTypes: true });
+      const listing = await readDirectoryEntriesBounded(transaction, TRANSACTION_ENTRY_NAMES.size + 1);
+      if (listing.truncated) continue;
+      transactionEntries = listing.entries;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
       throw error;
     }
     if (transactionEntries.some((candidate) => candidate.isDirectory() || !TRANSACTION_ENTRY_NAMES.has(candidate.name))) continue;
+    if (!await hasValidTransactionOwner(transaction)) continue;
     const state = await readPublishState(transaction);
     if (state === undefined && !await hasRecoveryArtifacts(transaction)) continue;
     const quarantine = isRecovery ? transaction : join(outDir, `.buzzer-preview-recovery-${stem}-${randomUUID()}`);
@@ -836,7 +885,9 @@ async function removeLockDirectory(directory: string): Promise<boolean> {
   try {
     const metadata = await lstat(directory);
     if (!metadata.isDirectory() || metadata.isSymbolicLink()) return false;
-    entries = await readdir(directory, { withFileTypes: true });
+    const listing = await readDirectoryEntriesBounded(directory, LOCK_ENTRY_NAMES.size + 1);
+    if (listing.truncated) return false;
+    entries = listing.entries;
   } catch {
     return false;
   }
@@ -936,15 +987,21 @@ async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner
       try {
         const metadata = await lstat(lockDirectory);
         if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error("lock path is not a private directory");
-        const entries = await readdir(lockDirectory, { withFileTypes: true });
+        const listing = await readDirectoryEntriesBounded(lockDirectory, LOCK_ENTRY_NAMES.size + 1);
+        if (listing.truncated) throw new Error("lock directory contains too many entries");
+        const entries = listing.entries;
         if (entries.some((entry) => entry.isDirectory() || entry.isSymbolicLink() || !LOCK_ENTRY_NAMES.has(entry.name))) throw new Error("lock directory contains unknown entries");
         const heartbeatMetadata = await lstat(join(lockDirectory, "heartbeat")).catch(() => metadata);
         const age = Date.now() - heartbeatMetadata.mtimeMs;
         const ready = entries.some((entry) => entry.name === "ready");
         if (!ready) {
-          // The ready marker fences the owner metadata. Age alone cannot prove
-          // that a process did not pause during lock initialization.
-          stale = false;
+          // A crash before ready can be reclaimed only when a complete owner
+          // identity is already durable and the process is definitely gone.
+          const ownerText = new TextDecoder().decode(await readRegularFile(join(lockDirectory, "pid"), 128));
+          const owner = Number(ownerText.trim());
+          const ownerToken = new TextDecoder().decode(await readRegularFile(join(lockDirectory, "owner"), 128)).trim();
+          if (!Number.isSafeInteger(owner) || owner <= 0 || ownerToken.length === 0) throw new Error("partial lock owner is incomplete");
+          stale = !await isProcessAlive(owner) && (reclaimDeadOwner || age > LOCK_STALE_MS);
         } else {
           const ownerText = new TextDecoder().decode(await readRegularFile(join(lockDirectory, "pid"), 128));
           const owner = Number(ownerText.trim());
@@ -989,6 +1046,7 @@ async function publishOutputsLocked(outDir: string, stem: string, midi: Uint8Arr
   const tempMidiPath = join(transaction, "midi.new");
   const tempWavPath = join(transaction, "wav.new");
   try {
+    await writeSyncedFile(join(transaction, ".owner"), new TextEncoder().encode(`${randomUUID()}\n`));
     await writeSyncedFile(tempMidiPath, midi);
     await writeSyncedFile(tempWavPath, wav);
     await writePublishState(transaction, "prepared");
@@ -1088,14 +1146,14 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     if (!outDirStat.isDirectory() || outDirStat.isSymbolicLink()) throw new CliError("--out-dir must resolve to a real directory");
     const { config, events } = await parseScoreFile(inputPath);
     const stem = validateStem(parsed.stem ?? basename(inputPath, extname(inputPath)));
-    await publishOutputs(outDir, stem, encodeMidi(config, events), encodeWav(config, events));
+    const [midiPath, wavPath] = await publishOutputs(outDir, stem, encodeMidi(config, events), encodeWav(config, events));
     const totalSeconds = events.reduce((total, event) => total + event.durationS, 0);
-    console.log("[OK] Wrote MIDI preview");
-    console.log("[OK] Wrote WAV preview");
-    console.log(`[INFO] Duration: ${totalSeconds.toFixed(2)}s, tempo=${config.tempoBpm}, waveform=${config.audio.waveform}`);
+    console.log(`[OK] Wrote: ${midiPath}`);
+    console.log(`[OK] Wrote: ${wavPath}`);
+    console.log(`[INFO] Duration: ${totalSeconds.toFixed(2)}s, tempo=${config.tempoBpm} bpm, waveform=${config.audio.waveform}`);
     return 0;
   } catch (error) {
-    console.error(`error: ${error instanceof CliError ? error.message : "preview generation failed"}`);
+    console.error(`error: ${error instanceof Error ? error.message : String(error)}`);
     return error instanceof CliError ? error.exitCode : 1;
   }
 }

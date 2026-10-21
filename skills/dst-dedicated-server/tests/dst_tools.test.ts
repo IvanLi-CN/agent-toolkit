@@ -434,7 +434,7 @@ esac
   });
 
   test("redacts arbitrary paths and IPv4/IPv6 addresses from operational diagnostics", () => {
-    const diagnostic = "denied /workspace/private/key /home/alice/My Secret/token ../relative/private/key \\\\server\\share\\private via 192.0.2.8, [2001:db8::7], and ::ffff:192.0.2.9";
+    const diagnostic = "denied /workspace/private/key /srv/fixture/My Secret/token ../relative/private/key \\\\server\\share\\private via 192.0.2.8, [2001:db8::7], and ::ffff:192.0.2.9";
     const redacted = redactOperationalText(diagnostic);
     expect(redacted).not.toContain("/workspace/private/key");
     expect(redacted).not.toContain("../relative/private/key");

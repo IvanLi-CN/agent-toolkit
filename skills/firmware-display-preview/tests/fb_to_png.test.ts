@@ -153,6 +153,18 @@ describe("framebuffer to PNG helper", () => {
     }
   });
 
+  test("accepts bounded trailing framebuffer data for legacy captures", async () => {
+    const root = await mkdtemp(join(process.env.TMPDIR ?? "/tmp", "agent-toolkit-fb-trailing-"));
+    try {
+      const input = join(root, "frame.raw");
+      const output = join(root, "frame.png");
+      await writeFile(input, Uint8Array.from([255, 7, 8, 9, 10, 11]));
+      expect(await main(["--format", "gray8", "--width", "1", "--height", "1", "--in", input, "--out", output])).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("replaces an output symlink without touching its target", async () => {
     const root = await mkdtemp(join(process.env.TMPDIR ?? "/tmp", "agent-toolkit-fb-output-"));
     try {

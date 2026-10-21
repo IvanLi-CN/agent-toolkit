@@ -108,7 +108,7 @@ function inputBounds(format: FramebufferFormat, options: ConvertOptions): { mini
     const pages = Math.ceil(options.height / 8);
     const bytes = options.width * pages;
     if (!Number.isSafeInteger(bytes) || bytes > MAX_FRAMEBUFFER_INPUT_BYTES) throw new Error("framebuffer input exceeds the byte limit");
-    return { minimum: bytes, maximum: bytes };
+    return { minimum: bytes, maximum: MAX_FRAMEBUFFER_INPUT_BYTES };
   }
   if (format === "mono1") rowBytes = Math.ceil(options.width / 8);
   else if (format === "gray8") rowBytes = options.width;
@@ -116,11 +116,10 @@ function inputBounds(format: FramebufferFormat, options: ConvertOptions): { mini
   else rowBytes = options.width * 3;
   const stride = strideFor(rowBytes, options.strideBytes);
   const minimum = (options.height - 1) * stride + rowBytes;
-  const maximum = options.height * stride;
-  if (!Number.isSafeInteger(minimum) || !Number.isSafeInteger(maximum) || maximum > MAX_FRAMEBUFFER_INPUT_BYTES) {
+  if (!Number.isSafeInteger(minimum) || minimum > MAX_FRAMEBUFFER_INPUT_BYTES) {
     throw new Error("framebuffer input exceeds the byte limit");
   }
-  return { minimum, maximum };
+  return { minimum, maximum: MAX_FRAMEBUFFER_INPUT_BYTES };
 }
 
 async function readFramebufferInput(path: string, bounds: { minimum: number; maximum: number }): Promise<Uint8Array> {

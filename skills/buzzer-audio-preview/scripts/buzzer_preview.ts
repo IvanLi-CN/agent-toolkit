@@ -2,7 +2,7 @@
 
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, rename, rm, rmdir, unlink, utimes } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, rename, rm, unlink, utimes } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 
@@ -524,6 +524,8 @@ async function writeSyncedFile(path: string, data: Uint8Array): Promise<void> {
 
 const LOCK_STALE_MS = 5 * 60 * 1000;
 const LOCK_HEARTBEAT_MS = 30 * 1000;
+const PROCESS_IDENTITY_TIMEOUT_MS = 1_000;
+const MAX_TRANSACTION_DIRECTORIES = 256;
 type PublishState = "prepared" | "midi-backed-up" | "backups-complete" | "midi-published" | "wav-publishing" | "wav-published" | "complete";
 const TRANSACTION_ENTRY_NAMES = new Set([
   ".state",
@@ -635,24 +637,23 @@ async function syncDirectory(path: string): Promise<void> {
 async function removeTransactionDirectory(directory: string): Promise<void> {
   let entries;
   try {
+    const metadata = await lstat(directory);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) return;
     entries = await readdir(directory, { withFileTypes: true });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
     throw error;
   }
-  if (entries.some((entry) => entry.isDirectory() || !TRANSACTION_ENTRY_NAMES.has(entry.name))) return;
-  for (const entry of entries) {
-    try {
-      await unlink(join(directory, entry.name));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-  }
+  if (entries.some((entry) => entry.isDirectory() || entry.isSymbolicLink() || !TRANSACTION_ENTRY_NAMES.has(entry.name))) return;
+  const tombstone = join(dirname(directory), `.buzzer-preview-delete-${randomUUID()}`);
   try {
-    await rmdir(directory);
+    await rename(directory, tombstone);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
   }
+  await rm(tombstone, { recursive: true, force: true, maxRetries: 0 });
+  await syncDirectory(dirname(directory));
 }
 
 async function writePublishState(directory: string, state: PublishState): Promise<void> {
@@ -774,6 +775,9 @@ async function recoverPublishTransactions(outDir: string, stem: string, midiPath
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
     throw error;
   }
+  if (entries.length > MAX_TRANSACTION_DIRECTORIES) {
+    throw new Error(`too many publication transactions in ${outDir}`);
+  }
   for (const entry of entries) {
     const isTransaction = entry.name.startsWith(transactionPrefix);
     const isRecovery = entry.name.startsWith(recoveryPrefix);
@@ -824,17 +828,20 @@ async function isProcessAlive(pid: number): Promise<boolean> {
 async function removeLockDirectory(directory: string): Promise<boolean> {
   let entries;
   try {
+    const metadata = await lstat(directory);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) return false;
     entries = await readdir(directory, { withFileTypes: true });
   } catch {
     return false;
   }
-  if (entries.some((entry) => entry.isDirectory() || !LOCK_ENTRY_NAMES.has(entry.name))) return false;
-  for (const entry of entries) await unlink(join(directory, entry.name)).catch(() => undefined);
+  if (entries.some((entry) => entry.isDirectory() || entry.isSymbolicLink() || !LOCK_ENTRY_NAMES.has(entry.name))) return false;
+  const tombstone = join(dirname(directory), `.buzzer-preview-delete-${randomUUID()}`);
   try {
-    await rmdir(directory);
+    await rename(directory, tombstone);
   } catch {
     return false;
   }
+  await rm(tombstone, { recursive: true, force: true, maxRetries: 0 });
   await syncDirectory(dirname(directory));
   return true;
 }
@@ -854,7 +861,13 @@ async function processIdentity(pid: number): Promise<string | undefined> {
     }
   }
   try {
-    const child = Bun.spawn(["ps", "-o", "lstart=", "-p", String(pid)], { stdout: "pipe", stderr: "pipe" });
+    const child = Bun.spawn(["ps", "-o", "lstart=", "-p", String(pid)], {
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: PROCESS_IDENTITY_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+      maxBuffer: 4096,
+    });
     const [status, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
     const value = stdout.trim();
     return status === 0 && value.length > 0 ? `ps:${value}` : undefined;
@@ -876,7 +889,7 @@ async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner
   const lockDirectory = join(outDir, `.buzzer-preview-${stem}.lock`);
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      await mkdir(lockDirectory);
+      await mkdir(lockDirectory, { mode: 0o700 });
       const owner = randomUUID();
       const identity = await processIdentity(process.pid);
       await syncDirectory(outDir);
@@ -936,9 +949,10 @@ async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner
               .then((value) => new TextDecoder().decode(value).trim())
               .catch(() => "");
             const currentIdentity = recordedIdentity.length > 0 ? await processIdentity(owner) : undefined;
-            stale = currentIdentity === undefined
-              ? age > LOCK_STALE_MS
-              : recordedIdentity.length > 0 && currentIdentity !== recordedIdentity && age > LOCK_STALE_MS;
+            stale = currentIdentity !== undefined
+              && recordedIdentity.length > 0
+              && currentIdentity !== recordedIdentity
+              && age > LOCK_STALE_MS;
           }
         }
       } catch {
@@ -1024,8 +1038,11 @@ async function publishOutputs(outDir: string, stem: string, midi: Uint8Array, wa
 
 export async function readPublishedPair(outDir: string, stem: string): Promise<{ midi: Uint8Array; wav: Uint8Array }> {
   validateStem(stem);
-  const midiPath = resolve(outDir, `${stem}.mid`);
-  const wavPath = resolve(outDir, `${stem}.wav`);
+  const resolvedOutDir = resolve(outDir);
+  const outDirMetadata = await lstat(resolvedOutDir);
+  if (!outDirMetadata.isDirectory() || outDirMetadata.isSymbolicLink()) throw new Error("output directory must be a real directory");
+  const midiPath = join(resolvedOutDir, `${stem}.mid`);
+  const wavPath = join(resolvedOutDir, `${stem}.wav`);
   let lastError: unknown;
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {

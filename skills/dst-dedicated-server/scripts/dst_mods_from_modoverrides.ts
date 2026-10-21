@@ -463,8 +463,8 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
       let summary: ShardSummary;
       try {
         try {
-          child.stdin.write(script);
-          child.stdin.end();
+          await child.stdin.write(script);
+          await child.stdin.end();
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "EPIPE") throw error;
         }

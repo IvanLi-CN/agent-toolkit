@@ -136,8 +136,12 @@ async function runWithStdin(
   };
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
-    child.stdin.write(input);
-    child.stdin.end();
+    try {
+      await child.stdin.write(input);
+      await child.stdin.end();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EPIPE") throw error;
+    }
     const stopForReadTimeout = () => {
       timedOut = true;
       requestStop();
@@ -198,6 +202,7 @@ async function syncDirectory(path: string): Promise<void> {
 
 const SENSITIVE_NAME = "(?:password|passwd|passphrase|pwd|secret|token|credential|private[_ -]?key|api[_ -]?key|access[_ -]?key|authorization|bearer)";
 const SENSITIVE_KEY = `(?:[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*|"[^"\\r\\n]*${SENSITIVE_NAME}[^"\\r\\n]*"|'[^'\\r\\n]*${SENSITIVE_NAME}[^'\\r\\n]*')`;
+const SENSITIVE_KEY_TOKEN = `(?:[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*|\\[[^\\]\\r\\n]*${SENSITIVE_NAME}[^\\]\\r\\n]*\\])`;
 const SENSITIVE_ASSIGNMENT = new RegExp(
   `((?:[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*)\\s*[:=]\\s*)(?!\\s*\\[REDACTED\\])("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|(?:Bearer|Basic)\\s+[^;\\r\\n]+?(?=[ \\t]+\\b${SENSITIVE_NAME}\\b(?:[ \\t]+|[:=])|\\r?\\n|$)|[^;\\r\\n]+?(?=[ \\t]+\\b${SENSITIVE_NAME}\\b(?:[ \\t]+|[:=])|\\r?\\n|$))`,
   "gi",
@@ -208,9 +213,41 @@ const SENSITIVE_QUOTED_ASSIGNMENT = new RegExp(
 );
 const SENSITIVE_BARE_VALUE = new RegExp(`\\b(${SENSITIVE_NAME})\\s+(?![A-Za-z0-9_.-]+\\s*[:=]|\\[REDACTED\\])([^,;\\r\\n]+?)(?=(?:\\s+(?:via|and)\\s+)|[,;\\r\\n]|$)`, "gi");
 const UNREDACTED_SENSITIVE_ASSIGNMENT = new RegExp(`(?:\\b${SENSITIVE_NAME}|${SENSITIVE_KEY})\\s*[:=](?!\\s*\\[REDACTED\\])`, "i");
+const AUTHORIZATION_TOKEN = /\b(Bearer|Basic)\s+[^\s,;]+/gi;
+const BRACKETED_SENSITIVE_ASSIGNMENT = new RegExp(`(\\[[^\\]\\r\\n]*${SENSITIVE_NAME}[^\\]\\r\\n]*\\]\\s*[:=]\\s*)(?!\\s*\\[REDACTED\\])([^,;\\r\\n]+)`, "gi");
+const ENCODED_SENSITIVE_ASSIGNMENT = new RegExp(`(\\b[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*\\s*%3[dD]\\s*)(?!\\s*\\[REDACTED\\])([^&\\s,;]+)`, "gi");
+const SENSITIVE_BLOCK_HEADER = new RegExp(`^([ \\t]*${SENSITIVE_KEY_TOKEN}\\s*[:=]\\s*[|>][-+0-9]*)\\s*$`, "i");
+
+function redactSensitiveBlocks(text: string): string {
+  const lines = text.split(/\r?\n/);
+  const redacted: string[] = [];
+  let blockIndent: number | undefined;
+  for (const line of lines) {
+    const indent = line.match(/^[ \\t]*/)?.[0].length ?? 0;
+    if (blockIndent !== undefined) {
+      if (line.trim() === "" || indent > blockIndent) {
+        redacted.push(`${line.slice(0, indent)}[REDACTED]`);
+        continue;
+      }
+      blockIndent = undefined;
+    }
+    const match = SENSITIVE_BLOCK_HEADER.exec(line);
+    SENSITIVE_BLOCK_HEADER.lastIndex = 0;
+    if (match !== null) {
+      blockIndent = indent;
+      redacted.push(`${match[1]} [REDACTED]`);
+    } else {
+      redacted.push(line);
+    }
+  }
+  return redacted.join("\n");
+}
 
 export function redactSensitiveText(text: string): string {
-  const redacted = text
+  const redacted = redactSensitiveBlocks(text)
+    .replace(AUTHORIZATION_TOKEN, "$1 [REDACTED]")
+    .replace(BRACKETED_SENSITIVE_ASSIGNMENT, "$1[REDACTED]")
+    .replace(ENCODED_SENSITIVE_ASSIGNMENT, "$1[REDACTED]")
     .replace(SENSITIVE_ASSIGNMENT, "$1[REDACTED]")
     .replace(SENSITIVE_QUOTED_ASSIGNMENT, "$1[REDACTED]")
     .replace(SENSITIVE_BARE_VALUE, "$1 [REDACTED]");

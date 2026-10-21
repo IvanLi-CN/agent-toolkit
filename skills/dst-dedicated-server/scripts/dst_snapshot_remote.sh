@@ -18,7 +18,11 @@ echo "### Resources"
 echo
 if have_cmd uptime; then echo "- uptime: $(uptime)"; fi
 if have_cmd df; then
-  df -h "$HOME" 2>/dev/null | awk 'NR == 2 { print "- home_fs: size=" $2 " used=" $3 " available=" $4 " capacity=" $5; found=1 } END { if (!found) print "> home filesystem metrics unavailable." }'
+  if df_line="$(df -h "$HOME" 2>/dev/null | awk 'NR == 2 { print "- home_fs: size=" $2 " used=" $3 " available=" $4 " capacity=" $5; found=1 } END { if (!found) print "> home filesystem metrics unavailable." }')"; then
+    printf '%s\n' "$df_line"
+  else
+    echo "> home filesystem metrics unavailable."
+  fi
 fi
 if have_cmd free; then free -h || true; fi
 echo
@@ -118,7 +122,7 @@ while IFS= read -r cluster; do
     fi
   done
   echo
-done < <(find "$KLEI_DIR" -type d \( -path "$KLEI_DIR" -o -prune \) -print 2>/dev/null || true)
+done < <(find "$KLEI_DIR" -type d \( -path "$KLEI_DIR" -o -prune \) -print 2>/dev/null | head -n 129 || true)
 
 echo "### Server binary (best-effort)"
 echo

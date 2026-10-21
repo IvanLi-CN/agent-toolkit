@@ -23,13 +23,27 @@ fi
 target_pgid=""
 if command -v setsid >/dev/null 2>&1; then
   target_pgid="pending"
-  setsid "$@" &
+  target_anchor_path="$status_dir/target"
+  setsid -f sh -c 'printf "%s\\n" "$$" > "$1"; shift; exec "$@"' agent-toolkit-target "$target_anchor_path" "$@" &
 else
   set -m 2>/dev/null || true
   "$@" &
 fi
-target_pid=$!
-if [ "$target_pgid" = "pending" ]; then target_pgid="$target_pid"; fi
+target_launcher_pid=$!
+if [ "$target_pgid" = "pending" ]; then
+  target_pid=""
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    candidate_target_pid="$(cat "$target_anchor_path" 2>/dev/null || true)"
+    case "$candidate_target_pid" in
+      ''|*[!0-9]*) sleep 0.01 ;;
+      *) target_pid="$candidate_target_pid"; break ;;
+    esac
+  done
+  if [ -z "$target_pid" ]; then target_pid="$target_launcher_pid"; fi
+  target_pgid="$target_pid"
+else
+  target_pid="$target_launcher_pid"
+fi
 for _ in 1 2 3 4 5; do
   observed_target_pgid="$(ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ' || true)"
   case "$observed_target_pgid" in

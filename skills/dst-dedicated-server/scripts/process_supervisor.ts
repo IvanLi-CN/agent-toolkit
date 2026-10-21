@@ -9,6 +9,10 @@ shift
 status_dir="$(dirname -- "$status_path")"
 cleanup() { rm -rf -- "$status_dir"; }
 parent_pid="\${AGENT_TOOLKIT_SUPERVISOR_PARENT_PID:-\$PPID}"
+parent_starttime=""
+if [ -r "/proc/$parent_pid/stat" ]; then
+  parent_starttime="$(awk '{ sub(/.*\\) /, ""); print $20 }' "/proc/$parent_pid/stat" 2>/dev/null || true)"
+fi
 if command -v setsid >/dev/null 2>&1; then
   setsid "$@" &
 else
@@ -50,8 +54,12 @@ signal_tree() {
 trap 'signal_tree TERM; signal_tree KILL; cleanup; exit 143' HUP INT TERM
 parent_is_alive() {
   if [ -r "/proc/$parent_pid/stat" ]; then
-    parent_state="$(awk '{ print $3 }' "/proc/$parent_pid/stat" 2>/dev/null || true)"
-    [ "$parent_state" != "Z" ] && [ -n "$parent_state" ]
+    parent_identity="$(awk '{ sub(/.*\\) /, ""); print $1 " " $20 }' "/proc/$parent_pid/stat" 2>/dev/null || true)"
+    parent_state="\${parent_identity%% *}"
+    current_starttime="\${parent_identity#* }"
+    [ "$parent_state" != "Z" ] && [ -n "$parent_state" ] && {
+      [ -z "$parent_starttime" ] || [ "$current_starttime" = "$parent_starttime" ]
+    }
     return
   fi
   kill -0 "$parent_pid" 2>/dev/null

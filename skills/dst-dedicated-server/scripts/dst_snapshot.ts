@@ -494,6 +494,15 @@ async function boundedDirectoryEntries(path: string, limit = MAX_LOCAL_DIRECTORY
   return { entries, truncated };
 }
 
+function renderBoundedDirectoryOverview(entries: Dirent[], truncated: boolean, redactions: string[]): string {
+  const lines = entries.map((entry) => {
+    const kind = entry.isDirectory() ? "dir" : entry.isSymbolicLink() ? "symlink" : entry.isFile() ? "file" : "other";
+    return `- ${kind}: ${entry.name}`;
+  });
+  if (truncated) lines.push(`> Directory entry scan truncated at ${MAX_LOCAL_DIRECTORY_ENTRIES} entries.`);
+  return redactDirectoryListing(lines.join("\n"), redactions);
+}
+
 async function ensureSnapshotTemporaryRoot(parent: string): Promise<string> {
   const parentMetadata = await lstat(parent);
   if (!parentMetadata.isDirectory() || parentMetadata.isSymbolicLink()) throw new Error("snapshot output parent must be a real directory");
@@ -713,7 +722,6 @@ async function localCollect(options: SnapshotOptions): Promise<string> {
   }
 
   const pathRedactions = [localDir, process.env.HOME ?? homedir(), homedir()];
-  lines.push("### Directory overview", "", await commandFirstLines(["ls", "-la", "--", localDir], 200, pathRedactions, true), "");
   let entryListing: { entries: Dirent[]; truncated: boolean };
   try {
     entryListing = await boundedDirectoryEntries(localDir);
@@ -722,7 +730,7 @@ async function localCollect(options: SnapshotOptions): Promise<string> {
     return lines.join("\n");
   }
   const entries = entryListing.entries;
-  if (entryListing.truncated) lines.push(`> Directory entry scan truncated at ${MAX_LOCAL_DIRECTORY_ENTRIES} entries.`, "");
+  lines.push("### Directory overview", "", renderBoundedDirectoryOverview(entries, entryListing.truncated, pathRedactions), "");
   const logFiles = entries
     .filter((entry) => entry.isFile() && entry.name.includes("log") && entry.name.endsWith(".txt"))
     .map((entry) => join(localDir, entry.name))

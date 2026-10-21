@@ -881,6 +881,10 @@ async function localCollect(options: SnapshotOptions): Promise<string> {
 
 async function remoteCollect(options: SnapshotOptions, script: string): Promise<{ text: string; failed: boolean }> {
   const lines = ["## Remote", "", "- Target: `<configured-remote>`", ""];
+  if (Bun.which("ssh") === null) {
+    lines.push("> ssh not found on this machine. Skipping remote collection.", "");
+    return { text: lines.join("\n"), failed: false };
+  }
   const target = `${options.user}@${options.host}`;
   let connectivity: CommandResult;
   try {
@@ -890,8 +894,11 @@ async function remoteCollect(options: SnapshotOptions, script: string): Promise<
       lines.push("> Local process supervisor could not establish a verified process-group anchor.", "> Remote collection was not attempted; fix the local runtime and retry.", "");
       return { text: lines.join("\n"), failed: true };
     }
-    lines.push("> ssh not found on this machine. Skipping remote collection.", "");
-    return { text: lines.join("\n"), failed: false };
+    const detail = renderReportInline(error instanceof Error ? error.message : String(error), [options.host, options.user, homedir()]);
+    lines.push("> Remote SSH connectivity check could not be started.");
+    if (detail.length > 0) lines.push(`> Reason: ${detail}`);
+    lines.push("");
+    return { text: lines.join("\n"), failed: true };
   }
   if (connectivity.timedOut) {
     lines.push("> Remote SSH connectivity check timed out after 5s. Verify reachability and run the command interactively, then re-run this script.", "");

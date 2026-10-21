@@ -669,6 +669,24 @@ esac
     }
   });
 
+  test("skips remote collection only when SSH is unavailable", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-no-ssh-"));
+    try {
+      const output = join(root, "snapshot.md");
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
+        ["--no-local", "--host", "fixture-host", "--user", "fixture-user", "--out", output],
+        { ...process.env, PATH: root } as Record<string, string>,
+      );
+      expect(result.status).toBe(0);
+      const report = await readFile(output, "utf8");
+      expect(report).toContain("ssh not found on this machine");
+      expect(report).not.toContain("Remote SSH connectivity check could not be started");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("redacts sensitive values from successful remote snapshot output", { timeout: 15_000 }, async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-redaction-"));
     const previousPath = process.env.PATH;
@@ -998,6 +1016,7 @@ esac
       expect(Number.isInteger(descendantPid)).toBe(true);
       expect(isAlive(descendantPid)).toBe(true);
       supervised.child.kill("SIGTERM");
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(true);
       await supervised.wrapperExited;
       for (let attempt = 0; attempt < 30 && isAlive(descendantPid); attempt += 1) await Bun.sleep(100);
       expect(isAlive(descendantPid)).toBe(false);
@@ -1014,12 +1033,12 @@ esac
     }
   });
 
-  test("starts the cleanup acknowledgement deadline when stopping", { timeout: 10_000 }, async () => {
+  test("starts the cleanup acknowledgement deadline when stopping", { timeout: 20_000 }, async () => {
     if (process.platform === "win32") return;
     let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
     try {
       supervised = await spawnSupervised(["sh", "-c", "sleep 30"]);
-      await Bun.sleep(2_500);
+      await Bun.sleep(5_500);
       supervised.child.kill("SIGTERM");
       expect(await supervised.waitForCleanupAcknowledged()).toBe(true);
       await supervised.wrapperExited;
@@ -1094,6 +1113,7 @@ esac
       expect(Number.isInteger(detachedPid)).toBe(true);
       expect(detachedPid === undefined ? false : isAlive(detachedPid)).toBe(true);
       supervised.child.kill("SIGTERM");
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(true);
       await supervised.wrapperExited;
       for (let attempt = 0; attempt < 30 && detachedPid !== undefined && isAlive(detachedPid); attempt += 1) await Bun.sleep(100);
       expect(detachedPid === undefined ? false : isAlive(detachedPid)).toBe(false);

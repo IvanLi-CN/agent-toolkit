@@ -583,7 +583,6 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
       await wrapperExited;
       throw new Error("supervisor_not_ready");
     }
-    waitForCleanupAcknowledged();
     return supervised;
   } catch (error) {
     await rm(directory, { recursive: true, force: true });

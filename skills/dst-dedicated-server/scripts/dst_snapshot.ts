@@ -53,6 +53,7 @@ export const MAX_LOCAL_CLUSTER_PATHS = 4_096;
 export const MAX_LOCAL_CLUSTER_SCAN_ENTRIES = 4_096;
 export const MAX_LOCAL_LOG_LISTING_ENTRIES = 200;
 const SUPERVISOR_STOP_GRACE_MS = 250;
+const SUPERVISOR_FORCE_KILL_MS = 6_000;
 const SNAPSHOT_TEMP_PREFIX = ".dst-snapshot-tmp-";
 const SNAPSHOT_TEMP_ROOT_NAME = ".agent-toolkit-dst-snapshot-tmp";
 const SNAPSHOT_OWNER_MARKER = "agent-toolkit-dst-snapshot-v1\n";
@@ -138,7 +139,7 @@ async function runWithStdin(
   let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
   const requestStop = () => {
     killProcessTree(supervised, "SIGTERM");
-    if (forceKillTimer === undefined) forceKillTimer = setTimeout(() => killProcessTree(supervised, "SIGKILL"), 1_000);
+    if (forceKillTimer === undefined) forceKillTimer = setTimeout(() => killProcessTree(supervised, "SIGKILL"), SUPERVISOR_FORCE_KILL_MS);
   };
   const stopForLimit = () => {
     outputTruncated = true;

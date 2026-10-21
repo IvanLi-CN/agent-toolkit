@@ -12,6 +12,8 @@ ready_path="$status_dir/ready"
 cleanup_ack_path="\${AGENT_TOOLKIT_SUPERVISOR_CLEANUP_ACK_PATH:-$status_dir/cleanup-done}"
 cleanup_ack_enabled=1
 captured_descendants_path="$status_dir/descendants"
+pending_descendants_path="$status_dir/descendant-pids"
+snapshot_started_path="$status_dir/snapshot-started"
 parent_dead_path="$status_dir/parent-dead"
 cleanup() {
   if [ "$cleanup_ack_enabled" = "1" ] && [ ! -e "$parent_dead_path" ]; then
@@ -243,6 +245,20 @@ descendants() {
     }
   '
 }
+snapshot_descendants() {
+  : > "$snapshot_started_path" 2>/dev/null || true
+  descendants > "$pending_descendants_path" 2>/dev/null || true
+}
+start_snapshot() {
+  snapshot_pid=""
+  snapshot_descendants &
+  snapshot_pid="$!"
+  snapshot_wait=0
+  while [ ! -e "$snapshot_started_path" ] && [ "$snapshot_wait" -lt 100 ]; do
+    sleep 0.001
+    snapshot_wait=$((snapshot_wait + 1))
+  done
+}
 record_descendants() {
   if [ ! -e "$captured_descendants_path" ]; then : > "$captured_descendants_path" 2>/dev/null || true; fi
   captured_count="$(wc -l < "$captured_descendants_path" 2>/dev/null || printf '0')"
@@ -257,9 +273,7 @@ record_descendants() {
       printf '%s\n' "$captured_record" >> "$captured_descendants_path"
       captured_count=$((captured_count + 1))
     fi
-  done <<EOF
-$(descendants)
-EOF
+  done < "$pending_descendants_path"
 }
 signal_captured_descendants() {
   [ -f "$captured_descendants_path" ] || return 0
@@ -274,7 +288,7 @@ signal_captured_descendants() {
 }
 signal_tree() {
   signal="$1"
-  record_descendants
+  if [ "$signal" = "TERM" ]; then start_snapshot; fi
   wrapper_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' || true)"
   current_target_pgid=""
   group_signal_succeeded=0
@@ -291,6 +305,8 @@ signal_tree() {
       fi
       ;;
   esac
+  if [ -n "$snapshot_pid" ]; then wait "$snapshot_pid" 2>/dev/null || true; snapshot_pid=""; fi
+  if [ "$signal" = "TERM" ]; then record_descendants; fi
   signal_captured_descendants
   if [ "$group_signal_succeeded" = "1" ] || ! target_identity_matches; then return; fi
   for pid in $(descendants); do
@@ -303,14 +319,25 @@ signal_tree() {
   done
 }
 watchdog_pid=""
+termination_started=0
 stop_watchdog() {
   if [ -n "$watchdog_pid" ]; then
     kill "$watchdog_pid" 2>/dev/null || true
     wait "$watchdog_pid" 2>/dev/null || true
   fi
 }
+terminate_supervised_tree() {
+  if [ "$termination_started" = "1" ]; then return 0; fi
+  termination_started=1
+  signal_tree TERM
+  sleep 0.25
+  signal_tree KILL
+  stop_anchor
+  stop_watchdog
+  cleanup
+}
 hold_pid=""
-trap 'if [ -n "$hold_pid" ]; then kill "$hold_pid" 2>/dev/null || true; fi; signal_tree TERM; signal_tree KILL; stop_anchor; stop_watchdog; cleanup; exit 143' HUP INT TERM
+trap 'if [ "$termination_started" = "1" ]; then :; else if [ -n "$hold_pid" ]; then kill "$hold_pid" 2>/dev/null || true; fi; terminate_supervised_tree; exit 143; fi' HUP INT TERM
 parent_is_alive() {
   if [ "$parent_identity_mode" = "proc" ] && [ -r "/proc/$parent_pid/stat" ]; then
     parent_identity="$(awk '{ sub(/.*\\) /, ""); print $1 " " $20 }' "/proc/$parent_pid/stat" 2>/dev/null || true)"
@@ -347,7 +374,6 @@ watch_parent </dev/null >/dev/null 2>&1 &
 watchdog_pid=$!
 target_status=""
 while [ -z "$target_status" ]; do
-  record_descendants
   candidate_target_status="$(cat "$target_status_path" 2>/dev/null || true)"
   case "$candidate_target_status" in
     ''|*[!0-9]*)
@@ -356,12 +382,8 @@ while [ -z "$target_status" ]; do
       else
         if ! parent_is_alive; then
           cleanup_ack_enabled=0
-          signal_tree TERM
-          sleep 1
-          signal_tree KILL
-          stop_anchor
-          stop_watchdog
-          cleanup
+          : > "$parent_dead_path" 2>/dev/null || true
+          terminate_supervised_tree
           exit 143
         fi
         sleep 0.01
@@ -372,12 +394,8 @@ while [ -z "$target_status" ]; do
 done
 if ! parent_is_alive; then
   cleanup_ack_enabled=0
-  signal_tree TERM
-  sleep 1
-  signal_tree KILL
-  stop_anchor
-  stop_watchdog
-  cleanup
+  : > "$parent_dead_path" 2>/dev/null || true
+  terminate_supervised_tree
   exit 143
 fi
 printf '%s\\n' "$target_status" > "$status_path"
@@ -388,12 +406,7 @@ sleep "$hold_seconds" &
 hold_pid="$!"
 wait "$hold_pid" 2>/dev/null || true
 hold_pid=""
-signal_tree TERM
-sleep 0.25
-signal_tree KILL
-stop_anchor
-stop_watchdog
-cleanup
+terminate_supervised_tree
 `;
 
 export interface SupervisedChild {
@@ -482,7 +495,7 @@ async function removeCleanupAckRoot(path: string): Promise<void> {
 }
 
 async function waitForCleanupAck(path: string, wrapperExited: Promise<number>): Promise<boolean> {
-  const deadline = Date.now() + 2_000;
+  const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
     if (await consumeCleanupAck(path)) return true;
     const wrapperDone = await Promise.race([

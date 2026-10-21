@@ -562,7 +562,7 @@ describe("DST local Bun tooling", () => {
     }
   });
 
-  test("preserves remote selection, missing shard resources, and failed SSH diagnostics", { timeout: 15_000 }, async () => {
+  test("preserves remote selection, missing shard resources, and failed SSH diagnostics", { timeout: 30_000 }, async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-"));
     const previousPath = process.env.PATH;
     try {
@@ -617,7 +617,7 @@ esac
     }
   });
 
-  test("keeps a completed shard summary when the next shard fails", async () => {
+  test("keeps a completed shard summary when the next shard fails", { timeout: 15_000 }, async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-partial-"));
     const previousPath = process.env.PATH;
     try {

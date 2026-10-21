@@ -6,6 +6,7 @@ import { spawnSupervised, type SupervisedChild } from "./process_supervisor.ts";
 
 export const MAX_MOD_OVERRIDE_BYTES = 1024 * 1024;
 const SUPERVISOR_STOP_GRACE_MS = 250;
+const SUPERVISOR_FORCE_KILL_MS = 6_000;
 
 export type ModState = "true" | "false" | "unknown";
 
@@ -512,7 +513,7 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
       const timeout = setTimeout(() => {
         timedOut = true;
         killProcessTree(supervised, "SIGTERM");
-        if (forceKillTimer === undefined) forceKillTimer = setTimeout(() => killProcessTree(supervised, "SIGKILL"), 1_000);
+        if (forceKillTimer === undefined) forceKillTimer = setTimeout(() => killProcessTree(supervised, "SIGKILL"), SUPERVISOR_FORCE_KILL_MS);
       }, REMOTE_COMMAND_TIMEOUT_MS);
       let summary: ShardSummary;
       try {
@@ -526,7 +527,7 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
           summary = await parseRemoteResponseStream(parsed.cluster, shard, filePath, child.stdout);
         } catch (error) {
           killProcessTree(supervised, "SIGTERM");
-          if (forceKillTimer === undefined) forceKillTimer = setTimeout(() => killProcessTree(supervised, "SIGKILL"), 1_000);
+          if (forceKillTimer === undefined) forceKillTimer = setTimeout(() => killProcessTree(supervised, "SIGKILL"), SUPERVISOR_FORCE_KILL_MS);
           await readText(child.stdout, 64 * 1024, 1_000);
           const [exitCode, stderr] = await Promise.all([exitPromise, stderrPromise]);
           const detail = redactOperationalText(stderr.trim(), [parsed.host, parsed.user]);

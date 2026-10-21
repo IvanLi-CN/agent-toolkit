@@ -510,7 +510,7 @@ async function writeSyncedFile(path: string, data: Uint8Array): Promise<void> {
 
 const LOCK_STALE_MS = 5 * 60 * 1000;
 const LOCK_HEARTBEAT_MS = 30 * 1000;
-type PublishState = "prepared" | "midi-backed-up" | "backups-complete" | "midi-published" | "complete";
+type PublishState = "prepared" | "midi-backed-up" | "backups-complete" | "midi-published" | "wav-publishing" | "wav-published" | "complete";
 const TRANSACTION_ENTRY_NAMES = new Set([
   ".state",
   ".state.tmp",
@@ -636,7 +636,7 @@ async function writePublishState(directory: string, state: PublishState): Promis
 async function readPublishState(directory: string): Promise<PublishState | undefined> {
   try {
     const state = new TextDecoder().decode(await readRegularFile(join(directory, ".state"))).trim();
-    if (state === "prepared" || state === "midi-backed-up" || state === "backups-complete" || state === "midi-published" || state === "complete") return state;
+    if (state === "prepared" || state === "midi-backed-up" || state === "backups-complete" || state === "midi-published" || state === "wav-publishing" || state === "wav-published" || state === "complete") return state;
   } catch {
     // An incomplete transaction is safe to discard before its first state commit.
   }
@@ -700,8 +700,11 @@ async function restoreTransaction(directory: string, midiPath: string, wavPath: 
   }
 
   const midi = await restoreOutput(directory, "midi.backup", midiPath, "midi.restoring", "midi.restored", "midi.symlink");
-  await restoreOutput(directory, "wav.backup", wavPath, "wav.restoring", "wav.restored", "wav.symlink");
-  if ((state === "backups-complete" || state === "midi-published") && !midi.inProgress) await removeFile(midiPath);
+  const wav = await restoreOutput(directory, "wav.backup", wavPath, "wav.restoring", "wav.restored", "wav.symlink");
+  if (state === "backups-complete" || state === "midi-published" || state === "wav-publishing" || state === "wav-published") {
+    if (!midi.inProgress) await removeFile(midiPath);
+    if ((state === "wav-publishing" || state === "wav-published") && !wav.inProgress) await removeFile(wavPath);
+  }
   await syncDirectory(dirname(midiPath));
   await removeTransactionDirectory(directory);
   await syncDirectory(dirname(midiPath));
@@ -871,9 +874,11 @@ async function publishOutputsLocked(outDir: string, stem: string, midi: Uint8Arr
     await syncDirectory(transaction);
     await syncDirectory(outDir);
     await writePublishState(transaction, "midi-published");
+    await writePublishState(transaction, "wav-publishing");
     await rename(tempWavPath, wavPath);
     await syncDirectory(transaction);
     await syncDirectory(outDir);
+    await writePublishState(transaction, "wav-published");
     await writePublishState(transaction, "complete");
     await removeTransactionDirectory(transaction);
     await syncDirectory(outDir);

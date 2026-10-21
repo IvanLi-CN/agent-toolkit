@@ -71,17 +71,6 @@ export class ModOverrideParser {
   }
 
   private consumeLine(line: string): void {
-    const start = isRecordStart(line);
-    if (start !== null) {
-      this.finishCurrent();
-      this.current = start[1]!;
-      this.state = "unknown";
-      this.inConfig = false;
-      this.configDepth = 0;
-      this.pendingConfig = false;
-    }
-    if (this.current === undefined) return;
-
     let outsideLine = line;
     if (this.inConfig) {
       const segment = stripConfigurationSegment(line, 0, this.configDepth);
@@ -109,6 +98,17 @@ export class ModOverrideParser {
         outsideLine = segment.outside;
       }
     }
+
+    const start = isRecordStart(outsideLine);
+    if (start !== null) {
+      this.finishCurrent();
+      this.current = start[1]!;
+      this.state = "unknown";
+      this.inConfig = false;
+      this.configDepth = 0;
+      this.pendingConfig = false;
+    }
+    if (this.current === undefined) return;
 
     if (this.state === "unknown" && !this.inConfig && /enabled\s*=\s*true/.test(outsideLine)) this.state = "true";
     if (this.state === "unknown" && !this.inConfig && /enabled\s*=\s*false/.test(outsideLine)) this.state = "false";

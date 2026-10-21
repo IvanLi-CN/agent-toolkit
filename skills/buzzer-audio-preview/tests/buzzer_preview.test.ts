@@ -436,6 +436,25 @@ describe("buzzer MIDI and WAV helper", () => {
     }
   });
 
+  test("removes a newly published WAV after an interrupted pair commit", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-wav-recovery-"));
+    try {
+      const output = join(root, "out");
+      const transaction = join(output, ".buzzer-preview-txn-fixture-wav-recovery");
+      await mkdir(transaction, { recursive: true });
+      await writeFile(join(output, "fixture.mid"), "new-midi");
+      await writeFile(join(output, "fixture.wav"), "new-wav");
+      await writeFile(join(transaction, "midi.backup"), "old-midi");
+      await writeFile(join(transaction, ".state"), "wav-publishing\n");
+      await expect(readPublishedPair(output, "fixture")).rejects.toThrow();
+      expect(await readFile(join(output, "fixture.mid"), "utf8")).toBe("old-midi");
+      await expect(readFile(join(output, "fixture.wav"), "utf8")).rejects.toThrow(/ENOENT/);
+      expect(await readdir(output)).not.toContain(".buzzer-preview-txn-fixture-wav-recovery");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("rejects path traversal through the published pair API", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-pair-boundary-"));
     try {

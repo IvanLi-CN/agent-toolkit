@@ -108,6 +108,15 @@ describe("DST local Bun tooling", () => {
     enabled = true,
   },
 }`)).toEqual([{ id: "500", state: "true" }]);
+
+    expect(parseModOverrides(`return {
+  ["workshop-600"] = {
+    configuration_options = {
+      ["workshop-999"] = { enabled = true },
+    },
+    enabled = false,
+  },
+}`)).toEqual([{ id: "600", state: "false" }]);
   });
 
   test("collects a bounded local snapshot without printing secret contents", async () => {

@@ -255,7 +255,6 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
     const child = Bun.spawn(
       ["sh", "-c", SUPERVISOR_SCRIPT, "agent-toolkit-supervisor", statusPath, ...args],
       {
-        detached: true,
         stdin: "pipe",
         stdout: "pipe",
         stderr: "pipe",

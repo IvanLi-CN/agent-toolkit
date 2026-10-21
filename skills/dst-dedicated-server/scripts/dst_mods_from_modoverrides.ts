@@ -184,13 +184,24 @@ function displayIds(ids: string[]): string {
   return ids.length === 0 ? "(none)" : ids.join(" ");
 }
 
+function escapeMarkdownInline(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll("\\", "\\\\")
+    .replace(/[\x60*_{}[\]()#+!|]/g, "\\$&");
+}
+
 export function renderSummary(cluster: string, summary: ShardSummary): string {
-  if (!summary.present) return [`## ${cluster} / ${summary.shard}`, "", `- modoverrides.lua: missing (${summary.filePath})`, ""].join("\n");
+  const safeCluster = escapeMarkdownInline(cluster);
+  const safeFilePath = escapeMarkdownInline(summary.filePath);
+  if (!summary.present) return [`## ${safeCluster} / ${summary.shard}`, "", `- modoverrides.lua: missing (${safeFilePath})`, ""].join("\n");
   const enabled = listIds(summary.mods, "true");
   const disabled = listIds(summary.mods, "false");
   const unknown = listIds(summary.mods, "unknown");
   const lines = [
-    `## ${cluster} / ${summary.shard}`,
+    `## ${safeCluster} / ${summary.shard}`,
     "",
     "- modoverrides.lua: present",
     `- mods: ${summary.mods.length}`,

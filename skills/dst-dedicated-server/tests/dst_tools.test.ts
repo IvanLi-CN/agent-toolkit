@@ -85,6 +85,8 @@ describe("DST local Bun tooling", () => {
     const mixedSecrets = ["passphrase", "=", "fixture-secret", " pwd ", "fixture-secret"].join("");
     expect(redactSensitiveText(mixedSecrets)).toBe("passphrase=[REDACTED] pwd [REDACTED]");
     expect(redactOperationalText("permission denied: foo\\..\\private\\fixture-secret")).toContain("<redacted-path>");
+    expect(redactOperationalText("provider credentials fixture-secret")).not.toContain("fixture-secret");
+    expect(redactOperationalText("JWT fixture-jwt-secret")).not.toContain("fixture-jwt-secret");
   });
 
   test("does not expose a secret that crosses the bounded log tail", async () => {
@@ -146,6 +148,19 @@ describe("DST local Bun tooling", () => {
     expect(() => parseArgs(["--host", "fixture-host", "--user", "fixture-user", "--cluster", "safe\n## forged heading"], {})).toThrow(/single path segment/);
     expect(() => parseArgs(["--host", "-oProxyCommand=touch /tmp/pwned", "--user", "fixture-user", "--cluster", "fixture"], {})).toThrow(/invalid SSH token/);
     expect(() => parseArgs(["--host", "fixture-host", "--user", "-oProxyCommand=touch /tmp/pwned", "--cluster", "fixture"], {})).toThrow(/invalid SSH token/);
+  });
+
+  test("escapes cluster and file labels before rendering Markdown", () => {
+    const summary = renderSummary("<img src=x onerror=alert(1)>", {
+      shard: "Master",
+      present: false,
+      filePath: "<script>alert(1)</script>",
+      mods: [],
+    });
+    expect(summary).not.toContain("<img");
+    expect(summary).not.toContain("<script>");
+    expect(summary).toContain("&lt;img");
+    expect(summary).toContain("&lt;script");
   });
 
   test("parses nested mod configuration without executing Lua and renders shard differences", () => {

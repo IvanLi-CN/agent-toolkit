@@ -52,7 +52,9 @@ signal_tree() {
   case "$target_pgid" in
     ''|*[!0-9]*) ;;
     *)
-      if [ "$target_pgid" != "$wrapper_pgid" ] && kill -"$signal" -- "-$target_pgid" 2>/dev/null; then return; fi
+      if [ "$target_pgid" != "$wrapper_pgid" ]; then
+        kill -"$signal" -- "-$target_pgid" 2>/dev/null || true
+      fi
       ;;
   esac
   for pid in $(descendants); do

@@ -213,7 +213,7 @@ async function syncDirectory(path: string): Promise<void> {
   }
 }
 
-const SENSITIVE_NAME = "(?:password|passwd|pass[ _-]?phrase|pwd|secret|token|credential|private[_ -]?key|api[_ -]?key|access[_ -]?key|signing[_ -]?key|encryption[_ -]?key|database[_ -]?url|mongo[_ -]?uri|authorization|bearer|cookie|set[ _-]?cookie|session(?:[_ -]?id)?)";
+const SENSITIVE_NAME = "(?:password|passwd|pass[ _-]?phrase|pwd|secret|token|credential(?:s)?|jwt|private[_ -]?key|api[_ -]?key|access[_ -]?key|signing[_ -]?key|encryption[_ -]?key|database[_ -]?url|mongo[_ -]?uri|authorization|bearer|cookie|set[ _-]?cookie|session(?:[_ -]?id)?)";
 const SENSITIVE_KEY = `(?:[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*|"[^"\\r\\n]*${SENSITIVE_NAME}[^"\\r\\n]*"|'[^'\\r\\n]*${SENSITIVE_NAME}[^'\\r\\n]*')`;
 const SENSITIVE_KEY_TOKEN = `(?:[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*|\\[[^\\]\\r\\n]*${SENSITIVE_NAME}[^\\]\\r\\n]*\\])`;
 const SENSITIVE_ASSIGNMENT = new RegExp(

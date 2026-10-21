@@ -16,12 +16,22 @@ pending_descendants_path="$status_dir/descendant-pids"
 snapshot_started_path="$status_dir/snapshot-started"
 parent_dead_path="$status_dir/parent-dead"
 cleanup() {
+  cleanup_ack_created=0
   if [ "$cleanup_ack_enabled" = "1" ] && [ ! -e "$parent_dead_path" ]; then
-    mkdir "$cleanup_ack_path" 2>/dev/null || true
+    if mkdir "$cleanup_ack_path" 2>/dev/null; then cleanup_ack_created=1; fi
   else
     rmdir "$(dirname -- "$cleanup_ack_path")" 2>/dev/null || true
   fi
   rm -rf -- "$status_dir"
+  if [ "$cleanup_ack_created" = "1" ]; then
+    cleanup_ack_wait=0
+    while [ -d "$cleanup_ack_path" ] && [ "$cleanup_ack_wait" -lt 120 ]; do
+      sleep 0.05
+      cleanup_ack_wait=$((cleanup_ack_wait + 1))
+    done
+    rmdir "$cleanup_ack_path" 2>/dev/null || true
+    rmdir "$(dirname -- "$cleanup_ack_path")" 2>/dev/null || true
+  fi
 }
 parent_pid="\${AGENT_TOOLKIT_SUPERVISOR_PARENT_PID:-\$PPID}"
 parent_starttime=""

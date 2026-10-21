@@ -926,7 +926,7 @@ esac
     }
   });
 
-  test("cleans a detached supervisor directory after its parent exits", { timeout: 10_000 }, async () => {
+  test("cleans a detached supervisor directory after its parent exits", { timeout: 30_000 }, async () => {
     if (process.platform === "win32") return;
     const before = new Set((await readdir(tmpdir())).filter((entry) => entry.startsWith(".agent-toolkit-dst-supervisor-")));
     const markerRoot = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-parent-"));
@@ -950,7 +950,7 @@ esac
       expect(await child.exited).toBe(0);
       let leftovers: string[] = [];
       let descendantPid: number | undefined;
-      for (let attempt = 0; attempt < 40; attempt += 1) {
+      for (let attempt = 0; attempt < 120; attempt += 1) {
         await Bun.sleep(250);
         leftovers = (await readdir(tmpdir())).filter((entry) => entry.startsWith(".agent-toolkit-dst-supervisor-") && !before.has(entry));
         try {

@@ -24,21 +24,6 @@ stat_signature() {
   return 1
 }
 
-content_digest() {
-  local value
-  if command -v sha256sum >/dev/null 2>&1; then
-    value="$(sha256sum "$1" 2>/dev/null | awk '{print $1}')"
-  elif command -v shasum >/dev/null 2>&1; then
-    value="$(shasum -a 256 "$1" 2>/dev/null | awk '{print $1}')"
-  elif command -v openssl >/dev/null 2>&1; then
-    value="$(openssl dgst -sha256 "$1" 2>/dev/null | awk -F'= ' '{print $2}')"
-  else
-    value="$(cksum "$1" 2>/dev/null | awk '{print $1 ":" $2}')"
-  fi
-  [[ -n "$value" ]] || return 1
-  printf '%s' "$value"
-}
-
 klei_base="$HOME/.klei"
 klei_root="$klei_base/DoNotStarveTogether"
 cluster_dir="$klei_root/$cluster"
@@ -65,11 +50,6 @@ if [[ -z "$file_stat" ]]; then
   printf 'MISSING\n'
   exit 0
 fi
-file_digest="$(content_digest "$file" || true)"
-if [[ -z "$file_digest" ]]; then
-  printf 'modoverrides.lua digest unavailable\n' >&2
-  exit 1
-fi
 exec 9<"$file" || { printf 'MISSING\n'; exit 0; }
 fd_stat="$(stat_signature /proc/self/fd/9 || stat_signature /dev/fd/9 || true)"
 if [[ "$fd_stat" != "$file_stat" || -L "$klei_base" || -L "$klei_root" || -L "$cluster_dir" || -L "$shard_dir" || -L "$file" ]]; then
@@ -86,16 +66,26 @@ if (( size > max_bytes )); then
   exit 1
 fi
 temporary="$(mktemp)"
+verification="$(mktemp)"
 projection="$(mktemp)"
-trap 'rm -f "$temporary" "$projection"' EXIT
+trap 'rm -f "$temporary" "$verification" "$projection"' EXIT
 head -c $((max_bytes + 1)) <&9 >"$temporary"
 actual="$(wc -c < "$temporary")"
 actual="${actual//[[:space:]]/}"
 file_after_stat="$(stat_signature "$file" || true)"
 fd_after_stat="$(stat_signature /proc/self/fd/9 || stat_signature /dev/fd/9 || true)"
 exec 9<&-
-file_after_digest="$(content_digest "$file" || true)"
-if (( actual != size )) || [[ "$file_after_stat" != "$file_stat" || "$fd_after_stat" != "$fd_stat" || -z "$file_after_digest" || "$file_after_digest" != "$file_digest" ]]; then
+if [[ -L "$file" ]]; then
+  printf 'modoverrides.lua changed during collection\n' >&2
+  exit 1
+fi
+exec 8<"$file" || { printf 'modoverrides.lua changed during collection\n' >&2; exit 1; }
+verification_fd_stat="$(stat_signature /proc/self/fd/8 || stat_signature /dev/fd/8 || true)"
+head -c $((max_bytes + 1)) <&8 >"$verification"
+verification_size="$(wc -c < "$verification")"
+verification_size="${verification_size//[[:space:]]/}"
+exec 8<&-
+if (( actual != size || verification_size != size )) || [[ "$file_after_stat" != "$file_stat" || "$fd_after_stat" != "$fd_stat" || "$verification_fd_stat" != "$file_stat" ]] || ! cmp -s "$temporary" "$verification"; then
   printf 'modoverrides.lua changed during collection\n' >&2
   exit 1
 fi

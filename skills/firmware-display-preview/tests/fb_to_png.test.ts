@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { mkdtemp, readFile, readlink, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { inflateSync } from "node:zlib";
 import { join } from "node:path";
-import { convertFramebuffer, encodePng, expandUser, main, MAX_FRAMEBUFFER_PIXELS, type ConvertOptions } from "../scripts/fb_to_png.ts";
+import { convertFramebuffer, encodePng, expandUser, main, MAX_FRAMEBUFFER_INPUT_BYTES, MAX_FRAMEBUFFER_PIXELS, type ConvertOptions } from "../scripts/fb_to_png.ts";
 
 function crc32(data: Uint8Array): number {
   let value = 0xffffffff;
@@ -138,6 +138,19 @@ describe("framebuffer to PNG helper", () => {
     expect(await main(["--unknown"])).toBe(2);
     expect(await main(["--width"])).toBe(2);
     expect(await main(["--format", "invalid", "--width", "1", "--height", "1", "--in", "fixture", "--out", "fixture"])).toBe(2);
+  });
+
+  test("rejects input files with unbounded trailing data", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-fb-input-bound-"));
+    try {
+      const input = join(root, "frame.raw");
+      const output = join(root, "frame.png");
+      await writeFile(input, new Uint8Array(1));
+      await truncate(input, MAX_FRAMEBUFFER_INPUT_BYTES + 1);
+      expect(await main(["--format", "gray8", "--width", "1", "--height", "1", "--in", input, "--out", output])).toBe(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test("replaces an output symlink without touching its target", async () => {

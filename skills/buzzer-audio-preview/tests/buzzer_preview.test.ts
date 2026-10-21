@@ -6,6 +6,8 @@ import {
   encodeMidi,
   encodeWav,
   MAX_RENDERED_AUDIO_BYTES,
+  MAX_PUBLISHED_WAV_BYTES,
+  MAX_SCORE_INPUT_BYTES,
   MAX_SCORE_EVENTS,
   main,
   parseScore,
@@ -147,6 +149,7 @@ describe("buzzer MIDI and WAV helper", () => {
     expect(() => parseScore({ events: [{ note: "C4" }] })).toThrow(/missing duration/);
     expect(() => parseScore({ events: [{ note: "C4", beats: 1, ms: 10 }] })).toThrow(/ambiguous duration/);
     expect(() => parseScore({ events: Array.from({ length: MAX_SCORE_EVENTS + 1 }, () => ({ note: "C4", ms: 1 })) })).toThrow(/at most/);
+    expect(() => encodeMidi(config, [{ kind: "rest", durationS: 1_000_000_000 }])).toThrow(/VLQ/);
   });
 
   test("preserves explicit null rejection and Python-compatible numeric conversions", () => {
@@ -459,6 +462,23 @@ describe("buzzer MIDI and WAV helper", () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-pair-boundary-"));
     try {
       await expect(readPublishedPair(root, "../outside")).rejects.toThrow(/without path separators/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("bounds score input and published output reads", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-read-bounds-"));
+    try {
+      const input = join(root, "oversized.json");
+      await writeFile(input, new Uint8Array(MAX_SCORE_INPUT_BYTES + 1));
+      expect(await main(["--in", input, "--out-dir", join(root, "generated")])).toBe(1);
+
+      const output = join(root, "out");
+      await mkdir(output, { recursive: true });
+      await writeFile(join(output, "fixture.mid"), "MThd");
+      await writeFile(join(output, "fixture.wav"), new Uint8Array(MAX_PUBLISHED_WAV_BYTES + 1));
+      await expect(readPublishedPair(output, "fixture")).rejects.toThrow(/exceeds/);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

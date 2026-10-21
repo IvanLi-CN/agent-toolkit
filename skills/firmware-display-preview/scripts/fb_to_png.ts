@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
-import { lstat, mkdtemp, open, readFile, rename, rm, unlink } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, mkdtemp, open, rename, rm, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { deflateSync } from "node:zlib";
 import { basename, dirname, join, resolve } from "node:path";
@@ -9,6 +10,7 @@ export type FramebufferFormat = "ssd1306" | "mono1" | "gray8" | "rgb565" | "rgb8
 export type PngMode = "L" | "RGB";
 
 export const MAX_FRAMEBUFFER_PIXELS = 16_777_216;
+export const MAX_FRAMEBUFFER_INPUT_BYTES = 128 * 1024 * 1024;
 
 function validateDimensions(width: number, height: number): void {
   if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0) {
@@ -95,8 +97,43 @@ export function encodePng(width: number, height: number, mode: PngMode, rows: Ui
 
 function strideFor(defaultStride: number, requested: number | undefined): number {
   if (requested === undefined) return defaultStride;
-  if (requested < defaultStride) throw new Error(`stride_bytes too small: ${requested} (need >= ${defaultStride})`);
+  if (!Number.isSafeInteger(requested) || requested < defaultStride) throw new Error(`stride_bytes too small: ${requested} (need >= ${defaultStride})`);
   return requested;
+}
+
+function inputBounds(format: FramebufferFormat, options: ConvertOptions): { minimum: number; maximum: number } {
+  validateDimensions(options.width, options.height);
+  let rowBytes: number;
+  if (format === "ssd1306") {
+    const pages = Math.ceil(options.height / 8);
+    const bytes = options.width * pages;
+    if (!Number.isSafeInteger(bytes) || bytes > MAX_FRAMEBUFFER_INPUT_BYTES) throw new Error("framebuffer input exceeds the byte limit");
+    return { minimum: bytes, maximum: bytes };
+  }
+  if (format === "mono1") rowBytes = Math.ceil(options.width / 8);
+  else if (format === "gray8") rowBytes = options.width;
+  else if (format === "rgb565") rowBytes = options.width * 2;
+  else rowBytes = options.width * 3;
+  const stride = strideFor(rowBytes, options.strideBytes);
+  const minimum = (options.height - 1) * stride + rowBytes;
+  const maximum = options.height * stride;
+  if (!Number.isSafeInteger(minimum) || !Number.isSafeInteger(maximum) || maximum > MAX_FRAMEBUFFER_INPUT_BYTES) {
+    throw new Error("framebuffer input exceeds the byte limit");
+  }
+  return { minimum, maximum };
+}
+
+async function readFramebufferInput(path: string, bounds: { minimum: number; maximum: number }): Promise<Uint8Array> {
+  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const metadata = await handle.stat();
+    if (!metadata.isFile()) throw new Error("framebuffer input must be a regular file");
+    if (metadata.size > bounds.maximum) throw new Error(`framebuffer input exceeds the ${bounds.maximum}-byte limit`);
+    if (metadata.size < bounds.minimum) return await handle.readFile();
+    return await handle.readFile();
+  } finally {
+    await handle.close();
+  }
 }
 
 function requireBytes(data: Uint8Array, need: number): void {
@@ -323,8 +360,7 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
       return 0;
     }
     validateDimensions(parsed.width, parsed.height);
-    const data = new Uint8Array(await readFile(resolve(expandUser(parsed.input))));
-    const converted = convertFramebuffer(data, parsed.format, {
+    const options = {
       width: parsed.width,
       height: parsed.height,
       strideBytes: parsed.strideBytes,
@@ -332,7 +368,9 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
       bitOrder: parsed.bitOrder,
       ssd1306BitOrder: parsed.ssd1306BitOrder,
       invert: parsed.invert,
-    });
+    };
+    const data = await readFramebufferInput(resolve(expandUser(parsed.input)), inputBounds(parsed.format, options));
+    const converted = convertFramebuffer(data, parsed.format, options);
     const outputPath = resolve(expandUser(parsed.output));
     const parentStat = await lstat(dirname(outputPath));
     if (!parentStat.isDirectory()) throw new CliError("--out parent must be a directory");

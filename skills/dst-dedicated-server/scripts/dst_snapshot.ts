@@ -227,6 +227,7 @@ export function redactOperationalText(text: string, values: string[] = []): stri
     .replace(/\b[A-Za-z]:[\\/](?:[^"'<>`\n,;)\]}]|\\ )+?(?=$|[\n"'<>`,;)\]}]|\s+[A-Za-z0-9_.-]+\s*[:=])/g, "<redacted-path>")
     .replace(/(^|[\s"'(=:])(?:\.\.?[\\/])+[^"'<>`\n,;)\]}]+/g, "$1<redacted-path>")
     .replace(/(^|[\s"'(=:])\\\\[^"'<>`\n,;)\]}]+/g, "$1<redacted-path>")
+    .replace(/(^|[\s"'(=:])(?=[^"'<>`\n,;)\]}\s]+[\\/]\.\.?[\\/])[^"'<>`\n,;)\]}]+/g, "$1<redacted-path>")
     .replace(/(?<![A-Za-z0-9])(?:(?:[0-9A-Fa-f]{0,4}:){1,7})(?:\d{1,3}\.){3}\d{1,3}(?![A-Za-z0-9])/g, "<redacted-address>")
     .replace(/(?<![A-Za-z0-9])(?:(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}(?:%[A-Za-z0-9._-]+)?)(?![A-Za-z0-9])/g, "<redacted-address>")
     .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "<redacted-address>");

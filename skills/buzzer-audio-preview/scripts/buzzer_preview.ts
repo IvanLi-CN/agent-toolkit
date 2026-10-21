@@ -55,7 +55,12 @@ export interface RestEvent {
 export type ScoreEvent = NoteEvent | RestEvent;
 
 export const MAX_SCORE_EVENTS = 4_096;
+export const MAX_SCORE_INPUT_BYTES = 4 * 1024 * 1024;
 export const MAX_RENDERED_AUDIO_BYTES = 64 * 1024 * 1024;
+export const MAX_MIDI_DELTA_TICKS = 0x0fff_ffff;
+export const MAX_PUBLISHED_MIDI_BYTES = 16 * 1024 * 1024;
+export const MAX_PUBLISHED_WAV_BYTES = MAX_RENDERED_AUDIO_BYTES + 44;
+const MAX_TRANSACTION_METADATA_BYTES = 4 * 1024;
 
 export function clamp01(value: number): number {
   return Math.max(0, Math.min(1, value));
@@ -266,12 +271,16 @@ export function parseScore(raw: unknown): { config: ScoreConfig; events: ScoreEv
 }
 
 export async function parseScoreFile(path: string): Promise<{ config: ScoreConfig; events: ScoreEvent[] }> {
-  const input = await Bun.file(expandUser(path)).json();
+  const file = Bun.file(expandUser(path));
+  if (file.size > MAX_SCORE_INPUT_BYTES) throw new Error(`score input exceeds the ${MAX_SCORE_INPUT_BYTES}-byte limit`);
+  const input = await file.json();
   return parseScore(input);
 }
 
 function varLen(value: number): Uint8Array {
-  if (!Number.isSafeInteger(value) || value < 0) throw new Error("varlen cannot be negative");
+  if (!Number.isSafeInteger(value) || value < 0 || value > MAX_MIDI_DELTA_TICKS) {
+    throw new Error(`MIDI delta exceeds the four-byte VLQ limit (${MAX_MIDI_DELTA_TICKS} ticks)`);
+  }
   const bytes = [value & 0x7f];
   let remaining = Math.floor(value / 128);
   while (remaining > 0) {
@@ -325,7 +334,13 @@ export function encodeMidi(config: ScoreConfig, events: ScoreEvent[]): Uint8Arra
   let pendingDelta = 0;
   for (const event of events) {
     const ticks = Math.max(0, roundTiesToEven(event.durationS * config.tempoBpm * config.ppqn / 60));
+    if (!Number.isSafeInteger(ticks) || ticks > MAX_MIDI_DELTA_TICKS) {
+      throw new Error(`MIDI event duration exceeds the four-byte VLQ limit (${MAX_MIDI_DELTA_TICKS} ticks)`);
+    }
     if (event.kind === "rest") {
+      if (pendingDelta > MAX_MIDI_DELTA_TICKS - ticks) {
+        throw new Error(`MIDI rest duration exceeds the four-byte VLQ limit (${MAX_MIDI_DELTA_TICKS} ticks)`);
+      }
       pendingDelta += ticks;
       continue;
     }
@@ -570,11 +585,12 @@ async function moveOutputToBackup(source: string, destination: string, symlinkMa
   }
 }
 
-async function readRegularFile(path: string): Promise<Uint8Array> {
+async function readRegularFile(path: string, maxBytes = MAX_TRANSACTION_METADATA_BYTES): Promise<Uint8Array> {
   const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   try {
     const metadata = await handle.stat();
     if (!metadata.isFile()) throw new Error(`published output is not a regular file: ${path}`);
+    if (metadata.size > maxBytes) throw new Error(`file exceeds the ${maxBytes}-byte limit: ${path}`);
     return await handle.readFile();
   } finally {
     await handle.close();
@@ -926,8 +942,8 @@ export async function readPublishedPair(outDir: string, stem: string): Promise<{
       try {
         await recoverPublishTransactions(outDir, stem, midiPath, wavPath);
         return {
-          midi: await readRegularFile(midiPath),
-          wav: await readRegularFile(wavPath),
+          midi: await readRegularFile(midiPath, MAX_PUBLISHED_MIDI_BYTES),
+          wav: await readRegularFile(wavPath, MAX_PUBLISHED_WAV_BYTES),
         };
       } finally {
         await release();
@@ -953,7 +969,7 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     await mkdir(outDir, { recursive: true });
     const outDirStat = await lstat(outDir);
     if (!outDirStat.isDirectory() || outDirStat.isSymbolicLink()) throw new CliError("--out-dir must resolve to a real directory");
-    const { config, events } = parseScore(JSON.parse(await readFile(inputPath, "utf8")));
+    const { config, events } = await parseScoreFile(inputPath);
     const stem = validateStem(parsed.stem ?? basename(inputPath, extname(inputPath)));
     await publishOutputs(outDir, stem, encodeMidi(config, events), encodeWav(config, events));
     const totalSeconds = events.reduce((total, event) => total + event.durationS, 0);

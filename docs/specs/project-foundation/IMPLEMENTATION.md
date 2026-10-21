@@ -2,13 +2,13 @@
 
 ## Current Status
 
-The foundation implementation is delivered in bounded slices. This slice keeps the 16 public Skills unchanged, establishes a public root governance guide, and replaces the maintained repository checks with directly executed TypeScript under the installed Bun runtime. The broader Skill migrations and documentation site remain separate contracts.
+The foundation implementation is delivered in bounded slices. The public allowlist and direct-consumer boundary are established, repository checks run directly under the installed Bun runtime, and the integrated helper migrations preserve their existing contracts. The remaining Skill-specific implementation and documentation-site work is tracked by its own contracts.
 
 ## Implementation Coverage
 
 - Public membership and direct-source consumption: PUBLIC_SKILLS.txt, skills/README.md, and existing consumer instructions.
 - Repository validation: `bin/spec_contract_check.ts`, `bin/skills_index_check.ts`, `bin/public_boundary_check.ts`, `bin/public_skill_boundary_check.ts`, and `bin/source_target_inventory_check.ts` are the maintained Bun entrypoints. `bin/public_tool_boundary_check.ts` recursively checks local TypeScript, JavaScript, Python, and Shell dependencies, rejects unverifiable loader forms and imports of excluded test files, and keeps local references inside the public repository. The source-target inventory also rejects duplicate or invalid public manifest names before comparing source and target. The old private workflow-only root tools are not part of the public source.
-- Skill implementations: [SCRIPT-LANGUAGE-MATRIX.md](SCRIPT-LANGUAGE-MATRIX.md) distinguishes source implementations from accepted targets. The `agent-vm-ops` controller now runs as one TypeScript/Bun entrypoint with a Bun lifecycle suite; remaining Python/Shell tests stay authoritative for Skills that still own those runtimes.
+- Skill implementations: [SCRIPT-LANGUAGE-MATRIX.md](SCRIPT-LANGUAGE-MATRIX.md) distinguishes source implementations from accepted targets and records the migrated Buzzer, DST, framebuffer, Git-sync, and Agent VM control surfaces. The `agent-vm-ops` controller now runs as one TypeScript/Bun entrypoint with a Bun lifecycle suite; Python/Shell tests stay authoritative for Skills that still own those runtimes.
 - Public design material: Agent VM lifecycle, CLI, retention/reclamation designs and ADRs are already present. This slice anchors the CVM Python module-integration and XP policy/audit guarantees to their current Skill contracts and tests; the broader usage guides and documentation site remain separate work.
 - Verification coverage: SPEC.md retains seven cross-cutting evidence requirements and 48 detailed domain scenarios, in addition to the project requirement assertions. The controller suite verifies fake-native lifecycle, persistence, idempotence, bounded process handling and exact integer storage; no result is inferred from document presence alone.
 

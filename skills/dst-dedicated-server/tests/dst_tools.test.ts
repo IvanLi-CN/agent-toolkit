@@ -41,6 +41,7 @@ describe("DST local Bun tooling", () => {
     expect(redactSensitiveText("api_key=[REDACTED] token raw-secret")).toBe("api_key=[REDACTED] token [REDACTED]");
     const mixedSecrets = ["passphrase", "=", "fixture-secret", " pwd ", "fixture-secret"].join("");
     expect(redactSensitiveText(mixedSecrets)).toBe("passphrase=[REDACTED] pwd [REDACTED]");
+    expect(redactOperationalText("permission denied: foo\\..\\private\\fixture-secret")).toContain("<redacted-path>");
   });
 
   test("does not expose a secret that crosses the bounded log tail", async () => {

@@ -4,7 +4,7 @@ import { constants, type Dirent } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { lstat, mkdtemp, open, opendir, rename, rm, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { spawnSupervised, type SupervisedChild } from "./process_supervisor.ts";
 
 interface SnapshotOptions {
@@ -199,14 +199,14 @@ async function syncDirectory(path: string): Promise<void> {
 const SENSITIVE_NAME = "(?:password|passwd|passphrase|pwd|secret|token|credential|private[_ -]?key|api[_ -]?key|access[_ -]?key|authorization|bearer)";
 const SENSITIVE_KEY = `(?:[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*|"[^"\\r\\n]*${SENSITIVE_NAME}[^"\\r\\n]*"|'[^'\\r\\n]*${SENSITIVE_NAME}[^'\\r\\n]*')`;
 const SENSITIVE_ASSIGNMENT = new RegExp(
-  `((?:[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*)\\s*[:=]\\s*)("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|(?:Bearer|Basic)\\s+[^\\s;]+|[^\\s;]+)`,
+  `((?:[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*)\\s*[:=]\\s*)(?!\\s*\\[REDACTED\\])("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|(?:Bearer|Basic)\\s+[^;\\r\\n]+?(?=[ \\t]+\\b${SENSITIVE_NAME}\\b(?:[ \\t]+|[:=])|\\r?\\n|$)|[^;\\r\\n]+?(?=[ \\t]+\\b${SENSITIVE_NAME}\\b(?:[ \\t]+|[:=])|\\r?\\n|$))`,
   "gi",
 );
 const SENSITIVE_QUOTED_ASSIGNMENT = new RegExp(
-  `(${SENSITIVE_KEY}\\s*[:=]\\s*)("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|(?:Bearer|Basic)\\s+[^\\s;]+|[^\\s;]+)`,
+  `(${SENSITIVE_KEY}\\s*[:=]\\s*)(?!\\s*\\[REDACTED\\])("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|(?:Bearer|Basic)\\s+[^;\\r\\n]+?(?=[ \\t]+\\b${SENSITIVE_NAME}\\b(?:[ \\t]+|[:=])|\\r?\\n|$)|[^;\\r\\n]+?(?=[ \\t]+\\b${SENSITIVE_NAME}\\b(?:[ \\t]+|[:=])|\\r?\\n|$))`,
   "gi",
 );
-const SENSITIVE_BARE_VALUE = new RegExp(`\\b(${SENSITIVE_NAME})\\s+(?!\\[REDACTED\\])([^\\s;]+)`, "gi");
+const SENSITIVE_BARE_VALUE = new RegExp(`\\b(${SENSITIVE_NAME})\\s+(?![A-Za-z0-9_.-]+\\s*[:=]|\\[REDACTED\\])([^\\s;]+)`, "gi");
 const UNREDACTED_SENSITIVE_ASSIGNMENT = new RegExp(`(?:\\b${SENSITIVE_NAME}|${SENSITIVE_KEY})\\s*[:=](?!\\s*\\[REDACTED\\])`, "i");
 
 export function redactSensitiveText(text: string): string {
@@ -223,10 +223,10 @@ export function redactOperationalText(text: string, values: string[] = []): stri
     redacted = redacted.split(value).join("<redacted-path>");
   }
   return redactSensitiveText(redacted)
-    .replace(/\/(?:[^\s"'<>`]|\\ )+/g, "<redacted-path>")
-    .replace(/\b[A-Za-z]:[\\/](?:[^\s"'<>`]|\\ )+/g, "<redacted-path>")
-    .replace(/(^|[\s"'(=:])(?:\.\.?[\\/])+[^\s"'<>`]+/g, "$1<redacted-path>")
-    .replace(/(^|[\s"'(=:])\\\\[^\s"'<>`]+/g, "$1<redacted-path>")
+    .replace(/\/(?:[^"'<>`\n,;)\]}]|\\ )+?(?=$|[\n"'<>`,;)\]}]|\s+[A-Za-z0-9_.-]+\s*[:=])/g, "<redacted-path>")
+    .replace(/\b[A-Za-z]:[\\/](?:[^"'<>`\n,;)\]}]|\\ )+?(?=$|[\n"'<>`,;)\]}]|\s+[A-Za-z0-9_.-]+\s*[:=])/g, "<redacted-path>")
+    .replace(/(^|[\s"'(=:])(?:\.\.?[\\/])+[^"'<>`\n,;)\]}]+/g, "$1<redacted-path>")
+    .replace(/(^|[\s"'(=:])\\\\[^"'<>`\n,;)\]}]+/g, "$1<redacted-path>")
     .replace(/(?<![A-Za-z0-9])(?:(?:[0-9A-Fa-f]{0,4}:){1,7})(?:\d{1,3}\.){3}\d{1,3}(?![A-Za-z0-9])/g, "<redacted-address>")
     .replace(/(?<![A-Za-z0-9])(?:(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}(?:%[A-Za-z0-9._-]+)?)(?![A-Za-z0-9])/g, "<redacted-address>")
     .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "<redacted-address>");
@@ -292,7 +292,7 @@ async function boundedDirectoryEntries(path: string): Promise<{ entries: Dirent[
 }
 
 async function localCollect(options: SnapshotOptions): Promise<string> {
-  const localDir = expandUser(options.localDir);
+  const localDir = resolve(expandUser(options.localDir));
   const lines: string[] = [
     "## Local",
     "",
@@ -313,7 +313,7 @@ async function localCollect(options: SnapshotOptions): Promise<string> {
   }
 
   const pathRedactions = [localDir, process.env.HOME ?? homedir(), homedir()];
-  lines.push("### Directory overview", "", await commandFirstLines(["ls", "-la", localDir], 200, pathRedactions), "");
+  lines.push("### Directory overview", "", await commandFirstLines(["ls", "-la", "--", localDir], 200, pathRedactions), "");
   let entryListing: { entries: Dirent[]; truncated: boolean };
   try {
     entryListing = await boundedDirectoryEntries(localDir);
@@ -328,7 +328,7 @@ async function localCollect(options: SnapshotOptions): Promise<string> {
     .map((entry) => join(localDir, entry.name))
     .sort();
   lines.push("### Known log files (first 200 lines of listing)", "");
-  if (logFiles.length > 0) lines.push(await commandFirstLines(["ls", "-la", ...logFiles], 200, pathRedactions));
+  if (logFiles.length > 0) lines.push(await commandFirstLines(["ls", "-la", "--", ...logFiles], 200, pathRedactions));
   lines.push("");
 
   const clientLog = join(localDir, "client_log.txt");

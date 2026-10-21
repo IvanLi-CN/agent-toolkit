@@ -35,6 +35,7 @@ describe("DST local Bun tooling", () => {
     expect(redactSensitiveText('api_key="prefix\\"LEAK"')).toBe("api_key=[REDACTED]");
     expect(redactSensitiveText('{"token":"json-secret", "api_key": "other-secret"}')).not.toMatch(/json-secret|other-secret/);
     expect(redactSensitiveText("api_token=abc,SECRET_TAIL")).toBe("api_token=[REDACTED]");
+    expect(redactSensitiveText("api_key=value with fixture-secret")).toBe("api_key=[REDACTED]");
     const multilineToken = ["token", "=", '"', "first-line\nsecond-line", '"'].join("");
     expect(redactSensitiveText(multilineToken)).toBe("token=[REDACTED]");
     expect(redactSensitiveText("api_key=[REDACTED] token raw-secret")).toBe("api_key=[REDACTED] token [REDACTED]");
@@ -141,6 +142,24 @@ describe("DST local Bun tooling", () => {
       expect(report).not.toContain(local);
       expect(report).not.toContain("secret-fixture");
     } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not treat an option-like relative local directory as an ls flag", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-local-option-"));
+    const previousCwd = process.cwd();
+    try {
+      await mkdir(join(root, "-R"));
+      await writeFile(join(root, "outside-secret.txt"), "should not be listed");
+      process.chdir(root);
+      const output = join(root, "snapshot.md");
+      expect(await snapshotMain(["--local-dir", "-R", "--no-remote", "--out", output])).toBe(0);
+      const report = await readFile(output, "utf8");
+      expect(report).toContain("## Local");
+      expect(report).not.toContain("outside-secret.txt");
+    } finally {
+      process.chdir(previousCwd);
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -415,7 +434,7 @@ esac
   });
 
   test("redacts arbitrary paths and IPv4/IPv6 addresses from operational diagnostics", () => {
-    const diagnostic = "denied /workspace/private/key ../relative/private/key \\\\server\\share\\private via 192.0.2.8, [2001:db8::7], and ::ffff:192.0.2.9";
+    const diagnostic = "denied /workspace/private/key /home/alice/My Secret/token ../relative/private/key \\\\server\\share\\private via 192.0.2.8, [2001:db8::7], and ::ffff:192.0.2.9";
     const redacted = redactOperationalText(diagnostic);
     expect(redacted).not.toContain("/workspace/private/key");
     expect(redacted).not.toContain("../relative/private/key");
@@ -425,6 +444,7 @@ esac
     expect(redacted).not.toContain("2001:db8::7");
     expect(redacted).toContain("<redacted-path>");
     expect(redacted).toContain("<redacted-address>");
+    expect(redacted).not.toContain("My Secret");
   });
 
   test("redacts relative and UNC paths after assignment delimiters", () => {

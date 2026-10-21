@@ -338,6 +338,17 @@ test("treats an identity-matched zombie as already reaped", () => {
   expect(killed).toEqual([]);
 });
 
+test("treats a member that vanishes during cleanup as reaped", () => {
+  let existsCalls = 0;
+  const result = killProcessTree([{ pid: 4246, starttime: "vanishing-starttime" }], {
+    exists: () => ++existsCalls === 1,
+    readIdentity: () => "vanishing-starttime",
+    zombie: () => false,
+    kill: () => false,
+  });
+  expect(result).toEqual({ killed: true, error: null });
+});
+
 linuxTest("kills a TERM-ignoring descendant after the leader exits on SIGTERM", async () => {
   const runner = new CommandRunner();
   const probeRoot = root("agent-vm-term-descendant");

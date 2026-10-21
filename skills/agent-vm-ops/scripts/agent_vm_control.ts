@@ -1418,6 +1418,7 @@ export function killProcessTree(members: readonly ProcessIdentity[], options: Pr
       if (!exists(member.pid)) continue;
       const current = readIdentity(member.pid);
       if (!current) {
+        if (!exists(member.pid)) continue;
         cleanupError ??= "process_identity_unverified";
         identityBlocked = true;
         continue;
@@ -1428,12 +1429,13 @@ export function killProcessTree(members: readonly ProcessIdentity[], options: Pr
         continue;
       }
       if (zombie(member.pid)) continue;
-      if (!kill(member.pid, 9)) cleanupError ??= "PermissionError";
+      if (!kill(member.pid, 9) && exists(member.pid)) cleanupError ??= "PermissionError";
     }
     const remaining = members.filter((member) => {
       if (!exists(member.pid)) return false;
       const current = readIdentity(member.pid);
       if (!current) {
+        if (!exists(member.pid)) return false;
         cleanupError ??= "process_identity_unverified";
         identityBlocked = true;
         return true;
@@ -1735,7 +1737,13 @@ export class CommandRunner {
           if (!remaining.length && (leaderExitedAfterTerm || !processExists(processHandle.pid))) break;
           await sleep(50);
         }
-        const finalEnvironment = addBoundEnvironmentMembers();
+        environmentInspectionIncomplete = false;
+        let finalEnvironment = addBoundEnvironmentMembers();
+        for (let attempt = 0; attempt < 3 && !finalEnvironment.complete; attempt += 1) {
+          await sleep(10);
+          environmentInspectionIncomplete = false;
+          finalEnvironment = addBoundEnvironmentMembers();
+        }
         addKnown(processPipeMembers(leaderPipeTargets, pipeScope()).members);
         const finalDescendants = processDescendantsFromRoots([...known.values()]);
         let finalInspectionComplete = finalDescendants.complete;

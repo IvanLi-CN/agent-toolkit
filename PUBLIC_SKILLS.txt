@@ -13,7 +13,6 @@ firmware-display-preview
 git-remote-troubleshoot
 git-sync
 linux-server-init
-mcu-agentd-project-integration
 step-stl-print-repair
 tavily-hikari-infra
 xp-infra

@@ -253,9 +253,6 @@ async function startRemote(options: ModOptions, shard: "Master" | "Caves"): Prom
 }
 
 function killProcessTree(supervised: SupervisedChild, signal: "SIGTERM" | "SIGKILL"): void {
-  if (process.platform !== "win32") {
-    try { process.kill(-supervised.child.pid, signal); } catch { /* The supervisor may already be gone. */ }
-  }
   try { supervised.child.kill(signal); } catch { /* The supervisor may already be gone. */ }
 }
 

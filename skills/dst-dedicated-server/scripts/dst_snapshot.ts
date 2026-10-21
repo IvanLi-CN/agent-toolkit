@@ -42,9 +42,6 @@ function expandUser(path: string): string {
 
 function killProcessTree(supervised: SupervisedChild, signal: "SIGTERM" | "SIGKILL"): void {
   try { supervised.child.kill(signal); } catch { /* The supervisor may already be gone. */ }
-  if (process.platform !== "win32") {
-    try { process.kill(-supervised.child.pid, signal); } catch { /* The supervisor may already be gone. */ }
-  }
 }
 
 export const MAX_REMOTE_OUTPUT_BYTES = 256 * 1024;

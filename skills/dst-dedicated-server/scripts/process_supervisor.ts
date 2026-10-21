@@ -15,6 +15,7 @@ cleanup_ack_enabled=1
 captured_descendants_path="$status_dir/descendants"
 pending_descendants_path="$status_dir/descendant-pids"
 snapshot_started_path="$status_dir/snapshot-started"
+snapshot_finished_path="$status_dir/snapshot-finished"
 descendant_scan_truncated_path="$status_dir/descendant-scan-truncated"
 descendant_scan_failed_path="$status_dir/descendant-scan-failed"
 descendant_scan_input_path="$status_dir/descendant-scan-input"
@@ -236,12 +237,28 @@ process_identity() {
       return 0
     fi
   fi
-  process_ps_start="$(ps -o lstart= -p "$process_id" 2>/dev/null | awk 'NR == 1 { sub(/^[ \t]*/, ""); sub(/[ \t]*$/, ""); print; exit }')"
+  process_ps_start="$(LC_ALL=C ps -o lstart= -p "$process_id" 2>/dev/null | awk '
+    $1 ~ /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat)$/ &&
+    $2 ~ /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$/ &&
+    $3 ~ /^[0-9][0-9]*$/ &&
+    $4 ~ /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/ &&
+    $5 ~ /^[0-9][0-9][0-9][0-9]$/ { print; exit }
+  ')"
   if [ -n "$process_ps_start" ]; then
     printf 'ps:%s\n' "$process_ps_start"
     return 0
   fi
   return 1
+}
+identity_is_valid() {
+  case "$1" in
+    proc:*|ps:*) ;;
+    *) return 1 ;;
+  esac
+  case "$1" in
+    *"
+"*) return 1 ;;
+  esac
 }
 descendants() {
   if ! ps -eo pid=,ppid= > "$descendant_scan_input_path" 2>/dev/null; then
@@ -300,13 +317,15 @@ descendants() {
   esac
 }
 snapshot_descendants() {
-  : > "$snapshot_started_path" 2>/dev/null || true
+  if ! : > "$snapshot_started_path" 2>/dev/null; then cleanup_ack_enabled=0; fi
   if ! descendants > "$pending_descendants_path" 2>/dev/null; then
     cleanup_ack_enabled=0
     : > "$descendant_scan_failed_path" 2>/dev/null || true
   fi
+  if ! : > "$snapshot_finished_path" 2>/dev/null; then cleanup_ack_enabled=0; fi
 }
 start_snapshot() {
+  if ! rm -f "$snapshot_started_path" "$snapshot_finished_path" 2>/dev/null; then cleanup_ack_enabled=0; fi
   snapshot_pid=""
   snapshot_descendants &
   snapshot_pid="$!"
@@ -315,6 +334,20 @@ start_snapshot() {
     sleep 0.001
     snapshot_wait=$((snapshot_wait + 1))
   done
+}
+wait_for_snapshot() {
+  [ -n "$snapshot_pid" ] || return 0
+  snapshot_wait=0
+  while [ ! -e "$snapshot_finished_path" ] && [ "$snapshot_wait" -lt 100 ]; do
+    sleep 0.01
+    snapshot_wait=$((snapshot_wait + 1))
+  done
+  if [ ! -e "$snapshot_finished_path" ]; then
+    cleanup_ack_enabled=0
+    kill -KILL "$snapshot_pid" 2>/dev/null || true
+  fi
+  wait "$snapshot_pid" 2>/dev/null || true
+  snapshot_pid=""
 }
 record_descendants() {
   if [ ! -e "$captured_descendants_path" ]; then : > "$captured_descendants_path" 2>/dev/null || true; fi
@@ -338,6 +371,7 @@ signal_captured_descendants() {
     case "$captured_pid" in ''|*[!0-9]*) continue ;; esac
     [ "$captured_pid" = "$$" ] && continue
     current_captured_identity="$(process_identity "$captured_pid" 2>/dev/null || true)"
+    if ! identity_is_valid "$current_captured_identity"; then current_captured_identity=""; fi
     [ -n "$current_captured_identity" ] || continue
     [ "$current_captured_identity" = "$captured_identity" ] || continue
     kill -"$signal" "$captured_pid" 2>/dev/null || true
@@ -346,10 +380,6 @@ signal_captured_descendants() {
 signal_tree() {
   signal="$1"
   start_snapshot
-  if [ "$signal" = "KILL" ] && [ -n "$snapshot_pid" ]; then
-    wait "$snapshot_pid" 2>/dev/null || true
-    snapshot_pid=""
-  fi
   wrapper_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' || true)"
   current_target_pgid=""
   group_signal_succeeded=0
@@ -366,7 +396,7 @@ signal_tree() {
       fi
       ;;
   esac
-  if [ -n "$snapshot_pid" ]; then wait "$snapshot_pid" 2>/dev/null || true; snapshot_pid=""; fi
+  wait_for_snapshot
   record_descendants
   if [ -e "$descendant_scan_truncated_path" ] || [ -e "$descendant_scan_failed_path" ]; then cleanup_ack_enabled=0; fi
   signal_captured_descendants
@@ -395,8 +425,48 @@ process_is_live() {
   fi
   kill -0 "$process_id" 2>/dev/null
 }
+captured_identity_for_pid() {
+  captured_lookup_pid="$1"
+  [ -f "$captured_descendants_path" ] || return 1
+  awk -F'|' -v pid="$captured_lookup_pid" '$1 == pid { print $2; found = 1; exit } END { if (!found) exit 1 }' "$captured_descendants_path"
+}
+verify_captured_descendants() {
+  [ -f "$captured_descendants_path" ] || return 0
+  while IFS='|' read -r captured_pid captured_identity; do
+    case "$captured_pid" in ''|*[!0-9]*) continue ;; esac
+    [ "$captured_pid" = "$$" ] && continue
+    if ! process_is_live "$captured_pid"; then
+      continue
+    fi
+    current_captured_identity="$(process_identity "$captured_pid" 2>/dev/null || true)"
+    if ! identity_is_valid "$current_captured_identity"; then current_captured_identity=""; fi
+    if [ -z "$current_captured_identity" ]; then
+      cleanup_ack_enabled=0
+      return 1
+    fi
+    if [ "$current_captured_identity" != "$captured_identity" ]; then
+      cleanup_ack_enabled=0
+      return 1
+    fi
+    if process_is_live "$captured_pid"; then
+      kill -KILL "$captured_pid" 2>/dev/null || true
+      sleep 0.05
+      if process_is_live "$captured_pid"; then
+        current_captured_identity="$(process_identity "$captured_pid" 2>/dev/null || true)"
+        if ! identity_is_valid "$current_captured_identity" || [ "$current_captured_identity" = "$captured_identity" ]; then
+          cleanup_ack_enabled=0
+          return 1
+        fi
+        cleanup_ack_enabled=0
+        return 1
+      fi
+      continue
+    fi
+  done < "$captured_descendants_path"
+}
 verify_descendant_cleanup() {
   verify_descendants_path="$status_dir/remaining-descendants"
+  verify_captured_descendants || return 1
   if ! descendants > "$verify_descendants_path" 2>/dev/null; then
     cleanup_ack_enabled=0
     return 1
@@ -407,6 +477,13 @@ verify_descendant_cleanup() {
     [ "$remaining_pid" = "$target_pid" ] && continue
     [ "$remaining_pid" = "$$" ] && continue
     if process_is_live "$remaining_pid"; then
+      expected_remaining_identity="$(captured_identity_for_pid "$remaining_pid" 2>/dev/null || true)"
+      current_remaining_identity="$(process_identity "$remaining_pid" 2>/dev/null || true)"
+      if ! identity_is_valid "$current_remaining_identity"; then current_remaining_identity=""; fi
+      if [ -z "$expected_remaining_identity" ] || [ "$current_remaining_identity" != "$expected_remaining_identity" ]; then
+        cleanup_ack_enabled=0
+        return 1
+      fi
       remaining_descendants=1
       kill -KILL "$remaining_pid" 2>/dev/null || true
     fi
@@ -425,6 +502,7 @@ verify_descendant_cleanup() {
       return 1
     fi
   done < "$verify_descendants_path"
+  verify_captured_descendants
 }
 watchdog_pid=""
 termination_started=0

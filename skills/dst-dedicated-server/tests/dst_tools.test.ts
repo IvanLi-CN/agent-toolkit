@@ -905,20 +905,45 @@ esac
   test("cleans a detached supervisor directory after its parent exits", { timeout: 10_000 }, async () => {
     if (process.platform === "win32") return;
     const before = new Set((await readdir(tmpdir())).filter((entry) => entry.startsWith(".agent-toolkit-dst-supervisor-")));
+    const markerRoot = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-parent-"));
+    const marker = join(markerRoot, "descendant.pid");
     const moduleUrl = pathToFileURL(join(import.meta.dir, "..", "scripts", "process_supervisor.ts")).href;
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
     const child = Bun.spawn([
       process.execPath,
       "-e",
-      `import { spawnSupervised } from ${JSON.stringify(moduleUrl)}; await spawnSupervised(["sh", "-c", "sleep 30"]); process.exit(0);`,
+      `import { spawnSupervised } from ${JSON.stringify(moduleUrl)}; await spawnSupervised(["sh", "-c", "sleep 30 & printf '%s\\n' \\\"$!\\\" > \\\"${marker}\\\"; wait"]); process.exit(0);`,
     ], { stdout: "pipe", stderr: "pipe" });
-    expect(await child.exited).toBe(0);
-    let leftovers: string[] = [];
-    for (let attempt = 0; attempt < 24; attempt += 1) {
-      await Bun.sleep(250);
-      leftovers = (await readdir(tmpdir())).filter((entry) => entry.startsWith(".agent-toolkit-dst-supervisor-") && !before.has(entry));
-      if (leftovers.length === 0) break;
+    try {
+      expect(await child.exited).toBe(0);
+      let leftovers: string[] = [];
+      let descendantPid: number | undefined;
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        await Bun.sleep(250);
+        leftovers = (await readdir(tmpdir())).filter((entry) => entry.startsWith(".agent-toolkit-dst-supervisor-") && !before.has(entry));
+        try {
+          descendantPid = Number((await readFile(marker, "utf8")).trim());
+        } catch {
+          // The child may exit before the target writes its marker.
+        }
+        if (leftovers.length === 0 && descendantPid !== undefined) break;
+      }
+      expect(leftovers).toEqual([]);
+      expect(Number.isInteger(descendantPid)).toBe(true);
+      for (let attempt = 0; attempt < 30 && descendantPid !== undefined && isAlive(descendantPid); attempt += 1) {
+        await Bun.sleep(100);
+      }
+      expect(descendantPid === undefined ? false : isAlive(descendantPid)).toBe(false);
+    } finally {
+      await rm(markerRoot, { recursive: true, force: true });
     }
-    expect(leftovers).toEqual([]);
   });
 
   test("kills a target process group after its leader exits", { timeout: 10_000 }, async () => {

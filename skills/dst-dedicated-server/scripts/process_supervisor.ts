@@ -107,6 +107,18 @@ target_is_alive() {
 }
 stop_anchor() {
   if target_identity_matches; then
+    anchor_pgid="$(ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ' || true)"
+    wrapper_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' || true)"
+    case "$anchor_pgid" in
+      ''|*[!0-9]*) ;;
+      *)
+        if [ "$anchor_pgid" != "$wrapper_pgid" ]; then
+          kill TERM "-$anchor_pgid" 2>/dev/null || true
+          sleep 0.1
+          kill KILL "-$anchor_pgid" 2>/dev/null || true
+        fi
+        ;;
+    esac
     kill TERM "$target_pid" 2>/dev/null || true
     sleep 0.1
     kill KILL "$target_pid" 2>/dev/null || true
@@ -114,7 +126,6 @@ stop_anchor() {
 }
 descendants() {
   ps -eo pid=,ppid= 2>/dev/null | awk -v root="$target_pid" '
-    NR > 4096 { exit }
     { parent[$1] = $2 }
     function is_descendant(pid, current, depth) {
       current = parent[pid]
@@ -174,7 +185,14 @@ parent_is_alive() {
   return 1
 }
 watch_parent() {
-  while parent_is_alive; do sleep 1; done
+  watch_sleep_pid=""
+  trap 'if [ -n "$watch_sleep_pid" ]; then kill "$watch_sleep_pid" 2>/dev/null || true; fi; exit 0' HUP INT TERM
+  while parent_is_alive; do
+    sleep 1 &
+    watch_sleep_pid="$!"
+    wait "$watch_sleep_pid" 2>/dev/null || true
+    watch_sleep_pid=""
+  done
   signal_tree TERM
   sleep 1
   signal_tree KILL
@@ -216,12 +234,21 @@ printf '%s\\n' "$target_status" > "$status_path"
 exec 0<&- 1>&- 2>&-
 hold_seconds=5
 if [ -d "/proc/$$/fd" ]; then hold_seconds=0.25; fi
-(
-  sleep "$hold_seconds"
+hold_process() {
+  hold_sleep_pid=""
+  trap 'if [ -n "$hold_sleep_pid" ]; then kill "$hold_sleep_pid" 2>/dev/null || true; fi; exit 0' HUP INT TERM
+  sleep "$hold_seconds" &
+  hold_sleep_pid="$!"
+  wait "$hold_sleep_pid" 2>/dev/null || exit 0
+  hold_sleep_pid=""
   signal_tree TERM
-  sleep 0.25
+  sleep 0.25 &
+  hold_sleep_pid="$!"
+  wait "$hold_sleep_pid" 2>/dev/null || exit 0
+  hold_sleep_pid=""
   signal_tree KILL
-) </dev/null >/dev/null 2>&1 &
+}
+hold_process </dev/null >/dev/null 2>&1 &
 hold_pid=$!
 while target_is_alive; do sleep 0.05; done
 kill "$hold_pid" 2>/dev/null || true

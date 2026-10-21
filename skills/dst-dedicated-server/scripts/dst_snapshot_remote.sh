@@ -83,7 +83,14 @@ fi
 echo "- klei_dir: <remote-home>/.klei/DoNotStarveTogether"
 echo
 
-for cluster in "$KLEI_DIR"/*; do
+cluster_count=0
+while IFS= read -r cluster; do
+  [[ "$cluster" == "$KLEI_DIR" ]] && continue
+  ((cluster_count += 1))
+  if (( cluster_count > 128 )); then
+    echo "> cluster inventory truncated at 128 entries."
+    break
+  fi
   [[ -d "$cluster" && ! -L "$cluster" ]] || continue
   echo "#### Cluster: <cluster>"
   if [[ -f "$cluster/cluster.ini" ]]; then
@@ -111,7 +118,7 @@ for cluster in "$KLEI_DIR"/*; do
     fi
   done
   echo
-done
+done < <(find "$KLEI_DIR" -type d -prune -print 2>/dev/null || true)
 
 echo "### Server binary (best-effort)"
 echo

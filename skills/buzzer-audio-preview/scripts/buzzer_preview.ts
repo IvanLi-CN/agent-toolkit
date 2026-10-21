@@ -271,9 +271,8 @@ export function parseScore(raw: unknown): { config: ScoreConfig; events: ScoreEv
 }
 
 export async function parseScoreFile(path: string): Promise<{ config: ScoreConfig; events: ScoreEvent[] }> {
-  const file = Bun.file(expandUser(path));
-  if (file.size > MAX_SCORE_INPUT_BYTES) throw new Error(`score input exceeds the ${MAX_SCORE_INPUT_BYTES}-byte limit`);
-  const input = await file.json();
+  const inputPath = expandUser(path);
+  const input = JSON.parse(new TextDecoder().decode(await readBoundedRegularFile(inputPath, MAX_SCORE_INPUT_BYTES, "score input")));
   return parseScore(input);
 }
 
@@ -586,12 +585,26 @@ async function moveOutputToBackup(source: string, destination: string, symlinkMa
 }
 
 async function readRegularFile(path: string, maxBytes = MAX_TRANSACTION_METADATA_BYTES): Promise<Uint8Array> {
+  return readBoundedRegularFile(path, maxBytes, "published output");
+}
+
+async function readBoundedRegularFile(path: string, maxBytes: number, label: string): Promise<Uint8Array> {
   const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   try {
     const metadata = await handle.stat();
-    if (!metadata.isFile()) throw new Error(`published output is not a regular file: ${path}`);
-    if (metadata.size > maxBytes) throw new Error(`file exceeds the ${maxBytes}-byte limit: ${path}`);
-    return await handle.readFile();
+    if (!metadata.isFile()) throw new Error(`${label} is not a regular file: ${path}`);
+    const size = Number(metadata.size);
+    if (!Number.isSafeInteger(size) || size > maxBytes) throw new Error(`${label} exceeds the ${maxBytes}-byte limit: ${path}`);
+    const data = Buffer.alloc(size);
+    let offset = 0;
+    while (offset < size) {
+      const result = await handle.read(data, offset, size - offset, offset);
+      if (result.bytesRead === 0) break;
+      offset += result.bytesRead;
+    }
+    const finalMetadata = await handle.stat();
+    if (offset !== size || finalMetadata.size !== metadata.size) throw new Error(`${label} changed while reading: ${path}`);
+    return data;
   } finally {
     await handle.close();
   }
@@ -721,6 +734,10 @@ async function restoreOutput(
 }
 
 async function restoreTransaction(directory: string, midiPath: string, wavPath: string): Promise<void> {
+  const directoryMetadata = await lstat(directory);
+  if (!directoryMetadata.isDirectory() || directoryMetadata.isSymbolicLink()) {
+    throw new Error(`transaction path is not a private directory: ${directory}`);
+  }
   const state = await readPublishState(directory);
   if (state === undefined) {
     if (await hasRecoveryArtifacts(directory)) {
@@ -752,12 +769,34 @@ async function recoverPublishTransactions(outDir: string, stem: string, midiPath
   let entries;
   try {
     entries = await readdir(outDir, { withFileTypes: true });
-  } catch {
-    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
   }
   for (const entry of entries) {
     if (!entry.isDirectory() || !entry.name.startsWith(prefix)) continue;
-    await restoreTransaction(join(outDir, entry.name), midiPath, wavPath);
+    const transaction = join(outDir, entry.name);
+    let transactionEntries;
+    try {
+      transactionEntries = await readdir(transaction, { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
+    if (transactionEntries.some((candidate) => candidate.isDirectory() || !TRANSACTION_ENTRY_NAMES.has(candidate.name))) continue;
+    const quarantine = join(outDir, `.buzzer-preview-recovery-${stem}-${randomUUID()}`);
+    try {
+      await rename(transaction, quarantine);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
+    try {
+      await restoreTransaction(quarantine, midiPath, wavPath);
+    } catch (error) {
+      await rename(quarantine, transaction).catch(() => undefined);
+      throw error;
+    }
   }
 }
 
@@ -837,7 +876,7 @@ async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner
       return async () => {
         clearInterval(heartbeat);
         try {
-          const currentOwner = (await readFile(join(lockDirectory, "owner"), "utf8")).trim();
+          const currentOwner = new TextDecoder().decode(await readRegularFile(join(lockDirectory, "owner"), 128)).trim();
           if (currentOwner === owner) await removeLockDirectory(lockDirectory);
         } catch {
           // A replacement owner must never be removed by an old releaser.
@@ -850,24 +889,27 @@ async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner
         const metadata = await lstat(lockDirectory);
         if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error("lock path is not a private directory");
         const entries = await readdir(lockDirectory, { withFileTypes: true });
-        if (entries.some((entry) => entry.isDirectory() || !LOCK_ENTRY_NAMES.has(entry.name))) throw new Error("lock directory contains unknown entries");
+        if (entries.some((entry) => entry.isDirectory() || entry.isSymbolicLink() || !LOCK_ENTRY_NAMES.has(entry.name))) throw new Error("lock directory contains unknown entries");
         const heartbeatMetadata = await lstat(join(lockDirectory, "heartbeat")).catch(() => metadata);
         const age = Date.now() - heartbeatMetadata.mtimeMs;
         const ready = entries.some((entry) => entry.name === "ready");
         if (!ready) {
           stale = age > LOCK_STALE_MS;
         } else {
-          const ownerText = await readFile(join(lockDirectory, "pid"), "utf8");
-          const owner = Number.parseInt(ownerText.trim(), 10);
+          const ownerText = new TextDecoder().decode(await readRegularFile(join(lockDirectory, "pid"), 128));
+          const owner = Number(ownerText.trim());
+          if (!Number.isSafeInteger(owner) || owner <= 0) throw new Error("lock pid is invalid");
           const alive = await isProcessAlive(owner);
           if (!alive) {
             stale = reclaimDeadOwner || age > LOCK_STALE_MS;
           } else {
-            const recordedIdentity = await readFile(join(lockDirectory, "identity"), "utf8").then((value) => value.trim()).catch(() => "");
+            const recordedIdentity = await readRegularFile(join(lockDirectory, "identity"), 512)
+              .then((value) => new TextDecoder().decode(value).trim())
+              .catch(() => "");
             const currentIdentity = recordedIdentity.length > 0 ? await processIdentity(owner) : undefined;
             stale = currentIdentity === undefined
               ? age > LOCK_STALE_MS
-              : recordedIdentity.length > 0 && currentIdentity !== recordedIdentity && (reclaimDeadOwner || age > LOCK_STALE_MS);
+              : recordedIdentity.length > 0 && currentIdentity !== recordedIdentity && age > LOCK_STALE_MS;
           }
         }
       } catch {

@@ -31,11 +31,13 @@ function byteStream(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
 describe("DST local Bun tooling", () => {
   test("redacts bearer, basic, and escaped quoted secrets completely", () => {
     expect(redactSensitiveText("Authorization: Bearer fixture-secret")).toBe("Authorization: [REDACTED]");
+    expect(redactSensitiveText("Authorization Bearer fixture-secret")).toBe("Authorization [REDACTED]");
     expect(redactSensitiveText("Authorization: Basic fixture-secret")).toBe("Authorization: [REDACTED]");
     expect(redactSensitiveText('api_key="prefix\\"LEAK"')).toBe("api_key=[REDACTED]");
     expect(redactSensitiveText('{"token":"json-secret", "api_key": "other-secret"}')).not.toMatch(/json-secret|other-secret/);
     expect(redactSensitiveText("api_token=abc,SECRET_TAIL")).toBe("api_token=[REDACTED]");
     expect(redactSensitiveText("api_key=value with fixture-secret")).toBe("api_key=[REDACTED]");
+    expect(redactSensitiveText("password fixture secret with spaces")).toBe("password [REDACTED]");
     const multilineToken = ["token", "=", '"', "first-line\nsecond-line", '"'].join("");
     expect(redactSensitiveText(multilineToken)).toBe("token=[REDACTED]");
     expect(redactSensitiveText("api_key=[REDACTED] token raw-secret")).toBe("api_key=[REDACTED] token [REDACTED]");
@@ -109,6 +111,13 @@ describe("DST local Bun tooling", () => {
     enabled = true,
   },
 }`)).toEqual([{ id: "500", state: "true" }]);
+
+    expect(parseModOverrides(`return {
+  ["workshop-550"] = { configuration_options =
+    { ["workshop-999"] = { enabled = true } },
+    enabled = false,
+  },
+}`)).toEqual([{ id: "550", state: "false" }]);
 
     expect(parseModOverrides(`return {
   ["workshop-600"] = {

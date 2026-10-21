@@ -128,9 +128,18 @@ async function readFramebufferInput(path: string, bounds: { minimum: number; max
   try {
     const metadata = await handle.stat();
     if (!metadata.isFile()) throw new Error("framebuffer input must be a regular file");
-    if (metadata.size > bounds.maximum) throw new Error(`framebuffer input exceeds the ${bounds.maximum}-byte limit`);
-    if (metadata.size < bounds.minimum) return await handle.readFile();
-    return await handle.readFile();
+    const size = Number(metadata.size);
+    if (!Number.isSafeInteger(size) || size > bounds.maximum) throw new Error(`framebuffer input exceeds the ${bounds.maximum}-byte limit`);
+    const data = new Uint8Array(size);
+    let offset = 0;
+    while (offset < size) {
+      const result = await handle.read(data, offset, size - offset, offset);
+      if (result.bytesRead === 0) break;
+      offset += result.bytesRead;
+    }
+    const finalMetadata = await handle.stat();
+    if (offset !== size || finalMetadata.size !== metadata.size) throw new Error("framebuffer input changed while reading");
+    return data;
   } finally {
     await handle.close();
   }

@@ -104,9 +104,9 @@ export class ModOverrideParser {
       this.finishCurrent();
       this.current = start[1]!;
       this.state = "unknown";
-      this.inConfig = false;
-      this.configDepth = 0;
-      this.pendingConfig = false;
+      if (!this.inConfig && !this.pendingConfig) {
+        this.configDepth = 0;
+      }
     }
     if (this.current === undefined) return;
 
@@ -352,6 +352,10 @@ export async function parseRemoteResponseStream(
         }
       } else {
         consumeBody(bytes);
+      }
+      if (trailingBytes) {
+        await cancelReader();
+        break;
       }
     }
 

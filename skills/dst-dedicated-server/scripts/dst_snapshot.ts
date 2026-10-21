@@ -497,38 +497,57 @@ async function ensureSnapshotTemporaryRoot(parent: string): Promise<string> {
   const parentMetadata = await lstat(parent);
   if (!parentMetadata.isDirectory() || parentMetadata.isSymbolicLink()) throw new Error("snapshot output parent must be a real directory");
   const root = join(parent, SNAPSHOT_TEMP_ROOT_NAME);
-  await mkdir(root, { recursive: true, mode: 0o700 });
+  let createdRoot = false;
+  try {
+    await mkdir(root, { mode: 0o700 });
+    createdRoot = true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
   const metadata = await lstat(root);
   if (!metadata.isDirectory() || metadata.isSymbolicLink() || (metadata.mode & 0o077) !== 0) throw new Error("snapshot temporary root must be a private directory");
   if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) throw new Error("snapshot temporary root is not owned by the current user");
   const marker = join(root, ".owner");
-  try {
-    if ((await readFile(marker, "utf8")) !== SNAPSHOT_OWNER_MARKER) throw new Error("snapshot temporary root owner marker is invalid");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  const readMarker = async (): Promise<string | undefined> => {
+    let markerMetadata;
     try {
-      const handle = await open(marker, "wx", 0o600);
+      markerMetadata = await lstat(marker);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+    if (!markerMetadata.isFile() || markerMetadata.isSymbolicLink()) {
+      throw new Error("snapshot temporary root owner marker is invalid");
+    }
+    if (typeof process.getuid === "function" && markerMetadata.uid !== process.getuid()) {
+      throw new Error("snapshot temporary root owner marker is not owned by the current user");
+    }
+    return readFile(marker, "utf8");
+  };
+  if (createdRoot) {
+    const temporaryMarker = join(root, `.owner-tmp-${randomUUID()}`);
+    try {
+      const handle = await open(temporaryMarker, "wx", 0o600);
       try {
         await handle.writeFile(SNAPSHOT_OWNER_MARKER);
         await handle.sync();
       } finally {
         await handle.close();
       }
-    } catch (markerError) {
-      if ((markerError as NodeJS.ErrnoException).code !== "EEXIST") throw markerError;
-      let valid = false;
-      for (let attempt = 0; attempt < 20; attempt += 1) {
-        if ((await readFile(marker, "utf8").catch(() => "")) === SNAPSHOT_OWNER_MARKER) {
-          valid = true;
-          break;
-        }
-        await Bun.sleep(5);
-      }
-      if (!valid) throw markerError;
+      await rename(temporaryMarker, marker);
+      await syncDirectory(root);
+    } finally {
+      await unlink(temporaryMarker).catch(() => undefined);
     }
-    await syncDirectory(root);
+    return root;
   }
-  return root;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const value = await readMarker();
+    if (value === SNAPSHOT_OWNER_MARKER) return root;
+    if (value !== undefined) throw new Error("snapshot temporary root owner marker is invalid");
+    await Bun.sleep(5);
+  }
+  throw new Error("snapshot temporary root owner marker is invalid");
 }
 
 async function cleanupSnapshotTemporaryDirectories(root: string): Promise<void> {
@@ -549,7 +568,11 @@ async function cleanupSnapshotTemporaryDirectories(root: string): Promise<void> 
       try {
         const metadata = await lstat(path);
         if (!metadata.isDirectory() || metadata.isSymbolicLink() || Date.now() - metadata.mtimeMs < SNAPSHOT_TEMP_STALE_MS) continue;
-        if ((await readFile(join(path, ".owner"), "utf8")) !== SNAPSHOT_OWNER_MARKER) continue;
+        const ownerPath = join(path, ".owner");
+        const ownerMetadata = await lstat(ownerPath);
+        if (!ownerMetadata.isFile() || ownerMetadata.isSymbolicLink()) continue;
+        if (typeof process.getuid === "function" && ownerMetadata.uid !== process.getuid()) continue;
+        if ((await readFile(ownerPath, "utf8")) !== SNAPSHOT_OWNER_MARKER) continue;
         await rm(path, { recursive: true, force: true, maxRetries: 0 });
       } catch {
         // Preserve a concurrently changing directory for a later invocation.

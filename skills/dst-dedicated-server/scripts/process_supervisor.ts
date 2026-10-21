@@ -10,6 +10,7 @@ status_dir="$(dirname -- "$status_path")"
 supervisor_pid="$$"
 ready_path="$status_dir/ready"
 cleanup_ack_path="\${AGENT_TOOLKIT_SUPERVISOR_CLEANUP_ACK_PATH:-$status_dir/cleanup-done}"
+unset AGENT_TOOLKIT_SUPERVISOR_CLEANUP_ACK_PATH
 cleanup_ack_enabled=1
 captured_descendants_path="$status_dir/descendants"
 pending_descendants_path="$status_dir/descendant-pids"
@@ -344,7 +345,7 @@ signal_captured_descendants() {
 }
 signal_tree() {
   signal="$1"
-  if [ "$signal" = "TERM" ]; then start_snapshot; fi
+  start_snapshot
   wrapper_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' || true)"
   current_target_pgid=""
   group_signal_succeeded=0
@@ -362,7 +363,7 @@ signal_tree() {
       ;;
   esac
   if [ -n "$snapshot_pid" ]; then wait "$snapshot_pid" 2>/dev/null || true; snapshot_pid=""; fi
-  if [ "$signal" = "TERM" ]; then record_descendants; fi
+  record_descendants
   if [ -e "$descendant_scan_truncated_path" ] || [ -e "$descendant_scan_failed_path" ]; then cleanup_ack_enabled=0; fi
   signal_captured_descendants
   if [ "$group_signal_succeeded" = "1" ] || ! target_identity_matches; then return; fi
@@ -375,6 +376,46 @@ signal_tree() {
     fi
   done
   if [ -e "$descendant_scan_truncated_path" ] || [ -e "$descendant_scan_failed_path" ]; then cleanup_ack_enabled=0; fi
+}
+process_is_live() {
+  process_id="$1"
+  process_identity "$process_id" >/dev/null 2>&1 || return 1
+  if [ -r "/proc/$process_id/stat" ]; then
+    process_state="$(awk '{ sub(/.*\) /, ""); print $1 }' "/proc/$process_id/stat" 2>/dev/null || true)"
+    [ -n "$process_state" ] && [ "$process_state" != "Z" ] || return 1
+  fi
+  kill -0 "$process_id" 2>/dev/null
+}
+verify_descendant_cleanup() {
+  verify_descendants_path="$status_dir/remaining-descendants"
+  if ! descendants > "$verify_descendants_path" 2>/dev/null; then
+    cleanup_ack_enabled=0
+    return 1
+  fi
+  remaining_descendants=0
+  while read -r remaining_pid; do
+    case "$remaining_pid" in ''|*[!0-9]*) continue ;; esac
+    [ "$remaining_pid" = "$target_pid" ] && continue
+    [ "$remaining_pid" = "$$" ] && continue
+    if process_is_live "$remaining_pid"; then
+      remaining_descendants=1
+      kill -KILL "$remaining_pid" 2>/dev/null || true
+    fi
+  done < "$verify_descendants_path"
+  if [ "$remaining_descendants" = "1" ]; then sleep 0.05; fi
+  if ! descendants > "$verify_descendants_path" 2>/dev/null; then
+    cleanup_ack_enabled=0
+    return 1
+  fi
+  while read -r remaining_pid; do
+    case "$remaining_pid" in ''|*[!0-9]*) continue ;; esac
+    [ "$remaining_pid" = "$target_pid" ] && continue
+    [ "$remaining_pid" = "$$" ] && continue
+    if process_is_live "$remaining_pid"; then
+      cleanup_ack_enabled=0
+      return 1
+    fi
+  done < "$verify_descendants_path"
 }
 watchdog_pid=""
 termination_started=0
@@ -390,6 +431,7 @@ terminate_supervised_tree() {
   signal_tree TERM
   sleep 0.25
   signal_tree KILL
+  verify_descendant_cleanup
   stop_anchor
   stop_watchdog
   cleanup

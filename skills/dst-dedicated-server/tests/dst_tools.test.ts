@@ -1095,6 +1095,33 @@ esac
     }
   });
 
+  test("does not expose the cleanup acknowledgement path to the target", { timeout: 10_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-ack-env-"));
+    const marker = join(root, "target-saw-ack-path");
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    try {
+      supervised = await spawnSupervised([
+        "sh",
+        "-c",
+        "if [ -n \"$AGENT_TOOLKIT_SUPERVISOR_CLEANUP_ACK_PATH\" ]; then printf forged > \"$1\"; fi; sleep 30",
+        "agent-toolkit-supervised-target",
+        marker,
+      ]);
+      expect(await lstat(marker).catch(() => undefined)).toBeUndefined();
+      supervised.child.kill("SIGTERM");
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(true);
+      await supervised.wrapperExited;
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("cleans a descendant that leaves the target process group", { timeout: 10_000 }, async () => {
     if (process.platform === "win32") return;
     const setsidCheck = Bun.spawnSync(["sh", "-c", "command -v setsid"], { stdout: "ignore", stderr: "ignore" });

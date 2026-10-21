@@ -545,6 +545,11 @@ const TRANSACTION_ENTRY_NAMES = new Set([
   "wav.symlink",
 ]);
 const LOCK_ENTRY_NAMES = new Set(["pid", "owner", "identity", "heartbeat", "ready"]);
+const OWNER_NONCE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isValidOwnerNonce(value: string): boolean {
+  return OWNER_NONCE_PATTERN.test(value);
+}
 
 async function readDirectoryEntriesBounded(path: string, maxEntries: number): Promise<{ entries: Dirent[]; truncated: boolean }> {
   const directory = await opendir(path);
@@ -719,7 +724,7 @@ async function hasRecoveryArtifacts(directory: string): Promise<boolean> {
 async function hasValidTransactionOwner(directory: string): Promise<boolean> {
   try {
     const owner = new TextDecoder().decode(await readRegularFile(join(directory, ".owner"), 128)).trim();
-    return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(owner);
+    return isValidOwnerNonce(owner);
   } catch {
     return false;
   }
@@ -1000,12 +1005,13 @@ async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner
           const ownerText = new TextDecoder().decode(await readRegularFile(join(lockDirectory, "pid"), 128));
           const owner = Number(ownerText.trim());
           const ownerToken = new TextDecoder().decode(await readRegularFile(join(lockDirectory, "owner"), 128)).trim();
-          if (!Number.isSafeInteger(owner) || owner <= 0 || ownerToken.length === 0) throw new Error("partial lock owner is incomplete");
+          if (!Number.isSafeInteger(owner) || owner <= 0 || !isValidOwnerNonce(ownerToken)) throw new Error("partial lock owner is incomplete");
           stale = !await isProcessAlive(owner) && (reclaimDeadOwner || age > LOCK_STALE_MS);
         } else {
           const ownerText = new TextDecoder().decode(await readRegularFile(join(lockDirectory, "pid"), 128));
           const owner = Number(ownerText.trim());
-          if (!Number.isSafeInteger(owner) || owner <= 0) throw new Error("lock pid is invalid");
+          const ownerToken = new TextDecoder().decode(await readRegularFile(join(lockDirectory, "owner"), 128)).trim();
+          if (!Number.isSafeInteger(owner) || owner <= 0 || !isValidOwnerNonce(ownerToken)) throw new Error("lock owner is incomplete");
           const alive = await isProcessAlive(owner);
           if (!alive) {
             stale = reclaimDeadOwner || age > LOCK_STALE_MS;
@@ -1153,9 +1159,17 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     console.log(`[INFO] Duration: ${totalSeconds.toFixed(2)}s, tempo=${config.tempoBpm} bpm, waveform=${config.audio.waveform}`);
     return 0;
   } catch (error) {
-    console.error(`error: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`error: ${formatError(error)}`);
     return error instanceof CliError ? error.exitCode : 1;
   }
+}
+
+function formatError(error: unknown): string {
+  if (error instanceof AggregateError) {
+    const causes = error.errors.map((cause) => formatError(cause)).filter((message) => message.length > 0);
+    return [error.message, ...causes].join("; ");
+  }
+  return error instanceof Error ? error.message : String(error);
 }
 
 if (import.meta.main) process.exitCode = await main();

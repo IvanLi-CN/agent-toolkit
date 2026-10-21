@@ -30,6 +30,11 @@ class CliError extends Error {
   }
 }
 
+function formatCliError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.startsWith("error:") ? message : `error: ${message}`;
+}
+
 function expandUser(path: string): string {
   const home = process.env.HOME ?? homedir();
   return path === "~" ? home : path.startsWith("~/") ? `${home}/${path.slice(2)}` : path;
@@ -588,7 +593,7 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
   try {
     parsed = parseArgs(args);
   } catch (error) {
-    console.error(error instanceof Error ? error.message : String(error));
+    console.error(formatCliError(error));
     return error instanceof CliError ? error.exitCode : 2;
   }
   if (parsed === "help") {

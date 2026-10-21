@@ -18,6 +18,7 @@ import {
 } from "../scripts/buzzer_preview.ts";
 
 const FIXTURE_TRANSACTION_OWNER = "00000000-0000-4000-8000-000000000000\n";
+const FIXTURE_LOCK_OWNER = "00000000-0000-4000-8000-000000000001\n";
 
 async function captureStdout<T>(callback: () => Promise<T>): Promise<{ value: T; stdout: string[] }> {
   const originalLog = console.log;
@@ -359,7 +360,7 @@ describe("buzzer MIDI and WAV helper", () => {
       await writeFile(join(output, "fixture.wav"), "wav");
       await mkdir(lock);
       await writeFile(join(lock, "pid"), "2147483647\n");
-      await writeFile(join(lock, "owner"), "dead-owner\n");
+      await writeFile(join(lock, "owner"), FIXTURE_LOCK_OWNER);
       const pair = await readPublishedPair(output, "fixture");
       expect(pair.midi.toString()).toBe("midi");
       expect(pair.wav.toString()).toBe("wav");
@@ -410,7 +411,7 @@ describe("buzzer MIDI and WAV helper", () => {
       await writeFile(join(output, "fixture.wav"), "wav");
       await mkdir(lock);
       await writeFile(join(lock, "pid"), "2147483647\n");
-      await writeFile(join(lock, "owner"), "dead-owner\n");
+      await writeFile(join(lock, "owner"), FIXTURE_LOCK_OWNER);
       await writeFile(join(lock, "ready"), "");
       const pair = await readPublishedPair(output, "fixture");
       expect(pair.midi.toString()).toBe("midi");
@@ -439,6 +440,25 @@ describe("buzzer MIDI and WAV helper", () => {
       await writeFile(join(lock, "ready"), "");
       const old = new Date(Date.now() - 10 * 60 * 1000);
       await utimes(heartbeat, old, old);
+      expect(await main(["--in", input, "--out-dir", output, "--stem", "fixture"])).toBe(1);
+      expect(await readdir(output)).toContain(".buzzer-preview-fixture.lock");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves a user-owned lock with an invalid owner nonce", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-user-lock-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      const lock = join(output, ".buzzer-preview-fixture.lock");
+      await mkdir(output, { recursive: true });
+      await mkdir(lock);
+      await writeFile(join(lock, "pid"), "2147483647\n");
+      await writeFile(join(lock, "owner"), "user-owned\n");
+      await writeFile(join(lock, "ready"), "");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
       expect(await main(["--in", input, "--out-dir", output, "--stem", "fixture"])).toBe(1);
       expect(await readdir(output)).toContain(".buzzer-preview-fixture.lock");
     } finally {

@@ -29,6 +29,17 @@ function byteStream(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
 }
 
 describe("DST local Bun tooling", () => {
+  test("uses an error envelope for CLI parse failures", async () => {
+    const env = { ...process.env } as Record<string, string>;
+    const snapshot = await runTool(join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"), ["--unknown"], env);
+    expect(snapshot.status).toBe(2);
+    expect(snapshot.stderr).toStartWith("error: Unknown arg: --unknown");
+
+    const mods = await runTool(join(import.meta.dir, "..", "scripts", "dst_mods_from_modoverrides.ts"), ["--unknown"], env);
+    expect(mods.status).toBe(2);
+    expect(mods.stderr).toStartWith("error: Unknown arg: --unknown");
+  });
+
   test("redacts bearer, basic, and escaped quoted secrets completely", () => {
     expect(redactSensitiveText("Authorization: Bearer fixture-secret")).toBe("Authorization: [REDACTED]");
     expect(redactSensitiveText("Authorization Bearer fixture-secret")).toBe("Authorization [REDACTED]");

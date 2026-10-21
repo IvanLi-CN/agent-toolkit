@@ -33,6 +33,11 @@ class CliError extends Error {
   }
 }
 
+function formatCliError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.startsWith("error:") ? message : `error: ${message}`;
+}
+
 function isRecordStart(line: string): RegExpExecArray | null {
   return /\["workshop-(\d+)"\]/.exec(line);
 }
@@ -435,7 +440,7 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
   try {
     parsed = parseArgs(args);
   } catch (error) {
-    console.error(error instanceof Error ? error.message : String(error));
+    console.error(formatCliError(error));
     return error instanceof CliError ? error.exitCode : 2;
   }
   if (parsed === "help") {

@@ -346,6 +346,10 @@ signal_captured_descendants() {
 signal_tree() {
   signal="$1"
   start_snapshot
+  if [ "$signal" = "KILL" ] && [ -n "$snapshot_pid" ]; then
+    wait "$snapshot_pid" 2>/dev/null || true
+    snapshot_pid=""
+  fi
   wrapper_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' || true)"
   current_target_pgid=""
   group_signal_succeeded=0
@@ -383,6 +387,11 @@ process_is_live() {
   if [ -r "/proc/$process_id/stat" ]; then
     process_state="$(awk '{ sub(/.*\) /, ""); print $1 }' "/proc/$process_id/stat" 2>/dev/null || true)"
     [ -n "$process_state" ] && [ "$process_state" != "Z" ] || return 1
+  else
+    process_state="$(ps -o state= -p "$process_id" 2>/dev/null | awk 'NR == 1 { gsub(/[[:space:]]/, ""); print; exit }')"
+    case "$process_state" in
+      ''|Z*) return 1 ;;
+    esac
   fi
   kill -0 "$process_id" 2>/dev/null
 }

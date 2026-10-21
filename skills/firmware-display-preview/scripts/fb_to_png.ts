@@ -466,12 +466,11 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     };
     const data = await readFramebufferInput(resolve(expandUser(parsed.input)), inputBounds(parsed.format, options));
     const converted = convertFramebuffer(data, parsed.format, options);
-    const displayOutput = parsed.output;
     const outputPath = resolve(expandUser(parsed.output));
     const parentStat = await lstat(dirname(outputPath));
     if (!parentStat.isDirectory()) throw new CliError("--out parent must be a directory");
     await writePngAtomically(outputPath, encodePng(parsed.width, parsed.height, converted.mode, converted.rows));
-    console.log("[OK] Wrote: " + displayOutput);
+    console.log("[OK] Wrote: " + outputPath);
     return 0;
   } catch (error) {
     console.error(`error: ${error instanceof Error ? error.message : String(error)}`);

@@ -146,6 +146,27 @@ describe("framebuffer to PNG helper", () => {
     }
   });
 
+  test("prints the expanded output path for quoted tilde paths", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-fb-tilde-output-"));
+    const previousHome = process.env.HOME;
+    try {
+      process.env.HOME = root;
+      const input = join(root, "frame.raw");
+      const output = join(root, "preview.png");
+      await writeFile(input, Uint8Array.from([255]));
+      const captured = await captureStdout(() => main([
+        "--format", "gray8", "--width", "1", "--height", "1", "--in", input, "--out", "~/preview.png",
+      ]));
+      expect(captured.value).toBe(0);
+      expect(captured.stdout).toContain(`[OK] Wrote: ${output}`);
+      expect([...((await readFile(output)).slice(0, 8))]).toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("returns argparse failures as exit code 2", async () => {
     expect(await main(["--unknown"])).toBe(2);
     expect(await main(["--width"])).toBe(2);

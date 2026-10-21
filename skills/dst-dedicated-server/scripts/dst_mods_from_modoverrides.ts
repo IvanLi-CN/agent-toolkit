@@ -393,7 +393,7 @@ export async function parseRemoteResponseStream(
         if (header === "MISSING" || header.startsWith("MISSING ")) {
           if (rest.byteLength > 0) trailingBytes = true;
         } else if (header === "CLUSTER_MISSING") {
-          throw new Error(`remote cluster not found: ${cluster}`);
+          throw new Error("remote cluster not found");
         } else {
           const match = /^PRESENT (\d+)$/.exec(header);
           if (match === null) throw new Error("remote mod collection returned an invalid response");

@@ -884,7 +884,11 @@ async function remoteCollect(options: SnapshotOptions, script: string): Promise<
   let connectivity: CommandResult;
   try {
     connectivity = await runWithStdin(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", target, "echo", "ok"], "", 5_000);
-  } catch {
+  } catch (error) {
+    if (error instanceof Error && error.message === "supervisor_not_ready") {
+      lines.push("> Local process supervisor could not establish a verified process-group anchor.", "> Remote collection was not attempted; fix the local runtime and retry.", "");
+      return { text: lines.join("\n"), failed: true };
+    }
     lines.push("> ssh not found on this machine. Skipping remote collection.", "");
     return { text: lines.join("\n"), failed: false };
   }

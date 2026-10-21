@@ -891,6 +891,16 @@ esac
       present: false,
       filePath: "fixture/Master/modoverrides.lua",
     });
+
+    const privateCluster = "password=fixture-secret";
+    try {
+      await parseRemoteResponseStream(privateCluster, "Master", "fixture/Master/modoverrides.lua", byteStream([new TextEncoder().encode("CLUSTER_MISSING\n")]));
+      throw new Error("expected CLUSTER_MISSING to fail");
+    } catch (error) {
+      expect(String(error)).toContain("remote cluster not found");
+      expect(String(error)).not.toContain(privateCluster);
+      expect(String(error)).not.toContain("fixture-secret");
+    }
   });
 
   test("times out a remote response stream that never produces bytes", async () => {
@@ -921,6 +931,7 @@ esac
     const before = new Set((await readdir(tmpdir())).filter((entry) => entry.startsWith(".agent-toolkit-dst-supervisor-")));
     const markerRoot = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-parent-"));
     const marker = join(markerRoot, "descendant.pid");
+    const finished = join(markerRoot, "finished");
     const moduleUrl = pathToFileURL(join(import.meta.dir, "..", "scripts", "process_supervisor.ts")).href;
     const isAlive = (pid: number): boolean => {
       try {
@@ -933,7 +944,7 @@ esac
     const child = Bun.spawn([
       process.execPath,
       "-e",
-      `import { spawnSupervised } from ${JSON.stringify(moduleUrl)}; await spawnSupervised(["sh", "-c", "sleep 30 & printf '%s\\n' \\\"$!\\\" > \\\"${marker}\\\"; wait"]); process.exit(0);`,
+      `import { readFile } from "node:fs/promises"; import { spawnSupervised } from ${JSON.stringify(moduleUrl)}; await spawnSupervised(["sh", "-c", "sleep 30 & printf '%s\\n' \\\"$!\\\" > \\\"${marker}\\\"; printf done > \\\"${finished}\\\"; exit 0"]); for (let attempt = 0; attempt < 40; attempt += 1) { try { if ((await readFile(${JSON.stringify(finished)}, "utf8")).trim() === "done") break; } catch {} await Bun.sleep(5); } process.exit(0);`,
     ], { stdout: "pipe", stderr: "pipe" });
     try {
       expect(await child.exited).toBe(0);
@@ -1018,6 +1029,84 @@ esac
         await supervised.wrapperExited.catch(() => undefined);
         await supervised.cleanup();
       }
+    }
+  });
+
+  test("does not follow a cleanup acknowledgement symlink", { timeout: 10_000 }, async () => {
+    if (process.platform === "win32") return;
+    const prefix = ".agent-toolkit-dst-supervisor-ack-";
+    const before = new Set((await readdir(tmpdir())).filter((entry) => entry.startsWith(prefix)));
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-ack-canary-"));
+    const canary = join(root, "canary");
+    await writeFile(canary, "sentinel\n", "utf8");
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    try {
+      supervised = await spawnSupervised(["sh", "-c", "sleep 30"]);
+      const ackRoot = (await readdir(tmpdir())).find((entry) => entry.startsWith(prefix) && !before.has(entry));
+      expect(ackRoot).toBeString();
+      await symlink(canary, join(tmpdir(), ackRoot!, "done"));
+      supervised.child.kill("SIGTERM");
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(false);
+      await supervised.wrapperExited;
+      expect(await readFile(canary, "utf8")).toBe("sentinel\n");
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("cleans a descendant that leaves the target process group", { timeout: 10_000 }, async () => {
+    if (process.platform === "win32") return;
+    const setsidCheck = Bun.spawnSync(["sh", "-c", "command -v setsid"], { stdout: "ignore", stderr: "ignore" });
+    if (setsidCheck.exitCode !== 0) return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-independent-group-"));
+    const marker = join(root, "detached.pid");
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    let detachedPid: number | undefined;
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    try {
+      supervised = await spawnSupervised([
+        "sh",
+        "-c",
+        "setsid sh -c 'trap \"\" TERM; sleep 30' & detached=$!; printf '%s\\n' \"$detached\" > \"$1\"; while :; do sleep 1; done",
+        "agent-toolkit-supervised-target",
+        marker,
+      ]);
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        try {
+          detachedPid = Number((await readFile(marker, "utf8")).trim());
+          break;
+        } catch {
+          await Bun.sleep(25);
+        }
+      }
+      expect(Number.isInteger(detachedPid)).toBe(true);
+      expect(detachedPid === undefined ? false : isAlive(detachedPid)).toBe(true);
+      supervised.child.kill("SIGTERM");
+      await supervised.wrapperExited;
+      for (let attempt = 0; attempt < 30 && detachedPid !== undefined && isAlive(detachedPid); attempt += 1) await Bun.sleep(100);
+      expect(detachedPid === undefined ? false : isAlive(detachedPid)).toBe(false);
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (detachedPid !== undefined && isAlive(detachedPid)) {
+        try { process.kill(detachedPid, "SIGKILL"); } catch { /* The detached process may have exited. */ }
+      }
+      await rm(root, { recursive: true, force: true });
     }
   });
 });

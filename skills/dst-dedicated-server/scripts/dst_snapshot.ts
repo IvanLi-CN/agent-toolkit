@@ -54,6 +54,7 @@ export const LOCAL_COMMAND_TIMEOUT_MS = 5_000;
 export const MAX_LOCAL_DIRECTORY_ENTRIES = 4_096;
 export const MAX_LOCAL_CLUSTER_PATHS = 4_096;
 export const MAX_LOCAL_CLUSTER_SCAN_ENTRIES = 4_096;
+export const MAX_LOCAL_LOG_LISTING_ENTRIES = 200;
 const SUPERVISOR_STOP_GRACE_MS = 250;
 const SNAPSHOT_TEMP_PREFIX = ".dst-snapshot-tmp-";
 const SNAPSHOT_TEMP_ROOT_NAME = ".agent-toolkit-dst-snapshot-tmp";
@@ -495,6 +496,50 @@ function renderBoundedDirectoryOverview(entries: Dirent[], truncated: boolean, r
   return redactDirectoryListing(lines.join("\n"), redactions);
 }
 
+function formatPermissionMode(mode: number, entry: Dirent): string {
+  const type = entry.isDirectory() ? "d" : entry.isSymbolicLink() ? "l" : entry.isFile() ? "-" : "?";
+  const bits = [
+    [0o400, "r"], [0o200, "w"], [0o100, "x"],
+    [0o040, "r"], [0o020, "w"], [0o010, "x"],
+    [0o004, "r"], [0o002, "w"], [0o001, "x"],
+  ] as const;
+  return type + bits.map(([bit, value]) => (mode & bit) !== 0 ? value : "-").join("");
+}
+
+function escapeReportName(name: string): string {
+  return JSON.stringify(name)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function redactReportName(name: string): string {
+  return escapeReportName(redactSensitiveText(name).replace(SENSITIVE_FILENAME, "<redacted-name>"));
+}
+
+async function renderKnownLogListing(localDir: string, entries: Dirent[], redactions: string[]): Promise<string> {
+  const logEntries = entries
+    .filter((entry) => entry.isFile() && entry.name.includes("log") && entry.name.endsWith(".txt"))
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .slice(0, MAX_LOCAL_LOG_LISTING_ENTRIES);
+  const lines: string[] = [];
+  const renderedNames = new Map<string, string>();
+  for (const entry of logEntries) {
+    try {
+      const metadata = await lstat(join(localDir, entry.name));
+      if (!metadata.isFile() || metadata.isSymbolicLink()) continue;
+      const nameToken = `__AGENT_TOOLKIT_LOG_NAME_${renderedNames.size}__`;
+      renderedNames.set(nameToken, redactReportName(entry.name));
+      lines.push(`${formatPermissionMode(metadata.mode, entry)} ${metadata.nlink} ${metadata.uid}:${metadata.gid} ${metadata.size} ${metadata.mtime.toISOString()} ${nameToken}`);
+    } catch {
+      // The directory entry may disappear between the bounded scan and metadata read.
+    }
+  }
+  let output = redactDirectoryListing(lines.join("\n"), redactions);
+  for (const [token, name] of renderedNames) output = output.replaceAll(token, name);
+  return output;
+}
+
 async function ensureSnapshotTemporaryRoot(parent: string): Promise<string> {
   const parentMetadata = await lstat(parent);
   if (!parentMetadata.isDirectory() || parentMetadata.isSymbolicLink()) throw new Error("snapshot output parent must be a real directory");
@@ -726,11 +771,9 @@ async function localCollect(options: SnapshotOptions): Promise<string> {
   }
   const entries = entryListing.entries;
   lines.push("### Directory overview", "", renderBoundedDirectoryOverview(entries, entryListing.truncated, pathRedactions), "");
-  const logEntries = entries
-    .filter((entry) => entry.isFile() && entry.name.includes("log") && entry.name.endsWith(".txt"))
-    .sort((left, right) => left.name.localeCompare(right.name));
   lines.push("### Known log files (first 200 lines of listing)", "");
-  if (logEntries.length > 0) lines.push(renderBoundedDirectoryOverview(logEntries, false, pathRedactions));
+  const knownLogListing = await renderKnownLogListing(localDir, entries, pathRedactions);
+  if (knownLogListing.length > 0) lines.push(knownLogListing);
   lines.push("");
 
   const clientLog = join(localDir, "client_log.txt");

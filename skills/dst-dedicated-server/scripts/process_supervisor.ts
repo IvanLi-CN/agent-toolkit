@@ -21,15 +21,10 @@ if [ "$parent_identity_mode" != "proc" ]; then
   if [ -n "$parent_ps_start" ]; then parent_identity_mode="ps"; fi
 fi
 target_pgid=""
-if command -v setsid >/dev/null 2>&1; then
-  target_pgid="pending"
-  setsid "$@" &
-else
-  set -m 2>/dev/null || true
-  "$@" &
-fi
+set -m 2>/dev/null || true
+"$@" &
 target_pid=$!
-if [ "$target_pgid" = "pending" ]; then target_pgid="$target_pid"; fi
+target_pgid="$target_pid"
 for _ in 1 2 3 4 5; do
   observed_target_pgid="$(ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ' || true)"
   case "$observed_target_pgid" in
@@ -57,10 +52,7 @@ signal_tree() {
   case "$target_pgid" in
     ''|*[!0-9]*) ;;
     *)
-      if [ "$target_pgid" != "$wrapper_pgid" ]; then
-        kill -"$signal" -- "-$target_pgid" 2>/dev/null || true
-        return
-      fi
+      if [ "$target_pgid" != "$wrapper_pgid" ] && kill -"$signal" -- "-$target_pgid" 2>/dev/null; then return; fi
       ;;
   esac
   for pid in $(descendants); do

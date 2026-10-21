@@ -12,7 +12,7 @@ import {
   renderSummary,
   type ShardSummary,
 } from "../scripts/dst_mods_from_modoverrides.ts";
-import { main as snapshotMain, MAX_LOCAL_DIRECTORY_ENTRIES, MAX_REMOTE_OUTPUT_BYTES, redactOperationalText, redactSensitiveText, safeTail } from "../scripts/dst_snapshot.ts";
+import { main as snapshotMain, MAX_LOCAL_DIRECTORY_ENTRIES, MAX_LOCAL_LOG_LISTING_ENTRIES, MAX_REMOTE_OUTPUT_BYTES, redactOperationalText, redactSensitiveText, safeTail } from "../scripts/dst_snapshot.ts";
 import { spawnSupervised } from "../scripts/process_supervisor.ts";
 
 async function runTool(script: string, args: string[], env: Record<string, string>): Promise<{ status: number; stdout: string; stderr: string }> {
@@ -313,6 +313,25 @@ describe("DST local Bun tooling", () => {
       const output = join(root, "snapshot.md");
       expect(await snapshotMain(["--local-dir", local, "--no-remote", "--out", output])).toBe(0);
       expect(await readFile(output, "utf8")).toContain(`Directory entry scan truncated at ${MAX_LOCAL_DIRECTORY_ENTRIES} entries.`);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps the known log listing at the historical 200-line bound", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-log-list-limit-"));
+    try {
+      const local = join(root, "client");
+      await mkdir(local, { recursive: true });
+      await Promise.all(Array.from({ length: MAX_LOCAL_LOG_LISTING_ENTRIES + 5 }, (_, index) => writeFile(join(local, `server-log-${String(index).padStart(3, "0")}.txt`), "")));
+      const output = join(root, "snapshot.md");
+      expect(await snapshotMain(["--local-dir", local, "--no-remote", "--out", output])).toBe(0);
+      const report = await readFile(output, "utf8");
+      const listing = report.split("### Known log files (first 200 lines of listing)\n\n")[1]?.split("### client_log.txt")[0] ?? "";
+      expect(listing).toContain("server-log-000.txt");
+      expect(listing).toContain(`server-log-${String(MAX_LOCAL_LOG_LISTING_ENTRIES - 1).padStart(3, "0")}.txt`);
+      expect(listing).not.toContain(`server-log-${String(MAX_LOCAL_LOG_LISTING_ENTRIES).padStart(3, "0")}.txt`);
+      expect(listing.match(/server-log-\d{3}\.txt/g)?.length).toBe(MAX_LOCAL_LOG_LISTING_ENTRIES);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

@@ -576,7 +576,7 @@ esac
       expect(result.stdout).not.toContain("configuration_options");
 
       const leakedPath = ["/home", "fixture-user", "private"].join("/");
-      await writeFile(fakeSsh, `#!/bin/sh\ncase "$*" in\n  *"echo ok"*) exit 0 ;;\n  *) cat >/dev/null; echo 'denied ${leakedPath} api_key=fixture-secret' >&2; exit 1 ;;\nesac\n`);
+      await writeFile(fakeSsh, `#!/bin/sh\ncase "$*" in\n  *"echo ok"*) exit 0 ;;\n  *) cat >/dev/null; echo 'denied [forged](javascript:alert(1)) ${leakedPath} api_key=fixture-secret' >&2; exit 1 ;;\nesac\n`);
       await chmod(fakeSsh, 0o755);
       const failed = await runTool(join(import.meta.dir, "..", "scripts", "dst_mods_from_modoverrides.ts"), ["--host", "fixture-host", "--user", "fixture-user", "--cluster", "fixture-cluster"], env);
       expect(failed.status).toBe(1);
@@ -595,7 +595,8 @@ esac
       const snapshot = await readFile(snapshotOutput, "utf8");
       expect(snapshot).toContain("Remote collection command failed");
       expect(snapshot).toContain("denied");
-      expect(snapshot).toContain("api_key=[REDACTED]");
+      expect(snapshot).not.toContain("[forged](javascript:alert(1))");
+      expect(snapshot).toContain("api_key=&#91;REDACTED&#93;");
       expect(snapshot).not.toContain("fixture-secret");
     } finally {
       await rm(root, { recursive: true, force: true });

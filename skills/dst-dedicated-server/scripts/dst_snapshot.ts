@@ -386,12 +386,21 @@ function escapeReportText(text: string): string {
     .replaceAll("`", "&#96;");
 }
 
+function escapeReportInlineText(text: string): string {
+  return escapeReportText(text)
+    .replaceAll("[", "&#91;")
+    .replaceAll("]", "&#93;")
+    .replaceAll("(", "&#40;")
+    .replaceAll(")", "&#41;");
+}
+
 function renderReportCodeBlock(text: string, values: string[] = []): string {
   return ["```text", escapeReportText(redactOperationalText(text, values)), "```"].join("\n");
 }
 
 function renderReportInline(text: string, values: string[] = []): string {
-  return escapeReportText(redactOperationalText(text, values).replace(/\r?\n/g, " "));
+  const normalized = redactOperationalText(text, values).replace(/\r?\n/g, " ");
+  return normalized.length > 0 ? `\`${escapeReportInlineText(normalized)}\`` : "";
 }
 
 function redactDirectoryListing(text: string, values: string[] = []): string {

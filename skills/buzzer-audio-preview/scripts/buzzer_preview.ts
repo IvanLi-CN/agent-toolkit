@@ -558,7 +558,8 @@ async function moveOutputToBackup(source: string, destination: string, symlinkMa
       throw new Error(`output path is not a regular file or symlink: ${source}`);
     }
     if (metadata.isSymbolicLink()) {
-      await writeSyncedFile(symlinkMarker, new TextEncoder().encode(`${await readlink(source)}\n`));
+      await writeSyncedFile(symlinkMarker, new TextEncoder().encode(JSON.stringify(await readlink(source))));
+      await syncDirectory(dirname(symlinkMarker));
     }
     await rename(source, destination);
     return metadata.isSymbolicLink() ? "symlink" : "file";
@@ -661,7 +662,14 @@ async function restoreOutput(
   const backupMetadata = await lstat(backupPath);
   if (backupMetadata.isSymbolicLink()) {
     if (!await pathExists(symlinkPath)) throw new Error(`transaction backup is not a regular file or approved symlink: ${backupPath}`);
-    const expectedTarget = new TextDecoder().decode(await readRegularFile(symlinkPath)).trim();
+    let expectedTarget: string;
+    try {
+      const decoded = JSON.parse(new TextDecoder().decode(await readRegularFile(symlinkPath)));
+      if (typeof decoded !== "string") throw new Error("invalid symlink marker");
+      expectedTarget = decoded;
+    } catch {
+      throw new Error(`transaction backup is not a regular file or approved symlink: ${backupPath}`);
+    }
     const actualTarget = await readlink(backupPath);
     if (expectedTarget !== actualTarget) throw new Error(`transaction backup is not a regular file or approved symlink: ${backupPath}`);
     await moveIfPresent(backupPath, outputPath, true);
@@ -673,6 +681,7 @@ async function restoreOutput(
   await syncDirectory(directory);
   await writeSyncedFile(restoredPath, new Uint8Array());
   await removeFile(restoringPath);
+  await syncDirectory(directory);
   return { hasBackup: true, inProgress: true };
 }
 
@@ -765,10 +774,13 @@ async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner
       await mkdir(lockDirectory);
       const owner = randomUUID();
       const identity = await processIdentity(process.pid);
+      await syncDirectory(outDir);
       await writeSyncedFile(join(lockDirectory, "pid"), new TextEncoder().encode(`${process.pid}\n`));
       await writeSyncedFile(join(lockDirectory, "owner"), new TextEncoder().encode(`${owner}\n`));
       if (identity !== undefined) await writeSyncedFile(join(lockDirectory, "identity"), new TextEncoder().encode(`${identity}\n`));
+      await syncDirectory(lockDirectory);
       await writeSyncedFile(join(lockDirectory, "ready"), new Uint8Array());
+      await syncDirectory(lockDirectory);
       return async () => {
         try {
           const currentOwner = (await readFile(join(lockDirectory, "owner"), "utf8")).trim();

@@ -14,6 +14,16 @@ case "$shard" in
   *) printf 'INVALID_SHARD\n' >&2; exit 2 ;;
 esac
 
+stat_signature() {
+  local value
+  value="$(stat -Lc '%i:%Y:%Z:%s' "$1" 2>/dev/null || stat -f '%i:%m:%c:%z' "$1" 2>/dev/null || true)"
+  if [[ -n "$value" ]]; then
+    printf '%s' "$value"
+    return 0
+  fi
+  return 1
+}
+
 klei_base="$HOME/.klei"
 klei_root="$klei_base/DoNotStarveTogether"
 cluster_dir="$klei_root/$cluster"
@@ -35,13 +45,13 @@ if [[ ! -f "$file" || -L "$file" ]]; then
   exit 0
 fi
 
-file_stat="$(stat -Lc '%i:%s' "$file" 2>/dev/null || stat -f '%i:%z' "$file" 2>/dev/null || true)"
+file_stat="$(stat_signature "$file" || true)"
 if [[ -z "$file_stat" ]]; then
   printf 'MISSING\n'
   exit 0
 fi
 exec 9<"$file" || { printf 'MISSING\n'; exit 0; }
-fd_stat="$(stat -Lc '%i:%s' /proc/self/fd/9 2>/dev/null || stat -f '%i:%z' /dev/fd/9 2>/dev/null || true)"
+fd_stat="$(stat_signature /proc/self/fd/9 || stat_signature /dev/fd/9 || true)"
 if [[ "$fd_stat" != "$file_stat" || -L "$klei_base" || -L "$klei_root" || -L "$cluster_dir" || -L "$shard_dir" || -L "$file" ]]; then
   exec 9<&-
   printf 'MISSING\n'
@@ -59,10 +69,12 @@ temporary="$(mktemp)"
 projection="$(mktemp)"
 trap 'rm -f "$temporary" "$projection"' EXIT
 head -c $((max_bytes + 1)) <&9 >"$temporary"
-exec 9<&-
 actual="$(wc -c < "$temporary")"
 actual="${actual//[[:space:]]/}"
-if (( actual != size )); then
+file_after_stat="$(stat_signature "$file" || true)"
+fd_after_stat="$(stat_signature /proc/self/fd/9 || stat_signature /dev/fd/9 || true)"
+exec 9<&-
+if (( actual != size )) || [[ "$file_after_stat" != "$file_stat" || "$fd_after_stat" != "$fd_stat" ]]; then
   printf 'modoverrides.lua changed during collection\n' >&2
   exit 1
 fi

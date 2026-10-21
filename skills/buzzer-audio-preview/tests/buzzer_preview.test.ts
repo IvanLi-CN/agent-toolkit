@@ -214,7 +214,7 @@ describe("buzzer MIDI and WAV helper", () => {
     try {
       const input = join(root, "fixture.json");
       const output = join(root, "out");
-      const outside = join(root, "outside.bin");
+      const outside = join(root, "outside target\n");
       await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
       await mkdir(output, { recursive: true });
       await writeFile(outside, "sentinel");
@@ -232,7 +232,7 @@ describe("buzzer MIDI and WAV helper", () => {
     try {
       const input = join(root, "fixture.json");
       const output = join(root, "out");
-      const outside = join(root, "outside.bin");
+      const outside = join(root, "outside target\n");
       await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
       await mkdir(output, { recursive: true });
       await writeFile(outside, "sentinel");

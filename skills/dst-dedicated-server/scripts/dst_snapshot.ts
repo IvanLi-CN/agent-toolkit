@@ -225,8 +225,8 @@ export function redactOperationalText(text: string, values: string[] = []): stri
   return redactSensitiveText(redacted)
     .replace(/\/(?:[^\s"'<>`]|\\ )+/g, "<redacted-path>")
     .replace(/\b[A-Za-z]:[\\/](?:[^\s"'<>`]|\\ )+/g, "<redacted-path>")
-    .replace(/(^|[\s"'(])(?:\.\.?[\\/])+[^\s"'<>`]+/g, "$1<redacted-path>")
-    .replace(/(^|[\s"'(])\\\\[^\s"'<>`]+/g, "$1<redacted-path>")
+    .replace(/(^|[\s"'(=:])(?:\.\.?[\\/])+[^\s"'<>`]+/g, "$1<redacted-path>")
+    .replace(/(^|[\s"'(=:])\\\\[^\s"'<>`]+/g, "$1<redacted-path>")
     .replace(/(?<![A-Za-z0-9])(?:(?:[0-9A-Fa-f]{0,4}:){1,7})(?:\d{1,3}\.){3}\d{1,3}(?![A-Za-z0-9])/g, "<redacted-address>")
     .replace(/(?<![A-Za-z0-9])(?:(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}(?:%[A-Za-z0-9._-]+)?)(?![A-Za-z0-9])/g, "<redacted-address>")
     .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "<redacted-address>");
@@ -545,7 +545,8 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     }
     await syncDirectory(parent);
   } catch (error) {
-    console.error(`error: cannot publish snapshot at <configured-output>: ${error instanceof Error ? error.message : String(error)}`);
+    const detail = redactOperationalText(error instanceof Error ? error.message : String(error), [outputPath, dirname(outputPath)]);
+    console.error(`error: cannot publish snapshot at <configured-output>: ${detail || "publication failed"}`);
     return 2;
   }
   console.log("<configured-output>");

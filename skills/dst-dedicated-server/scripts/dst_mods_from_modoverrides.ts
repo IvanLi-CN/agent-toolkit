@@ -418,7 +418,7 @@ export function parseArgs(args: string[], env: Record<string, string | undefined
   if (host.length === 0) throw new CliError("error: --host or DST_HOST is required");
   if (user.length === 0) throw new CliError("error: --user or DST_USER is required");
   if (cluster.length === 0) throw new CliError("error: --cluster or DST_CLUSTER is required");
-  if (cluster === "." || cluster === ".." || cluster.includes("/") || cluster.includes("\\") || cluster.includes("\0")) {
+  if (cluster === "." || cluster === ".." || cluster.includes("/") || cluster.includes("\\") || cluster.includes("\0") || /[\u0000-\u001f\u007f\u2028\u2029]/u.test(cluster)) {
     throw new CliError("error: --cluster must be a single path segment");
   }
   validateSshToken(host, "host");

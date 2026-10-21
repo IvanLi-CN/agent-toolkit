@@ -58,6 +58,7 @@ describe("DST local Bun tooling", () => {
   test("rejects cluster path traversal before opening SSH", () => {
     expect(() => parseArgs(["--host", "fixture-host", "--user", "fixture-user", "--cluster", "../escape"], {})).toThrow(/single path segment/);
     expect(() => parseArgs(["--host", "fixture-host", "--user", "fixture-user", "--cluster", "fixture\\escape"], {})).toThrow(/single path segment/);
+    expect(() => parseArgs(["--host", "fixture-host", "--user", "fixture-user", "--cluster", "safe\n## forged heading"], {})).toThrow(/single path segment/);
     expect(() => parseArgs(["--host", "-oProxyCommand=touch /tmp/pwned", "--user", "fixture-user", "--cluster", "fixture"], {})).toThrow(/invalid SSH token/);
     expect(() => parseArgs(["--host", "fixture-host", "--user", "-oProxyCommand=touch /tmp/pwned", "--cluster", "fixture"], {})).toThrow(/invalid SSH token/);
   });
@@ -392,6 +393,33 @@ esac
     expect(redacted).not.toContain("2001:db8::7");
     expect(redacted).toContain("<redacted-path>");
     expect(redacted).toContain("<redacted-address>");
+  });
+
+  test("redacts relative and UNC paths after assignment delimiters", () => {
+    const diagnostic = String.raw`file=..\private\key path:\\server\share\private`;
+    const redacted = redactOperationalText(diagnostic);
+    expect(redacted).not.toContain("..\\private\\key");
+    expect(redacted).not.toContain("\\\\server\\share\\private");
+    expect(redacted).toContain("<redacted-path>");
+  });
+
+  test("redacts snapshot publication errors", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-publish-error-"));
+    const previousPath = process.env.PATH;
+    try {
+      const output = join(root, "publication-secret", "snapshot.md");
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
+        ["--no-local", "--no-remote", "--out", output],
+        { ...process.env, PATH: previousPath ?? "" } as Record<string, string>,
+      );
+      expect(result.status).toBe(2);
+      expect(result.stderr).not.toContain("publication-secret");
+      expect(result.stderr).not.toContain(".dst-snapshot-tmp-");
+      expect(result.stderr).toContain("<redacted-path>");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test("rejects an oversized remote snapshot before writing unbounded output", async () => {

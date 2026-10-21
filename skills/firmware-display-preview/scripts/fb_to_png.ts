@@ -298,6 +298,17 @@ async function writePngAtomically(outputPath: string, data: Uint8Array): Promise
       await handle.close();
     }
     await rename(temporaryPath, outputPath);
+    try {
+      const directoryHandle = await open(parent, "r");
+      try {
+        await directoryHandle.sync();
+      } finally {
+        await directoryHandle.close();
+      }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EINVAL" && code !== "ENOTSUP" && code !== "EOPNOTSUPP" && code !== "EBADF" && code !== "EISDIR") throw error;
+    }
   } finally {
     await unlink(temporaryPath).catch(() => undefined);
     await rm(temporaryDirectory, { recursive: true, force: true });

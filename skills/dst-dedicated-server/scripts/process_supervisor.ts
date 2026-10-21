@@ -63,6 +63,7 @@ for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
   esac
 done
 if [ -z "$target_pid" ]; then target_pid="$target_launcher_pid"; fi
+target_launcher_pid="$target_pid"
 for _ in 1 2 3 4 5; do
   observed_target_pgid="$(ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ' || true)"
   case "$observed_target_pgid" in
@@ -93,6 +94,21 @@ target_identity_matches() {
     return
   fi
   return 1
+}
+target_is_alive() {
+  if [ -r "/proc/$target_pid/stat" ]; then
+    target_state="$(awk '{ sub(/.*\) /, ""); print $1 }' "/proc/$target_pid/stat" 2>/dev/null || true)"
+    [ -n "$target_state" ] && [ "$target_state" != "Z" ] && kill -0 "$target_pid" 2>/dev/null
+    return
+  fi
+  kill -0 "$target_pid" 2>/dev/null
+}
+stop_anchor() {
+  if target_identity_matches; then
+    kill TERM "$target_pid" 2>/dev/null || true
+    sleep 0.1
+    kill KILL "$target_pid" 2>/dev/null || true
+  fi
 }
 descendants() {
   ps -eo pid=,ppid= 2>/dev/null | awk -v root="$target_pid" '
@@ -160,6 +176,7 @@ watch_parent() {
   signal_tree TERM
   sleep 1
   signal_tree KILL
+  stop_anchor
 }
 watch_parent </dev/null >/dev/null 2>&1 &
 watchdog_pid=$!
@@ -168,14 +185,14 @@ while [ -z "$target_status" ]; do
   candidate_target_status="$(cat "$target_status_path" 2>/dev/null || true)"
   case "$candidate_target_status" in
     ''|*[!0-9]*)
-      if ! kill -0 "$target_launcher_pid" 2>/dev/null; then
-        wait "$target_launcher_pid" 2>/dev/null
-        target_status=$?
+      if ! target_is_alive; then
+        target_status=143
       else
         if ! parent_is_alive; then
           signal_tree TERM
           sleep 1
           signal_tree KILL
+          stop_anchor
           cleanup
           exit 143
         fi
@@ -189,6 +206,7 @@ if ! parent_is_alive; then
   signal_tree TERM
   sleep 1
   signal_tree KILL
+  stop_anchor
   cleanup
   exit 143
 fi
@@ -201,7 +219,7 @@ exec 0<&- 1>&- 2>&-
   signal_tree KILL
 ) </dev/null >/dev/null 2>&1 &
 hold_pid=$!
-wait "$target_launcher_pid" 2>/dev/null || true
+while target_is_alive; do sleep 0.05; done
 kill "$hold_pid" 2>/dev/null || true
 wait "$hold_pid" 2>/dev/null || true
 stop_watchdog

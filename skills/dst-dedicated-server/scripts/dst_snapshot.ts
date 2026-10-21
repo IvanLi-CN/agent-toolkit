@@ -177,7 +177,7 @@ async function runWithStdin(
     if (timeout !== undefined) clearTimeout(timeout);
     if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
     requestStop();
-    const cleanupReady = await supervised.cleanupAcknowledged;
+    const cleanupReady = await supervised.waitForCleanupAcknowledged();
     await Promise.race([supervised.wrapperExited.then(() => undefined, () => undefined), new Promise<void>((resolve) => setTimeout(resolve, SUPERVISOR_STOP_GRACE_MS))]);
     if (!cleanupReady || !(await Promise.race([supervised.wrapperExited.then(() => true, () => true), Bun.sleep(0).then(() => false)]))) {
       killProcessTree(supervised, "SIGKILL");

@@ -84,17 +84,25 @@ while [ "$target_pgid_attempt" -lt 100 ]; do
     *) target_pgid="$observed_target_pgid"; break ;;
   esac
 done
-target_identity_mode="unknown"
-target_starttime=""
-target_ps_start=""
-if [ -r "/proc/$target_pid/stat" ]; then
-  target_starttime="$(awk '{ sub(/.*\\) /, ""); print $20 }' "/proc/$target_pid/stat" 2>/dev/null || true)"
-  if [ -n "$target_starttime" ]; then target_identity_mode="proc"; fi
-fi
-if [ "$target_identity_mode" != "proc" ]; then
+capture_target_identity() {
+  target_identity_mode="unknown"
+  target_starttime=""
+  target_ps_start=""
+  if [ -r "/proc/$target_pid/stat" ]; then
+    target_starttime="$(awk '{ sub(/.*\\) /, ""); print $20 }' "/proc/$target_pid/stat" 2>/dev/null || true)"
+    if [ -n "$target_starttime" ]; then
+      target_identity_mode="proc"
+      return 0
+    fi
+  fi
   target_ps_start="$(ps -o lstart= -p "$target_pid" 2>/dev/null | awk 'NR == 1 { sub(/^[ \\t]*/, ""); sub(/[ \\t]*$/, ""); print; exit }')"
-  if [ -n "$target_ps_start" ]; then target_identity_mode="ps"; fi
-fi
+  if [ -n "$target_ps_start" ]; then
+    target_identity_mode="ps"
+    return 0
+  fi
+  return 1
+}
+capture_target_identity || true
 printf '%s\\n' ready > "$ready_path"
 refresh_target_reference() {
   target_reference_attempt=0
@@ -109,9 +117,9 @@ refresh_target_reference() {
         if [ "$candidate_target_pid" != "$target_pid" ]; then
           target_pid="$candidate_target_pid"
           target_pgid=""
-          target_identity_mode="unknown"
-          target_starttime=""
-          target_ps_start=""
+          capture_target_identity || true
+        elif [ "$target_identity_mode" = "unknown" ]; then
+          capture_target_identity || true
         fi
         break
         ;;
@@ -151,9 +159,7 @@ target_is_alive() {
 }
 stop_anchor() {
   refresh_target_reference
-  if target_identity_matches || {
-    [ "$target_identity_mode" = "unknown" ] && case "$target_pid" in ''|*[!0-9]*) false ;; *) true ;; esac
-  }; then
+  if target_identity_matches; then
     anchor_pgid="$(ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ' || true)"
     wrapper_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' || true)"
     case "$anchor_pgid" in
@@ -161,17 +167,13 @@ stop_anchor() {
       *)
         if [ "$anchor_pgid" != "$wrapper_pgid" ]; then
           kill TERM "-$anchor_pgid" 2>/dev/null || true
-          if target_identity_matches || [ "$target_identity_mode" = "unknown" ]; then
-            kill KILL "-$anchor_pgid" 2>/dev/null || true
-          fi
+          if target_identity_matches; then kill KILL "-$anchor_pgid" 2>/dev/null || true; fi
         fi
         ;;
     esac
-    if target_identity_matches || [ "$target_identity_mode" = "unknown" ]; then
+    if target_identity_matches; then
       kill TERM "$target_pid" 2>/dev/null || true
-      if target_identity_matches || [ "$target_identity_mode" = "unknown" ]; then
-        kill KILL "$target_pid" 2>/dev/null || true
-      fi
+      if target_identity_matches; then kill KILL "$target_pid" 2>/dev/null || true; fi
     fi
   fi
 }
@@ -333,7 +335,7 @@ export interface SupervisedChild {
   child: Bun.Subprocess<"pipe", "pipe", "pipe">;
   exited: Promise<number>;
   wrapperExited: Promise<number>;
-  cleanupAcknowledged: Promise<boolean>;
+  waitForCleanupAcknowledged: () => Promise<boolean>;
   cleanup(): Promise<void>;
 }
 
@@ -360,11 +362,11 @@ async function waitForTarget(path: string, wrapperExited: Promise<number>): Prom
   }
 }
 
-async function waitForReady(path: string, wrapperExited: Promise<number>): Promise<void> {
+async function waitForReady(path: string, wrapperExited: Promise<number>): Promise<boolean> {
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
     try {
-      if ((await readFile(path, "utf8")).trim() === "ready") return;
+      if ((await readFile(path, "utf8")).trim() === "ready") return true;
     } catch {
       // The wrapper may have completed before the readiness marker was observed.
     }
@@ -372,8 +374,9 @@ async function waitForReady(path: string, wrapperExited: Promise<number>): Promi
       wrapperExited.then(() => true, () => true),
       Bun.sleep(20).then(() => false),
     ]);
-    if (wrapperDone) return;
+    if (wrapperDone) return false;
   }
+  return false;
 }
 
 async function waitForCleanupAck(path: string, wrapperExited: Promise<number>): Promise<boolean> {
@@ -413,7 +416,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
       child,
       exited: child.exited,
       wrapperExited: child.exited,
-      cleanupAcknowledged: Promise.resolve(true),
+      waitForCleanupAcknowledged: () => Promise.resolve(true),
       cleanup: async () => undefined,
     };
   }
@@ -441,13 +444,20 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
       child,
       exited: waitForTarget(statusPath, wrapperExited),
       wrapperExited,
-      cleanupAcknowledged: waitForCleanupAck(cleanupAckPath, wrapperExited),
+      waitForCleanupAcknowledged: () => waitForCleanupAck(cleanupAckPath, wrapperExited),
       cleanup: async () => {
         await rm(directory, { recursive: true, force: true });
         await rm(cleanupAckPath, { force: true });
       },
     };
-    await waitForReady(readyPath, wrapperExited);
+    const ready = await waitForReady(readyPath, wrapperExited);
+    if (!ready) {
+      try { child.kill("SIGTERM"); } catch { /* The wrapper may already be gone. */ }
+      await Promise.race([wrapperExited, Bun.sleep(250)]);
+      try { child.kill("SIGKILL"); } catch { /* The wrapper may already be gone. */ }
+      await wrapperExited;
+      throw new Error("supervisor_not_ready");
+    }
     return supervised;
   } catch (error) {
     await rm(directory, { recursive: true, force: true });

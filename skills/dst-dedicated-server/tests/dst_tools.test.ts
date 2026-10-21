@@ -1002,4 +1002,22 @@ esac
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  test("starts the cleanup acknowledgement deadline when stopping", { timeout: 10_000 }, async () => {
+    if (process.platform === "win32") return;
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    try {
+      supervised = await spawnSupervised(["sh", "-c", "sleep 30"]);
+      await Bun.sleep(2_500);
+      supervised.child.kill("SIGTERM");
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(true);
+      await supervised.wrapperExited;
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+    }
+  });
 });

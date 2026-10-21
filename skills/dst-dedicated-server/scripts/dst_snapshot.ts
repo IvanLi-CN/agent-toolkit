@@ -381,6 +381,22 @@ export function redactOperationalText(text: string, values: string[] = []): stri
     .replace(/\b[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+\b/g, "<redacted-host>");
 }
 
+function escapeReportText(text: string): string {
+  return text
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll("`", "&#96;");
+}
+
+function renderReportCodeBlock(text: string, values: string[] = []): string {
+  return ["```text", escapeReportText(redactOperationalText(text, values)), "```"].join("\n");
+}
+
+function renderReportInline(text: string, values: string[] = []): string {
+  return escapeReportText(redactOperationalText(text, values).replace(/\r?\n/g, " "));
+}
+
 function redactDirectoryListing(text: string, values: string[] = []): string {
   return redactOperationalText(text, values).replace(SENSITIVE_FILENAME, "<redacted-name>");
 }
@@ -783,7 +799,7 @@ async function localCollect(options: SnapshotOptions): Promise<string> {
   const clientLog = join(localDir, "client_log.txt");
   try {
     const clientTail = await safeTail(clientLog, 80, localDir);
-    if (clientTail.length > 0) lines.push("### client_log.txt (tail 80)", "", redactOperationalText(clientTail.trimEnd(), pathRedactions), "");
+    if (clientTail.length > 0) lines.push("### client_log.txt (tail 80)", "", renderReportCodeBlock(clientTail.trimEnd(), pathRedactions), "");
   } catch {
     // The file is optional.
   }
@@ -868,7 +884,7 @@ async function remoteCollect(options: SnapshotOptions, script: string): Promise<
   }
   if (connectivity.exitCode !== 0) {
     lines.push("> Remote SSH failed (host down, wrong IP/port, or missing SSH key).");
-    const detail = redactOperationalText(connectivity.stderr.trim(), [options.host, options.user]);
+    const detail = renderReportInline(connectivity.stderr.trim(), [options.host, options.user]);
     if (detail.length > 0) lines.push(`> Reason: ${detail}`);
     lines.push("> Next step: verify reachability and run the configured SSH target interactively, then re-run this script.", "");
     return { text: lines.join("\n"), failed: false };
@@ -878,7 +894,7 @@ async function remoteCollect(options: SnapshotOptions, script: string): Promise<
   try {
     result = await runWithStdin(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", target, "bash", "-s"], script);
   } catch (error) {
-    const detail = redactOperationalText(error instanceof Error ? error.message : String(error), [options.host, options.user, homedir()]);
+    const detail = renderReportInline(error instanceof Error ? error.message : String(error), [options.host, options.user, homedir()]);
     lines.push("> Remote collection command could not be started.");
     if (detail.length > 0) lines.push(`> Reason: ${detail}`);
     lines.push("");
@@ -894,12 +910,12 @@ async function remoteCollect(options: SnapshotOptions, script: string): Promise<
   }
   if (result.exitCode !== 0) {
     lines.push("> Remote collection command failed.");
-    const detail = redactOperationalText(result.stderr.trim(), [options.host, options.user]);
+    const detail = renderReportInline(result.stderr.trim(), [options.host, options.user]);
     if (detail.length > 0) lines.push(`> Reason: ${detail}`);
     lines.push("");
     return { text: lines.join("\n"), failed: true };
   }
-  lines.push(redactOperationalText(result.stdout.trimEnd(), [options.host, options.user, homedir()]), "");
+  lines.push(renderReportCodeBlock(result.stdout.trimEnd(), [options.host, options.user, homedir()]), "");
   return { text: lines.join("\n"), failed: false };
 }
 

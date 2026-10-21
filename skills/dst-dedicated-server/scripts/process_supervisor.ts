@@ -20,30 +20,49 @@ if [ "$parent_identity_mode" != "proc" ]; then
   parent_ps_start="$(ps -o lstart= -p "$parent_pid" 2>/dev/null | awk 'NR == 1 { sub(/^[ \t]*/, ""); sub(/[ \t]*$/, ""); print; exit }')"
   if [ -n "$parent_ps_start" ]; then parent_identity_mode="ps"; fi
 fi
+target_status_path="$status_dir/target-status"
+target_anchor_path="$status_dir/target"
 target_pgid=""
+target_pid=""
 if command -v setsid >/dev/null 2>&1; then
-  target_pgid="pending"
-  target_anchor_path="$status_dir/target"
-  setsid -w sh -c 'printf "%s\\n" "$$" > "$1"; shift; exec "$@"' agent-toolkit-target "$target_anchor_path" "$@" &
+  setsid sh -c '
+    anchor_path="$1"
+    result_path="$2"
+    shift 2
+    printf "%s\\n" "$$" > "$anchor_path"
+    "$@" &
+    target_pid=$!
+    wait "$target_pid"
+    target_status=$?
+    printf "%s\\n" "$target_status" > "$result_path"
+    exec 0<&- 1>&- 2>&-
+    while :; do sleep 1; done
+  ' agent-toolkit-target "$target_anchor_path" "$target_status_path" "$@" &
 else
   set -m 2>/dev/null || true
-  "$@" &
+  sh -c '
+    anchor_path="$1"
+    result_path="$2"
+    shift 2
+    printf "%s\\n" "$$" > "$anchor_path"
+    "$@" &
+    target_pid=$!
+    wait "$target_pid"
+    target_status=$?
+    printf "%s\\n" "$target_status" > "$result_path"
+    exec 0<&- 1>&- 2>&-
+    while :; do sleep 1; done
+  ' agent-toolkit-target "$target_anchor_path" "$target_status_path" "$@" &
 fi
 target_launcher_pid=$!
-if [ "$target_pgid" = "pending" ]; then
-  target_pid=""
-  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    candidate_target_pid="$(cat "$target_anchor_path" 2>/dev/null || true)"
-    case "$candidate_target_pid" in
-      ''|*[!0-9]*) sleep 0.01 ;;
-      *) target_pid="$candidate_target_pid"; break ;;
-    esac
-  done
-  if [ -z "$target_pid" ]; then target_pid="$target_launcher_pid"; fi
-  target_pgid="$target_pid"
-else
-  target_pid="$target_launcher_pid"
-fi
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  candidate_target_pid="$(cat "$target_anchor_path" 2>/dev/null || true)"
+  case "$candidate_target_pid" in
+    ''|*[!0-9]*) sleep 0.01 ;;
+    *) target_pid="$candidate_target_pid"; break ;;
+  esac
+done
+if [ -z "$target_pid" ]; then target_pid="$target_launcher_pid"; fi
 for _ in 1 2 3 4 5; do
   observed_target_pgid="$(ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ' || true)"
   case "$observed_target_pgid" in
@@ -51,8 +70,33 @@ for _ in 1 2 3 4 5; do
     *) target_pgid="$observed_target_pgid"; break ;;
   esac
 done
+target_identity_mode="unknown"
+target_starttime=""
+target_ps_start=""
+if [ -r "/proc/$target_pid/stat" ]; then
+  target_starttime="$(awk '{ sub(/.*\\) /, ""); print $20 }' "/proc/$target_pid/stat" 2>/dev/null || true)"
+  if [ -n "$target_starttime" ]; then target_identity_mode="proc"; fi
+fi
+if [ "$target_identity_mode" != "proc" ]; then
+  target_ps_start="$(ps -o lstart= -p "$target_pid" 2>/dev/null | awk 'NR == 1 { sub(/^[ \\t]*/, ""); sub(/[ \\t]*$/, ""); print; exit }')"
+  if [ -n "$target_ps_start" ]; then target_identity_mode="ps"; fi
+fi
+target_identity_matches() {
+  if [ "$target_identity_mode" = "proc" ] && [ -r "/proc/$target_pid/stat" ]; then
+    current_target_start="$(awk '{ sub(/.*\\) /, ""); print $20 }' "/proc/$target_pid/stat" 2>/dev/null || true)"
+    [ -n "$current_target_start" ] && [ "$current_target_start" = "$target_starttime" ]
+    return
+  fi
+  if [ "$target_identity_mode" = "ps" ]; then
+    current_target_ps_start="$(ps -o lstart= -p "$target_pid" 2>/dev/null | awk 'NR == 1 { sub(/^[ \\t]*/, ""); sub(/[ \\t]*$/, ""); print; exit }')"
+    [ -n "$current_target_ps_start" ] && [ "$current_target_ps_start" = "$target_ps_start" ]
+    return
+  fi
+  return 1
+}
 descendants() {
   ps -eo pid=,ppid= 2>/dev/null | awk -v root="$target_pid" '
+    NR > 4096 { exit }
     { parent[$1] = $2 }
     function is_descendant(pid, current, depth) {
       current = parent[pid]
@@ -68,11 +112,15 @@ descendants() {
 signal_tree() {
   signal="$1"
   wrapper_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' || true)"
-  case "$target_pgid" in
+  current_target_pgid=""
+  if target_identity_matches; then
+    current_target_pgid="$(ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ' || true)"
+  fi
+  case "$current_target_pgid" in
     ''|*[!0-9]*) ;;
     *)
-      if [ "$target_pgid" != "$wrapper_pgid" ]; then
-        kill -"$signal" -- "-$target_pgid" 2>/dev/null || true
+      if [ "$current_target_pgid" = "$target_pgid" ] && [ "$current_target_pgid" != "$wrapper_pgid" ]; then
+        kill -"$signal" "-$current_target_pgid" 2>/dev/null || true
       fi
       ;;
   esac
@@ -115,8 +163,28 @@ watch_parent() {
 }
 watch_parent </dev/null >/dev/null 2>&1 &
 watchdog_pid=$!
-wait "$target_launcher_pid"
-target_status=$?
+target_status=""
+while [ -z "$target_status" ]; do
+  candidate_target_status="$(cat "$target_status_path" 2>/dev/null || true)"
+  case "$candidate_target_status" in
+    ''|*[!0-9]*)
+      if ! kill -0 "$target_launcher_pid" 2>/dev/null; then
+        wait "$target_launcher_pid" 2>/dev/null
+        target_status=$?
+      else
+        if ! parent_is_alive; then
+          signal_tree TERM
+          sleep 1
+          signal_tree KILL
+          cleanup
+          exit 143
+        fi
+        sleep 0.01
+      fi
+      ;;
+    *) target_status="$candidate_target_status" ;;
+  esac
+done
 if ! parent_is_alive; then
   signal_tree TERM
   sleep 1
@@ -126,7 +194,17 @@ if ! parent_is_alive; then
 fi
 printf '%s\\n' "$target_status" > "$status_path"
 exec 0<&- 1>&- 2>&-
-wait "$watchdog_pid"
+(
+  sleep 5
+  signal_tree TERM
+  sleep 1
+  signal_tree KILL
+) </dev/null >/dev/null 2>&1 &
+hold_pid=$!
+wait "$target_launcher_pid" 2>/dev/null || true
+kill "$hold_pid" 2>/dev/null || true
+wait "$hold_pid" 2>/dev/null || true
+stop_watchdog
 cleanup
 `;
 

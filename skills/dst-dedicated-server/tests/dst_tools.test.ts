@@ -681,6 +681,36 @@ esac
     }
   });
 
+  test("renders untrusted remote report text without Markdown or HTML injection", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-markdown-"));
+    const previousPath = process.env.PATH;
+    try {
+      const fakeSsh = join(root, "ssh");
+      await writeFile(fakeSsh, `#!/bin/sh
+case "$*" in
+  *"echo ok"*) exit 0 ;;
+  *) printf '# forged heading\\n<img src=x onerror=alert(1)>\\n[forged](https://example.test)\\napi_key=fixture-secret\\n' ;;
+esac
+`);
+      await chmod(fakeSsh, 0o755);
+      const output = join(root, "snapshot.md");
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
+        ["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", output],
+        { ...process.env, PATH: `${root}:${previousPath ?? ""}` } as Record<string, string>,
+      );
+      expect(result.status).toBe(0);
+      const report = await readFile(output, "utf8");
+      expect(report).toContain("&lt;img src=x onerror=alert(1)&gt;");
+      expect(report).not.toContain("<img src=x onerror=alert(1)>");
+      expect(report).not.toContain("[forged](https://example.test)");
+      expect(report).toContain("api_key=[REDACTED]");
+      expect(report).not.toContain("fixture-secret");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("redacts arbitrary paths and IPv4/IPv6 addresses from operational diagnostics", () => {
     const diagnostic = "denied /workspace/private/key /srv/fixture/My Secret/token ../relative/private/key \\\\server\\share\\private via 192.0.2.8, [2001:db8::7], and ::ffff:192.0.2.9";
     const redacted = redactOperationalText(diagnostic);

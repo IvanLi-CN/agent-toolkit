@@ -29,6 +29,7 @@ if command -v setsid >/dev/null 2>&1; then
     anchor_path="$1"
     result_path="$2"
     shift 2
+    trap ':' HUP INT TERM
     printf "%s\\n" "$$" > "$anchor_path"
     "$@" &
     target_pid=$!
@@ -44,6 +45,7 @@ else
     anchor_path="$1"
     result_path="$2"
     shift 2
+    trap ':' HUP INT TERM
     printf "%s\\n" "$$" > "$anchor_path"
     "$@" &
     target_pid=$!
@@ -212,10 +214,12 @@ if ! parent_is_alive; then
 fi
 printf '%s\\n' "$target_status" > "$status_path"
 exec 0<&- 1>&- 2>&-
+hold_seconds=5
+if [ -d "/proc/$$/fd" ]; then hold_seconds=0.25; fi
 (
-  sleep 5
+  sleep "$hold_seconds"
   signal_tree TERM
-  sleep 1
+  sleep 0.25
   signal_tree KILL
 ) </dev/null >/dev/null 2>&1 &
 hold_pid=$!

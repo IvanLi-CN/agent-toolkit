@@ -2,7 +2,7 @@
 
 import { constants, type Dirent } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, mkdtemp, open, opendir, realpath, rename, rm, unlink, type FileHandle } from "node:fs/promises";
+import { lstat, link, mkdir, mkdtemp, open, opendir, realpath, rename, rm, unlink, type FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawnSupervised, type SupervisedChild } from "./process_supervisor.ts";
@@ -454,6 +454,7 @@ export async function safeTail(file: string, lines: number, allowedRoot?: string
         }
       }
       const completeText = partialLine ? text.slice(firstLineEnd + 1) : text;
+      if (partialLine && /^\s/.test(completeText)) return "[REDACTED: bounded log tail begins mid-record]";
       return redactSensitiveText(completeText.split(/\r?\n/).slice(-lines).join("\n"));
     } finally {
       await handle?.close();
@@ -558,8 +559,12 @@ async function ensureSnapshotTemporaryRoot(parent: string): Promise<string> {
       } finally {
         await handle.close();
       }
-      await rename(temporaryMarker, marker);
-      await syncDirectory(root);
+      try {
+        await link(temporaryMarker, marker);
+        await syncDirectory(root);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST" || await readMarker() !== true) throw error;
+      }
     } finally {
       await unlink(temporaryMarker).catch(() => undefined);
     }
@@ -588,26 +593,32 @@ async function ensureSnapshotTemporaryRoot(parent: string): Promise<string> {
     const temporaryMarker = join(root, temporaryEntries[0]!);
     if (await readMarker(temporaryMarker) !== true) throw new Error("snapshot temporary root owner marker is invalid");
     try {
-      await rename(temporaryMarker, marker);
+      await link(temporaryMarker, marker);
       await syncDirectory(root);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       if (await readMarker() !== true) throw new Error("snapshot temporary root owner marker is invalid");
+    } finally {
+      await unlink(temporaryMarker).catch(() => undefined);
     }
     return root;
   }
   if (entries.length !== 0) throw new Error("snapshot temporary root owner marker is invalid");
+  const temporaryMarker = join(root, `.owner-tmp-${randomUUID()}`);
   try {
-    const handle = await open(marker, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
+    const handle = await open(temporaryMarker, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
     try {
       await handle.writeFile(SNAPSHOT_OWNER_MARKER);
       await handle.sync();
     } finally {
       await handle.close();
     }
+    await link(temporaryMarker, marker);
     await syncDirectory(root);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST" || await readMarker() !== true) throw error;
+  } finally {
+    await unlink(temporaryMarker).catch(() => undefined);
   }
   return root;
 }

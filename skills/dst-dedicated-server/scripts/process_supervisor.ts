@@ -63,6 +63,7 @@ wait "$watchdog_pid" 2>/dev/null || true
 printf '%s\\n' "$target_status" > "$status_path"
 exec 0<&- 1>&- 2>&-
 sleep 5
+cleanup
 `;
 
 export interface SupervisedChild {

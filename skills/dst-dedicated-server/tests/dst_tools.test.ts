@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   MAX_MOD_OVERRIDE_BYTES,
   parseRemoteResponseStream,
@@ -92,6 +93,19 @@ describe("DST local Bun tooling", () => {
       const tail = await safeTail(log, 80);
       expect(tail).not.toContain("fixture-secret");
       expect(tail).toContain("visible-line");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("redacts a multiline secret continuation when the bounded tail begins mid-record", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-tail-block-boundary-"));
+    try {
+      const log = join(root, "client_log.txt");
+      await writeFile(log, `password: |\n  ${"x".repeat(300_000)}\n  fixture-secret\nvisible-line\n`);
+      const tail = await safeTail(log, 80);
+      expect(tail).toContain("[REDACTED: bounded log tail begins mid-record]");
+      expect(tail).not.toContain("fixture-secret");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -759,5 +773,42 @@ esac
   test("times out a remote response stream that never produces bytes", async () => {
     const hanging = new ReadableStream<Uint8Array>({ start() {} });
     await expect(parseRemoteResponseStream("fixture-cluster", "Master", "fixture", hanging, 10)).rejects.toThrow(/timed out/);
+  });
+
+  test("publishes reports across processes while claiming the snapshot owner marker", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-process-concurrent-"));
+    try {
+      const output = join(root, "snapshot.md");
+      const script = join(import.meta.dir, "..", "scripts", "dst_snapshot.ts");
+      const env = { ...process.env } as Record<string, string>;
+      const results = await Promise.all([
+        runTool(script, ["--no-local", "--no-remote", "--out", output], env),
+        runTool(script, ["--no-local", "--no-remote", "--out", output], env),
+      ]);
+      expect(results.map((result) => result.status).sort()).toEqual([0, 0]);
+      expect(await readFile(output, "utf8")).toContain("# DST snapshot");
+      expect((await readdir(root)).filter((entry) => entry.startsWith(".dst-snapshot-tmp-")).length).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("cleans a detached supervisor directory after its parent exits", { timeout: 10_000 }, async () => {
+    if (process.platform === "win32") return;
+    const before = new Set((await readdir(tmpdir())).filter((entry) => entry.startsWith(".agent-toolkit-dst-supervisor-")));
+    const moduleUrl = pathToFileURL(join(import.meta.dir, "..", "scripts", "process_supervisor.ts")).href;
+    const child = Bun.spawn([
+      process.execPath,
+      "-e",
+      `import { spawnSupervised } from ${JSON.stringify(moduleUrl)}; await spawnSupervised(["sh", "-c", "sleep 30"]); process.exit(0);`,
+    ], { stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(0);
+    let leftovers: string[] = [];
+    for (let attempt = 0; attempt < 24; attempt += 1) {
+      await Bun.sleep(250);
+      leftovers = (await readdir(tmpdir())).filter((entry) => entry.startsWith(".agent-toolkit-dst-supervisor-") && !before.has(entry));
+      if (leftovers.length === 0) break;
+    }
+    expect(leftovers).toEqual([]);
   });
 });

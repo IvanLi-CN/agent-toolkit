@@ -2,7 +2,7 @@
 
 import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, mkdtemp, open, opendir, readFile, readlink, rename, rm, unlink, utimes } from "node:fs/promises";
+import { lstat, link, mkdir, mkdtemp, open, opendir, readFile, readlink, rename, rm, unlink, utimes } from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
@@ -595,19 +595,21 @@ async function readOwnerKey(): Promise<Uint8Array> {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       const key = randomBytes(OWNER_KEY_BYTES);
+      const temporaryPath = join(dirname(path), `.owner-key-tmp-${randomUUID()}`);
       const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0);
       try {
-        const handle = await open(path, flags, 0o600);
+        const handle = await open(temporaryPath, flags, 0o600);
         try {
           await handle.writeFile(key);
           await handle.sync();
         } finally {
           await handle.close();
         }
+        await link(temporaryPath, path);
         await syncDirectory(dirname(path));
         return key;
       } catch (createError) {
-        if ((createError as NodeJS.ErrnoException).code !== "EEXIST") throw createError;
+        if ((createError as NodeJS.ErrnoException).code !== "EEXIST" || !await pathExists(path)) throw createError;
         const existing = await readBoundedRegularFile(path, OWNER_KEY_BYTES, "owner key");
         const metadata = await lstat(path);
         if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error("owner key must be a regular file");
@@ -615,6 +617,8 @@ async function readOwnerKey(): Promise<Uint8Array> {
         if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) throw new Error("owner key is not owned by the current user");
         if (existing.length !== OWNER_KEY_BYTES) throw new Error("owner key has an invalid length");
         return existing;
+      } finally {
+        await unlink(temporaryPath).catch(() => undefined);
       }
     }
   })();
@@ -989,10 +993,14 @@ async function restoreTransaction(directory: string, midiPath: string, wavPath: 
   const midi = await restoreOutput(directory, "midi.backup", midiPath, "midi.restoring", "midi.restored", "midi.symlink");
   const wav = await restoreOutput(directory, "wav.backup", wavPath, "wav.restoring", "wav.restored", "wav.symlink");
   if (state === "midi-backing-up" && !midi.inProgress) {
-    throw new Error(`MIDI backup is incomplete; preserving transaction: ${directory}`);
+    await removeTransactionDirectory(directory);
+    await syncDirectory(dirname(midiPath));
+    return;
   }
   if (state === "wav-backing-up" && !wav.inProgress) {
-    throw new Error(`WAV backup is incomplete; preserving transaction: ${directory}`);
+    await removeTransactionDirectory(directory);
+    await syncDirectory(dirname(midiPath));
+    return;
   }
   if (state === "backups-complete" || state === "midi-published" || state === "wav-publishing" || state === "wav-published") {
     if (!midi.inProgress) await removeFile(midiPath);

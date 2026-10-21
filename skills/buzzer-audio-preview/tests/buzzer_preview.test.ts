@@ -420,6 +420,46 @@ describe("buzzer MIDI and WAV helper", () => {
     }
   });
 
+  test("preserves rollback artifacts when the transaction state is malformed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-invalid-state-"));
+    try {
+      const output = join(root, "out");
+      const transaction = join(output, ".buzzer-preview-txn-fixture-invalid-state");
+      await mkdir(transaction, { recursive: true });
+      await writeFile(join(output, "fixture.mid"), "new-midi");
+      await writeFile(join(output, "fixture.wav"), "old-wav");
+      await writeFile(join(transaction, "midi.backup"), "old-midi");
+      await writeFile(join(transaction, ".state"), "not-a-publish-state\n");
+      await expect(readPublishedPair(output, "fixture")).rejects.toThrow(/transaction state is invalid/);
+      expect(await readFile(join(output, "fixture.mid"), "utf8")).toBe("new-midi");
+      expect(await readFile(join(output, "fixture.wav"), "utf8")).toBe("old-wav");
+      expect(await readFile(join(transaction, "midi.backup"), "utf8")).toBe("old-midi");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves rollback artifacts when the transaction state is a symlink", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-state-symlink-"));
+    try {
+      const output = join(root, "out");
+      const transaction = join(output, ".buzzer-preview-txn-fixture-state-symlink");
+      const outside = join(root, "outside-state");
+      await mkdir(transaction, { recursive: true });
+      await writeFile(join(output, "fixture.mid"), "new-midi");
+      await writeFile(join(output, "fixture.wav"), "old-wav");
+      await writeFile(join(transaction, "midi.backup"), "old-midi");
+      await writeFile(outside, "midi-published\n");
+      await symlink(outside, join(transaction, ".state"));
+      await expect(readPublishedPair(output, "fixture")).rejects.toThrow(/transaction state is unreadable/);
+      expect(await readFile(join(output, "fixture.mid"), "utf8")).toBe("new-midi");
+      expect(await readFile(join(output, "fixture.wav"), "utf8")).toBe("old-wav");
+      expect(await readFile(join(transaction, "midi.backup"), "utf8")).toBe("old-midi");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("preserves an output after a restore crash marker is left behind", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-restore-marker-"));
     try {

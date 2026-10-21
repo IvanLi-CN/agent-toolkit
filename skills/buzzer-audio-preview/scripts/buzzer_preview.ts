@@ -653,10 +653,28 @@ async function readPublishState(directory: string): Promise<PublishState | undef
   try {
     const state = new TextDecoder().decode(await readRegularFile(join(directory, ".state"))).trim();
     if (state === "prepared" || state === "midi-backed-up" || state === "backups-complete" || state === "midi-published" || state === "wav-publishing" || state === "wav-published" || state === "complete") return state;
-  } catch {
-    // An incomplete transaction is safe to discard before its first state commit.
+    throw new Error(`transaction state is invalid: ${directory}`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    if (error instanceof Error && error.message.startsWith("transaction state is invalid:")) throw error;
+    throw new Error(`transaction state is unreadable: ${directory}`, { cause: error });
   }
-  return undefined;
+}
+
+async function hasRecoveryArtifacts(directory: string): Promise<boolean> {
+  for (const name of [
+    "midi.backup",
+    "wav.backup",
+    "midi.restoring",
+    "midi.restored",
+    "wav.restoring",
+    "wav.restored",
+    "midi.symlink",
+    "wav.symlink",
+  ]) {
+    if (await pathExists(join(directory, name))) return true;
+  }
+  return false;
 }
 
 async function restoreOutput(
@@ -705,6 +723,9 @@ async function restoreOutput(
 async function restoreTransaction(directory: string, midiPath: string, wavPath: string): Promise<void> {
   const state = await readPublishState(directory);
   if (state === undefined) {
+    if (await hasRecoveryArtifacts(directory)) {
+      throw new Error(`transaction state is missing while recovery artifacts exist: ${directory}`);
+    }
     await removeTransactionDirectory(directory);
     await syncDirectory(dirname(directory));
     return;

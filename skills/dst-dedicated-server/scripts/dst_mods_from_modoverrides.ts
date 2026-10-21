@@ -219,6 +219,11 @@ async function readText(stream: ReadableStream<Uint8Array>, maxBytes = 64 * 1024
   const decoder = new TextDecoder();
   let text = "";
   let remaining = maxBytes;
+  let cancelPromise: Promise<void> | undefined;
+  const cancelReader = (): Promise<void> => {
+    if (cancelPromise === undefined) cancelPromise = reader.cancel().catch(() => undefined);
+    return cancelPromise;
+  };
   const readWithDeadline = async () => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     type ReadResult = Awaited<ReturnType<typeof reader.read>>;
@@ -227,7 +232,7 @@ async function readText(stream: ReadableStream<Uint8Array>, maxBytes = 64 * 1024
         reader.read(),
         new Promise<ReadResult>((resolve) => {
           timer = setTimeout(() => {
-            void reader.cancel();
+            void cancelReader();
             resolve({ done: true } as ReadResult);
           }, timeoutMs);
         }),
@@ -241,7 +246,7 @@ async function readText(stream: ReadableStream<Uint8Array>, maxBytes = 64 * 1024
       const { done, value } = await readWithDeadline();
       if (done) break;
       if (remaining <= 0) {
-        await reader.cancel();
+        await cancelReader();
         break;
       }
       const chunk = value ?? new Uint8Array();
@@ -249,12 +254,13 @@ async function readText(stream: ReadableStream<Uint8Array>, maxBytes = 64 * 1024
       text += decoder.decode(portion, { stream: true });
       remaining -= portion.byteLength;
       if (chunk.byteLength > portion.byteLength) {
-        await reader.cancel();
+        await cancelReader();
         break;
       }
     }
     return text + decoder.decode();
   } finally {
+    if (cancelPromise !== undefined) await cancelPromise;
     reader.releaseLock();
   }
 }
@@ -273,6 +279,11 @@ export async function parseRemoteResponseStream(
   let parser: ModOverrideParser | undefined;
   let bodyDecoder: TextDecoder | undefined;
   let trailingBytes = false;
+  let cancelPromise: Promise<void> | undefined;
+  const cancelReader = (): Promise<void> => {
+    if (cancelPromise === undefined) cancelPromise = reader.cancel().catch(() => undefined);
+    return cancelPromise;
+  };
   const deadline = Date.now() + timeoutMs;
 
   const consumeBody = (bytes: Uint8Array): void => {
@@ -291,7 +302,7 @@ export async function parseRemoteResponseStream(
     while (true) {
       const remainingMs = deadline - Date.now();
       if (remainingMs <= 0) {
-        void reader.cancel();
+        await cancelReader();
         throw new Error(`remote mod collection timed out after ${timeoutMs / 1000}s`);
       }
       type ReadResult = Awaited<ReturnType<typeof reader.read>>;
@@ -309,7 +320,7 @@ export async function parseRemoteResponseStream(
         );
       });
       if (result.kind === "timeout") {
-        void reader.cancel();
+        await cancelReader();
         throw new Error(`remote mod collection timed out after ${timeoutMs / 1000}s`);
       }
       const { done, value } = result.value;
@@ -354,6 +365,7 @@ export async function parseRemoteResponseStream(
     parser.consume(bodyDecoder.decode());
     return { shard, present: true, filePath, mods: parser.finish() };
   } finally {
+    if (cancelPromise !== undefined) await cancelPromise;
     reader.releaseLock();
   }
 }

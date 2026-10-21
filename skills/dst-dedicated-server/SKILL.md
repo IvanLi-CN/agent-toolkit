@@ -37,4 +37,4 @@ Treat cluster tokens, server tokens, passwords and provider credentials as secre
 - `scripts/dst_snapshot.ts`: local options, filesystem reads, bounded report composition, and remote SSH orchestration.
 - `scripts/dst_snapshot_remote.sh`: native commands executed on the remote host for the redacted baseline.
 - `scripts/dst_mods_from_modoverrides.ts`: local safe parser, summaries, and shard comparison.
-- `scripts/dst_mods_remote_collect.sh`: remote byte collection of `modoverrides.lua` only.
+- `scripts/dst_mods_remote_collect.sh`: remote bounded projection of Workshop IDs and top-level enabled state; it never emits configuration values or arbitrary source text.

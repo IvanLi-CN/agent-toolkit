@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readlink, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -227,6 +227,41 @@ describe("buzzer MIDI and WAV helper", () => {
     }
   });
 
+  test("restores a preexisting output symlink after a later publication failure", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-symlink-recovery-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      const outside = join(root, "outside.bin");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      await mkdir(output, { recursive: true });
+      await writeFile(outside, "sentinel");
+      await symlink(outside, join(output, "fixture.mid"));
+      await mkdir(join(output, "fixture.wav"));
+      expect(await main(["--in", input, "--out-dir", output])).toBe(1);
+      expect(await readlink(join(output, "fixture.mid"))).toBe(outside);
+      expect(await readFile(outside, "utf8")).toBe("sentinel");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not reclaim a partially initialized lock", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-partial-lock-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      const lock = join(output, ".buzzer-preview-fixture.lock");
+      await mkdir(lock, { recursive: true });
+      await writeFile(join(lock, "pid"), "2147483647\n");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      expect(await main(["--in", input, "--out-dir", output])).toBe(1);
+      expect(await readdir(output)).toContain(".buzzer-preview-fixture.lock");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("rejects output directories without deleting their contents", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-directory-"));
     try {
@@ -306,6 +341,7 @@ describe("buzzer MIDI and WAV helper", () => {
       await mkdir(lock);
       await writeFile(join(lock, "pid"), "2147483647\n");
       await writeFile(join(lock, "owner"), "dead-owner\n");
+      await writeFile(join(lock, "ready"), "");
       const pair = await readPublishedPair(output, "fixture");
       expect(pair.midi.toString()).toBe("midi");
       expect(pair.wav.toString()).toBe("wav");

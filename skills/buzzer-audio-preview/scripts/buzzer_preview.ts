@@ -2,7 +2,7 @@
 
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, mkdtemp, open, readdir, readFile, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, rename, rm, rmdir, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 
@@ -521,8 +521,10 @@ const TRANSACTION_ENTRY_NAMES = new Set([
   "midi.restored",
   "wav.restoring",
   "wav.restored",
+  "midi.symlink",
+  "wav.symlink",
 ]);
-const LOCK_ENTRY_NAMES = new Set(["pid", "owner"]);
+const LOCK_ENTRY_NAMES = new Set(["pid", "owner", "identity", "ready"]);
 
 async function pathExists(path: string): Promise<boolean> {
   try {
@@ -533,14 +535,33 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-async function moveIfPresent(source: string, destination: string, allowSymlink = true): Promise<boolean> {
+type MovedOutput = false | "file" | "symlink";
+
+async function moveIfPresent(source: string, destination: string, allowSymlink = true): Promise<MovedOutput> {
   try {
     const metadata = await lstat(source);
     if (!metadata.isFile() && !(allowSymlink && metadata.isSymbolicLink())) {
       throw new Error(`output path is not a regular file${allowSymlink ? " or symlink" : ""}: ${source}`);
     }
     await rename(source, destination);
-    return true;
+    return metadata.isSymbolicLink() ? "symlink" : "file";
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function moveOutputToBackup(source: string, destination: string, symlinkMarker: string): Promise<MovedOutput> {
+  try {
+    const metadata = await lstat(source);
+    if (!metadata.isFile() && !metadata.isSymbolicLink()) {
+      throw new Error(`output path is not a regular file or symlink: ${source}`);
+    }
+    if (metadata.isSymbolicLink()) {
+      await writeSyncedFile(symlinkMarker, new TextEncoder().encode(`${await readlink(source)}\n`));
+    }
+    await rename(source, destination);
+    return metadata.isSymbolicLink() ? "symlink" : "file";
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw error;
@@ -612,7 +633,7 @@ async function writePublishState(directory: string, state: PublishState): Promis
 
 async function readPublishState(directory: string): Promise<PublishState | undefined> {
   try {
-    const state = (await readFile(join(directory, ".state"), "utf8")).trim();
+    const state = new TextDecoder().decode(await readRegularFile(join(directory, ".state"))).trim();
     if (state === "prepared" || state === "midi-backed-up" || state === "backups-complete" || state === "midi-published" || state === "complete") return state;
   } catch {
     // An incomplete transaction is safe to discard before its first state commit.
@@ -626,16 +647,30 @@ async function restoreOutput(
   outputPath: string,
   restoringName: "midi.restoring" | "wav.restoring",
   restoredName: "midi.restored" | "wav.restored",
+  symlinkName: "midi.symlink" | "wav.symlink",
 ): Promise<{ hasBackup: boolean; inProgress: boolean }> {
   const backupPath = join(directory, backupName);
   const restoringPath = join(directory, restoringName);
   const restoredPath = join(directory, restoredName);
+  const symlinkPath = join(directory, symlinkName);
   const hasBackup = await pathExists(backupPath);
-  const inProgress = hasBackup || await pathExists(restoringPath) || await pathExists(restoredPath);
+  const inProgress = hasBackup || await pathExists(restoringPath) || await pathExists(restoredPath) || await pathExists(symlinkPath);
   if (!hasBackup) return { hasBackup: false, inProgress };
 
   await writeSyncedFile(restoringPath, new Uint8Array());
-  await moveIfPresent(backupPath, outputPath, false);
+  const backupMetadata = await lstat(backupPath);
+  if (backupMetadata.isSymbolicLink()) {
+    if (!await pathExists(symlinkPath)) throw new Error(`transaction backup is not a regular file or approved symlink: ${backupPath}`);
+    const expectedTarget = new TextDecoder().decode(await readRegularFile(symlinkPath)).trim();
+    const actualTarget = await readlink(backupPath);
+    if (expectedTarget !== actualTarget) throw new Error(`transaction backup is not a regular file or approved symlink: ${backupPath}`);
+    await moveIfPresent(backupPath, outputPath, true);
+  } else {
+    if (!backupMetadata.isFile() || await pathExists(symlinkPath)) throw new Error(`transaction backup is not a regular file: ${backupPath}`);
+    await moveIfPresent(backupPath, outputPath, false);
+  }
+  await syncDirectory(dirname(outputPath));
+  await syncDirectory(directory);
   await writeSyncedFile(restoredPath, new Uint8Array());
   await removeFile(restoringPath);
   return { hasBackup: true, inProgress: true };
@@ -645,18 +680,21 @@ async function restoreTransaction(directory: string, midiPath: string, wavPath: 
   const state = await readPublishState(directory);
   if (state === undefined) {
     await removeTransactionDirectory(directory);
+    await syncDirectory(dirname(directory));
     return;
   }
   if (state === "complete") {
     await removeTransactionDirectory(directory);
+    await syncDirectory(dirname(directory));
     return;
   }
 
-  const midi = await restoreOutput(directory, "midi.backup", midiPath, "midi.restoring", "midi.restored");
-  await restoreOutput(directory, "wav.backup", wavPath, "wav.restoring", "wav.restored");
+  const midi = await restoreOutput(directory, "midi.backup", midiPath, "midi.restoring", "midi.restored", "midi.symlink");
+  await restoreOutput(directory, "wav.backup", wavPath, "wav.restoring", "wav.restored", "wav.symlink");
   if ((state === "backups-complete" || state === "midi-published") && !midi.inProgress) await removeFile(midiPath);
   await syncDirectory(dirname(midiPath));
   await removeTransactionDirectory(directory);
+  await syncDirectory(dirname(midiPath));
 }
 
 async function recoverPublishTransactions(outDir: string, stem: string, midiPath: string, wavPath: string): Promise<void> {
@@ -693,6 +731,31 @@ async function removeLockDirectory(directory: string): Promise<void> {
   if (entries.some((entry) => entry.isDirectory() || !LOCK_ENTRY_NAMES.has(entry.name))) return;
   for (const entry of entries) await unlink(join(directory, entry.name)).catch(() => undefined);
   await rmdir(directory).catch(() => undefined);
+  await syncDirectory(dirname(directory));
+}
+
+async function processIdentity(pid: number): Promise<string | undefined> {
+  if (!Number.isInteger(pid) || pid <= 0 || process.platform === "win32") return undefined;
+  if (process.platform === "linux") {
+    try {
+      const stat = await readFile(`/proc/${pid}/stat`, "utf8");
+      const closingParenthesis = stat.lastIndexOf(")");
+      if (closingParenthesis >= 0) {
+        const fields = stat.slice(closingParenthesis + 2).trim().split(/\s+/);
+        if (fields[19] !== undefined && fields[19].length > 0) return `linux:${fields[19]}`;
+      }
+    } catch {
+      // The process may have exited or /proc may be unavailable.
+    }
+  }
+  try {
+    const child = Bun.spawn(["ps", "-o", "lstart=", "-p", String(pid)], { stdout: "pipe", stderr: "pipe" });
+    const [status, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+    const value = stdout.trim();
+    return status === 0 && value.length > 0 ? `ps:${value}` : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner = false): Promise<() => Promise<void>> {
@@ -701,8 +764,11 @@ async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner
     try {
       await mkdir(lockDirectory);
       const owner = randomUUID();
-      await writeFile(join(lockDirectory, "pid"), `${process.pid}\n`, { mode: 0o600 });
-      await writeFile(join(lockDirectory, "owner"), `${owner}\n`, { mode: 0o600 });
+      const identity = await processIdentity(process.pid);
+      await writeSyncedFile(join(lockDirectory, "pid"), new TextEncoder().encode(`${process.pid}\n`));
+      await writeSyncedFile(join(lockDirectory, "owner"), new TextEncoder().encode(`${owner}\n`));
+      if (identity !== undefined) await writeSyncedFile(join(lockDirectory, "identity"), new TextEncoder().encode(`${identity}\n`));
+      await writeSyncedFile(join(lockDirectory, "ready"), new Uint8Array());
       return async () => {
         try {
           const currentOwner = (await readFile(join(lockDirectory, "owner"), "utf8")).trim();
@@ -720,12 +786,20 @@ async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner
         const entries = await readdir(lockDirectory, { withFileTypes: true });
         if (entries.some((entry) => entry.isDirectory() || !LOCK_ENTRY_NAMES.has(entry.name))) throw new Error("lock directory contains unknown entries");
         const age = Date.now() - metadata.mtimeMs;
-        if (entries.length === 0) {
+        const ready = entries.some((entry) => entry.name === "ready");
+        if (!ready) {
           stale = age > LOCK_STALE_MS;
         } else {
           const ownerText = await readFile(join(lockDirectory, "pid"), "utf8");
           const owner = Number.parseInt(ownerText.trim(), 10);
-          stale = !await isProcessAlive(owner) && (reclaimDeadOwner || age > LOCK_STALE_MS);
+          const alive = await isProcessAlive(owner);
+          if (!alive) {
+            stale = reclaimDeadOwner || age > LOCK_STALE_MS;
+          } else {
+            const recordedIdentity = await readFile(join(lockDirectory, "identity"), "utf8").then((value) => value.trim()).catch(() => "");
+            const currentIdentity = recordedIdentity.length > 0 ? await processIdentity(owner) : undefined;
+            stale = recordedIdentity.length > 0 && currentIdentity !== undefined && currentIdentity !== recordedIdentity && (reclaimDeadOwner || age > LOCK_STALE_MS);
+          }
         }
       } catch {
         stale = false;
@@ -756,16 +830,24 @@ async function publishOutputsLocked(outDir: string, stem: string, midi: Uint8Arr
     await writeSyncedFile(tempMidiPath, midi);
     await writeSyncedFile(tempWavPath, wav);
     await writePublishState(transaction, "prepared");
-    await moveIfPresent(midiPath, join(transaction, "midi.backup"));
+    await moveOutputToBackup(midiPath, join(transaction, "midi.backup"), join(transaction, "midi.symlink"));
+    await syncDirectory(outDir);
+    await syncDirectory(transaction);
     await writePublishState(transaction, "midi-backed-up");
-    await moveIfPresent(wavPath, join(transaction, "wav.backup"));
+    await moveOutputToBackup(wavPath, join(transaction, "wav.backup"), join(transaction, "wav.symlink"));
+    await syncDirectory(outDir);
+    await syncDirectory(transaction);
     await writePublishState(transaction, "backups-complete");
     await rename(tempMidiPath, midiPath);
+    await syncDirectory(transaction);
+    await syncDirectory(outDir);
     await writePublishState(transaction, "midi-published");
     await rename(tempWavPath, wavPath);
+    await syncDirectory(transaction);
     await syncDirectory(outDir);
     await writePublishState(transaction, "complete");
     await removeTransactionDirectory(transaction);
+    await syncDirectory(outDir);
     return [midiPath, wavPath];
   } catch (error) {
     try {
@@ -839,14 +921,14 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     if (!outDirStat.isDirectory() || outDirStat.isSymbolicLink()) throw new CliError("--out-dir must resolve to a real directory");
     const { config, events } = parseScore(JSON.parse(await readFile(inputPath, "utf8")));
     const stem = validateStem(parsed.stem ?? basename(inputPath, extname(inputPath)));
-    const [midiPath, wavPath] = await publishOutputs(outDir, stem, encodeMidi(config, events), encodeWav(config, events));
+    await publishOutputs(outDir, stem, encodeMidi(config, events), encodeWav(config, events));
     const totalSeconds = events.reduce((total, event) => total + event.durationS, 0);
-    console.log(`[OK] Wrote: ${midiPath}`);
-    console.log(`[OK] Wrote: ${wavPath}`);
+    console.log("[OK] Wrote MIDI preview");
+    console.log("[OK] Wrote WAV preview");
     console.log(`[INFO] Duration: ${totalSeconds.toFixed(2)}s, tempo=${config.tempoBpm}, waveform=${config.audio.waveform}`);
     return 0;
   } catch (error) {
-    console.error(`error: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`error: ${error instanceof CliError ? error.message : "preview generation failed"}`);
     return error instanceof CliError ? error.exitCode : 1;
   }
 }

@@ -59,7 +59,7 @@ Local Bun follows the installed host runtime; CI follows the latest stable Bun a
 ### Game-server diagnostics
 
 - [`dst_snapshot.ts`](../../../skills/dst-dedicated-server/scripts/dst_snapshot.ts): use TS/Bun for local options, filesystem reads, bounded result handling, and Markdown report composition. [`dst_snapshot_remote.sh`](../../../skills/dst-dedicated-server/scripts/dst_snapshot_remote.sh) retains remote native collection in Shell.
-- [`dst_mods_from_modoverrides.ts`](../../../skills/dst-dedicated-server/scripts/dst_mods_from_modoverrides.ts): use TS/Bun locally to interpret safely collected shard data and produce enabled/disabled/unknown summaries and comparisons. [`dst_mods_remote_collect.sh`](../../../skills/dst-dedicated-server/scripts/dst_mods_remote_collect.sh) collects only the selected raw file. Do not execute an untrusted Lua configuration as a parsing shortcut or claim a broader Lua grammar than the tested contract.
+- [`dst_mods_from_modoverrides.ts`](../../../skills/dst-dedicated-server/scripts/dst_mods_from_modoverrides.ts): use TS/Bun locally to interpret safely collected shard data and produce enabled/disabled/unknown summaries and comparisons. [`dst_mods_remote_collect.sh`](../../../skills/dst-dedicated-server/scripts/dst_mods_remote_collect.sh) emits only a bounded projection of Workshop IDs and top-level enabled state, never the selected raw file. Do not execute an untrusted Lua configuration as a parsing shortcut or claim a broader Lua grammar than the tested contract.
 
 ### Media and firmware helpers
 

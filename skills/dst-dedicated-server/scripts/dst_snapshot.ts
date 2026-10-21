@@ -61,13 +61,18 @@ async function readBounded(
   let text = "";
   let remaining = maxBytes;
   let truncated = false;
+  let cancelPromise: Promise<void> | undefined;
+  const cancelReader = (): Promise<void> => {
+    if (cancelPromise === undefined) cancelPromise = reader.cancel().catch(() => undefined);
+    return cancelPromise;
+  };
   const deadline = Date.now() + timeoutMs;
   try {
     while (true) {
       const remainingMs = deadline - Date.now();
       if (remainingMs <= 0) {
         onTimeout();
-        void reader.cancel();
+        await cancelReader();
         break;
       }
       type ReadResult = Awaited<ReturnType<typeof reader.read>>;
@@ -86,7 +91,7 @@ async function readBounded(
       });
       if (result.kind === "timeout") {
         onTimeout();
-        void reader.cancel();
+        await cancelReader();
         break;
       }
       const { done, value } = result.value;
@@ -96,7 +101,7 @@ async function readBounded(
         text += decoder.decode(chunk.slice(0, remaining), { stream: true });
         truncated = true;
         onLimit();
-        await reader.cancel();
+        await cancelReader();
         break;
       }
       text += decoder.decode(chunk, { stream: true });
@@ -104,6 +109,7 @@ async function readBounded(
     }
     return { text: text + decoder.decode(), truncated };
   } finally {
+    if (cancelPromise !== undefined) await cancelPromise;
     reader.releaseLock();
   }
 }
@@ -219,6 +225,9 @@ export function redactOperationalText(text: string, values: string[] = []): stri
   return redactSensitiveText(redacted)
     .replace(/\/(?:[^\s"'<>`]|\\ )+/g, "<redacted-path>")
     .replace(/\b[A-Za-z]:[\\/](?:[^\s"'<>`]|\\ )+/g, "<redacted-path>")
+    .replace(/(^|[\s"'(])(?:\.\.?[\\/])+[^\s"'<>`]+/g, "$1<redacted-path>")
+    .replace(/(^|[\s"'(])\\\\[^\s"'<>`]+/g, "$1<redacted-path>")
+    .replace(/(?<![A-Za-z0-9])(?:(?:[0-9A-Fa-f]{0,4}:){1,7})(?:\d{1,3}\.){3}\d{1,3}(?![A-Za-z0-9])/g, "<redacted-address>")
     .replace(/(?<![A-Za-z0-9])(?:(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}(?:%[A-Za-z0-9._-]+)?)(?![A-Za-z0-9])/g, "<redacted-address>")
     .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "<redacted-address>");
 }

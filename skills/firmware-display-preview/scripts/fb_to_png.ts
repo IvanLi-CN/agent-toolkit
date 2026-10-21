@@ -326,10 +326,10 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     const parentStat = await lstat(dirname(outputPath));
     if (!parentStat.isDirectory()) throw new CliError("--out parent must be a directory");
     await writePngAtomically(outputPath, encodePng(parsed.width, parsed.height, converted.mode, converted.rows));
-    console.log(`[OK] Wrote: ${parsed.output}`);
+    console.log("[OK] Wrote PNG preview");
     return 0;
   } catch (error) {
-    console.error(`error: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`error: ${error instanceof CliError ? error.message : "framebuffer conversion failed"}`);
     return error instanceof CliError ? error.exitCode : 1;
   }
 }

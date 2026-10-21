@@ -56,7 +56,8 @@ if (( size > max_bytes )); then
   exit 1
 fi
 temporary="$(mktemp)"
-trap 'rm -f "$temporary"' EXIT
+projection="$(mktemp)"
+trap 'rm -f "$temporary" "$projection"' EXIT
 head -c $((max_bytes + 1)) <&9 >"$temporary"
 exec 9<&-
 actual="$(wc -c < "$temporary")"
@@ -65,5 +66,103 @@ if (( actual != size )); then
   printf 'modoverrides.lua changed during collection\n' >&2
   exit 1
 fi
-printf 'PRESENT %s\n' "$size"
-cat "$temporary"
+
+# Project the Lua table down to Workshop IDs and top-level enabled booleans.
+# The remote boundary never emits configuration values or arbitrary source text.
+awk '
+function count_char(value, character, rest, position, count) {
+  rest = value
+  count = 0
+  while ((position = index(rest, character)) > 0) {
+    count++
+    rest = substr(rest, position + 1)
+  }
+  return count
+}
+function brace_delta(value) {
+  return count_char(value, "{") - count_char(value, "}")
+}
+function close_at_depth(value, depth, position, character) {
+  for (position = 1; position <= length(value); position++) {
+    character = substr(value, position, 1)
+    if (character == "{") depth++
+    else if (character == "}") {
+      depth--
+      if (depth == 0) return position
+    }
+  }
+  return 0
+}
+function flush_record() {
+  if (current_id == "") return
+  printf "[\"%s\"] = {", current_id
+  if (current_enabled != "") printf " enabled = %s,", current_enabled
+  print " },"
+  current_id = ""
+  current_enabled = ""
+}
+function process_outside(value, enabled) {
+  if (match(value, /\["workshop-[0-9]+"\]/)) {
+    flush_record()
+    current_id = substr(value, RSTART + 2, RLENGTH - 4)
+  }
+  if (current_id != "" && match(value, /enabled[[:space:]]*=[[:space:]]*(true|false)/)) {
+    enabled = substr(value, RSTART, RLENGTH)
+    sub(/^.*=[[:space:]]*/, "", enabled)
+    current_enabled = enabled
+  }
+}
+{
+  line = $0
+  if (pending_config) {
+    brace = index(line, "{")
+    if (brace == 0) next
+    config = substr(line, brace)
+    pending_config = 0
+    config_depth = brace_delta(config)
+    if (config_depth > 0) {
+      in_config = 1
+      next
+    }
+    closing = close_at_depth(config, 0)
+    process_outside(substr(config, closing + 1))
+    next
+  }
+  if (in_config) {
+    previous_depth = config_depth
+    config_depth += brace_delta(line)
+    if (config_depth > 0) next
+    closing = close_at_depth(line, previous_depth)
+    in_config = 0
+    config_depth = 0
+    process_outside(substr(line, closing + 1))
+    next
+  }
+  marker = match(line, /configuration_options[[:space:]]*=/)
+  if (marker) {
+    marker_start = RSTART
+    process_outside(substr(line, 1, marker_start - 1))
+    config = substr(line, marker_start)
+    brace = index(config, "{")
+    if (brace == 0) {
+      pending_config = 1
+      next
+    }
+    config = substr(config, brace)
+    config_depth = brace_delta(config)
+    if (config_depth > 0) {
+      in_config = 1
+      next
+    }
+    closing = close_at_depth(config, 0)
+    process_outside(substr(config, closing + 1))
+    next
+  }
+  process_outside(line)
+}
+END { flush_record() }
+' "$temporary" >"$projection"
+projected_size="$(wc -c < "$projection")"
+projected_size="${projected_size//[[:space:]]/}"
+printf 'PRESENT %s\n' "$projected_size"
+cat "$projection"

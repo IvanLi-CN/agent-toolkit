@@ -208,7 +208,7 @@ describe("DST local Bun tooling", () => {
       const home = join(root, "home");
       const shard = join(home, ".klei", "DoNotStarveTogether", "fixture", "Master");
       await mkdir(shard, { recursive: true });
-      await writeFile(join(shard, "modoverrides.lua"), '["workshop-123"] = { enabled = true }\n');
+      await writeFile(join(shard, "modoverrides.lua"), '["workshop-123"] = { configuration_options = { password = "fixture-secret", enabled = false }, enabled = true }\n');
       const child = Bun.spawn(["bash", join(import.meta.dir, "..", "scripts", "dst_mods_remote_collect.sh"), "fixture", "Master"], {
         env: { ...process.env, HOME: home }, stdout: "pipe", stderr: "pipe",
       });
@@ -217,6 +217,9 @@ describe("DST local Bun tooling", () => {
       expect(stderr).toBe("");
       expect(stdout).toContain("PRESENT ");
       expect(stdout).toContain("workshop-123");
+      expect(stdout).toContain("enabled = true");
+      expect(stdout).not.toContain("configuration_options");
+      expect(stdout).not.toContain("fixture-secret");
       expect(stdout).not.toContain(home);
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -379,10 +382,13 @@ esac
   });
 
   test("redacts arbitrary paths and IPv4/IPv6 addresses from operational diagnostics", () => {
-    const diagnostic = "denied /workspace/private/key via 192.0.2.8 and [2001:db8::7]";
+    const diagnostic = "denied /workspace/private/key ../relative/private/key \\\\server\\share\\private via 192.0.2.8, [2001:db8::7], and ::ffff:192.0.2.9";
     const redacted = redactOperationalText(diagnostic);
     expect(redacted).not.toContain("/workspace/private/key");
+    expect(redacted).not.toContain("../relative/private/key");
+    expect(redacted).not.toContain("\\\\server\\share\\private");
     expect(redacted).not.toContain("192.0.2.8");
+    expect(redacted).not.toContain("192.0.2.9");
     expect(redacted).not.toContain("2001:db8::7");
     expect(redacted).toContain("<redacted-path>");
     expect(redacted).toContain("<redacted-address>");

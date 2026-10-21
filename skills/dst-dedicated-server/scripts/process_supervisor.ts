@@ -8,8 +8,6 @@ status_path="$1"
 shift
 status_dir="$(dirname -- "$status_path")"
 cleanup() { rm -rf -- "$status_dir"; }
-trap cleanup EXIT
-trap 'cleanup; exit 143' HUP INT TERM
 parent_pid="\${AGENT_TOOLKIT_SUPERVISOR_PARENT_PID:-\$PPID}"
 if command -v setsid >/dev/null 2>&1; then
   setsid "$@" &
@@ -49,6 +47,7 @@ signal_tree() {
     kill -"$signal" "$pid" 2>/dev/null || true
   done
 }
+trap 'signal_tree TERM; signal_tree KILL; cleanup; exit 143' HUP INT TERM
 watch_parent() {
   while kill -0 "$parent_pid" 2>/dev/null; do sleep 1; done
   signal_tree TERM

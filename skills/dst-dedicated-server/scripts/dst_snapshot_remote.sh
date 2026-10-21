@@ -148,10 +148,28 @@ emit_cluster() {
   return 0
 }
 
-shopt -s nullglob
-for cluster in "$KLEI_DIR"/*; do
-  emit_cluster "$cluster" || break
-done
+if have_cmd find; then
+  set +e
+  find "$KLEI_DIR" -mindepth 1 -maxdepth 1 -type d -print0 | (
+    cluster_count=0
+    while IFS= read -r -d '' cluster; do
+      if ! emit_cluster "$cluster"; then
+        if (( cluster_count > 128 )); then
+          exit 125
+        fi
+        exit 1
+      fi
+    done
+    exit 0
+  )
+  cluster_scan_status=$?
+  set -e
+  if (( cluster_scan_status != 0 && cluster_scan_status != 125 && cluster_scan_status != 141 )); then
+    echo "> cluster inventory unavailable."
+  fi
+else
+  echo "> find not found; cluster inventory unavailable."
+fi
 
 echo "### Server binary (best-effort)"
 echo

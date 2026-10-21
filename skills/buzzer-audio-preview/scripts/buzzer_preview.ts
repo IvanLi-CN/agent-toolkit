@@ -932,6 +932,7 @@ async function restoreOutput(
   if (!hasBackup) return { hasBackup: false, inProgress };
 
   await writeSyncedFile(restoringPath, new Uint8Array());
+  await syncDirectory(directory);
   const backupMetadata = await lstat(backupPath);
   if (backupMetadata.isSymbolicLink()) {
     if (!await pathExists(symlinkPath)) throw new Error(`transaction backup is not a regular file or approved symlink: ${backupPath}`);
@@ -953,6 +954,7 @@ async function restoreOutput(
   await syncDirectory(dirname(outputPath));
   await syncDirectory(directory);
   await writeSyncedFile(restoredPath, new Uint8Array());
+  await syncDirectory(directory);
   await removeFile(restoringPath);
   await syncDirectory(directory);
   return { hasBackup: true, inProgress: true };
@@ -1122,6 +1124,18 @@ async function removeLockDirectory(directory: string, expectedOwner?: string): P
   } catch {
     return false;
   }
+  if (expectedOwner !== undefined) {
+    try {
+      const owner = new TextDecoder().decode(await readRegularFile(join(tombstone, "owner"), 128)).trim();
+      if (owner !== expectedOwner) {
+        await rename(tombstone, directory).catch(() => undefined);
+        return false;
+      }
+    } catch {
+      await rename(tombstone, directory).catch(() => undefined);
+      return false;
+    }
+  }
   await rm(tombstone, { recursive: true, force: true, maxRetries: 0 });
   await syncDirectory(dirname(directory));
   return true;
@@ -1220,6 +1234,7 @@ async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "EEXIST" && code !== "ENOTEMPTY") throw error;
       let stale = false;
+      let staleOwnerToken: string | undefined;
       try {
         const metadata = await lstat(lockDirectory);
         if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error("lock path is not a private directory");
@@ -1237,12 +1252,14 @@ async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner
           const owner = Number(ownerText.trim());
           const ownerToken = new TextDecoder().decode(await readRegularFile(join(lockDirectory, "owner"), 128)).trim();
           if (!Number.isSafeInteger(owner) || owner <= 0 || !await hasValidOwnerRecord(ownerToken)) throw new Error("partial lock owner is incomplete");
+          staleOwnerToken = ownerToken;
           stale = !await isProcessAlive(owner) && (reclaimDeadOwner || age > LOCK_STALE_MS);
         } else {
           const ownerText = new TextDecoder().decode(await readRegularFile(join(lockDirectory, "pid"), 128));
           const owner = Number(ownerText.trim());
           const ownerToken = new TextDecoder().decode(await readRegularFile(join(lockDirectory, "owner"), 128)).trim();
           if (!Number.isSafeInteger(owner) || owner <= 0 || !await hasValidOwnerRecord(ownerToken)) throw new Error("lock owner is incomplete");
+          staleOwnerToken = ownerToken;
           const alive = await isProcessAlive(owner);
           if (!alive) {
             stale = reclaimDeadOwner || age > LOCK_STALE_MS;
@@ -1261,7 +1278,7 @@ async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner
         stale = false;
       }
       if (!stale) throw new Error("output publication is already in progress");
-      if (!await removeLockDirectory(lockDirectory)) continue;
+      if (!await removeLockDirectory(lockDirectory, staleOwnerToken)) continue;
     }
   }
   throw new Error("could not acquire output publication lock");

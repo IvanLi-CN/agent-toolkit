@@ -68,6 +68,15 @@ describe("DST local Bun tooling", () => {
     expect(redactOperationalText("api_key%3Dfixture-secret&SECRET_TAIL")).not.toContain("SECRET_TAIL");
     expect(redactSensitiveText("Cookie: sessionid=fixture-secret")).not.toContain("fixture-secret");
     expect(redactSensitiveText("Set-Cookie: session_id=fixture-secret")).not.toContain("fixture-secret");
+    const additionalSecretNames = [
+      ["SIGNING", "_KEY"].join(""),
+      ["ENCRYPTION", "_KEY"].join(""),
+      ["DATABASE", "_URL"].join(""),
+      ["MONGO", "_URI"].join(""),
+    ];
+    for (const name of additionalSecretNames) {
+      expect(redactSensitiveText(`${name}=fixture-secret`)).not.toContain("fixture-secret");
+    }
     expect(redactSensitiveText('{"bearer": "json-bearer-secret", "basic": "json-basic-secret"}')).not.toMatch(/json-bearer-secret|json-basic-secret/);
     expect(redactSensitiveText("token={\n  \"value\": \"fixture-secret\"")).not.toContain("fixture-secret");
     const mixedSecrets = ["passphrase", "=", "fixture-secret", " pwd ", "fixture-secret"].join("");
@@ -684,6 +693,19 @@ esac
       const output = join(root, "snapshot.md");
       expect(await snapshotMain(["--no-local", "--no-remote", "--out", output])).toBe(0);
       expect(await readdir(tempRoot)).not.toContain(".dst-snapshot-tmp-stale");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("recovers an ownerless empty snapshot temp root after interruption", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-temp-root-recovery-"));
+    try {
+      const tempRoot = join(root, ".agent-toolkit-dst-snapshot-tmp");
+      await mkdir(tempRoot, { mode: 0o700 });
+      const output = join(root, "snapshot.md");
+      expect(await snapshotMain(["--no-local", "--no-remote", "--out", output])).toBe(0);
+      expect(await readFile(join(tempRoot, ".owner"), "utf8")).toBe("agent-toolkit-dst-snapshot-v1\n");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

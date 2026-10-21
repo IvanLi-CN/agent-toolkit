@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { constants } from "node:fs";
-import { lstat, mkdtemp, open, opendir, readFile, rename, rm, unlink } from "node:fs/promises";
+import { lstat, mkdtemp, open, opendir, rename, rm, unlink, type FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { deflateSync } from "node:zlib";
 import { basename, dirname, join, resolve } from "node:path";
@@ -16,6 +16,39 @@ const TEMP_DIRECTORY_PREFIX = ".fb-to-png-tmp-";
 const TEMP_OWNER_MARKER = "agent-toolkit-fb-to-png-v1\n";
 const MAX_TEMP_DIRECTORY_SCAN_ENTRIES = 128;
 const TEMP_DIRECTORY_STALE_MS = 15 * 60 * 1000;
+
+async function hasOwnedMarker(path: string): Promise<boolean> {
+  let metadata;
+  try {
+    metadata = await lstat(path);
+  } catch {
+    return false;
+  }
+  if (!metadata.isFile() || metadata.isSymbolicLink()) return false;
+  if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) return false;
+  const noFollow = constants.O_NOFOLLOW;
+  if (noFollow === undefined) return false;
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(path, constants.O_RDONLY | noFollow | (constants.O_NONBLOCK ?? 0));
+    const openedMetadata = await handle.stat();
+    if (!openedMetadata.isFile()) return false;
+    const expected = new TextEncoder().encode(TEMP_OWNER_MARKER);
+    const buffer = new Uint8Array(expected.byteLength + 1);
+    let offset = 0;
+    while (offset < buffer.byteLength) {
+      const result = await handle.read(buffer, offset, buffer.byteLength - offset, null);
+      if (result.bytesRead === 0) break;
+      offset += result.bytesRead;
+    }
+    if (offset !== expected.byteLength) return false;
+    return expected.every((value, index) => buffer[index] === value);
+  } catch {
+    return false;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
 
 function validateDimensions(width: number, height: number): void {
   if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0) {
@@ -365,7 +398,7 @@ async function cleanupStaleTemporaryDirectories(parent: string): Promise<void> {
       try {
         const metadata = await lstat(temporaryDirectory);
         if (!metadata.isDirectory() || metadata.isSymbolicLink() || Date.now() - metadata.mtimeMs < TEMP_DIRECTORY_STALE_MS) continue;
-        if ((await readFile(join(temporaryDirectory, ".owner"), "utf8")) !== TEMP_OWNER_MARKER) continue;
+        if (!await hasOwnedMarker(join(temporaryDirectory, ".owner"))) continue;
         await rm(temporaryDirectory, { recursive: true, force: true, maxRetries: 0 });
       } catch {
         // Preserve an unexpected or concurrently changing directory.
@@ -389,7 +422,7 @@ async function writePngAtomically(outputPath: string, data: Uint8Array): Promise
     } finally {
       await owner.close();
     }
-    const handle = await open(temporaryPath, "w", 0o600);
+    const handle = await open(temporaryPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
     try {
       await handle.writeFile(data);
       await handle.sync();
@@ -433,11 +466,12 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     };
     const data = await readFramebufferInput(resolve(expandUser(parsed.input)), inputBounds(parsed.format, options));
     const converted = convertFramebuffer(data, parsed.format, options);
+    const displayOutput = parsed.output;
     const outputPath = resolve(expandUser(parsed.output));
     const parentStat = await lstat(dirname(outputPath));
     if (!parentStat.isDirectory()) throw new CliError("--out parent must be a directory");
     await writePngAtomically(outputPath, encodePng(parsed.width, parsed.height, converted.mode, converted.rows));
-    console.log(`[OK] Wrote: ${outputPath}`);
+    console.log("[OK] Wrote: " + displayOutput);
     return 0;
   } catch (error) {
     console.error(`error: ${error instanceof Error ? error.message : String(error)}`);

@@ -41,27 +41,70 @@ my ($source, $destination, $limit) = @ARGV;
 my $flags = Fcntl::O_RDONLY() | Fcntl::O_NONBLOCK();
 my $nofollow = eval { Fcntl::O_NOFOLLOW() };
 $flags |= $nofollow if defined $nofollow;
+exit 9 unless defined $nofollow;
 sysopen(my $input, $source, $flags) or exit 10;
 my @metadata = stat($input);
 exit 11 unless @metadata && (($metadata[2] & 0170000) == 0100000);
-open(my $output, '>', $destination) or exit 12;
+sysopen(my $output, $destination, Fcntl::O_WRONLY() | Fcntl::O_CREAT() | Fcntl::O_EXCL() | $nofollow, 0600) or exit 12;
+my @output_metadata = stat($output);
+exit 13 unless @output_metadata && (($output_metadata[2] & 0170000) == 0100000);
 binmode($input);
 binmode($output);
 my $remaining = 0 + $limit;
 while ($remaining > 0) {
   my $bytes = sysread($input, my $buffer, $remaining);
   if (!defined $bytes) {
-    exit 13 if $!{EAGAIN} || $!{EWOULDBLOCK};
-    exit 14;
+    exit 14 if $!{EAGAIN} || $!{EWOULDBLOCK};
+    exit 15;
   }
   last if $bytes == 0;
-  print {$output} $buffer or exit 15;
+  my $offset = 0;
+  while ($offset < $bytes) {
+    my $written = syswrite($output, $buffer, $bytes - $offset, $offset);
+    exit 16 unless defined $written && $written > 0;
+    $offset += $written;
+  }
   $remaining -= $bytes;
 }
-close($output) or exit 16;
-close($input) or exit 17;
+close($output) or exit 17;
+close($input) or exit 18;
 exit 0;
 PERL
+}
+
+write_stream_to_new_regular_file() {
+  local destination="$1"
+  local limit="$2"
+  if ! command -v perl >/dev/null 2>&1; then
+    printf 'PERL_REQUIRED_FOR_SAFE_FILE_WRITE\n' >&2
+    return 1
+  fi
+  perl -MFcntl -e '
+my ($destination, $limit) = @ARGV;
+my $nofollow = eval { Fcntl::O_NOFOLLOW() };
+exit 20 unless defined $nofollow;
+my $flags = Fcntl::O_WRONLY() | Fcntl::O_CREAT() | Fcntl::O_EXCL() | $nofollow;
+sysopen(my $output, $destination, $flags, 0600) or exit 21;
+my @metadata = stat($output);
+exit 22 unless @metadata && (($metadata[2] & 0170000) == 0100000);
+my $remaining = 0 + $limit;
+while (1) {
+  my $request = $remaining < 65536 ? $remaining + 1 : 65536;
+  my $bytes = sysread(STDIN, my $buffer, $request);
+  exit 23 unless defined $bytes;
+  last if $bytes == 0;
+  exit 24 if $bytes > $remaining;
+  my $offset = 0;
+  while ($offset < $bytes) {
+    my $written = syswrite($output, $buffer, $bytes - $offset, $offset);
+    exit 25 unless defined $written && $written > 0;
+    $offset += $written;
+  }
+  $remaining -= $bytes;
+}
+close($output) or exit 26;
+exit 0;
+' "$destination" "$limit"
 }
 
 klei_base="$HOME/.klei"
@@ -104,10 +147,11 @@ if (( size > max_bytes )); then
   printf 'modoverrides.lua exceeds %s bytes\n' "$max_bytes" >&2
   exit 1
 fi
-temporary="$(mktemp)"
-verification="$(mktemp)"
-projection="$(mktemp)"
-trap 'rm -f "$temporary" "$verification" "$projection"' EXIT
+temporary_dir="$(mktemp -d)"
+temporary="$temporary_dir/input"
+verification="$temporary_dir/verification"
+projection="$temporary_dir/projection"
+trap 'rm -rf "$temporary_dir"' EXIT
 if ! read_bounded_regular_file "$file" "$temporary" $((max_bytes + 1)); then
   printf 'cannot safely read modoverrides.lua\n' >&2
   exit 1
@@ -135,9 +179,7 @@ if (( actual != size || verification_size != size )) || [[ "$file_after_stat" !=
   exit 1
 fi
 
-# Project the Lua table down to Workshop IDs and top-level enabled booleans.
-# The remote boundary never emits configuration values or arbitrary source text.
-awk '
+if ! awk '
 function mask_lua(value, output, position, character, next_character, quote, escaped, comment, quote_start, literal) {
   output = ""
   escaped = 0
@@ -262,7 +304,10 @@ function process_outside(value, enabled) {
   process_outside(masked_line)
 }
 END { flush_record() }
-' "$temporary" >"$projection"
+' "$temporary" | write_stream_to_new_regular_file "$projection" "$max_bytes"; then
+  printf 'cannot safely write projected modoverrides data\n' >&2
+  exit 1
+fi
 projected_size="$(wc -c < "$projection")"
 projected_size="${projected_size//[[:space:]]/}"
 printf 'PRESENT %s\n' "$projected_size"

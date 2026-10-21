@@ -557,11 +557,16 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
       },
     ) as Bun.Subprocess<"pipe", "pipe", "pipe">;
     const wrapperExited = child.exited;
+    let cleanupAckPromise: Promise<boolean> | undefined;
+    const waitForCleanupAcknowledged = (): Promise<boolean> => {
+      cleanupAckPromise ??= waitForCleanupAck(cleanupAckPath, wrapperExited);
+      return cleanupAckPromise;
+    };
     const supervised: SupervisedChild = {
       child,
       exited: waitForTarget(statusPath, wrapperExited),
       wrapperExited,
-      waitForCleanupAcknowledged: () => waitForCleanupAck(cleanupAckPath, wrapperExited),
+      waitForCleanupAcknowledged,
       cleanup: async () => {
         await rm(directory, { recursive: true, force: true });
         await removeCleanupAck(cleanupAckPath);
@@ -571,13 +576,14 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
     const ready = await waitForReady(readyPath, wrapperExited);
     if (!ready) {
       try { child.kill("SIGTERM"); } catch { /* The wrapper may already be gone. */ }
-      const cleanupReady = await waitForCleanupAck(cleanupAckPath, wrapperExited);
+      const cleanupReady = await waitForCleanupAcknowledged();
       if (!cleanupReady) {
         try { child.kill("SIGKILL"); } catch { /* The wrapper may already be gone. */ }
       }
       await wrapperExited;
       throw new Error("supervisor_not_ready");
     }
+    waitForCleanupAcknowledged();
     return supervised;
   } catch (error) {
     await rm(directory, { recursive: true, force: true });

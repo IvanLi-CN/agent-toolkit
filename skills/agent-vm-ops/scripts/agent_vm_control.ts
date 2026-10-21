@@ -1456,7 +1456,9 @@ function safeProcessSignal(pid: number, expectedIdentity: string | undefined, si
     if (!processExists(pid)) return { sent: false, error: null };
     if (!expectedIdentity) return { sent: false, error: "process_identity_unverified" };
     const current = processStartIdentity(pid);
-    if (!current) return { sent: false, error: "process_identity_unverified" };
+    if (!current) return processExists(pid)
+      ? { sent: false, error: "process_identity_unverified" }
+      : { sent: false, error: null };
     if (current !== expectedIdentity) return { sent: false, error: "process_identity_mismatch" };
     if (group) {
       if (targetPgid === undefined) return { sent: false, error: "process_group_identity_unverified" };

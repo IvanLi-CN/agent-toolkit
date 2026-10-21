@@ -2,7 +2,7 @@
 
 import { constants, type Dirent } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { lstat, mkdtemp, open, opendir, realpath, rename, rm, unlink } from "node:fs/promises";
+import { lstat, mkdtemp, open, opendir, realpath, rename, rm, unlink, type FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawnSupervised, type SupervisedChild } from "./process_supervisor.ts";
@@ -54,6 +54,10 @@ export const LOCAL_COMMAND_TIMEOUT_MS = 5_000;
 export const MAX_LOCAL_DIRECTORY_ENTRIES = 4_096;
 export const MAX_LOCAL_CLUSTER_PATHS = 4_096;
 export const MAX_LOCAL_CLUSTER_SCAN_ENTRIES = 4_096;
+const SUPERVISOR_STOP_GRACE_MS = 250;
+const SNAPSHOT_TEMP_PREFIX = ".dst-snapshot-tmp-";
+const SNAPSHOT_TEMP_STALE_MS = 15 * 60 * 1000;
+const MAX_SNAPSHOT_TEMP_SCAN_ENTRIES = 128;
 
 async function readBounded(
   stream: ReadableStream<Uint8Array>,
@@ -173,9 +177,9 @@ async function runWithStdin(
     if (timeout !== undefined) clearTimeout(timeout);
     if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
     requestStop();
-    await Promise.race([supervised.wrapperExited.then(() => undefined, () => undefined), new Promise<void>((resolve) => setTimeout(resolve, 1_000))]);
+    await Promise.race([supervised.wrapperExited.then(() => undefined, () => undefined), new Promise<void>((resolve) => setTimeout(resolve, SUPERVISOR_STOP_GRACE_MS))]);
     killProcessTree(supervised, "SIGKILL");
-    await Promise.race([supervised.wrapperExited.then(() => undefined, () => undefined), new Promise<void>((resolve) => setTimeout(resolve, 1_000))]);
+    await Promise.race([supervised.wrapperExited.then(() => undefined, () => undefined), new Promise<void>((resolve) => setTimeout(resolve, SUPERVISOR_STOP_GRACE_MS))]);
     if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
     await supervised.cleanup();
   }
@@ -220,6 +224,7 @@ const SENSITIVE_QUOTED_ASSIGNMENT = new RegExp(
 const SENSITIVE_BARE_VALUE = new RegExp(`\\b(${SENSITIVE_NAME})\\s+(?![A-Za-z0-9_.-]+\\s*[:=]|\\[REDACTED\\])([^,;\\r\\n]+?)(?=(?:\\s+(?:via|and)\\s+)|[,;\\r\\n]|$)`, "gi");
 const UNREDACTED_SENSITIVE_ASSIGNMENT = new RegExp(`(?:\\b${SENSITIVE_NAME}|${SENSITIVE_KEY})\\s*[:=](?!\\s*\\[REDACTED\\])`, "i");
 const AUTHORIZATION_TOKEN = /\b(Bearer|Basic)(?:\s*[:=])?\s*([^\s,;]+)/gi;
+const JSON_AUTHORIZATION_ASSIGNMENT = /(["'])(Bearer|Basic)\1\s*:\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^,}\r\n]+)/gi;
 const BRACKETED_SENSITIVE_ASSIGNMENT = new RegExp(`(\\[[^\\]\\r\\n]*${SENSITIVE_NAME}[^\\]\\r\\n]*\\]\\s*[:=]\\s*)(?!\\s*\\[REDACTED\\])([^\\r\\n]+)`, "gi");
 const ENCODED_SENSITIVE_ASSIGNMENT = new RegExp(`(\\b[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*\\s*%3[dD]\\s*)(?!\\s*\\[REDACTED\\])([^\\r\\n]+)`, "gi");
 const SENSITIVE_BLOCK_HEADER = new RegExp(`^([ \\t]*${SENSITIVE_KEY_TOKEN}\\s*[:=]\\s*[|>][-+0-9]*)\\s*$`, "i");
@@ -343,6 +348,7 @@ export function redactSensitiveText(text: string): string {
   const redacted = redactSensitiveCollections(redactSensitiveBlocks(redactSensitiveContinuations(normalized)))
     .replace(SENSITIVE_MULTILINE_ASSIGNMENT, "$1[REDACTED]")
     .replace(PRIVATE_KEY_BLOCK, "[REDACTED]")
+    .replace(JSON_AUTHORIZATION_ASSIGNMENT, "$1$2$1: [REDACTED]")
     .replace(AUTHORIZATION_TOKEN, "$1 [REDACTED]")
     .replace(BRACKETED_SENSITIVE_ASSIGNMENT, "$1[REDACTED]")
     .replace(ENCODED_SENSITIVE_ASSIGNMENT, "$1[REDACTED]")
@@ -395,12 +401,36 @@ async function containedPath(root: string, candidate: string): Promise<string | 
 export async function safeTail(file: string, lines: number, allowedRoot?: string): Promise<string> {
   if (lines <= 0) return "";
   try {
-    const safeFile = allowedRoot === undefined ? file : await containedPath(allowedRoot, file);
-    if (safeFile === undefined) return "";
-    const handle = await open(safeFile, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const noFollow = constants.O_NOFOLLOW ?? 0;
+    const nonBlocking = constants.O_NONBLOCK ?? 0;
+    let safeFile = file;
+    let rootIdentity: { dev: number; ino: number } | undefined;
+    let fileIdentity: { dev: number; ino: number } | undefined;
+    if (allowedRoot !== undefined) {
+      const safeRoot = await realpath(allowedRoot);
+      const rootMetadata = await lstat(safeRoot);
+      if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink()) return "";
+      const relativeFile = relative(safeRoot, file);
+      if (relativeFile === "" || relativeFile.startsWith("..") || isAbsolute(relativeFile) || relativeFile.includes("/") || relativeFile.includes("\\")) return "";
+      rootIdentity = { dev: rootMetadata.dev, ino: rootMetadata.ino };
+      safeFile = join(safeRoot, relativeFile);
+      const fileMetadata = await lstat(safeFile);
+      if (!fileMetadata.isFile() || fileMetadata.isSymbolicLink()) return "";
+      fileIdentity = { dev: fileMetadata.dev, ino: fileMetadata.ino };
+    } else {
+      const metadata = await lstat(file);
+      if (!metadata.isFile() || metadata.isSymbolicLink()) return "";
+    }
+    let handle: FileHandle | undefined;
     try {
+      handle = await open(safeFile, constants.O_RDONLY | nonBlocking | noFollow);
       const metadata = await handle.stat();
       if (!metadata.isFile()) return "";
+      if (fileIdentity !== undefined && (metadata.dev !== fileIdentity.dev || metadata.ino !== fileIdentity.ino)) return "";
+      if (rootIdentity !== undefined) {
+        const currentRoot = await lstat(dirname(safeFile));
+        if (!currentRoot.isDirectory() || currentRoot.isSymbolicLink() || currentRoot.dev !== rootIdentity.dev || currentRoot.ino !== rootIdentity.ino) return "";
+      }
       const bytesToRead = Math.min(metadata.size, 256 * 1024);
       const buffer = new Uint8Array(bytesToRead);
       const result = await handle.read(buffer, 0, bytesToRead, metadata.size - bytesToRead);
@@ -423,7 +453,7 @@ export async function safeTail(file: string, lines: number, allowedRoot?: string
       const completeText = partialLine ? text.slice(firstLineEnd + 1) : text;
       return redactSensitiveText(completeText.split(/\r?\n/).slice(-lines).join("\n"));
     } finally {
-      await handle.close();
+      await handle?.close();
     }
   } catch {
     return "";
@@ -458,6 +488,34 @@ async function boundedDirectoryEntries(path: string, limit = MAX_LOCAL_DIRECTORY
     await directory.close().catch(() => undefined);
   }
   return { entries, truncated };
+}
+
+async function cleanupSnapshotTemporaryDirectories(parent: string): Promise<void> {
+  let directory;
+  try {
+    directory = await opendir(parent);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  try {
+    let scanned = 0;
+    for await (const entry of directory) {
+      if (!entry.name.startsWith(SNAPSHOT_TEMP_PREFIX) || !entry.isDirectory() || entry.isSymbolicLink()) continue;
+      scanned += 1;
+      if (scanned > MAX_SNAPSHOT_TEMP_SCAN_ENTRIES) throw new Error(`snapshot temp directory scan exceeded ${MAX_SNAPSHOT_TEMP_SCAN_ENTRIES} entries`);
+      const path = join(parent, entry.name);
+      try {
+        const metadata = await lstat(path);
+        if (!metadata.isDirectory() || metadata.isSymbolicLink() || Date.now() - metadata.mtimeMs < SNAPSHOT_TEMP_STALE_MS) continue;
+        await rm(path, { recursive: true, force: true, maxRetries: 0 });
+      } catch {
+        // Preserve a concurrently changing directory for a later invocation.
+      }
+    }
+  } finally {
+    await directory.close().catch(() => undefined);
+  }
 }
 
 async function localCollect(options: SnapshotOptions): Promise<string> {
@@ -504,10 +562,8 @@ async function localCollect(options: SnapshotOptions): Promise<string> {
 
   const clientLog = join(localDir, "client_log.txt");
   try {
-    const safeClientLog = await containedPath(localDir, clientLog);
-    if (safeClientLog !== undefined && (await lstat(safeClientLog)).isFile()) {
-      lines.push("### client_log.txt (tail 80)", "", redactOperationalText((await safeTail(safeClientLog, 80, localDir)).trimEnd(), pathRedactions), "");
-    }
+    const clientTail = await safeTail(clientLog, 80, localDir);
+    if (clientTail.length > 0) lines.push("### client_log.txt (tail 80)", "", redactOperationalText(clientTail.trimEnd(), pathRedactions), "");
   } catch {
     // The file is optional.
   }
@@ -724,7 +780,8 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
   }
   try {
     const parent = dirname(outputPath);
-    const tempDir = await mkdtemp(join(parent, ".dst-snapshot-tmp-"));
+    await cleanupSnapshotTemporaryDirectories(parent);
+    const tempDir = await mkdtemp(join(parent, SNAPSHOT_TEMP_PREFIX));
     const tempPath = join(tempDir, basename(outputPath));
     try {
       const handle = await open(tempPath, "w", 0o600);

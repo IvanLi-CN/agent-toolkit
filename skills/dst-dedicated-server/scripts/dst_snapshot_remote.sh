@@ -17,7 +17,7 @@ if [[ -f "$OS_RELEASE_FILE" && ! -L "$OS_RELEASE_FILE" ]]; then
     case "$key" in
       ID)
         case "$value" in
-          alpine|amazon|arch|centos|debian|fedora|gentoo|kali|linuxmint|manjaro|nixos|opensuse*|oracle|raspbian|rhel|rocky|slackware|ubuntu|void)
+          alpine|amazon|arch|centos|debian|fedora|gentoo|kali|linuxmint|manjaro|nixos|opensuse|opensuse-leap|opensuse-tumbleweed|oracle|raspbian|rhel|rocky|slackware|ubuntu|void)
             printf '  - ID: %s\n' "$value"
             ;;
           *)
@@ -26,7 +26,7 @@ if [[ -f "$OS_RELEASE_FILE" && ! -L "$OS_RELEASE_FILE" ]]; then
         esac
         ;;
       VERSION_ID)
-        if [[ "$value" =~ ^[0-9]+([.][0-9]+)*$ ]]; then
+        if [[ "$value" =~ ^[0-9]{1,4}([.][0-9]{1,4}){0,3}$ ]]; then
           printf '  - VERSION_ID: %s\n' "$value"
         else
           echo '  - VERSION_ID: <redacted>'
@@ -111,13 +111,13 @@ echo "- klei_dir: <remote-home>/.klei/DoNotStarveTogether"
 echo
 
 cluster_count=0
-shopt -s nullglob
-for cluster in "$KLEI_DIR"/*; do
-  [[ -d "$cluster" && ! -L "$cluster" ]] || continue
+emit_cluster() {
+  local cluster="$1"
+  [[ -d "$cluster" && ! -L "$cluster" ]] || return 0
   ((cluster_count += 1))
   if (( cluster_count > 128 )); then
     echo "> cluster inventory truncated at 128 entries."
-    break
+    return 1
   fi
   echo "#### Cluster: <cluster>"
   if [[ -f "$cluster/cluster.ini" && ! -L "$cluster/cluster.ini" ]]; then
@@ -145,8 +145,19 @@ for cluster in "$KLEI_DIR"/*; do
     fi
   done
   echo
-done
-shopt -u nullglob
+  return 0
+}
+
+if find "$KLEI_DIR" -mindepth 1 -maxdepth 1 -type d -print0 >/dev/null 2>&1; then
+  while IFS= read -r -d '' cluster; do
+    emit_cluster "$cluster" || break
+  done < <(find "$KLEI_DIR" -mindepth 1 -maxdepth 1 -type d -print0)
+else
+  while IFS= read -r -d '' cluster; do
+    [[ "${cluster%/*}" == "$KLEI_DIR" ]] || continue
+    emit_cluster "$cluster" || break
+  done < <(find "$KLEI_DIR" -type d -print0)
+fi
 
 echo "### Server binary (best-effort)"
 echo

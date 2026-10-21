@@ -8,11 +8,26 @@ status_path="$1"
 shift
 status_dir="$(dirname -- "$status_path")"
 cleanup() { rm -rf -- "$status_dir"; }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'cleanup; exit 143' HUP INT TERM
+parent_pid="\${AGENT_TOOLKIT_SUPERVISOR_PARENT_PID:-\$PPID}"
 "$@" &
 target_pid=$!
+watch_parent() {
+  while kill -0 "$parent_pid" 2>/dev/null; do sleep 1; done
+  kill -TERM "$target_pid" 2>/dev/null || true
+  kill -TERM -- "-$target_pid" 2>/dev/null || true
+  sleep 1
+  kill -KILL "$target_pid" 2>/dev/null || true
+  kill -KILL -- "-$target_pid" 2>/dev/null || true
+  kill -TERM "$$" 2>/dev/null || true
+}
+watch_parent &
+watchdog_pid=$!
 wait "$target_pid"
 target_status=$?
+kill "$watchdog_pid" 2>/dev/null || true
+wait "$watchdog_pid" 2>/dev/null || true
 printf '%s\\n' "$target_status" > "$status_path"
 exec 0<&- 1>&- 2>&-
 sleep 5
@@ -64,7 +79,13 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
   try {
     const child = Bun.spawn(
       ["sh", "-c", SUPERVISOR_SCRIPT, "agent-toolkit-supervisor", statusPath, ...args],
-      { detached: true, stdin: "pipe", stdout: "pipe", stderr: "pipe" },
+      {
+        detached: true,
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+        env: { ...process.env, AGENT_TOOLKIT_SUPERVISOR_PARENT_PID: String(process.pid) },
+      },
     ) as Bun.Subprocess<"pipe", "pipe", "pipe">;
     const wrapperExited = child.exited;
     return {

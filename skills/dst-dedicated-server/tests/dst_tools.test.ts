@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -68,6 +68,7 @@ describe("DST local Bun tooling", () => {
     expect(redactOperationalText("api_key%3Dfixture-secret&SECRET_TAIL")).not.toContain("SECRET_TAIL");
     expect(redactSensitiveText("Cookie: sessionid=fixture-secret")).not.toContain("fixture-secret");
     expect(redactSensitiveText("Set-Cookie: session_id=fixture-secret")).not.toContain("fixture-secret");
+    expect(redactSensitiveText('{"bearer": "json-bearer-secret", "basic": "json-basic-secret"}')).not.toMatch(/json-bearer-secret|json-basic-secret/);
     expect(redactSensitiveText("token={\n  \"value\": \"fixture-secret\"")).not.toContain("fixture-secret");
     const mixedSecrets = ["passphrase", "=", "fixture-secret", " pwd ", "fixture-secret"].join("");
     expect(redactSensitiveText(mixedSecrets)).toBe("passphrase=[REDACTED] pwd [REDACTED]");
@@ -82,6 +83,19 @@ describe("DST local Bun tooling", () => {
       const tail = await safeTail(log, 80);
       expect(tail).not.toContain("fixture-secret");
       expect(tail).toContain("visible-line");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not block on a FIFO passed to safeTail", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-fifo-"));
+    try {
+      const fifo = join(root, "client_log.txt");
+      const maker = Bun.spawn(["mkfifo", fifo], { stdout: "pipe", stderr: "pipe" });
+      expect(await maker.exited).toBe(0);
+      const result = await Promise.race([safeTail(fifo, 80), Bun.sleep(500).then(() => "timed out")]);
+      expect(result).toBe("");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -155,6 +169,17 @@ describe("DST local Bun tooling", () => {
     enabled = false,
   },
 }`)).toEqual([{ id: "600", state: "false" }]);
+  });
+
+  test("ignores braces and enabled assignments inside Lua strings and comments", () => {
+    const source = `return {
+  ["workshop-401"] = { title = "}", note = "enabled = false", enabled = true }, -- enabled = false
+  ["workshop-402"] = { title = "-- not a comment", enabled = false },
+}`;
+    expect(parseModOverrides(source)).toEqual([
+      { id: "401", state: "true" },
+      { id: "402", state: "false" },
+    ]);
   });
 
   test("collects a bounded local snapshot without printing secret contents", async () => {
@@ -263,9 +288,10 @@ describe("DST local Bun tooling", () => {
       const child = Bun.spawn(["bash", join(import.meta.dir, "..", "scripts", "dst_mods_remote_collect.sh"), "fixture", "Master"], {
         env: { ...process.env, HOME: home }, stdout: "pipe", stderr: "pipe",
       });
-      const [status, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
-      expect(status).toBe(0);
-      expect(stdout).toContain("MISSING");
+      const [status, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      expect(status).toBe(1);
+      expect(stdout).toBe("");
+      expect(stderr).toContain("symlink");
       expect(stdout).not.toContain("workshop-999");
 
       const traversal = Bun.spawn(["bash", join(import.meta.dir, "..", "scripts", "dst_mods_remote_collect.sh"), "../../outside", "Master"], {
@@ -383,7 +409,7 @@ describe("DST local Bun tooling", () => {
       const privateHostname = ["prod-db", "internal"].join(".");
       const secretHost = ["secret", "host"].join("-");
       await mkdir(home, { recursive: true });
-      await writeFile(osRelease, `NAME=${privateHostname}\nID=${privateHostname}\nVERSION_ID=release-${privateHostname}\nBUILD_HOST=${secretHost}\n`);
+      await writeFile(osRelease, `NAME=${privateHostname}\nID=opensuse-${secretHost}\nVERSION_ID=1.2.3.4.5\nBUILD_HOST=${secretHost}\n`);
       const child = Bun.spawn(["bash", join(import.meta.dir, "..", "scripts", "dst_snapshot_remote.sh")], {
         env: { ...process.env, HOME: home, AGENT_TOOLKIT_DST_OS_RELEASE_FILE: osRelease }, stdout: "pipe", stderr: "pipe",
       });
@@ -633,6 +659,21 @@ esac
       const report = await readFile(output, "utf8");
       expect(report).toContain("# DST snapshot");
       expect((await readdir(root)).filter((entry) => entry.startsWith(".dst-snapshot-tmp-")).length).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("cleans stale snapshot temp directories on the next publish", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-temp-cleanup-"));
+    try {
+      const stale = join(root, ".dst-snapshot-tmp-stale");
+      await mkdir(stale);
+      const old = new Date(Date.now() - 20 * 60 * 1000);
+      await utimes(stale, old, old);
+      const output = join(root, "snapshot.md");
+      expect(await snapshotMain(["--no-local", "--no-remote", "--out", output])).toBe(0);
+      expect(await readdir(root)).not.toContain(".dst-snapshot-tmp-stale");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

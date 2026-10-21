@@ -439,12 +439,29 @@ describe("buzzer MIDI and WAV helper", () => {
     try {
       const input = join(root, "fixture.json");
       const output = join(root, "out");
-      const tombstone = join(output, ".buzzer-preview-delete-stale");
+      const tombstone = join(output, ".buzzer-preview-delete-00000000-0000-4000-8000-000000000002");
       await mkdir(tombstone, { recursive: true });
+      await writeFile(join(tombstone, "owner"), await fixtureOwnerRecord("00000000-0000-4000-8000-000000000002"));
       await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
       expect(await main(["--in", input, "--out-dir", output])).toBe(0);
-      expect(await readdir(output)).not.toContain(".buzzer-preview-delete-stale");
+      expect(await readdir(output)).not.toContain(".buzzer-preview-delete-00000000-0000-4000-8000-000000000002");
       expect(await readdir(output)).toContain("fixture.mid");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves a colliding deletion tombstone without a valid owner proof", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-delete-collision-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      const tombstone = join(output, ".buzzer-preview-delete-00000000-0000-4000-8000-000000000003");
+      await mkdir(tombstone, { recursive: true });
+      await writeFile(join(tombstone, "owner"), "not-a-valid-owner\n");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      expect(await main(["--in", input, "--out-dir", output])).toBe(0);
+      expect(await readdir(output)).toContain(".buzzer-preview-delete-00000000-0000-4000-8000-000000000003");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

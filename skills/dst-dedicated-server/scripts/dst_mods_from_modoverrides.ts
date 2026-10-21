@@ -5,6 +5,7 @@ import { REMOTE_COMMAND_TIMEOUT_MS, redactOperationalText, validateSshToken } fr
 import { spawnSupervised, type SupervisedChild } from "./process_supervisor.ts";
 
 export const MAX_MOD_OVERRIDE_BYTES = 1024 * 1024;
+const SUPERVISOR_STOP_GRACE_MS = 250;
 
 export type ModState = "true" | "false" | "unknown";
 
@@ -38,16 +39,52 @@ function formatCliError(error: unknown): string {
   return message.startsWith("error:") ? message : `error: ${message}`;
 }
 
+function maskLuaSyntax(line: string): string {
+  const output = line.split("");
+  let quote: '"' | "'" | undefined;
+  let quoteStart = -1;
+  let escaped = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index]!;
+    const next = line[index + 1];
+    if (quote !== undefined) {
+      output[index] = " ";
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) {
+        const literal = line.slice(quoteStart, index + 1);
+        if (/^"workshop-\d+"$/.test(literal) && line[quoteStart - 1] === "[" && line[index + 1] === "]") {
+          for (let literalIndex = quoteStart; literalIndex <= index; literalIndex += 1) output[literalIndex] = line[literalIndex]!;
+        }
+        quote = undefined;
+        quoteStart = -1;
+      }
+      continue;
+    }
+    if (character === "-" && next === "-") {
+      for (let comment = index; comment < line.length; comment += 1) output[comment] = " ";
+      break;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      quoteStart = index;
+      output[index] = " ";
+    }
+  }
+  return output.join("");
+}
+
 function isRecordStart(line: string): RegExpExecArray | null {
   return /\["workshop-(\d+)"\]/.exec(line);
 }
 
 function stripConfigurationSegment(line: string, start: number, initialDepth: number): { outside: string; depth: number } {
+  const masked = maskLuaSyntax(line);
   let depth = initialDepth;
   let opened = initialDepth > 0;
   let end = -1;
-  for (let index = start; index < line.length; index += 1) {
-    const character = line[index];
+  for (let index = start; index < masked.length; index += 1) {
+    const character = masked[index];
     if (character === "{") {
       depth += 1;
       opened = true;
@@ -59,7 +96,7 @@ function stripConfigurationSegment(line: string, start: number, initialDepth: nu
       }
     }
   }
-  return { outside: end >= 0 ? `${line.slice(0, start)}${line.slice(end + 1)}` : line.slice(0, start), depth };
+  return { outside: end >= 0 ? `${masked.slice(0, start)}${masked.slice(end + 1)}` : masked.slice(0, start), depth };
 }
 
 export class ModOverrideParser {
@@ -76,16 +113,17 @@ export class ModOverrideParser {
   }
 
   private consumeLine(line: string): void {
-    let outsideLine = line;
+    const maskedLine = maskLuaSyntax(line);
+    let outsideLine = maskedLine;
     if (this.inConfig) {
-      const segment = stripConfigurationSegment(line, 0, this.configDepth);
+      const segment = stripConfigurationSegment(maskedLine, 0, this.configDepth);
       this.configDepth = segment.depth;
       this.inConfig = this.configDepth > 0;
       outsideLine = segment.outside;
     } else if (this.pendingConfig) {
-      const openingBrace = line.indexOf("{");
+      const openingBrace = maskedLine.indexOf("{");
       if (openingBrace >= 0) {
-        const segment = stripConfigurationSegment(line, openingBrace, 0);
+        const segment = stripConfigurationSegment(maskedLine, openingBrace, 0);
         this.configDepth = segment.depth;
         this.inConfig = this.configDepth > 0;
         this.pendingConfig = false;
@@ -94,12 +132,12 @@ export class ModOverrideParser {
         outsideLine = "";
       }
     } else {
-      const marker = line.indexOf("configuration_options");
+      const marker = maskedLine.indexOf("configuration_options");
       if (marker >= 0) {
-        const segment = stripConfigurationSegment(line, marker, 0);
+        const segment = stripConfigurationSegment(maskedLine, marker, 0);
         this.configDepth = segment.depth;
         this.inConfig = this.configDepth > 0;
-        this.pendingConfig = !this.inConfig && line.slice(marker).indexOf("{") < 0;
+        this.pendingConfig = !this.inConfig && maskedLine.slice(marker).indexOf("{") < 0;
         outsideLine = segment.outside;
       }
     }
@@ -115,8 +153,8 @@ export class ModOverrideParser {
     }
     if (this.current === undefined) return;
 
-    if (this.state === "unknown" && !this.inConfig && /enabled\s*=\s*true/.test(outsideLine)) this.state = "true";
-    if (this.state === "unknown" && !this.inConfig && /enabled\s*=\s*false/.test(outsideLine)) this.state = "false";
+    if (this.state === "unknown" && !this.inConfig && /\benabled\s*=\s*true\b/.test(outsideLine)) this.state = "true";
+    if (this.state === "unknown" && !this.inConfig && /\benabled\s*=\s*false\b/.test(outsideLine)) this.state = "false";
   }
 
   consume(text: string): void {
@@ -213,9 +251,9 @@ function killProcessTree(supervised: SupervisedChild, signal: "SIGTERM" | "SIGKI
 async function terminateAndReap(supervised: SupervisedChild): Promise<void> {
   const observedExit = supervised.wrapperExited;
   killProcessTree(supervised, "SIGTERM");
-  await Promise.race([observedExit, new Promise<void>((resolve) => setTimeout(resolve, 1_000))]);
+  await Promise.race([observedExit, new Promise<void>((resolve) => setTimeout(resolve, SUPERVISOR_STOP_GRACE_MS))]);
   killProcessTree(supervised, "SIGKILL");
-  await Promise.race([observedExit, new Promise<void>((resolve) => setTimeout(resolve, 1_000))]);
+  await Promise.race([observedExit, new Promise<void>((resolve) => setTimeout(resolve, SUPERVISOR_STOP_GRACE_MS))]);
   await supervised.cleanup();
 }
 

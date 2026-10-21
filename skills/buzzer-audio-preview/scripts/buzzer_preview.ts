@@ -548,6 +548,7 @@ const TRANSACTION_ENTRY_NAMES = new Set([
 ]);
 const LOCK_ENTRY_NAMES = new Set(["pid", "owner", "identity", "heartbeat", "ready"]);
 const DELETE_TOMBSTONE_ENTRY_NAMES = new Set([...TRANSACTION_ENTRY_NAMES, ...LOCK_ENTRY_NAMES]);
+const DELETE_TOMBSTONE_NAME = /^\.buzzer-preview-delete-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const OWNER_NONCE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const OWNER_RECORD_PATTERN = /^([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.([0-9a-f]{64})$/i;
 const OWNER_KEY_FILE_ENV = "BUZZER_PREVIEW_OWNER_KEY_FILE";
@@ -776,21 +777,29 @@ async function removeTransactionDirectory(directory: string): Promise<void> {
   await syncDirectory(dirname(directory));
 }
 
-async function cleanupDeleteTombstones(outDir: string): Promise<void> {
+async function cleanupDeleteTombstones(outDir: string, startingScan = 0): Promise<number> {
   let directory;
   try {
     directory = await opendir(outDir);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return startingScan;
     throw error;
   }
+  let scanned = startingScan;
   try {
     for await (const entry of directory) {
+      if (scanned >= MAX_RECOVERY_SCAN_ENTRIES) throw new Error(`publication recovery scan exceeded ${MAX_RECOVERY_SCAN_ENTRIES} entries in ${outDir}`);
+      scanned += 1;
       if (!entry.isDirectory() || entry.isSymbolicLink() || !entry.name.startsWith(DELETE_TOMBSTONE_PREFIX)) continue;
+      if (!DELETE_TOMBSTONE_NAME.test(entry.name)) continue;
       const tombstone = join(outDir, entry.name);
       try {
         const listing = await readDirectoryEntriesBounded(tombstone, DELETE_TOMBSTONE_ENTRY_NAMES.size + 1);
         if (listing.truncated || listing.entries.some((candidate) => candidate.isDirectory() || !DELETE_TOMBSTONE_ENTRY_NAMES.has(candidate.name))) continue;
+        const ownerEntry = listing.entries.find((candidate) => candidate.name === ".owner" || candidate.name === "owner");
+        if (ownerEntry === undefined) continue;
+        const owner = new TextDecoder().decode(await readRegularFile(join(tombstone, ownerEntry.name), 256)).trim();
+        if (!await hasValidOwnerRecord(owner)) continue;
         await rm(tombstone, { recursive: true, force: true, maxRetries: 0 });
       } catch {
         // Preserve an unexpected or concurrently changing tombstone for a later retry.
@@ -800,6 +809,52 @@ async function cleanupDeleteTombstones(outDir: string): Promise<void> {
     await directory.close().catch(() => undefined);
   }
   await syncDirectory(outDir);
+  return scanned;
+}
+
+async function cleanupAbandonedStaging(outDir: string, stem: string, startingScan = 0): Promise<number> {
+  let directory;
+  try {
+    directory = await opendir(outDir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return startingScan;
+    throw error;
+  }
+  const lockPrefix = `${LOCK_TEMPORARY_PREFIX}${stem}-`;
+  const transactionPrefix = `.buzzer-preview-txn-${stem}-`;
+  let scanned = startingScan;
+  try {
+    for await (const entry of directory) {
+      if (scanned >= MAX_RECOVERY_SCAN_ENTRIES) throw new Error(`publication recovery scan exceeded ${MAX_RECOVERY_SCAN_ENTRIES} entries in ${outDir}`);
+      scanned += 1;
+      if (!entry.isDirectory() || entry.isSymbolicLink() || (!entry.name.startsWith(lockPrefix) && !entry.name.startsWith(transactionPrefix))) continue;
+      const path = join(outDir, entry.name);
+      try {
+        const metadata = await lstat(path);
+        if (!metadata.isDirectory() || metadata.isSymbolicLink() || Date.now() - metadata.mtimeMs < LOCK_STALE_MS) continue;
+        const allowedNames = entry.name.startsWith(lockPrefix) ? LOCK_ENTRY_NAMES : TRANSACTION_ENTRY_NAMES;
+        const listing = await readDirectoryEntriesBounded(path, allowedNames.size + 1);
+        if (listing.truncated || listing.entries.some((candidate) => candidate.isDirectory() || candidate.isSymbolicLink() || !allowedNames.has(candidate.name))) continue;
+        if (listing.entries.length === 0) {
+          await rm(path, { recursive: true, force: true, maxRetries: 0 });
+          continue;
+        }
+        if (entry.name.startsWith(lockPrefix)) {
+          const owner = new TextDecoder().decode(await readRegularFile(join(path, "owner"), 256)).trim();
+          const pid = Number(new TextDecoder().decode(await readRegularFile(join(path, "pid"), 128)).trim());
+          if (await hasValidOwnerRecord(owner) && Number.isSafeInteger(pid) && pid > 0 && !await isProcessAlive(pid)) await removeLockDirectory(path);
+          continue;
+        }
+        if (await hasValidTransactionOwner(path) && await readPublishState(path) === undefined && !await hasRecoveryArtifacts(path)) await removeTransactionDirectory(path);
+      } catch {
+        // Preserve an unexpected or concurrently changing staging directory.
+      }
+    }
+  } finally {
+    await directory.close().catch(() => undefined);
+  }
+  await syncDirectory(outDir);
+  return scanned;
 }
 
 async function writePublishState(directory: string, state: PublishState): Promise<void> {
@@ -929,14 +984,14 @@ async function restoreTransaction(directory: string, midiPath: string, wavPath: 
 }
 
 async function recoverPublishTransactions(outDir: string, stem: string, midiPath: string, wavPath: string): Promise<void> {
-  await cleanupDeleteTombstones(outDir);
+  let scanned = await cleanupDeleteTombstones(outDir);
+  scanned = await cleanupAbandonedStaging(outDir, stem, scanned);
   const transactionPrefix = `.buzzer-preview-txn-${stem}-`;
   const recoveryPrefix = `.buzzer-preview-recovery-${stem}-`;
   const candidates: Dirent[] = [];
   try {
     const directory = await opendir(outDir);
     try {
-      let scanned = 0;
       for await (const entry of directory) {
         if (scanned >= MAX_RECOVERY_SCAN_ENTRIES) throw new Error(`publication transaction scan exceeded ${MAX_RECOVERY_SCAN_ENTRIES} entries in ${outDir}`);
         scanned += 1;
@@ -1100,7 +1155,8 @@ async function refreshLockHeartbeat(path: string): Promise<void> {
 
 async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner = false): Promise<() => Promise<void>> {
   const lockDirectory = join(outDir, `.buzzer-preview-${stem}.lock`);
-  await cleanupDeleteTombstones(outDir);
+  const scanned = await cleanupDeleteTombstones(outDir);
+  await cleanupAbandonedStaging(outDir, stem, scanned);
   for (let attempt = 0; attempt < 2; attempt += 1) {
     let temporaryDirectory: string | undefined;
     try {

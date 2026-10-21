@@ -243,7 +243,8 @@ stop_watchdog() {
     wait "$watchdog_pid" 2>/dev/null || true
   fi
 }
-trap 'signal_tree TERM; signal_tree KILL; stop_anchor; stop_watchdog; cleanup; exit 143' HUP INT TERM
+hold_pid=""
+trap 'if [ -n "$hold_pid" ]; then kill "$hold_pid" 2>/dev/null || true; fi; signal_tree TERM; signal_tree KILL; stop_anchor; stop_watchdog; cleanup; exit 143' HUP INT TERM
 parent_is_alive() {
   if [ "$parent_identity_mode" = "proc" ] && [ -r "/proc/$parent_pid/stat" ]; then
     parent_identity="$(awk '{ sub(/.*\\) /, ""); print $1 " " $20 }' "/proc/$parent_pid/stat" 2>/dev/null || true)"
@@ -314,6 +315,12 @@ if ! parent_is_alive; then
 fi
 printf '%s\\n' "$target_status" > "$status_path"
 exec 0<&- 1>&- 2>&-
+hold_seconds=5
+if [ -d "/proc/$$/fd" ]; then hold_seconds=0.25; fi
+sleep "$hold_seconds" &
+hold_pid="$!"
+wait "$hold_pid" 2>/dev/null || true
+hold_pid=""
 signal_tree TERM
 sleep 0.25
 signal_tree KILL

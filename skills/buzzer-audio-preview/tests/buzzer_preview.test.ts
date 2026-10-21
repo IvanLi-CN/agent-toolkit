@@ -351,6 +351,31 @@ describe("buzzer MIDI and WAV helper", () => {
     }
   });
 
+  test("reclaims an aged lock when process identity is unavailable", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-identityless-lock-"));
+    try {
+      const output = join(root, "out");
+      const lock = join(output, ".buzzer-preview-fixture.lock");
+      const heartbeat = join(lock, "heartbeat");
+      await mkdir(output, { recursive: true });
+      await writeFile(join(output, "fixture.mid"), "midi");
+      await writeFile(join(output, "fixture.wav"), "wav");
+      await mkdir(lock);
+      await writeFile(join(lock, "pid"), `${process.pid}\n`);
+      await writeFile(join(lock, "owner"), "identityless-owner\n");
+      await writeFile(heartbeat, `${Date.now() - 10 * 60 * 1000}\n`);
+      await writeFile(join(lock, "ready"), "");
+      const old = new Date(Date.now() - 10 * 60 * 1000);
+      await utimes(heartbeat, old, old);
+      const pair = await readPublishedPair(output, "fixture");
+      expect(pair.midi.toString()).toBe("midi");
+      expect(pair.wav.toString()).toBe("wav");
+      expect(await readdir(output)).not.toContain(".buzzer-preview-fixture.lock");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("recovers an interrupted publication before reading a pair", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-recovery-"));
     try {

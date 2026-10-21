@@ -24,6 +24,21 @@ stat_signature() {
   return 1
 }
 
+content_digest() {
+  local value
+  if command -v sha256sum >/dev/null 2>&1; then
+    value="$(sha256sum "$1" 2>/dev/null | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    value="$(shasum -a 256 "$1" 2>/dev/null | awk '{print $1}')"
+  elif command -v openssl >/dev/null 2>&1; then
+    value="$(openssl dgst -sha256 "$1" 2>/dev/null | awk -F'= ' '{print $2}')"
+  else
+    value="$(cksum "$1" 2>/dev/null | awk '{print $1 ":" $2}')"
+  fi
+  [[ -n "$value" ]] || return 1
+  printf '%s' "$value"
+}
+
 klei_base="$HOME/.klei"
 klei_root="$klei_base/DoNotStarveTogether"
 cluster_dir="$klei_root/$cluster"
@@ -50,6 +65,11 @@ if [[ -z "$file_stat" ]]; then
   printf 'MISSING\n'
   exit 0
 fi
+file_digest="$(content_digest "$file" || true)"
+if [[ -z "$file_digest" ]]; then
+  printf 'modoverrides.lua digest unavailable\n' >&2
+  exit 1
+fi
 exec 9<"$file" || { printf 'MISSING\n'; exit 0; }
 fd_stat="$(stat_signature /proc/self/fd/9 || stat_signature /dev/fd/9 || true)"
 if [[ "$fd_stat" != "$file_stat" || -L "$klei_base" || -L "$klei_root" || -L "$cluster_dir" || -L "$shard_dir" || -L "$file" ]]; then
@@ -74,7 +94,8 @@ actual="${actual//[[:space:]]/}"
 file_after_stat="$(stat_signature "$file" || true)"
 fd_after_stat="$(stat_signature /proc/self/fd/9 || stat_signature /dev/fd/9 || true)"
 exec 9<&-
-if (( actual != size )) || [[ "$file_after_stat" != "$file_stat" || "$fd_after_stat" != "$fd_stat" ]]; then
+file_after_digest="$(content_digest "$file" || true)"
+if (( actual != size )) || [[ "$file_after_stat" != "$file_stat" || "$fd_after_stat" != "$fd_stat" || -z "$file_after_digest" || "$file_after_digest" != "$file_digest" ]]; then
   printf 'modoverrides.lua changed during collection\n' >&2
   exit 1
 fi

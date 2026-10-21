@@ -2,7 +2,7 @@
 
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, rename, rm, rmdir, unlink } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, rename, rm, rmdir, unlink, utimes } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 
@@ -509,6 +509,7 @@ async function writeSyncedFile(path: string, data: Uint8Array): Promise<void> {
 }
 
 const LOCK_STALE_MS = 5 * 60 * 1000;
+const LOCK_HEARTBEAT_MS = 30 * 1000;
 type PublishState = "prepared" | "midi-backed-up" | "backups-complete" | "midi-published" | "complete";
 const TRANSACTION_ENTRY_NAMES = new Set([
   ".state",
@@ -524,7 +525,7 @@ const TRANSACTION_ENTRY_NAMES = new Set([
   "midi.symlink",
   "wav.symlink",
 ]);
-const LOCK_ENTRY_NAMES = new Set(["pid", "owner", "identity", "ready"]);
+const LOCK_ENTRY_NAMES = new Set(["pid", "owner", "identity", "heartbeat", "ready"]);
 
 async function pathExists(path: string): Promise<boolean> {
   try {
@@ -767,6 +768,15 @@ async function processIdentity(pid: number): Promise<string | undefined> {
   }
 }
 
+async function refreshLockHeartbeat(path: string): Promise<void> {
+  try {
+    const now = new Date();
+    await utimes(path, now, now);
+  } catch {
+    // A failed heartbeat is handled by the age-based stale-lock policy.
+  }
+}
+
 async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner = false): Promise<() => Promise<void>> {
   const lockDirectory = join(outDir, `.buzzer-preview-${stem}.lock`);
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -778,10 +788,14 @@ async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner
       await writeSyncedFile(join(lockDirectory, "pid"), new TextEncoder().encode(`${process.pid}\n`));
       await writeSyncedFile(join(lockDirectory, "owner"), new TextEncoder().encode(`${owner}\n`));
       if (identity !== undefined) await writeSyncedFile(join(lockDirectory, "identity"), new TextEncoder().encode(`${identity}\n`));
+      const heartbeatPath = join(lockDirectory, "heartbeat");
+      await writeSyncedFile(heartbeatPath, new TextEncoder().encode(`${Date.now()}\n`));
       await syncDirectory(lockDirectory);
       await writeSyncedFile(join(lockDirectory, "ready"), new Uint8Array());
       await syncDirectory(lockDirectory);
+      const heartbeat = setInterval(() => { void refreshLockHeartbeat(heartbeatPath); }, LOCK_HEARTBEAT_MS);
       return async () => {
+        clearInterval(heartbeat);
         try {
           const currentOwner = (await readFile(join(lockDirectory, "owner"), "utf8")).trim();
           if (currentOwner === owner) await removeLockDirectory(lockDirectory);
@@ -797,7 +811,8 @@ async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner
         if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error("lock path is not a private directory");
         const entries = await readdir(lockDirectory, { withFileTypes: true });
         if (entries.some((entry) => entry.isDirectory() || !LOCK_ENTRY_NAMES.has(entry.name))) throw new Error("lock directory contains unknown entries");
-        const age = Date.now() - metadata.mtimeMs;
+        const heartbeatMetadata = await lstat(join(lockDirectory, "heartbeat")).catch(() => metadata);
+        const age = Date.now() - heartbeatMetadata.mtimeMs;
         const ready = entries.some((entry) => entry.name === "ready");
         if (!ready) {
           stale = age > LOCK_STALE_MS;
@@ -810,7 +825,9 @@ async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner
           } else {
             const recordedIdentity = await readFile(join(lockDirectory, "identity"), "utf8").then((value) => value.trim()).catch(() => "");
             const currentIdentity = recordedIdentity.length > 0 ? await processIdentity(owner) : undefined;
-            stale = recordedIdentity.length > 0 && currentIdentity !== undefined && currentIdentity !== recordedIdentity && (reclaimDeadOwner || age > LOCK_STALE_MS);
+            stale = currentIdentity === undefined
+              ? age > LOCK_STALE_MS
+              : recordedIdentity.length > 0 && currentIdentity !== recordedIdentity && (reclaimDeadOwner || age > LOCK_STALE_MS);
           }
         }
       } catch {

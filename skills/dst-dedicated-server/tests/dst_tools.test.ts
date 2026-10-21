@@ -227,6 +227,38 @@ describe("DST local Bun tooling", () => {
     }
   });
 
+  test("remote mod collection rejects a same-size in-place rewrite after reading", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-mutation-"));
+    try {
+      const home = join(root, "home");
+      const shard = join(home, ".klei", "DoNotStarveTogether", "fixture", "Master");
+      await mkdir(shard, { recursive: true });
+      const original = '["workshop-123"] = { enabled = true }\n';
+      const mutation = '["workshop-456"] = { enabled = true }\n';
+      expect(new TextEncoder().encode(original).length).toBe(new TextEncoder().encode(mutation).length);
+      const target = join(shard, "modoverrides.lua");
+      await writeFile(target, original);
+      const bin = join(root, "bin");
+      await mkdir(bin);
+      const realHead = Bun.which("head");
+      if (realHead === null) throw new Error("head is required for this regression test");
+      const wrapper = join(bin, "head");
+      await writeFile(wrapper, `#!/bin/sh\n"$REAL_HEAD" "$@"\nstatus=$?\nif [ "$status" -eq 0 ]; then printf '%s' "$MUTATION" > "$TARGET"; fi\nexit "$status"\n`);
+      await chmod(wrapper, 0o755);
+      const child = Bun.spawn(["bash", join(import.meta.dir, "..", "scripts", "dst_mods_remote_collect.sh"), "fixture", "Master"], {
+        env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH ?? ""}`, REAL_HEAD: realHead, TARGET: target, MUTATION: mutation },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [status, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      expect(status).toBe(1);
+      expect(stdout).toBe("");
+      expect(stderr).toContain("changed during collection");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("remote snapshot refuses a symlinked Klei root", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-root-"));
     try {

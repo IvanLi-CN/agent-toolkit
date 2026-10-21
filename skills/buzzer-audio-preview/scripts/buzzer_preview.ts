@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { randomUUID } from "node:crypto";
+import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, mkdtemp, open, opendir, readFile, readlink, rename, rm, unlink, utimes } from "node:fs/promises";
 import type { Dirent } from "node:fs";
@@ -546,9 +546,72 @@ const TRANSACTION_ENTRY_NAMES = new Set([
 ]);
 const LOCK_ENTRY_NAMES = new Set(["pid", "owner", "identity", "heartbeat", "ready"]);
 const OWNER_NONCE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const OWNER_RECORD_PATTERN = /^([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.([0-9a-f]{64})$/i;
+const OWNER_KEY_FILE_ENV = "BUZZER_PREVIEW_OWNER_KEY_FILE";
+const OWNER_KEY_BYTES = 32;
+let ownerKeyPromise: Promise<Uint8Array> | undefined;
 
-function isValidOwnerNonce(value: string): boolean {
-  return OWNER_NONCE_PATTERN.test(value);
+function ownerKeyPath(): string {
+  const configured = process.env[OWNER_KEY_FILE_ENV];
+  return resolve(expandUser(configured ?? join("~", ".cache", "agent-toolkit", "buzzer-preview-owner.key")));
+}
+
+async function readOwnerKey(): Promise<Uint8Array> {
+  if (ownerKeyPromise !== undefined) return ownerKeyPromise;
+  const promise = (async () => {
+    const path = ownerKeyPath();
+    await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+    try {
+      const key = await readBoundedRegularFile(path, OWNER_KEY_BYTES, "owner key");
+      if (key.length !== OWNER_KEY_BYTES) throw new Error("owner key has an invalid length");
+      return key;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const key = randomBytes(OWNER_KEY_BYTES);
+      const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0);
+      try {
+        const handle = await open(path, flags, 0o600);
+        try {
+          await handle.writeFile(key);
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+        return key;
+      } catch (createError) {
+        if ((createError as NodeJS.ErrnoException).code !== "EEXIST") throw createError;
+        const existing = await readBoundedRegularFile(path, OWNER_KEY_BYTES, "owner key");
+        if (existing.length !== OWNER_KEY_BYTES) throw new Error("owner key has an invalid length");
+        return existing;
+      }
+    }
+  })();
+  ownerKeyPromise = promise;
+  try {
+    return await promise;
+  } catch (error) {
+    ownerKeyPromise = undefined;
+    throw error;
+  }
+}
+
+async function createOwnerRecord(): Promise<string> {
+  const nonce = randomUUID();
+  const key = await readOwnerKey();
+  const proof = createHmac("sha256", key).update(nonce).digest("hex");
+  return `${nonce}.${proof}`;
+}
+
+async function hasValidOwnerRecord(value: string): Promise<boolean> {
+  const match = OWNER_RECORD_PATTERN.exec(value);
+  if (match === null || !OWNER_NONCE_PATTERN.test(match[1]!)) return false;
+  try {
+    const key = await readOwnerKey();
+    const expected = createHmac("sha256", key).update(match[1]!).digest("hex");
+    return expected === match[2]!.toLowerCase();
+  } catch {
+    return false;
+  }
 }
 
 async function readDirectoryEntriesBounded(path: string, maxEntries: number): Promise<{ entries: Dirent[]; truncated: boolean }> {
@@ -724,7 +787,7 @@ async function hasRecoveryArtifacts(directory: string): Promise<boolean> {
 async function hasValidTransactionOwner(directory: string): Promise<boolean> {
   try {
     const owner = new TextDecoder().decode(await readRegularFile(join(directory, ".owner"), 128)).trim();
-    return isValidOwnerNonce(owner);
+    return await hasValidOwnerRecord(owner);
   } catch {
     return false;
   }
@@ -819,12 +882,12 @@ async function recoverPublishTransactions(outDir: string, stem: string, midiPath
     try {
       let scanned = 0;
       for await (const entry of directory) {
+        if (scanned >= MAX_RECOVERY_SCAN_ENTRIES) throw new Error(`publication transaction scan exceeded ${MAX_RECOVERY_SCAN_ENTRIES} entries in ${outDir}`);
         scanned += 1;
         if (entry.isDirectory() && (entry.name.startsWith(transactionPrefix) || entry.name.startsWith(recoveryPrefix))) {
           candidates.push(entry);
           if (candidates.length > MAX_TRANSACTION_DIRECTORIES) throw new Error(`too many publication transactions in ${outDir}`);
         }
-        if (scanned >= MAX_RECOVERY_SCAN_ENTRIES) break;
       }
     } finally {
       await directory.close().catch(() => undefined);
@@ -952,11 +1015,11 @@ async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       await mkdir(lockDirectory, { mode: 0o700 });
-      const owner = randomUUID();
+      const ownerToken = await createOwnerRecord();
       const identity = await processIdentity(process.pid);
       await syncDirectory(outDir);
       await writeSyncedFile(join(lockDirectory, "pid"), new TextEncoder().encode(`${process.pid}\n`));
-      await writeSyncedFile(join(lockDirectory, "owner"), new TextEncoder().encode(`${owner}\n`));
+      await writeSyncedFile(join(lockDirectory, "owner"), new TextEncoder().encode(`${ownerToken}\n`));
       if (identity !== undefined) await writeSyncedFile(join(lockDirectory, "identity"), new TextEncoder().encode(`${identity}\n`));
       const heartbeatPath = join(lockDirectory, "heartbeat");
       await writeSyncedFile(heartbeatPath, new TextEncoder().encode(`${Date.now()}\n`));
@@ -975,7 +1038,7 @@ async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner
         }
         try {
           const currentOwner = new TextDecoder().decode(await readRegularFile(join(quarantine, "owner"), 128)).trim();
-          if (currentOwner !== owner) {
+          if (currentOwner !== ownerToken) {
             await rename(quarantine, lockDirectory).catch(() => undefined);
             return;
           }
@@ -1005,13 +1068,13 @@ async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner
           const ownerText = new TextDecoder().decode(await readRegularFile(join(lockDirectory, "pid"), 128));
           const owner = Number(ownerText.trim());
           const ownerToken = new TextDecoder().decode(await readRegularFile(join(lockDirectory, "owner"), 128)).trim();
-          if (!Number.isSafeInteger(owner) || owner <= 0 || !isValidOwnerNonce(ownerToken)) throw new Error("partial lock owner is incomplete");
+          if (!Number.isSafeInteger(owner) || owner <= 0 || !await hasValidOwnerRecord(ownerToken)) throw new Error("partial lock owner is incomplete");
           stale = !await isProcessAlive(owner) && (reclaimDeadOwner || age > LOCK_STALE_MS);
         } else {
           const ownerText = new TextDecoder().decode(await readRegularFile(join(lockDirectory, "pid"), 128));
           const owner = Number(ownerText.trim());
           const ownerToken = new TextDecoder().decode(await readRegularFile(join(lockDirectory, "owner"), 128)).trim();
-          if (!Number.isSafeInteger(owner) || owner <= 0 || !isValidOwnerNonce(ownerToken)) throw new Error("lock owner is incomplete");
+          if (!Number.isSafeInteger(owner) || owner <= 0 || !await hasValidOwnerRecord(ownerToken)) throw new Error("lock owner is incomplete");
           const alive = await isProcessAlive(owner);
           if (!alive) {
             stale = reclaimDeadOwner || age > LOCK_STALE_MS;
@@ -1052,7 +1115,7 @@ async function publishOutputsLocked(outDir: string, stem: string, midi: Uint8Arr
   const tempMidiPath = join(transaction, "midi.new");
   const tempWavPath = join(transaction, "wav.new");
   try {
-    await writeSyncedFile(join(transaction, ".owner"), new TextEncoder().encode(`${randomUUID()}\n`));
+    await writeSyncedFile(join(transaction, ".owner"), new TextEncoder().encode(`${await createOwnerRecord()}\n`));
     await writeSyncedFile(tempMidiPath, midi);
     await writeSyncedFile(tempWavPath, wav);
     await writePublishState(transaction, "prepared");

@@ -227,6 +227,49 @@ const PRIVATE_KEY_BLOCK = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?---
 const ANSI_ESCAPE = /\u001B(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001B\\))/g;
 const CONTROL_CHARACTERS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g;
 const SENSITIVE_MULTILINE_ASSIGNMENT = new RegExp(`(${SENSITIVE_KEY_TOKEN}\\s*[:=])\\s*\\r?\\n(?:[ \\t]+[^\\r\\n]*(?:\\r?\\n|$))+`, "gi");
+const SENSITIVE_COLLECTION_ASSIGNMENT = new RegExp(`(${SENSITIVE_KEY}\\s*[:=]\\s*)([\\[{])`, "gi");
+
+function collectionEnd(text: string, openingIndex: number): number | undefined {
+  const stack: string[] = [];
+  let quote: '"' | "'" | undefined;
+  let escaped = false;
+  for (let index = openingIndex; index < text.length; index += 1) {
+    const character = text[index]!;
+    if (quote !== undefined) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) quote = undefined;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      continue;
+    }
+    if (character === "{" || character === "[") stack.push(character);
+    else if (character === "}" || character === "]") {
+      const opening = stack.at(-1);
+      if ((character === "}" && opening !== "{") || (character === "]" && opening !== "[")) return undefined;
+      stack.pop();
+      if (stack.length === 0) return index + 1;
+    }
+  }
+  return undefined;
+}
+
+function redactSensitiveCollections(text: string): string {
+  let output = "";
+  let cursor = 0;
+  SENSITIVE_COLLECTION_ASSIGNMENT.lastIndex = 0;
+  for (let match = SENSITIVE_COLLECTION_ASSIGNMENT.exec(text); match !== null; match = SENSITIVE_COLLECTION_ASSIGNMENT.exec(text)) {
+    const openingIndex = match.index + match[0].length - 1;
+    const end = collectionEnd(text, openingIndex);
+    if (end === undefined) continue;
+    output += text.slice(cursor, match.index) + match[1] + "[REDACTED]";
+    cursor = end;
+    SENSITIVE_COLLECTION_ASSIGNMENT.lastIndex = end;
+  }
+  return output + text.slice(cursor);
+}
 
 function redactSensitiveBlocks(text: string): string {
   const lines = text.split(/\r?\n/);
@@ -255,7 +298,7 @@ function redactSensitiveBlocks(text: string): string {
 
 export function redactSensitiveText(text: string): string {
   const normalized = text.replace(ANSI_ESCAPE, "").replace(CONTROL_CHARACTERS, "");
-  const redacted = redactSensitiveBlocks(normalized)
+  const redacted = redactSensitiveCollections(redactSensitiveBlocks(normalized))
     .replace(SENSITIVE_MULTILINE_ASSIGNMENT, "$1[REDACTED]")
     .replace(PRIVATE_KEY_BLOCK, "[REDACTED]")
     .replace(AUTHORIZATION_TOKEN, "$1 [REDACTED]")

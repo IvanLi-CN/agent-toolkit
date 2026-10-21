@@ -47,11 +47,16 @@ fi
 
 file_stat="$(stat_signature "$file" || true)"
 if [[ -z "$file_stat" ]]; then
-  printf 'MISSING\n'
-  exit 0
+  printf 'UNSUPPORTED_STAT\n' >&2
+  exit 1
 fi
 exec 9<"$file" || { printf 'MISSING\n'; exit 0; }
 fd_stat="$(stat_signature /proc/self/fd/9 || stat_signature /dev/fd/9 || true)"
+if [[ -z "$fd_stat" ]]; then
+  exec 9<&-
+  printf 'UNSUPPORTED_FD_STAT\n' >&2
+  exit 1
+fi
 if [[ "$fd_stat" != "$file_stat" || -L "$klei_base" || -L "$klei_root" || -L "$cluster_dir" || -L "$shard_dir" || -L "$file" ]]; then
   exec 9<&-
   printf 'MISSING\n'
@@ -75,6 +80,10 @@ actual="${actual//[[:space:]]/}"
 file_after_stat="$(stat_signature "$file" || true)"
 fd_after_stat="$(stat_signature /proc/self/fd/9 || stat_signature /dev/fd/9 || true)"
 exec 9<&-
+if [[ -z "$file_after_stat" || -z "$fd_after_stat" ]]; then
+  printf 'UNSUPPORTED_FD_STAT\n' >&2
+  exit 1
+fi
 if [[ -L "$file" ]]; then
   printf 'modoverrides.lua changed during collection\n' >&2
   exit 1
@@ -85,6 +94,10 @@ head -c $((max_bytes + 1)) <&8 >"$verification"
 verification_size="$(wc -c < "$verification")"
 verification_size="${verification_size//[[:space:]]/}"
 exec 8<&-
+if [[ -z "$verification_fd_stat" ]]; then
+  printf 'UNSUPPORTED_FD_STAT\n' >&2
+  exit 1
+fi
 if (( actual != size || verification_size != size )) || [[ "$file_after_stat" != "$file_stat" || "$fd_after_stat" != "$fd_stat" || "$verification_fd_stat" != "$file_stat" ]] || ! cmp -s "$temporary" "$verification"; then
   printf 'modoverrides.lua changed during collection\n' >&2
   exit 1

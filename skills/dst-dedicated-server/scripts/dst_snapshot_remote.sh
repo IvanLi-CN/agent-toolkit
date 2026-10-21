@@ -50,7 +50,7 @@ echo
 echo "### Processes (dontstarve/steamcmd/screen/tmux)"
 echo
 if have_cmd ps; then
-  ps -eo pid=,comm= 2>/dev/null | grep -Ei 'dontstarve|steamcmd|screen|tmux' | head -n 120 || true
+  ps -eo pid=,comm= 2>/dev/null | grep -Ei 'dontstarve|steamcmd|screen|tmux' | awk '{ print "- pid: " $1 " process: <redacted>" }' | head -n 120 || true
 fi
 echo
 

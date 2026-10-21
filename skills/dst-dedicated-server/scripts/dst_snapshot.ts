@@ -186,6 +186,7 @@ async function runWithStdin(
     await Promise.race([supervised.wrapperExited.then(() => undefined, () => undefined), new Promise<void>((resolve) => setTimeout(resolve, SUPERVISOR_STOP_GRACE_MS))]);
     if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
     await supervised.cleanup();
+    if (!cleanupReady) throw new Error("supervisor_cleanup_unverified");
   }
 }
 

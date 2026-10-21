@@ -267,6 +267,7 @@ async function terminateAndReap(supervised: SupervisedChild): Promise<void> {
   }
   await Promise.race([observedExit, new Promise<void>((resolve) => setTimeout(resolve, SUPERVISOR_STOP_GRACE_MS))]);
   await supervised.cleanup();
+  if (!cleanupReady) throw new Error("supervisor_cleanup_unverified");
 }
 
 async function readText(stream: ReadableStream<Uint8Array>, maxBytes = 64 * 1024, timeoutMs = REMOTE_COMMAND_TIMEOUT_MS): Promise<string> {

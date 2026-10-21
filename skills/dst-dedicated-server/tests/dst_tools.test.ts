@@ -202,6 +202,8 @@ describe("DST local Bun tooling", () => {
       await writeFile(join(local, "password"), "private\n");
       await writeFile(join(local, ".env"), "private\n");
       await writeFile(join(local, "id_rsa"), "private\n");
+      await writeFile(join(local, "private.key"), "private\n");
+      await writeFile(join(local, "auth.json"), "private\n");
       const output = join(root, "snapshot.md");
       expect(await snapshotMain(["--local-dir", local, "--no-remote", "--out", output])).toBe(0);
       const report = await readFile(output, "utf8");
@@ -215,6 +217,8 @@ describe("DST local Bun tooling", () => {
       expect(report).not.toMatch(/(^|\s)password(\s|$)/m);
       expect(report).not.toMatch(/(^|\s)\.env(\s|$)/m);
       expect(report).not.toMatch(/(^|\s)id_rsa(\s|$)/m);
+      expect(report).not.toMatch(/(^|\s)private\.key(\s|$)/m);
+      expect(report).not.toMatch(/(^|\s)auth\.json(\s|$)/m);
       expect(report).toContain("api_key=[REDACTED]");
       expect(report).not.toContain("entry-239.txt");
       expect(report).toContain("<cluster-1>");
@@ -340,13 +344,13 @@ describe("DST local Bun tooling", () => {
       await writeFile(target, original);
       const bin = join(root, "bin");
       await mkdir(bin);
-      const realHead = Bun.which("head");
-      if (realHead === null) throw new Error("head is required for this regression test");
-      const wrapper = join(bin, "head");
-      await writeFile(wrapper, `#!/bin/sh\n"$REAL_HEAD" "$@"\nstatus=$?\nif [ "$status" -eq 0 ]; then printf '%s' "$MUTATION" > "$TARGET"; fi\nexit "$status"\n`);
+      const realPerl = Bun.which("perl");
+      if (realPerl === null) throw new Error("perl is required for this regression test");
+      const wrapper = join(bin, "perl");
+      await writeFile(wrapper, `#!/bin/sh\n"$REAL_PERL" "$@"\nstatus=$?\nif [ "$status" -eq 0 ]; then printf '%s' "$MUTATION" > "$TARGET"; fi\nexit "$status"\n`);
       await chmod(wrapper, 0o755);
       const child = Bun.spawn(["bash", join(import.meta.dir, "..", "scripts", "dst_mods_remote_collect.sh"), "fixture", "Master"], {
-        env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH ?? ""}`, REAL_HEAD: realHead, TARGET: target, MUTATION: mutation },
+        env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH ?? ""}`, REAL_PERL: realPerl, TARGET: target, MUTATION: mutation },
         stdout: "pipe",
         stderr: "pipe",
       });
@@ -593,6 +597,8 @@ esac
     expect(redacted).toContain("<redacted-path>");
     expect(redacted).toContain("<redacted-address>");
     expect(redacted).not.toContain("My Secret");
+    const privateHostname = ["secret", "internal", "example"].join(".");
+    expect(redactOperationalText(`Could not resolve hostname ${privateHostname}`)).not.toContain(privateHostname);
   });
 
   test("redacts relative and UNC paths after assignment delimiters", () => {
@@ -667,13 +673,17 @@ esac
   test("cleans stale snapshot temp directories on the next publish", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-temp-cleanup-"));
     try {
-      const stale = join(root, ".dst-snapshot-tmp-stale");
+      const tempRoot = join(root, ".agent-toolkit-dst-snapshot-tmp");
+      await mkdir(tempRoot, { mode: 0o700 });
+      await writeFile(join(tempRoot, ".owner"), "agent-toolkit-dst-snapshot-v1\n");
+      const stale = join(tempRoot, ".dst-snapshot-tmp-stale");
       await mkdir(stale);
+      await writeFile(join(stale, ".owner"), "agent-toolkit-dst-snapshot-v1\n");
       const old = new Date(Date.now() - 20 * 60 * 1000);
       await utimes(stale, old, old);
       const output = join(root, "snapshot.md");
       expect(await snapshotMain(["--no-local", "--no-remote", "--out", output])).toBe(0);
-      expect(await readdir(root)).not.toContain(".dst-snapshot-tmp-stale");
+      expect(await readdir(tempRoot)).not.toContain(".dst-snapshot-tmp-stale");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

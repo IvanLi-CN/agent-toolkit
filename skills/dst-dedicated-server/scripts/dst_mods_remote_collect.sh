@@ -24,6 +24,46 @@ stat_signature() {
   return 1
 }
 
+read_bounded_regular_file() {
+  local source="$1"
+  local destination="$2"
+  local limit="$3"
+  if ! command -v perl >/dev/null 2>&1; then
+    printf 'PERL_REQUIRED_FOR_SAFE_FILE_READ\n' >&2
+    return 1
+  fi
+  perl - "$source" "$destination" "$limit" <<'PERL'
+use strict;
+use warnings;
+use Fcntl ();
+
+my ($source, $destination, $limit) = @ARGV;
+my $flags = Fcntl::O_RDONLY() | Fcntl::O_NONBLOCK();
+my $nofollow = eval { Fcntl::O_NOFOLLOW() };
+$flags |= $nofollow if defined $nofollow;
+sysopen(my $input, $source, $flags) or exit 10;
+my @metadata = stat($input);
+exit 11 unless @metadata && (($metadata[2] & 0170000) == 0100000);
+open(my $output, '>', $destination) or exit 12;
+binmode($input);
+binmode($output);
+my $remaining = 0 + $limit;
+while ($remaining > 0) {
+  my $bytes = sysread($input, my $buffer, $remaining);
+  if (!defined $bytes) {
+    exit 13 if $!{EAGAIN} || $!{EWOULDBLOCK};
+    exit 14;
+  }
+  last if $bytes == 0;
+  print {$output} $buffer or exit 15;
+  $remaining -= $bytes;
+}
+close($output) or exit 16;
+close($input) or exit 17;
+exit 0;
+PERL
+}
+
 klei_base="$HOME/.klei"
 klei_root="$klei_base/DoNotStarveTogether"
 cluster_dir="$klei_root/$cluster"
@@ -58,23 +98,9 @@ if [[ -z "$file_stat" ]]; then
   printf 'UNSUPPORTED_STAT\n' >&2
   exit 1
 fi
-exec 9<"$file" || { printf 'cannot open modoverrides.lua\n' >&2; exit 1; }
-fd_stat="$(stat_signature /proc/self/fd/9 || stat_signature /dev/fd/9 || true)"
-if [[ -z "$fd_stat" ]]; then
-  exec 9<&-
-  printf 'UNSUPPORTED_FD_STAT\n' >&2
-  exit 1
-fi
-if [[ "$fd_stat" != "$file_stat" || -L "$klei_base" || -L "$klei_root" || -L "$cluster_dir" || -L "$shard_dir" || -L "$file" ]]; then
-  exec 9<&-
-  printf 'modoverrides.lua changed during collection\n' >&2
-  exit 1
-fi
-
 size="${file_stat##*:}"
 max_bytes=$((1024 * 1024))
 if (( size > max_bytes )); then
-  exec 9<&-
   printf 'modoverrides.lua exceeds %s bytes\n' "$max_bytes" >&2
   exit 1
 fi
@@ -82,31 +108,29 @@ temporary="$(mktemp)"
 verification="$(mktemp)"
 projection="$(mktemp)"
 trap 'rm -f "$temporary" "$verification" "$projection"' EXIT
-head -c $((max_bytes + 1)) <&9 >"$temporary"
-actual="$(wc -c < "$temporary")"
-actual="${actual//[[:space:]]/}"
-file_after_stat="$(stat_signature "$file" || true)"
-fd_after_stat="$(stat_signature /proc/self/fd/9 || stat_signature /dev/fd/9 || true)"
-exec 9<&-
-if [[ -z "$file_after_stat" || -z "$fd_after_stat" ]]; then
-  printf 'UNSUPPORTED_FD_STAT\n' >&2
+if ! read_bounded_regular_file "$file" "$temporary" $((max_bytes + 1)); then
+  printf 'cannot safely read modoverrides.lua\n' >&2
   exit 1
 fi
+file_after_stat="$(stat_signature "$file" || true)"
+if [[ -z "$file_after_stat" || "$file_after_stat" != "$file_stat" || -L "$klei_base" || -L "$klei_root" || -L "$cluster_dir" || -L "$shard_dir" || -L "$file" ]]; then
+  printf 'modoverrides.lua changed during collection\n' >&2
+  exit 1
+fi
+actual="$(wc -c < "$temporary")"
+actual="${actual//[[:space:]]/}"
 if [[ -L "$file" || ! -f "$file" ]]; then
   printf 'modoverrides.lua changed during collection\n' >&2
   exit 1
 fi
-exec 8<"$file" || { printf 'modoverrides.lua changed during collection\n' >&2; exit 1; }
-verification_fd_stat="$(stat_signature /proc/self/fd/8 || stat_signature /dev/fd/8 || true)"
-head -c $((max_bytes + 1)) <&8 >"$verification"
-verification_size="$(wc -c < "$verification")"
-verification_size="${verification_size//[[:space:]]/}"
-exec 8<&-
-if [[ -z "$verification_fd_stat" ]]; then
-  printf 'UNSUPPORTED_FD_STAT\n' >&2
+if ! read_bounded_regular_file "$file" "$verification" $((max_bytes + 1)); then
+  printf 'cannot safely verify modoverrides.lua\n' >&2
   exit 1
 fi
-if (( actual != size || verification_size != size )) || [[ "$file_after_stat" != "$file_stat" || "$fd_after_stat" != "$fd_stat" || "$verification_fd_stat" != "$file_stat" ]] || ! cmp -s "$temporary" "$verification"; then
+verification_size="$(wc -c < "$verification")"
+verification_size="${verification_size//[[:space:]]/}"
+verification_file_stat="$(stat_signature "$file" || true)"
+if (( actual != size || verification_size != size )) || [[ "$file_after_stat" != "$file_stat" || "$verification_file_stat" != "$file_stat" ]] || ! cmp -s "$temporary" "$verification"; then
   printf 'modoverrides.lua changed during collection\n' >&2
   exit 1
 fi

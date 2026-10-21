@@ -11,16 +11,49 @@ cleanup() { rm -rf -- "$status_dir"; }
 trap cleanup EXIT
 trap 'cleanup; exit 143' HUP INT TERM
 parent_pid="\${AGENT_TOOLKIT_SUPERVISOR_PARENT_PID:-\$PPID}"
-"$@" &
+if command -v setsid >/dev/null 2>&1; then
+  setsid "$@" &
+else
+  "$@" &
+fi
 target_pid=$!
+descendants() {
+  ps -eo pid=,ppid= 2>/dev/null | awk -v root="$target_pid" '
+    { parent[$1] = $2 }
+    function is_descendant(pid, current, depth) {
+      current = parent[pid]
+      for (depth = 0; depth < 64 && current != ""; depth++) {
+        if (current == root) return 1
+        current = parent[current]
+      }
+      return 0
+    }
+    $1 == root || is_descendant($1) { print $1 }
+  '
+}
+signal_tree() {
+  signal="$1"
+  target_pgid="$(ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ' || true)"
+  wrapper_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' || true)"
+  case "$target_pgid" in
+    ''|*[!0-9]*) ;;
+    *)
+      if [ "$target_pgid" != "$wrapper_pgid" ]; then
+        kill -"$signal" -- "-$target_pgid" 2>/dev/null || true
+        return
+      fi
+      ;;
+  esac
+  for pid in $(descendants); do
+    [ "$pid" = "$$" ] && continue
+    kill -"$signal" "$pid" 2>/dev/null || true
+  done
+}
 watch_parent() {
   while kill -0 "$parent_pid" 2>/dev/null; do sleep 1; done
-  kill -TERM "$target_pid" 2>/dev/null || true
-  kill -TERM -- "-$target_pid" 2>/dev/null || true
+  signal_tree TERM
   sleep 1
-  kill -KILL "$target_pid" 2>/dev/null || true
-  kill -KILL -- "-$target_pid" 2>/dev/null || true
-  kill -TERM "$$" 2>/dev/null || true
+  signal_tree KILL
 }
 watch_parent &
 watchdog_pid=$!

@@ -148,16 +148,10 @@ emit_cluster() {
   return 0
 }
 
-if find "$KLEI_DIR" -mindepth 1 -maxdepth 1 -type d -print0 >/dev/null 2>&1; then
-  while IFS= read -r -d '' cluster; do
-    emit_cluster "$cluster" || break
-  done < <(find "$KLEI_DIR" -mindepth 1 -maxdepth 1 -type d -print0)
-else
-  while IFS= read -r -d '' cluster; do
-    [[ "${cluster%/*}" == "$KLEI_DIR" ]] || continue
-    emit_cluster "$cluster" || break
-  done < <(find "$KLEI_DIR" -type d -print0)
-fi
+shopt -s nullglob
+for cluster in "$KLEI_DIR"/*; do
+  emit_cluster "$cluster" || break
+done
 
 echo "### Server binary (best-effort)"
 echo

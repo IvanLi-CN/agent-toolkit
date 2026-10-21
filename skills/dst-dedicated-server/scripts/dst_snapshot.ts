@@ -2,7 +2,7 @@
 
 import { constants, type Dirent } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { lstat, mkdtemp, open, opendir, realpath, rename, rm, unlink, type FileHandle } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, opendir, readFile, realpath, rename, rm, unlink, type FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawnSupervised, type SupervisedChild } from "./process_supervisor.ts";
@@ -56,6 +56,8 @@ export const MAX_LOCAL_CLUSTER_PATHS = 4_096;
 export const MAX_LOCAL_CLUSTER_SCAN_ENTRIES = 4_096;
 const SUPERVISOR_STOP_GRACE_MS = 250;
 const SNAPSHOT_TEMP_PREFIX = ".dst-snapshot-tmp-";
+const SNAPSHOT_TEMP_ROOT_NAME = ".agent-toolkit-dst-snapshot-tmp";
+const SNAPSHOT_OWNER_MARKER = "agent-toolkit-dst-snapshot-v1\n";
 const SNAPSHOT_TEMP_STALE_MS = 15 * 60 * 1000;
 const MAX_SNAPSHOT_TEMP_SCAN_ENTRIES = 128;
 
@@ -229,7 +231,7 @@ const BRACKETED_SENSITIVE_ASSIGNMENT = new RegExp(`(\\[[^\\]\\r\\n]*${SENSITIVE_
 const ENCODED_SENSITIVE_ASSIGNMENT = new RegExp(`(\\b[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*\\s*%3[dD]\\s*)(?!\\s*\\[REDACTED\\])([^\\r\\n]+)`, "gi");
 const SENSITIVE_BLOCK_HEADER = new RegExp(`^([ \\t]*${SENSITIVE_KEY_TOKEN}\\s*[:=]\\s*[|>][-+0-9]*)\\s*$`, "i");
 const PRIVATE_KEY_BLOCK = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----/gi;
-const SENSITIVE_FILENAME = new RegExp("(?<![A-Za-z0-9])(?:[A-Za-z0-9_.-]*(?:" + SENSITIVE_NAME + "|env|id[_ -]?rsa)[A-Za-z0-9_.-]*)(?![A-Za-z0-9])", "gi");
+const SENSITIVE_FILENAME = new RegExp("(?<![A-Za-z0-9])(?:[A-Za-z0-9_.-]*(?:" + SENSITIVE_NAME + "|env|id[_ -]?rsa|private[._-]?(?:key|pem)|api[._-]?key|auth[._-]?json)[A-Za-z0-9_.-]*)(?![A-Za-z0-9])", "gi");
 const ANSI_ESCAPE = /\u001B(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001B\\))/g;
 const CONTROL_CHARACTERS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g;
 const SENSITIVE_MULTILINE_ASSIGNMENT = new RegExp(`(${SENSITIVE_KEY_TOKEN}\\s*[:=])\\s*\\r?\\n(?:[ \\t]+[^\\r\\n]*(?:\\r?\\n|$))+`, "gi");
@@ -371,7 +373,8 @@ export function redactOperationalText(text: string, values: string[] = []): stri
     .replace(/(^|[\s"'(=:])(?=[^"'<>`\n,;)\]}\s]+[\\/]\.\.?[\\/])[^"'<>`\n,;)\]}]+/g, "$1<redacted-path>")
     .replace(/(?<![A-Za-z0-9])(?:(?:[0-9A-Fa-f]{0,4}:){1,7})(?:\d{1,3}\.){3}\d{1,3}(?![A-Za-z0-9])/g, "<redacted-address>")
     .replace(/(?<![A-Za-z0-9])(?:(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}(?:%[A-Za-z0-9._-]+)?)(?![A-Za-z0-9])/g, "<redacted-address>")
-    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "<redacted-address>");
+    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "<redacted-address>")
+    .replace(/\b[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+\b/g, "<redacted-host>");
 }
 
 function redactDirectoryListing(text: string, values: string[] = []): string {
@@ -490,10 +493,48 @@ async function boundedDirectoryEntries(path: string, limit = MAX_LOCAL_DIRECTORY
   return { entries, truncated };
 }
 
-async function cleanupSnapshotTemporaryDirectories(parent: string): Promise<void> {
+async function ensureSnapshotTemporaryRoot(parent: string): Promise<string> {
+  const parentMetadata = await lstat(parent);
+  if (!parentMetadata.isDirectory() || parentMetadata.isSymbolicLink()) throw new Error("snapshot output parent must be a real directory");
+  const root = join(parent, SNAPSHOT_TEMP_ROOT_NAME);
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  const metadata = await lstat(root);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink() || (metadata.mode & 0o077) !== 0) throw new Error("snapshot temporary root must be a private directory");
+  if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) throw new Error("snapshot temporary root is not owned by the current user");
+  const marker = join(root, ".owner");
+  try {
+    if ((await readFile(marker, "utf8")) !== SNAPSHOT_OWNER_MARKER) throw new Error("snapshot temporary root owner marker is invalid");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    try {
+      const handle = await open(marker, "wx", 0o600);
+      try {
+        await handle.writeFile(SNAPSHOT_OWNER_MARKER);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+    } catch (markerError) {
+      if ((markerError as NodeJS.ErrnoException).code !== "EEXIST") throw markerError;
+      let valid = false;
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        if ((await readFile(marker, "utf8").catch(() => "")) === SNAPSHOT_OWNER_MARKER) {
+          valid = true;
+          break;
+        }
+        await Bun.sleep(5);
+      }
+      if (!valid) throw markerError;
+    }
+    await syncDirectory(root);
+  }
+  return root;
+}
+
+async function cleanupSnapshotTemporaryDirectories(root: string): Promise<void> {
   let directory;
   try {
-    directory = await opendir(parent);
+    directory = await opendir(root);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
     throw error;
@@ -501,13 +542,14 @@ async function cleanupSnapshotTemporaryDirectories(parent: string): Promise<void
   try {
     let scanned = 0;
     for await (const entry of directory) {
-      if (!entry.name.startsWith(SNAPSHOT_TEMP_PREFIX) || !entry.isDirectory() || entry.isSymbolicLink()) continue;
       scanned += 1;
       if (scanned > MAX_SNAPSHOT_TEMP_SCAN_ENTRIES) throw new Error(`snapshot temp directory scan exceeded ${MAX_SNAPSHOT_TEMP_SCAN_ENTRIES} entries`);
-      const path = join(parent, entry.name);
+      if (!entry.name.startsWith(SNAPSHOT_TEMP_PREFIX) || !entry.isDirectory() || entry.isSymbolicLink()) continue;
+      const path = join(root, entry.name);
       try {
         const metadata = await lstat(path);
         if (!metadata.isDirectory() || metadata.isSymbolicLink() || Date.now() - metadata.mtimeMs < SNAPSHOT_TEMP_STALE_MS) continue;
+        if ((await readFile(join(path, ".owner"), "utf8")) !== SNAPSHOT_OWNER_MARKER) continue;
         await rm(path, { recursive: true, force: true, maxRetries: 0 });
       } catch {
         // Preserve a concurrently changing directory for a later invocation.
@@ -780,10 +822,18 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
   }
   try {
     const parent = dirname(outputPath);
-    await cleanupSnapshotTemporaryDirectories(parent);
-    const tempDir = await mkdtemp(join(parent, SNAPSHOT_TEMP_PREFIX));
+    const tempRoot = await ensureSnapshotTemporaryRoot(parent);
+    await cleanupSnapshotTemporaryDirectories(tempRoot);
+    const tempDir = await mkdtemp(join(tempRoot, SNAPSHOT_TEMP_PREFIX));
     const tempPath = join(tempDir, basename(outputPath));
     try {
+      const owner = await open(join(tempDir, ".owner"), "wx", 0o600);
+      try {
+        await owner.writeFile(SNAPSHOT_OWNER_MARKER);
+        await owner.sync();
+      } finally {
+        await owner.close();
+      }
       const handle = await open(tempPath, "w", 0o600);
       try {
         await handle.writeFile(report.join("\n"), "utf8");

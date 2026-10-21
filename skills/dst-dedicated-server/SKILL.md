@@ -14,6 +14,7 @@ Use this Skill for a configured server whose SSH alias, user and local client di
 - `DST_LOCAL_DIR` is the optional local client data directory.
 - `DST_CLUSTER` selects the cluster on the remote host.
 - The local CLI uses the Bun installed on the host. Remote collection keeps its native Shell boundary and does not require Bun on the game server.
+- The remote mod collector requires a standard Perl runtime for nonblocking, no-follow file reads; if Perl is unavailable it fails closed instead of opening an unbounded remote stream.
 
 Set these values outside tracked files or pass them to the scripts. Missing host configuration fails closed; do not guess an address or path.
 

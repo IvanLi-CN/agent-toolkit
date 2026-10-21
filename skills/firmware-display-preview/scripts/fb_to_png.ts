@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { constants } from "node:fs";
-import { lstat, mkdtemp, open, rename, rm, unlink } from "node:fs/promises";
+import { lstat, mkdtemp, open, opendir, readFile, rename, rm, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { deflateSync } from "node:zlib";
 import { basename, dirname, join, resolve } from "node:path";
@@ -12,6 +12,10 @@ export type PngMode = "L" | "RGB";
 export const MAX_FRAMEBUFFER_PIXELS = 16_777_216;
 export const MAX_FRAMEBUFFER_INPUT_BYTES = 128 * 1024 * 1024;
 export const MAX_FRAMEBUFFER_ROWS = 1_048_576;
+const TEMP_DIRECTORY_PREFIX = ".fb-to-png-tmp-";
+const TEMP_OWNER_MARKER = "agent-toolkit-fb-to-png-v1\n";
+const MAX_TEMP_DIRECTORY_SCAN_ENTRIES = 128;
+const TEMP_DIRECTORY_STALE_MS = 15 * 60 * 1000;
 
 function validateDimensions(width: number, height: number): void {
   if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0) {
@@ -260,14 +264,18 @@ class CliError extends Error {
   }
 }
 
-function optionValue(args: string[], index: number, option: string): [string, number] {
+function optionValue(args: string[], index: number, option: string, inlineValue?: string): [string, number] {
+  if (inlineValue !== undefined) {
+    if (inlineValue.length === 0) throw new CliError(`${option} requires a value`);
+    return [inlineValue, index + 1];
+  }
   const value = args[index + 1];
   if (value === undefined || value.startsWith("--")) throw new CliError(`${option} requires a value`);
   return [value, index + 2];
 }
 
 function integerOption(value: string, option: string): number {
-  if (!/^-?\d+$/.test(value)) throw new CliError(`${option} must be an integer`);
+  if (!/^[+-]?\d+$/.test(value)) throw new CliError(`${option} must be an integer`);
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed)) throw new CliError(`${option} must be a safe integer`);
   return parsed;
@@ -300,25 +308,28 @@ export function parseArgs(args: string[]): CliOptions | "help" {
   for (let index = 0; index < args.length;) {
     const arg = args[index];
     if (arg === "-h" || arg === "--help") return "help";
+    const separator = arg.indexOf("=");
+    const option = separator > 0 ? arg.slice(0, separator) : arg;
+    const inlineValue = separator > 0 ? arg.slice(separator + 1) : undefined;
     if (arg === "--invert") {
       invert = true;
       index += 1;
       continue;
     }
-    if (["--format", "--width", "--height", "--in", "--out", "--stride-bytes", "--endian", "--bit-order", "--ssd1306-bit-order"].includes(arg)) {
-      const [value, next] = optionValue(args, index, arg);
-      if (arg === "--format") {
+    if (["--format", "--width", "--height", "--in", "--out", "--stride-bytes", "--endian", "--bit-order", "--ssd1306-bit-order"].includes(option)) {
+      const [value, next] = optionValue(args, index, option, inlineValue);
+      if (option === "--format") {
         if (!["ssd1306", "mono1", "gray8", "rgb565", "rgb888"].includes(value)) throw new CliError(`invalid --format: ${value}`);
         format = value as FramebufferFormat;
-      } else if (arg === "--width") width = integerOption(value, arg);
-      else if (arg === "--height") height = integerOption(value, arg);
-      else if (arg === "--in") input = value;
-      else if (arg === "--out") output = value;
-      else if (arg === "--stride-bytes") strideBytes = integerOption(value, arg);
-      else if (arg === "--endian") {
+      } else if (option === "--width") width = integerOption(value, option);
+      else if (option === "--height") height = integerOption(value, option);
+      else if (option === "--in") input = value;
+      else if (option === "--out") output = value;
+      else if (option === "--stride-bytes") strideBytes = integerOption(value, option);
+      else if (option === "--endian") {
         if (value !== "le" && value !== "be") throw new CliError(`invalid --endian: ${value}`);
         endian = value;
-      } else if (arg === "--bit-order") {
+      } else if (option === "--bit-order") {
         if (value !== "msb" && value !== "lsb") throw new CliError(`invalid --bit-order: ${value}`);
         bitOrder = value;
       } else {
@@ -336,11 +347,48 @@ export function parseArgs(args: string[]): CliOptions | "help" {
   return { format, width, height, input, output, strideBytes, endian, bitOrder, ssd1306BitOrder, invert };
 }
 
+async function cleanupStaleTemporaryDirectories(parent: string): Promise<void> {
+  let directory;
+  try {
+    directory = await opendir(parent);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  let scanned = 0;
+  try {
+    for await (const entry of directory) {
+      scanned += 1;
+      if (scanned > MAX_TEMP_DIRECTORY_SCAN_ENTRIES) throw new Error(`framebuffer temp directory scan exceeded ${MAX_TEMP_DIRECTORY_SCAN_ENTRIES} entries`);
+      if (!entry.name.startsWith(TEMP_DIRECTORY_PREFIX) || !entry.isDirectory() || entry.isSymbolicLink()) continue;
+      const temporaryDirectory = join(parent, entry.name);
+      try {
+        const metadata = await lstat(temporaryDirectory);
+        if (!metadata.isDirectory() || metadata.isSymbolicLink() || Date.now() - metadata.mtimeMs < TEMP_DIRECTORY_STALE_MS) continue;
+        if ((await readFile(join(temporaryDirectory, ".owner"), "utf8")) !== TEMP_OWNER_MARKER) continue;
+        await rm(temporaryDirectory, { recursive: true, force: true, maxRetries: 0 });
+      } catch {
+        // Preserve an unexpected or concurrently changing directory.
+      }
+    }
+  } finally {
+    await directory.close().catch(() => undefined);
+  }
+}
+
 async function writePngAtomically(outputPath: string, data: Uint8Array): Promise<void> {
   const parent = dirname(outputPath);
-  const temporaryDirectory = await mkdtemp(join(parent, ".fb-to-png-tmp-"));
+  await cleanupStaleTemporaryDirectories(parent);
+  const temporaryDirectory = await mkdtemp(join(parent, TEMP_DIRECTORY_PREFIX));
   const temporaryPath = join(temporaryDirectory, basename(outputPath));
   try {
+    const owner = await open(join(temporaryDirectory, ".owner"), "wx", 0o600);
+    try {
+      await owner.writeFile(TEMP_OWNER_MARKER);
+      await owner.sync();
+    } finally {
+      await owner.close();
+    }
     const handle = await open(temporaryPath, "w", 0o600);
     try {
       await handle.writeFile(data);

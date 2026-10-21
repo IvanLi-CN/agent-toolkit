@@ -473,7 +473,11 @@ class CliError extends Error {
   }
 }
 
-function optionValue(args: string[], index: number, option: string): [string, number] {
+function optionValue(args: string[], index: number, option: string, inlineValue?: string): [string, number] {
+  if (inlineValue !== undefined) {
+    if (inlineValue.length === 0) throw new CliError(`${option} requires a value`);
+    return [inlineValue, index + 1];
+  }
   const value = args[index + 1];
   if (value === undefined || value.startsWith("--")) throw new CliError(`${option} requires a value`);
   return [value, index + 2];
@@ -486,16 +490,19 @@ export function parseArgs(args: string[]): { input: string; outDir: string; stem
   for (let index = 0; index < args.length;) {
     const arg = args[index];
     if (arg === "-h" || arg === "--help") return "help";
-    if (arg === "--in") {
-      [input, index] = optionValue(args, index, "--in");
+    const separator = arg.indexOf("=");
+    const option = separator > 0 ? arg.slice(0, separator) : arg;
+    const inlineValue = separator > 0 ? arg.slice(separator + 1) : undefined;
+    if (option === "--in") {
+      [input, index] = optionValue(args, index, option, inlineValue);
       continue;
     }
-    if (arg === "--out-dir") {
-      [outDir, index] = optionValue(args, index, "--out-dir");
+    if (option === "--out-dir") {
+      [outDir, index] = optionValue(args, index, option, inlineValue);
       continue;
     }
-    if (arg === "--stem") {
-      [stem, index] = optionValue(args, index, "--stem");
+    if (option === "--stem") {
+      [stem, index] = optionValue(args, index, option, inlineValue);
       continue;
     }
     throw new CliError(`Unknown arg: ${arg}`);
@@ -506,16 +513,24 @@ export function parseArgs(args: string[]): { input: string; outDir: string; stem
 }
 
 function validateStem(stem: string): string {
-  if (stem.length === 0 || stem === "." || stem === ".." || stem.includes("\0") || isAbsolute(stem) || stem.includes("/") || stem.includes("\\")) {
-    throw new CliError("--stem must be a non-empty filename without path separators");
+  if (stem.length === 0 || stem === "." || stem === ".." || /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(stem) || isAbsolute(stem) || stem.includes("/") || stem.includes("\\")) {
+    throw new CliError("--stem must be a non-empty filename without path separators or control characters");
   }
   return stem;
 }
 
 async function writeSyncedFile(path: string, data: Uint8Array): Promise<void> {
-  const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | (constants.O_NOFOLLOW ?? 0);
+  try {
+    const existing = await lstat(path);
+    if (!existing.isFile() || existing.isSymbolicLink()) throw new Error(`output path is not a regular file: ${path}`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
   const handle = await open(path, flags, 0o600);
   try {
+    const metadata = await handle.stat();
+    if (!metadata.isFile()) throw new Error(`output path is not a regular file: ${path}`);
     await handle.writeFile(data);
     await handle.sync();
   } finally {
@@ -530,7 +545,7 @@ const MAX_TRANSACTION_DIRECTORIES = 256;
 const MAX_RECOVERY_SCAN_ENTRIES = 4_096;
 const DELETE_TOMBSTONE_PREFIX = ".buzzer-preview-delete-";
 const LOCK_TEMPORARY_PREFIX = ".buzzer-preview-lock-";
-type PublishState = "prepared" | "midi-backed-up" | "backups-complete" | "midi-published" | "wav-publishing" | "wav-published" | "complete";
+type PublishState = "prepared" | "midi-backing-up" | "midi-backed-up" | "wav-backing-up" | "backups-complete" | "midi-published" | "wav-publishing" | "wav-published" | "complete";
 const TRANSACTION_ENTRY_NAMES = new Set([
   ".owner",
   ".state",
@@ -835,10 +850,7 @@ async function cleanupAbandonedStaging(outDir: string, stem: string, startingSca
         const allowedNames = entry.name.startsWith(lockPrefix) ? LOCK_ENTRY_NAMES : TRANSACTION_ENTRY_NAMES;
         const listing = await readDirectoryEntriesBounded(path, allowedNames.size + 1);
         if (listing.truncated || listing.entries.some((candidate) => candidate.isDirectory() || candidate.isSymbolicLink() || !allowedNames.has(candidate.name))) continue;
-        if (listing.entries.length === 0) {
-          await rm(path, { recursive: true, force: true, maxRetries: 0 });
-          continue;
-        }
+        if (listing.entries.length === 0) continue;
         if (entry.name.startsWith(lockPrefix)) {
           const owner = new TextDecoder().decode(await readRegularFile(join(path, "owner"), 256)).trim();
           const pid = Number(new TextDecoder().decode(await readRegularFile(join(path, "pid"), 128)).trim());
@@ -867,7 +879,7 @@ async function writePublishState(directory: string, state: PublishState): Promis
 async function readPublishState(directory: string): Promise<PublishState | undefined> {
   try {
     const state = new TextDecoder().decode(await readRegularFile(join(directory, ".state"))).trim();
-    if (state === "prepared" || state === "midi-backed-up" || state === "backups-complete" || state === "midi-published" || state === "wav-publishing" || state === "wav-published" || state === "complete") return state;
+    if (state === "prepared" || state === "midi-backing-up" || state === "midi-backed-up" || state === "wav-backing-up" || state === "backups-complete" || state === "midi-published" || state === "wav-publishing" || state === "wav-published" || state === "complete") return state;
     throw new Error(`transaction state is invalid: ${directory}`);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
@@ -974,6 +986,12 @@ async function restoreTransaction(directory: string, midiPath: string, wavPath: 
 
   const midi = await restoreOutput(directory, "midi.backup", midiPath, "midi.restoring", "midi.restored", "midi.symlink");
   const wav = await restoreOutput(directory, "wav.backup", wavPath, "wav.restoring", "wav.restored", "wav.symlink");
+  if (state === "midi-backing-up" && !midi.inProgress) {
+    throw new Error(`MIDI backup is incomplete; preserving transaction: ${directory}`);
+  }
+  if (state === "wav-backing-up" && !wav.inProgress) {
+    throw new Error(`WAV backup is incomplete; preserving transaction: ${directory}`);
+  }
   if (state === "backups-complete" || state === "midi-published" || state === "wav-publishing" || state === "wav-published") {
     if (!midi.inProgress) await removeFile(midiPath);
     if ((state === "wav-publishing" || state === "wav-published") && !wav.inProgress) await removeFile(wavPath);
@@ -1034,6 +1052,7 @@ async function recoverPublishTransactions(outDir: string, stem: string, midiPath
     if (isTransaction) {
       try {
         await rename(transaction, quarantine);
+        await syncDirectory(outDir);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
         throw error;
@@ -1045,6 +1064,7 @@ async function recoverPublishTransactions(outDir: string, stem: string, midiPath
       if (isTransaction) {
         try {
           await rename(quarantine, transaction);
+          await syncDirectory(outDir);
         } catch (restoreError) {
           throw new AggregateError([error, restoreError], `output publication recovery failed; quarantine preserved: ${quarantine}`);
         }
@@ -1076,7 +1096,7 @@ async function isProcessAlive(pid: number): Promise<boolean> {
   }
 }
 
-async function removeLockDirectory(directory: string): Promise<boolean> {
+async function removeLockDirectory(directory: string, expectedOwner?: string): Promise<boolean> {
   let entries;
   try {
     const metadata = await lstat(directory);
@@ -1088,6 +1108,14 @@ async function removeLockDirectory(directory: string): Promise<boolean> {
     return false;
   }
   if (entries.length === 0 || entries.some((entry) => entry.isDirectory() || entry.isSymbolicLink() || !LOCK_ENTRY_NAMES.has(entry.name))) return false;
+  if (expectedOwner !== undefined) {
+    try {
+      const owner = new TextDecoder().decode(await readRegularFile(join(directory, "owner"), 128)).trim();
+      if (owner !== expectedOwner) return false;
+    } catch {
+      return false;
+    }
+  }
   const tombstone = join(dirname(directory), `${DELETE_TOMBSTONE_PREFIX}${randomUUID()}`);
   try {
     await rename(directory, tombstone);
@@ -1185,25 +1213,7 @@ async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner
       const heartbeat = setInterval(() => { void refreshLockHeartbeat(heartbeatPath); }, LOCK_HEARTBEAT_MS);
       return async () => {
         clearInterval(heartbeat);
-        const quarantine = join(outDir, `.buzzer-preview-release-${stem}-${randomUUID()}`);
-        try {
-          await rename(lockDirectory, quarantine);
-        } catch {
-          // A replacement owner or a missing lock must never be removed by an old releaser.
-          return;
-        }
-        try {
-          const currentOwner = new TextDecoder().decode(await readRegularFile(join(quarantine, "owner"), 128)).trim();
-          if (currentOwner !== ownerToken) {
-            await rename(quarantine, lockDirectory).catch(() => undefined);
-            return;
-          }
-          if (!await removeLockDirectory(quarantine)) {
-            await rename(quarantine, lockDirectory).catch(() => undefined);
-          }
-        } catch {
-          await rename(quarantine, lockDirectory).catch(() => undefined);
-        }
+        await removeLockDirectory(lockDirectory, ownerToken);
       };
     } catch (error) {
       if (temporaryDirectory !== undefined) await discardTemporaryLockDirectory(temporaryDirectory);
@@ -1251,13 +1261,7 @@ async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner
         stale = false;
       }
       if (!stale) throw new Error("output publication is already in progress");
-      const quarantine = join(outDir, `.buzzer-preview-reclaim-${stem}-${randomUUID()}`);
-      try {
-        await rename(lockDirectory, quarantine);
-      } catch {
-        continue;
-      }
-      await removeLockDirectory(quarantine);
+      if (!await removeLockDirectory(lockDirectory)) continue;
     }
   }
   throw new Error("could not acquire output publication lock");
@@ -1278,13 +1282,15 @@ async function publishOutputsLocked(outDir: string, stem: string, midi: Uint8Arr
     await writeSyncedFile(tempWavPath, wav);
     await writePublishState(transaction, "prepared");
     await syncDirectory(outDir);
+    await writePublishState(transaction, "midi-backing-up");
     await moveOutputToBackup(midiPath, join(transaction, "midi.backup"), join(transaction, "midi.symlink"));
-    await syncDirectory(outDir);
     await syncDirectory(transaction);
+    await syncDirectory(outDir);
     await writePublishState(transaction, "midi-backed-up");
+    await writePublishState(transaction, "wav-backing-up");
     await moveOutputToBackup(wavPath, join(transaction, "wav.backup"), join(transaction, "wav.symlink"));
-    await syncDirectory(outDir);
     await syncDirectory(transaction);
+    await syncDirectory(outDir);
     await writePublishState(transaction, "backups-complete");
     await rename(tempMidiPath, midiPath);
     await syncDirectory(transaction);

@@ -3,7 +3,7 @@ import { mkdtemp, readFile, readlink, rm, symlink, truncate, writeFile } from "n
 import { homedir, tmpdir } from "node:os";
 import { inflateSync } from "node:zlib";
 import { join } from "node:path";
-import { convertFramebuffer, encodePng, expandUser, main, MAX_FRAMEBUFFER_INPUT_BYTES, MAX_FRAMEBUFFER_PIXELS, MAX_FRAMEBUFFER_ROWS, type ConvertOptions } from "../scripts/fb_to_png.ts";
+import { convertFramebuffer, encodePng, expandUser, main, parseArgs, MAX_FRAMEBUFFER_INPUT_BYTES, MAX_FRAMEBUFFER_PIXELS, MAX_FRAMEBUFFER_ROWS, type ConvertOptions } from "../scripts/fb_to_png.ts";
 
 async function captureStdout<T>(callback: () => Promise<T>): Promise<{ value: T; stdout: string[] }> {
   const originalLog = console.log;
@@ -150,6 +150,7 @@ describe("framebuffer to PNG helper", () => {
     expect(await main(["--unknown"])).toBe(2);
     expect(await main(["--width"])).toBe(2);
     expect(await main(["--format", "invalid", "--width", "1", "--height", "1", "--in", "fixture", "--out", "fixture"])).toBe(2);
+    expect(parseArgs(["--format=gray8", "--width=+1", "--height=+1", "--in=fixture", "--out=fixture"])).toMatchObject({ format: "gray8", width: 1, height: 1, input: "fixture", output: "fixture" });
   });
 
   test("rejects input files with unbounded trailing data", async () => {

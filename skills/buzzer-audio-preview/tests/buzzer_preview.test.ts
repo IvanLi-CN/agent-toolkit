@@ -259,6 +259,8 @@ describe("buzzer MIDI and WAV helper", () => {
   test("rejects output stems that escape the selected directory", () => {
     expect(() => parseArgs(["--in", "fixture.json", "--stem", "../outside"])).toThrow(/without path separators/);
     expect(() => parseArgs(["--in", "fixture.json", "--stem", "/tmp/outside"])).toThrow(/without path separators/);
+    expect(() => parseArgs(["--in", "fixture.json", "--stem", "fixture\nINJECTED"])).toThrow(/control characters/);
+    expect(parseArgs(["--in=fixture.json", "--stem=fixture"])).toEqual({ input: "fixture.json", outDir: ".", stem: "fixture" });
   });
 
   test("replaces preexisting output symlinks without touching their targets", async () => {

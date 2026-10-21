@@ -50,7 +50,7 @@ echo
 echo "### Processes (dontstarve/steamcmd/screen/tmux)"
 echo
 if have_cmd ps; then
-  ps -eo pid=,comm= 2>/dev/null | grep -Ei 'dontstarve|steamcmd|screen|tmux' | awk '{ print "- pid: " $1 " process: <redacted>" }' | head -n 120 || true
+  ps -eo pid=,comm= 2>/dev/null | grep -Ei 'dontstarve|steamcmd|screen|tmux' | awk 'NR <= 120 { print "- pid: " $1 " process: <redacted>" }' || true
 fi
 echo
 
@@ -88,26 +88,26 @@ echo "- klei_dir: <remote-home>/.klei/DoNotStarveTogether"
 echo
 
 cluster_count=0
-while IFS= read -r cluster; do
-  [[ "$cluster" == "$KLEI_DIR" ]] && continue
+shopt -s nullglob
+for cluster in "$KLEI_DIR"/*; do
+  [[ -d "$cluster" && ! -L "$cluster" ]] || continue
   ((cluster_count += 1))
   if (( cluster_count > 128 )); then
     echo "> cluster inventory truncated at 128 entries."
     break
   fi
-  [[ -d "$cluster" && ! -L "$cluster" ]] || continue
   echo "#### Cluster: <cluster>"
-  if [[ -f "$cluster/cluster.ini" ]]; then
+  if [[ -f "$cluster/cluster.ini" && ! -L "$cluster/cluster.ini" ]]; then
     echo "- cluster.ini: present (contains cluster_password; do not paste)"
   fi
-  if [[ -f "$cluster/cluster_token.txt" ]]; then
+  if [[ -f "$cluster/cluster_token.txt" && ! -L "$cluster/cluster_token.txt" ]]; then
     echo "- cluster_token.txt: present (redacted)"
   fi
   for shard in Master Caves; do
     if [[ -d "$cluster/$shard" && ! -L "$cluster/$shard" ]]; then
       echo "- $shard/: present"
       for f in server.ini modoverrides.lua server_log.txt server_chat_log.txt; do
-        if [[ -f "$cluster/$shard/$f" ]]; then
+        if [[ -f "$cluster/$shard/$f" && ! -L "$cluster/$shard/$f" ]]; then
           if have_cmd stat; then
             if stat -c '%s bytes %y' "$cluster/$shard/$f" >/dev/null 2>&1; then
               echo "  - $f: $(stat -c '%s bytes %y' "$cluster/$shard/$f")"
@@ -122,7 +122,8 @@ while IFS= read -r cluster; do
     fi
   done
   echo
-done < <(find "$KLEI_DIR" -type d \( -path "$KLEI_DIR" -o -prune \) -print 2>/dev/null | head -n 129 || true)
+done
+shopt -u nullglob
 
 echo "### Server binary (best-effort)"
 echo

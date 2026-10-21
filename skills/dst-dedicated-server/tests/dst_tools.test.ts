@@ -61,6 +61,9 @@ describe("DST local Bun tooling", () => {
     const multilineToken = ["token", "=", '"', "first-line\nsecond-line", '"'].join("");
     expect(redactSensitiveText(multilineToken)).toBe("token=[REDACTED]");
     expect(redactSensitiveText("api_key=[REDACTED] token raw-secret")).toBe("api_key=[REDACTED] token [REDACTED]");
+    expect(redactSensitiveText("Cookie: sessionid=fixture-secret")).not.toContain("fixture-secret");
+    expect(redactSensitiveText("Set-Cookie: session_id=fixture-secret")).not.toContain("fixture-secret");
+    expect(redactSensitiveText("token={\n  \"value\": \"fixture-secret\"")).not.toContain("fixture-secret");
     const mixedSecrets = ["passphrase", "=", "fixture-secret", " pwd ", "fixture-secret"].join("");
     expect(redactSensitiveText(mixedSecrets)).toBe("passphrase=[REDACTED] pwd [REDACTED]");
     expect(redactOperationalText("permission denied: foo\\..\\private\\fixture-secret")).toContain("<redacted-path>");
@@ -354,6 +357,30 @@ describe("DST local Bun tooling", () => {
       expect(stdout).toContain("#### Cluster: <cluster>");
       expect(stdout).toContain("- cluster.ini: present (contains cluster_password; do not paste)");
       expect(stdout).not.toContain("fixture-secret");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("remote snapshot ignores symlinked cluster files", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-file-symlink-"));
+    try {
+      const home = join(root, "home");
+      const cluster = join(home, ".klei", "DoNotStarveTogether", "Cluster_fixture", "Master");
+      const outside = join(root, "outside-secret.txt");
+      await mkdir(cluster, { recursive: true });
+      await writeFile(outside, "outside-secret");
+      await symlink(outside, join(cluster, "server.ini"));
+      await symlink(outside, join(join(home, ".klei", "DoNotStarveTogether", "Cluster_fixture"), "cluster.ini"));
+      const child = Bun.spawn(["bash", join(import.meta.dir, "..", "scripts", "dst_snapshot_remote.sh")], {
+        env: { ...process.env, HOME: home }, stdout: "pipe", stderr: "pipe",
+      });
+      const [status, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+      expect(status).toBe(0);
+      expect(stdout).toContain("#### Cluster: <cluster>");
+      expect(stdout).not.toContain("cluster.ini: present");
+      expect(stdout).not.toContain("server.ini:");
+      expect(stdout).not.toContain("outside-secret");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

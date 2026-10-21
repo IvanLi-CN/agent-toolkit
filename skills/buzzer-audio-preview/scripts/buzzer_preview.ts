@@ -561,8 +561,16 @@ async function readOwnerKey(): Promise<Uint8Array> {
   const promise = (async () => {
     const path = ownerKeyPath();
     await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+    const parentMetadata = await lstat(dirname(path));
+    if (!parentMetadata.isDirectory() || parentMetadata.isSymbolicLink()) throw new Error("owner key parent must be a real private directory");
+    if ((parentMetadata.mode & 0o077) !== 0) throw new Error("owner key parent is accessible by group or other users");
+    if (typeof process.getuid === "function" && parentMetadata.uid !== process.getuid()) throw new Error("owner key parent is not owned by the current user");
     try {
       const key = await readBoundedRegularFile(path, OWNER_KEY_BYTES, "owner key");
+      const metadata = await lstat(path);
+      if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error("owner key must be a regular file");
+      if ((metadata.mode & 0o077) !== 0) throw new Error("owner key is accessible by group or other users");
+      if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) throw new Error("owner key is not owned by the current user");
       if (key.length !== OWNER_KEY_BYTES) throw new Error("owner key has an invalid length");
       return key;
     } catch (error) {
@@ -577,10 +585,15 @@ async function readOwnerKey(): Promise<Uint8Array> {
         } finally {
           await handle.close();
         }
+        await syncDirectory(dirname(path));
         return key;
       } catch (createError) {
         if ((createError as NodeJS.ErrnoException).code !== "EEXIST") throw createError;
         const existing = await readBoundedRegularFile(path, OWNER_KEY_BYTES, "owner key");
+        const metadata = await lstat(path);
+        if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error("owner key must be a regular file");
+        if ((metadata.mode & 0o077) !== 0) throw new Error("owner key is accessible by group or other users");
+        if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) throw new Error("owner key is not owned by the current user");
         if (existing.length !== OWNER_KEY_BYTES) throw new Error("owner key has an invalid length");
         return existing;
       }
@@ -902,16 +915,21 @@ async function recoverPublishTransactions(outDir: string, stem: string, midiPath
     if (!entry.isDirectory() || (!isTransaction && !isRecovery)) continue;
     const transaction = join(outDir, entry.name);
     let transactionEntries;
+    let ownerValid = false;
     try {
       const listing = await readDirectoryEntriesBounded(transaction, TRANSACTION_ENTRY_NAMES.size + 1);
-      if (listing.truncated) continue;
+      ownerValid = await hasValidTransactionOwner(transaction);
+      if (!ownerValid) continue;
+      if (listing.truncated) throw new Error(`publication transaction contains too many entries: ${transaction}`);
       transactionEntries = listing.entries;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
       throw error;
     }
-    if (transactionEntries.some((candidate) => candidate.isDirectory() || !TRANSACTION_ENTRY_NAMES.has(candidate.name))) continue;
-    if (!await hasValidTransactionOwner(transaction)) continue;
+    if (!ownerValid) continue;
+    if (transactionEntries.some((candidate) => candidate.isDirectory() || !TRANSACTION_ENTRY_NAMES.has(candidate.name))) {
+      throw new Error(`publication transaction contains unknown entries: ${transaction}`);
+    }
     const state = await readPublishState(transaction);
     if (state === undefined && !await hasRecoveryArtifacts(transaction)) continue;
     const quarantine = isRecovery ? transaction : join(outDir, `.buzzer-preview-recovery-${stem}-${randomUUID()}`);
@@ -940,6 +958,18 @@ async function recoverPublishTransactions(outDir: string, stem: string, midiPath
 
 async function isProcessAlive(pid: number): Promise<boolean> {
   if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (process.platform === "linux") {
+    try {
+      const stat = await readFile(`/proc/${pid}/stat`, "utf8");
+      const closingParenthesis = stat.lastIndexOf(")");
+      if (closingParenthesis >= 0) {
+        const fields = stat.slice(closingParenthesis + 2).trim().split(/\s+/);
+        if (fields[0] === "Z") return false;
+      }
+    } catch {
+      // Fall back to kill(2) when /proc is unavailable.
+    }
+  }
   try {
     process.kill(pid, 0);
     return true;

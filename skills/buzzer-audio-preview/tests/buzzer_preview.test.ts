@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHmac, randomBytes } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readlink, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readlink, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -588,6 +588,48 @@ describe("buzzer MIDI and WAV helper", () => {
       expect(pair.midi.toString()).toBe("current-midi");
       expect(pair.wav.toString()).toBe("current-wav");
       expect(await readdir(output)).toContain(".buzzer-preview-txn-fixture-forged");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fails closed for a valid owner transaction with unknown entries", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-unknown-owner-entry-"));
+    try {
+      const output = join(root, "out");
+      const transaction = join(output, ".buzzer-preview-txn-fixture-unknown-entry");
+      await mkdir(transaction, { recursive: true });
+      await writeFile(join(output, "fixture.mid"), "current-midi");
+      await writeFile(join(output, "fixture.wav"), "current-wav");
+      await writeFile(join(transaction, ".owner"), await fixtureOwnerRecord(FIXTURE_TRANSACTION_NONCE));
+      await writeFile(join(transaction, ".state"), "midi-published\n");
+      await writeFile(join(transaction, "unexpected"), "must-not-be-ignored");
+      await expect(readPublishedPair(output, "fixture")).rejects.toThrow(/unknown entries/);
+      expect(await readFile(join(output, "fixture.mid"), "utf8")).toBe("current-midi");
+      expect(await readdir(output)).toContain(".buzzer-preview-txn-fixture-unknown-entry");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects an owner key in an accessible directory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-owner-key-permissions-"));
+    try {
+      const keyDirectory = join(root, "key");
+      await mkdir(keyDirectory);
+      await chmod(keyDirectory, 0o755);
+      const keyFile = join(keyDirectory, "owner.key");
+      await writeFile(keyFile, randomBytes(32), { mode: 0o644 });
+      const input = join(root, "fixture.json");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      const child = Bun.spawn([process.execPath, join(import.meta.dir, "..", "scripts", "buzzer_preview.ts"), "--in", input, "--out-dir", join(root, "out")], {
+        env: { ...process.env, BUZZER_PREVIEW_OWNER_KEY_FILE: keyFile },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [status, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+      expect(status).toBe(1);
+      expect(stderr).toContain("accessible by group");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

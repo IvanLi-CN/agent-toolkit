@@ -206,7 +206,7 @@ async function syncDirectory(path: string): Promise<void> {
   }
 }
 
-const SENSITIVE_NAME = "(?:password|passwd|pass[ _-]?phrase|pwd|secret|token|credential|private[_ -]?key|api[_ -]?key|access[_ -]?key|authorization|bearer)";
+const SENSITIVE_NAME = "(?:password|passwd|pass[ _-]?phrase|pwd|secret|token|credential|private[_ -]?key|api[_ -]?key|access[_ -]?key|authorization|bearer|cookie|set[ _-]?cookie|session(?:[_ -]?id)?)";
 const SENSITIVE_KEY = `(?:[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*|"[^"\\r\\n]*${SENSITIVE_NAME}[^"\\r\\n]*"|'[^'\\r\\n]*${SENSITIVE_NAME}[^'\\r\\n]*')`;
 const SENSITIVE_KEY_TOKEN = `(?:[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*|\\[[^\\]\\r\\n]*${SENSITIVE_NAME}[^\\]\\r\\n]*\\])`;
 const SENSITIVE_ASSIGNMENT = new RegExp(
@@ -256,6 +256,29 @@ function collectionEnd(text: string, openingIndex: number): number | undefined {
   return undefined;
 }
 
+function hasUnbalancedDelimiter(text: string): boolean {
+  const stack: string[] = [];
+  let quote: '"' | "'" | undefined;
+  let escaped = false;
+  for (const character of text) {
+    if (quote !== undefined) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) quote = undefined;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+    } else if (character === "{" || character === "[") {
+      stack.push(character);
+    } else if (character === "}" || character === "]") {
+      const opening = stack.at(-1);
+      if ((character === "}" && opening === "{") || (character === "]" && opening === "[")) stack.pop();
+    }
+  }
+  return quote !== undefined || stack.length > 0;
+}
+
 function redactSensitiveCollections(text: string): string {
   let output = "";
   let cursor = 0;
@@ -263,7 +286,11 @@ function redactSensitiveCollections(text: string): string {
   for (let match = SENSITIVE_COLLECTION_ASSIGNMENT.exec(text); match !== null; match = SENSITIVE_COLLECTION_ASSIGNMENT.exec(text)) {
     const openingIndex = match.index + match[0].length - 1;
     const end = collectionEnd(text, openingIndex);
-    if (end === undefined) continue;
+    if (end === undefined) {
+      output += text.slice(cursor, match.index) + match[1] + "[REDACTED]";
+      cursor = text.length;
+      break;
+    }
     output += text.slice(cursor, match.index) + match[1] + "[REDACTED]";
     cursor = end;
     SENSITIVE_COLLECTION_ASSIGNMENT.lastIndex = end;
@@ -362,6 +389,18 @@ export async function safeTail(file: string, lines: number, allowedRoot?: string
       const partialLine = metadata.size > bytesToRead;
       const firstLineEnd = text.search(/\r?\n/);
       if (partialLine && firstLineEnd < 0) return "";
+      if (partialLine) {
+        const partialPrefix = text.slice(0, firstLineEnd);
+        const partialProbe = partialPrefix.length > 8_192
+          ? `${partialPrefix.slice(0, 4_096)}\n${partialPrefix.slice(-4_096)}`
+          : partialPrefix;
+        const sensitiveAssignment = UNREDACTED_SENSITIVE_ASSIGNMENT.test(partialProbe)
+          && /(?:[:=]\s*$|[:=]\s*[|>][-+0-9]*\s*$|[\[{])/.test(partialPrefix);
+        UNREDACTED_SENSITIVE_ASSIGNMENT.lastIndex = 0;
+        if (hasUnbalancedDelimiter(partialPrefix) || /^\s/.test(partialPrefix) || sensitiveAssignment) {
+          return "[REDACTED: bounded log tail begins mid-record]";
+        }
+      }
       const completeText = partialLine ? text.slice(firstLineEnd + 1) : text;
       return redactSensitiveText(completeText.split(/\r?\n/).slice(-lines).join("\n"));
     } finally {

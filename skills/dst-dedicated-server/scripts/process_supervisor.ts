@@ -1062,7 +1062,7 @@ if ! parent_is_alive; then
   exit 143
 fi
 printf '%s\\n' "$target_status" > "$status_path"
-exec 0<&- 1>&- 2>/dev/null
+exec 0<&- 1>/dev/null 2>/dev/null
 hold_seconds=5
 if [ -d "/proc/$$/fd" ]; then hold_seconds=0.25; fi
 sleep "$hold_seconds" &

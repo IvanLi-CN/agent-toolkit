@@ -274,6 +274,7 @@ describe("buzzer MIDI and WAV helper", () => {
       expect(await main(["--in", input, "--out-dir", output])).toBe(0);
       expect(await Bun.file(outside).text()).toBe("sentinel");
       expect((await readFile(join(output, "fixture.mid"))).slice(0, 4).toString()).toBe("MThd");
+      expect((await readdir(output)).some((entry) => entry.startsWith(".buzzer-preview-txn-") || entry.startsWith(".buzzer-preview-recovery-"))).toBe(false);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

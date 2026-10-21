@@ -219,11 +219,12 @@ const SENSITIVE_QUOTED_ASSIGNMENT = new RegExp(
 );
 const SENSITIVE_BARE_VALUE = new RegExp(`\\b(${SENSITIVE_NAME})\\s+(?![A-Za-z0-9_.-]+\\s*[:=]|\\[REDACTED\\])([^,;\\r\\n]+?)(?=(?:\\s+(?:via|and)\\s+)|[,;\\r\\n]|$)`, "gi");
 const UNREDACTED_SENSITIVE_ASSIGNMENT = new RegExp(`(?:\\b${SENSITIVE_NAME}|${SENSITIVE_KEY})\\s*[:=](?!\\s*\\[REDACTED\\])`, "i");
-const AUTHORIZATION_TOKEN = /\b(Bearer|Basic)\s+[^\s,;]+/gi;
-const BRACKETED_SENSITIVE_ASSIGNMENT = new RegExp(`(\\[[^\\]\\r\\n]*${SENSITIVE_NAME}[^\\]\\r\\n]*\\]\\s*[:=]\\s*)(?!\\s*\\[REDACTED\\])([^,;\\r\\n]+)`, "gi");
-const ENCODED_SENSITIVE_ASSIGNMENT = new RegExp(`(\\b[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*\\s*%3[dD]\\s*)(?!\\s*\\[REDACTED\\])([^&\\s,;]+)`, "gi");
+const AUTHORIZATION_TOKEN = /\b(Bearer|Basic)(?:\s*[:=])?\s*([^\s,;]+)/gi;
+const BRACKETED_SENSITIVE_ASSIGNMENT = new RegExp(`(\\[[^\\]\\r\\n]*${SENSITIVE_NAME}[^\\]\\r\\n]*\\]\\s*[:=]\\s*)(?!\\s*\\[REDACTED\\])([^\\r\\n]+)`, "gi");
+const ENCODED_SENSITIVE_ASSIGNMENT = new RegExp(`(\\b[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*\\s*%3[dD]\\s*)(?!\\s*\\[REDACTED\\])([^\\r\\n]+)`, "gi");
 const SENSITIVE_BLOCK_HEADER = new RegExp(`^([ \\t]*${SENSITIVE_KEY_TOKEN}\\s*[:=]\\s*[|>][-+0-9]*)\\s*$`, "i");
 const PRIVATE_KEY_BLOCK = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----/gi;
+const SENSITIVE_FILENAME = new RegExp("\\b(?=[A-Za-z0-9_.-]*" + SENSITIVE_NAME + "[A-Za-z0-9_.-]*\\b)(?=[A-Za-z0-9_.-]*[_.-])[A-Za-z0-9][A-Za-z0-9_.-]*\\b", "gi");
 const ANSI_ESCAPE = /\u001B(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001B\\))/g;
 const CONTROL_CHARACTERS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g;
 const SENSITIVE_MULTILINE_ASSIGNMENT = new RegExp(`(${SENSITIVE_KEY_TOKEN}\\s*[:=])\\s*\\r?\\n(?:[ \\t]+[^\\r\\n]*(?:\\r?\\n|$))+`, "gi");
@@ -353,6 +354,10 @@ export function redactOperationalText(text: string, values: string[] = []): stri
     .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "<redacted-address>");
 }
 
+function redactDirectoryListing(text: string, values: string[] = []): string {
+  return redactOperationalText(text, values).replace(SENSITIVE_FILENAME, "<redacted-name>");
+}
+
 export function validateSshToken(value: string, label: string): void {
   if (value.length === 0 || value.startsWith("-") || /[\u0000\r\n\t\s@/\\]/.test(value)) {
     throw new CliError(`error: --${label} contains an invalid SSH token`);
@@ -411,12 +416,13 @@ export async function safeTail(file: string, lines: number, allowedRoot?: string
   }
 }
 
-async function commandFirstLines(args: string[], lines: number, redactions: string[] = []): Promise<string> {
+async function commandFirstLines(args: string[], lines: number, redactions: string[] = [], redactNames = false): Promise<string> {
   try {
     const result = await runWithStdin(args, "", LOCAL_COMMAND_TIMEOUT_MS, MAX_LOCAL_COMMAND_OUTPUT_BYTES);
     const selected = result.stdout.split(/\r?\n/).slice(0, lines).join("\n").trimEnd();
     const marker = result.timedOut ? "[command timed out]" : result.outputTruncated ? "[output truncated]" : "";
-    return redactOperationalText([selected, marker].filter(Boolean).join("\n"), redactions);
+    const output = [selected, marker].filter(Boolean).join("\n");
+    return redactNames ? redactDirectoryListing(output, redactions) : redactOperationalText(output, redactions);
   } catch {
     return "[command unavailable]";
   }
@@ -464,7 +470,7 @@ async function localCollect(options: SnapshotOptions): Promise<string> {
   }
 
   const pathRedactions = [localDir, process.env.HOME ?? homedir(), homedir()];
-  lines.push("### Directory overview", "", await commandFirstLines(["ls", "-la", "--", localDir], 200, pathRedactions), "");
+  lines.push("### Directory overview", "", await commandFirstLines(["ls", "-la", "--", localDir], 200, pathRedactions, true), "");
   let entryListing: { entries: Dirent[]; truncated: boolean };
   try {
     entryListing = await boundedDirectoryEntries(localDir);
@@ -479,7 +485,7 @@ async function localCollect(options: SnapshotOptions): Promise<string> {
     .map((entry) => join(localDir, entry.name))
     .sort();
   lines.push("### Known log files (first 200 lines of listing)", "");
-  if (logFiles.length > 0) lines.push(await commandFirstLines(["ls", "-la", "--", ...logFiles], 200, pathRedactions));
+  if (logFiles.length > 0) lines.push(await commandFirstLines(["ls", "-la", "--", ...logFiles], 200, pathRedactions, true));
   lines.push("");
 
   const clientLog = join(localDir, "client_log.txt");

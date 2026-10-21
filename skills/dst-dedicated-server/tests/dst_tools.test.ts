@@ -42,8 +42,10 @@ describe("DST local Bun tooling", () => {
 
   test("redacts bearer, basic, and escaped quoted secrets completely", () => {
     expect(redactSensitiveText("Authorization: Bearer fixture-secret")).toBe("Authorization: [REDACTED]");
+    expect(redactSensitiveText("Authorization: Bearer : fixture-secret")).toBe("Authorization: [REDACTED]");
     expect(redactSensitiveText("Authorization Bearer fixture-secret")).toBe("Authorization [REDACTED]");
     expect(redactSensitiveText("Authorization: Basic fixture-secret")).toBe("Authorization: [REDACTED]");
+    expect(redactSensitiveText("Authorization: Basic = fixture-secret")).toBe("Authorization: [REDACTED]");
     expect(redactSensitiveText("Basic fixture-secret")).not.toContain("fixture-secret");
     expect(redactSensitiveText("pass phrase: fixture-secret")).not.toContain("fixture-secret");
     expect(redactSensitiveText("-----BEGIN PRIVATE KEY-----\nMIIEfixture-secret\n-----END PRIVATE KEY-----")).not.toContain("fixture-secret");
@@ -61,6 +63,8 @@ describe("DST local Bun tooling", () => {
     const multilineToken = ["token", "=", '"', "first-line\nsecond-line", '"'].join("");
     expect(redactSensitiveText(multilineToken)).toBe("token=[REDACTED]");
     expect(redactSensitiveText("api_key=[REDACTED] token raw-secret")).toBe("api_key=[REDACTED] token [REDACTED]");
+    expect(redactOperationalText("[api_key]=fixture-secret,SECRET_TAIL")).not.toContain("SECRET_TAIL");
+    expect(redactOperationalText("api_key%3Dfixture-secret&SECRET_TAIL")).not.toContain("SECRET_TAIL");
     expect(redactSensitiveText("Cookie: sessionid=fixture-secret")).not.toContain("fixture-secret");
     expect(redactSensitiveText("Set-Cookie: session_id=fixture-secret")).not.toContain("fixture-secret");
     expect(redactSensitiveText("token={\n  \"value\": \"fixture-secret\"")).not.toContain("fixture-secret");
@@ -168,6 +172,7 @@ describe("DST local Bun tooling", () => {
       await writeFile(join(cluster, "cluster.ini"), "cluster_password=secret-fixture\n");
       await writeFile(join(cluster, "cluster_token.txt"), "token-fixture\n");
       await writeFile(join(directCluster, "cluster_token.txt"), "token-fixture-direct\n");
+      await writeFile(join(local, "aws-prod-secret-key-SECRET_CANARY.pem"), "private\n");
       const output = join(root, "snapshot.md");
       expect(await snapshotMain(["--local-dir", local, "--no-remote", "--out", output])).toBe(0);
       const report = await readFile(output, "utf8");
@@ -177,6 +182,7 @@ describe("DST local Bun tooling", () => {
       expect(report).toContain("line-09999");
       expect(report).not.toContain("early-log-marker");
       expect(report).not.toContain("fixture-secret");
+      expect(report).not.toContain("aws-prod-secret-key-SECRET_CANARY.pem");
       expect(report).toContain("api_key=[REDACTED]");
       expect(report).not.toContain("entry-239.txt");
       expect(report).toContain("<cluster-1>");

@@ -748,7 +748,18 @@ async function removeTransactionDirectory(directory: string): Promise<void> {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
     throw error;
   }
-  if (entries.length === 0 || entries.some((entry) => entry.isDirectory() || entry.isSymbolicLink() || !TRANSACTION_ENTRY_NAMES.has(entry.name))) return;
+  if (entries.length === 0 || entries.some((entry) => entry.isDirectory() || !TRANSACTION_ENTRY_NAMES.has(entry.name))) return;
+  for (const entry of entries) {
+    if (!entry.isSymbolicLink()) continue;
+    if (entry.name !== "midi.backup" && entry.name !== "wav.backup") return;
+    const marker = join(directory, entry.name === "midi.backup" ? "midi.symlink" : "wav.symlink");
+    try {
+      const expectedTarget = JSON.parse(new TextDecoder().decode(await readRegularFile(marker)));
+      if (typeof expectedTarget !== "string" || expectedTarget !== await readlink(join(directory, entry.name))) return;
+    } catch {
+      return;
+    }
+  }
   const tombstone = join(dirname(directory), `.buzzer-preview-delete-${randomUUID()}`);
   try {
     await rename(directory, tombstone);

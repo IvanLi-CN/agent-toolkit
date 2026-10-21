@@ -765,7 +765,8 @@ async function restoreTransaction(directory: string, midiPath: string, wavPath: 
 }
 
 async function recoverPublishTransactions(outDir: string, stem: string, midiPath: string, wavPath: string): Promise<void> {
-  const prefix = `.buzzer-preview-txn-${stem}-`;
+  const transactionPrefix = `.buzzer-preview-txn-${stem}-`;
+  const recoveryPrefix = `.buzzer-preview-recovery-${stem}-`;
   let entries;
   try {
     entries = await readdir(outDir, { withFileTypes: true });
@@ -774,7 +775,9 @@ async function recoverPublishTransactions(outDir: string, stem: string, midiPath
     throw error;
   }
   for (const entry of entries) {
-    if (!entry.isDirectory() || !entry.name.startsWith(prefix)) continue;
+    const isTransaction = entry.name.startsWith(transactionPrefix);
+    const isRecovery = entry.name.startsWith(recoveryPrefix);
+    if (!entry.isDirectory() || (!isTransaction && !isRecovery)) continue;
     const transaction = join(outDir, entry.name);
     let transactionEntries;
     try {
@@ -784,17 +787,25 @@ async function recoverPublishTransactions(outDir: string, stem: string, midiPath
       throw error;
     }
     if (transactionEntries.some((candidate) => candidate.isDirectory() || !TRANSACTION_ENTRY_NAMES.has(candidate.name))) continue;
-    const quarantine = join(outDir, `.buzzer-preview-recovery-${stem}-${randomUUID()}`);
-    try {
-      await rename(transaction, quarantine);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-      throw error;
+    const quarantine = isRecovery ? transaction : join(outDir, `.buzzer-preview-recovery-${stem}-${randomUUID()}`);
+    if (isTransaction) {
+      try {
+        await rename(transaction, quarantine);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
     }
     try {
       await restoreTransaction(quarantine, midiPath, wavPath);
     } catch (error) {
-      await rename(quarantine, transaction).catch(() => undefined);
+      if (isTransaction) {
+        try {
+          await rename(quarantine, transaction);
+        } catch (restoreError) {
+          throw new AggregateError([error, restoreError], `output publication recovery failed; quarantine preserved: ${quarantine}`);
+        }
+      }
       throw error;
     }
   }
@@ -810,17 +821,22 @@ async function isProcessAlive(pid: number): Promise<boolean> {
   }
 }
 
-async function removeLockDirectory(directory: string): Promise<void> {
+async function removeLockDirectory(directory: string): Promise<boolean> {
   let entries;
   try {
     entries = await readdir(directory, { withFileTypes: true });
   } catch {
-    return;
+    return false;
   }
-  if (entries.some((entry) => entry.isDirectory() || !LOCK_ENTRY_NAMES.has(entry.name))) return;
+  if (entries.some((entry) => entry.isDirectory() || !LOCK_ENTRY_NAMES.has(entry.name))) return false;
   for (const entry of entries) await unlink(join(directory, entry.name)).catch(() => undefined);
-  await rmdir(directory).catch(() => undefined);
+  try {
+    await rmdir(directory);
+  } catch {
+    return false;
+  }
   await syncDirectory(dirname(directory));
+  return true;
 }
 
 async function processIdentity(pid: number): Promise<string | undefined> {
@@ -875,11 +891,24 @@ async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner
       const heartbeat = setInterval(() => { void refreshLockHeartbeat(heartbeatPath); }, LOCK_HEARTBEAT_MS);
       return async () => {
         clearInterval(heartbeat);
+        const quarantine = join(outDir, `.buzzer-preview-release-${stem}-${randomUUID()}`);
         try {
-          const currentOwner = new TextDecoder().decode(await readRegularFile(join(lockDirectory, "owner"), 128)).trim();
-          if (currentOwner === owner) await removeLockDirectory(lockDirectory);
+          await rename(lockDirectory, quarantine);
         } catch {
-          // A replacement owner must never be removed by an old releaser.
+          // A replacement owner or a missing lock must never be removed by an old releaser.
+          return;
+        }
+        try {
+          const currentOwner = new TextDecoder().decode(await readRegularFile(join(quarantine, "owner"), 128)).trim();
+          if (currentOwner !== owner) {
+            await rename(quarantine, lockDirectory).catch(() => undefined);
+            return;
+          }
+          if (!await removeLockDirectory(quarantine)) {
+            await rename(quarantine, lockDirectory).catch(() => undefined);
+          }
+        } catch {
+          await rename(quarantine, lockDirectory).catch(() => undefined);
         }
       };
     } catch (error) {

@@ -260,7 +260,7 @@ async function readText(stream: ReadableStream<Uint8Array>, maxBytes = 64 * 1024
     }
     return text + decoder.decode();
   } finally {
-    if (cancelPromise !== undefined) await cancelPromise;
+    await cancelReader();
     reader.releaseLock();
   }
 }

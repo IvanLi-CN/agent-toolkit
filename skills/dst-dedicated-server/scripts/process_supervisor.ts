@@ -10,15 +10,33 @@ status_dir="$(dirname -- "$status_path")"
 cleanup() { rm -rf -- "$status_dir"; }
 parent_pid="\${AGENT_TOOLKIT_SUPERVISOR_PARENT_PID:-\$PPID}"
 parent_starttime=""
+parent_identity_mode="unknown"
+parent_ps_start=""
 if [ -r "/proc/$parent_pid/stat" ]; then
   parent_starttime="$(awk '{ sub(/.*\\) /, ""); print $20 }' "/proc/$parent_pid/stat" 2>/dev/null || true)"
+  if [ -n "$parent_starttime" ]; then parent_identity_mode="proc"; fi
 fi
+if [ "$parent_identity_mode" != "proc" ]; then
+  parent_ps_start="$(ps -o lstart= -p "$parent_pid" 2>/dev/null | awk 'NR == 1 { sub(/^[ \t]*/, ""); sub(/[ \t]*$/, ""); print; exit }')"
+  if [ -n "$parent_ps_start" ]; then parent_identity_mode="ps"; fi
+fi
+target_pgid=""
 if command -v setsid >/dev/null 2>&1; then
+  target_pgid="pending"
   setsid "$@" &
 else
+  set -m 2>/dev/null || true
   "$@" &
 fi
 target_pid=$!
+if [ "$target_pgid" = "pending" ]; then target_pgid="$target_pid"; fi
+for _ in 1 2 3 4 5; do
+  observed_target_pgid="$(ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ' || true)"
+  case "$observed_target_pgid" in
+    ''|*[!0-9]*) sleep 0.01 ;;
+    *) target_pgid="$observed_target_pgid"; break ;;
+  esac
+done
 descendants() {
   ps -eo pid=,ppid= 2>/dev/null | awk -v root="$target_pid" '
     { parent[$1] = $2 }
@@ -35,7 +53,6 @@ descendants() {
 }
 signal_tree() {
   signal="$1"
-  target_pgid="$(ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ' || true)"
   wrapper_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' || true)"
   case "$target_pgid" in
     ''|*[!0-9]*) ;;
@@ -51,9 +68,16 @@ signal_tree() {
     kill -"$signal" "$pid" 2>/dev/null || true
   done
 }
-trap 'signal_tree TERM; signal_tree KILL; cleanup; exit 143' HUP INT TERM
+watchdog_pid=""
+stop_watchdog() {
+  if [ -n "$watchdog_pid" ]; then
+    kill "$watchdog_pid" 2>/dev/null || true
+    wait "$watchdog_pid" 2>/dev/null || true
+  fi
+}
+trap 'stop_watchdog; signal_tree TERM; signal_tree KILL; cleanup; exit 143' HUP INT TERM
 parent_is_alive() {
-  if [ -r "/proc/$parent_pid/stat" ]; then
+  if [ "$parent_identity_mode" = "proc" ] && [ -r "/proc/$parent_pid/stat" ]; then
     parent_identity="$(awk '{ sub(/.*\\) /, ""); print $1 " " $20 }' "/proc/$parent_pid/stat" 2>/dev/null || true)"
     parent_state="\${parent_identity%% *}"
     current_starttime="\${parent_identity#* }"
@@ -62,7 +86,13 @@ parent_is_alive() {
     }
     return
   fi
-  kill -0 "$parent_pid" 2>/dev/null
+  if [ "$parent_identity_mode" = "ps" ]; then
+    current_ps_start="$(ps -o lstart= -p "$parent_pid" 2>/dev/null | awk 'NR == 1 { sub(/^[ \t]*/, ""); sub(/[ \t]*$/, ""); print; exit }')"
+    current_ps_state="$(ps -o state= -p "$parent_pid" 2>/dev/null | awk 'NR == 1 { gsub(/[[:space:]]/, ""); print; exit }')"
+    [ -n "$current_ps_start" ] && [ "$current_ps_start" = "$parent_ps_start" ] && [ "$current_ps_state" != "Z" ]
+    return
+  fi
+  return 1
 }
 watch_parent() {
   while parent_is_alive; do sleep 1; done

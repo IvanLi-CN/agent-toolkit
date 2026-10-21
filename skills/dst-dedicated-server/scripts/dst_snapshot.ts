@@ -41,10 +41,10 @@ function expandUser(path: string): string {
 }
 
 function killProcessTree(supervised: SupervisedChild, signal: "SIGTERM" | "SIGKILL"): void {
+  try { supervised.child.kill(signal); } catch { /* The supervisor may already be gone. */ }
   if (process.platform !== "win32") {
     try { process.kill(-supervised.child.pid, signal); } catch { /* The supervisor may already be gone. */ }
   }
-  try { supervised.child.kill(signal); } catch { /* The supervisor may already be gone. */ }
 }
 
 export const MAX_REMOTE_OUTPUT_BYTES = 256 * 1024;
@@ -230,7 +230,7 @@ const JSON_AUTHORIZATION_ASSIGNMENT = /(["'])(Bearer|Basic)\1\s*:\s*("(?:\\.|[^"
 const BRACKETED_SENSITIVE_ASSIGNMENT = new RegExp(`(\\[[^\\]\\r\\n]*${SENSITIVE_NAME}[^\\]\\r\\n]*\\]\\s*[:=]\\s*)(?!\\s*\\[REDACTED\\])([^\\r\\n]+)`, "gi");
 const ENCODED_SENSITIVE_ASSIGNMENT = new RegExp(`(\\b[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*\\s*%3[dD]\\s*)(?!\\s*\\[REDACTED\\])([^\\r\\n]+)`, "gi");
 const SENSITIVE_BLOCK_HEADER = new RegExp(`^([ \\t]*${SENSITIVE_KEY_TOKEN}\\s*[:=]\\s*[|>][-+0-9]*)\\s*$`, "i");
-const PRIVATE_KEY_BLOCK = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----/gi;
+const PRIVATE_KEY_BLOCK = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/gi;
 const SENSITIVE_FILENAME = new RegExp("(?<![A-Za-z0-9])(?:[A-Za-z0-9_.-]*(?:" + SENSITIVE_NAME + "|env|id[_ -]?rsa|private[._-]?(?:key|pem)|api[._-]?key|auth[._-]?json)[A-Za-z0-9_.-]*)(?![A-Za-z0-9])", "gi");
 const ANSI_ESCAPE = /\u001B(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001B\\))/g;
 const CONTROL_CHARACTERS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g;
@@ -464,18 +464,6 @@ export async function safeTail(file: string, lines: number, allowedRoot?: string
   }
 }
 
-async function commandFirstLines(args: string[], lines: number, redactions: string[] = [], redactNames = false): Promise<string> {
-  try {
-    const result = await runWithStdin(args, "", LOCAL_COMMAND_TIMEOUT_MS, MAX_LOCAL_COMMAND_OUTPUT_BYTES);
-    const selected = result.stdout.split(/\r?\n/).slice(0, lines).join("\n").trimEnd();
-    const marker = result.timedOut ? "[command timed out]" : result.outputTruncated ? "[output truncated]" : "";
-    const output = [selected, marker].filter(Boolean).join("\n");
-    return redactNames ? redactDirectoryListing(output, redactions) : redactOperationalText(output, redactions);
-  } catch {
-    return "[command unavailable]";
-  }
-}
-
 async function boundedDirectoryEntries(path: string, limit = MAX_LOCAL_DIRECTORY_ENTRIES): Promise<{ entries: Dirent[]; truncated: boolean }> {
   const directory = await opendir(path);
   const entries: Dirent[] = [];
@@ -497,7 +485,11 @@ async function boundedDirectoryEntries(path: string, limit = MAX_LOCAL_DIRECTORY
 function renderBoundedDirectoryOverview(entries: Dirent[], truncated: boolean, redactions: string[]): string {
   const lines = entries.map((entry) => {
     const kind = entry.isDirectory() ? "dir" : entry.isSymbolicLink() ? "symlink" : entry.isFile() ? "file" : "other";
-    return `- ${kind}: ${entry.name}`;
+    const displayName = JSON.stringify(entry.name)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;");
+    return `- ${kind}: <code>${displayName}</code>`;
   });
   if (truncated) lines.push(`> Directory entry scan truncated at ${MAX_LOCAL_DIRECTORY_ENTRIES} entries.`);
   return redactDirectoryListing(lines.join("\n"), redactions);
@@ -601,7 +593,10 @@ async function ensureSnapshotTemporaryRoot(parent: string): Promise<string> {
   if (unknownEntries.length > 0 || temporaryEntries.length > 1) throw new Error("snapshot temporary root owner marker is invalid");
   if (temporaryEntries.length === 1) {
     const temporaryMarker = join(root, temporaryEntries[0]!);
-    if (await readMarker(temporaryMarker) !== true) throw new Error("snapshot temporary root owner marker is invalid");
+    if (await readMarker(temporaryMarker) !== true) {
+      if (await readMarker() === true) return root;
+      throw new Error("snapshot temporary root owner marker is invalid");
+    }
     try {
       await link(temporaryMarker, marker);
       await syncDirectory(root);
@@ -731,12 +726,11 @@ async function localCollect(options: SnapshotOptions): Promise<string> {
   }
   const entries = entryListing.entries;
   lines.push("### Directory overview", "", renderBoundedDirectoryOverview(entries, entryListing.truncated, pathRedactions), "");
-  const logFiles = entries
+  const logEntries = entries
     .filter((entry) => entry.isFile() && entry.name.includes("log") && entry.name.endsWith(".txt"))
-    .map((entry) => join(localDir, entry.name))
-    .sort();
+    .sort((left, right) => left.name.localeCompare(right.name));
   lines.push("### Known log files (first 200 lines of listing)", "");
-  if (logFiles.length > 0) lines.push(await commandFirstLines(["ls", "-la", "--", ...logFiles], 200, pathRedactions, true));
+  if (logEntries.length > 0) lines.push(renderBoundedDirectoryOverview(logEntries, false, pathRedactions));
   lines.push("");
 
   const clientLog = join(localDir, "client_log.txt");

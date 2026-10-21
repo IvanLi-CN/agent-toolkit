@@ -13,6 +13,7 @@ import {
   type ShardSummary,
 } from "../scripts/dst_mods_from_modoverrides.ts";
 import { main as snapshotMain, MAX_LOCAL_DIRECTORY_ENTRIES, MAX_REMOTE_OUTPUT_BYTES, redactOperationalText, redactSensitiveText, safeTail } from "../scripts/dst_snapshot.ts";
+import { spawnSupervised } from "../scripts/process_supervisor.ts";
 
 async function runTool(script: string, args: string[], env: Record<string, string>): Promise<{ status: number; stdout: string; stderr: string }> {
   const child = Bun.spawn([process.execPath, script, ...args], { env, stdout: "pipe", stderr: "pipe" });
@@ -50,6 +51,7 @@ describe("DST local Bun tooling", () => {
     expect(redactSensitiveText("Basic fixture-secret")).not.toContain("fixture-secret");
     expect(redactSensitiveText("pass phrase: fixture-secret")).not.toContain("fixture-secret");
     expect(redactSensitiveText("-----BEGIN PRIVATE KEY-----\nMIIEfixture-secret\n-----END PRIVATE KEY-----")).not.toContain("fixture-secret");
+    expect(redactSensitiveText("-----BEGIN PRIVATE KEY-----\nMIIEtruncated-fixture-secret\nvisible-after-truncation")).toBe("[REDACTED]");
     expect(redactSensitiveText("[api_key]=fixture-secret")).not.toContain("fixture-secret");
     expect(redactSensitiveText("api_key%3Dfixture-secret")).not.toContain("fixture-secret");
     expect(redactSensitiveText("password: |\n  fixture-secret\nnext: visible")).not.toContain("fixture-secret");
@@ -262,6 +264,23 @@ describe("DST local Bun tooling", () => {
       expect(report).toContain("<cluster-2>");
       expect(report).not.toContain(local);
       expect(report).not.toContain("secret-fixture");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("escapes filesystem names before inserting them into the report", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-name-escape-"));
+    try {
+      const local = join(root, "client");
+      await mkdir(local, { recursive: true });
+      await writeFile(join(local, "log<svg>\n- forged [link](url).txt"), "");
+      const output = join(root, "snapshot.md");
+      expect(await snapshotMain(["--local-dir", local, "--no-remote", "--out", output])).toBe(0);
+      const report = await readFile(output, "utf8");
+      expect(report).toContain("&lt;svg&gt;");
+      expect(report).not.toContain("<svg>");
+      expect(report).not.toContain("\n- forged [link]");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -665,7 +684,7 @@ esac
     }
   });
 
-  test("rejects an oversized remote snapshot before writing unbounded output", async () => {
+  test("rejects an oversized remote snapshot before writing unbounded output", { timeout: 10_000 }, async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-limit-"));
     const previousPath = process.env.PATH;
     try {
@@ -824,5 +843,48 @@ esac
       if (leftovers.length === 0) break;
     }
     expect(leftovers).toEqual([]);
+  });
+
+  test("kills a target process group after its leader exits", { timeout: 10_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-group-"));
+    const marker = join(root, "descendant.pid");
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    let descendantPid: number | undefined;
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    try {
+      supervised = await spawnSupervised([
+        "sh",
+        "-c",
+        "sleep 30 & printf '%s\\n' \"$!\" > \"$1\"; exit 0",
+        "agent-toolkit-supervised-target",
+        marker,
+      ]);
+      expect(await supervised.exited).toBe(0);
+      descendantPid = Number((await readFile(marker, "utf8")).trim());
+      expect(Number.isInteger(descendantPid)).toBe(true);
+      expect(isAlive(descendantPid)).toBe(true);
+      supervised.child.kill("SIGTERM");
+      await supervised.wrapperExited;
+      for (let attempt = 0; attempt < 30 && isAlive(descendantPid); attempt += 1) await Bun.sleep(100);
+      expect(isAlive(descendantPid)).toBe(false);
+    } finally {
+      if (supervised !== undefined) {
+        supervised.child.kill("SIGKILL");
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (descendantPid !== undefined && isAlive(descendantPid)) {
+        try { process.kill(descendantPid, "SIGKILL"); } catch { /* The descendant may have exited. */ }
+      }
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

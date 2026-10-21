@@ -454,7 +454,7 @@ export async function safeTail(file: string, lines: number, allowedRoot?: string
         }
       }
       const completeText = partialLine ? text.slice(firstLineEnd + 1) : text;
-      if (partialLine && /^\s/.test(completeText)) return "[REDACTED: bounded log tail begins mid-record]";
+      if (partialLine) return "[REDACTED: bounded log tail begins mid-record]";
       return redactSensitiveText(completeText.split(/\r?\n/).slice(-lines).join("\n"));
     } finally {
       await handle?.close();
@@ -563,7 +563,8 @@ async function ensureSnapshotTemporaryRoot(parent: string): Promise<string> {
         await link(temporaryMarker, marker);
         await syncDirectory(root);
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST" || await readMarker() !== true) throw error;
+        const code = (error as NodeJS.ErrnoException).code;
+        if ((code !== "EEXIST" && code !== "ENOENT") || await readMarker() !== true) throw error;
       }
     } finally {
       await unlink(temporaryMarker).catch(() => undefined);
@@ -596,7 +597,8 @@ async function ensureSnapshotTemporaryRoot(parent: string): Promise<string> {
       await link(temporaryMarker, marker);
       await syncDirectory(root);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST" && code !== "ENOENT") throw error;
       if (await readMarker() !== true) throw new Error("snapshot temporary root owner marker is invalid");
     } finally {
       await unlink(temporaryMarker).catch(() => undefined);
@@ -616,7 +618,8 @@ async function ensureSnapshotTemporaryRoot(parent: string): Promise<string> {
     await link(temporaryMarker, marker);
     await syncDirectory(root);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST" || await readMarker() !== true) throw error;
+    const code = (error as NodeJS.ErrnoException).code;
+    if ((code !== "EEXIST" && code !== "ENOENT") || await readMarker() !== true) throw error;
   } finally {
     await unlink(temporaryMarker).catch(() => undefined);
   }

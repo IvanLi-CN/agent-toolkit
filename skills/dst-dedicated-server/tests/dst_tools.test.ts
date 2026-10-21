@@ -92,7 +92,7 @@ describe("DST local Bun tooling", () => {
       await writeFile(log, `api_key=${"x".repeat(300_000)}fixture-secret\nvisible-line\n`);
       const tail = await safeTail(log, 80);
       expect(tail).not.toContain("fixture-secret");
-      expect(tail).toContain("visible-line");
+      expect(tail).toContain("[REDACTED: bounded log tail begins mid-record]");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -106,6 +106,20 @@ describe("DST local Bun tooling", () => {
       const tail = await safeTail(log, 80);
       expect(tail).toContain("[REDACTED: bounded log tail begins mid-record]");
       expect(tail).not.toContain("fixture-secret");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("redacts a PEM body when the bounded tail begins mid-record", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-tail-pem-boundary-"));
+    try {
+      const log = join(root, "client_log.txt");
+      const body = Array.from({ length: 6_000 }, (_, index) => `MIIE${String(index).padStart(4, "0")}${"A".repeat(56)}`).join("\n");
+      await writeFile(log, `-----BEGIN PRIVATE KEY-----\n${body}\n-----END PRIVATE KEY-----\nvisible-line\n`);
+      const tail = await safeTail(log, 80);
+      expect(tail).toContain("[REDACTED: bounded log tail begins mid-record]");
+      expect(tail).not.toContain("MIIE0000");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

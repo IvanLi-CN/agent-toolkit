@@ -48,8 +48,16 @@ signal_tree() {
   done
 }
 trap 'signal_tree TERM; signal_tree KILL; cleanup; exit 143' HUP INT TERM
+parent_is_alive() {
+  if [ -r "/proc/$parent_pid/stat" ]; then
+    parent_state="$(awk '{ print $3 }' "/proc/$parent_pid/stat" 2>/dev/null || true)"
+    [ "$parent_state" != "Z" ] && [ -n "$parent_state" ]
+    return
+  fi
+  kill -0 "$parent_pid" 2>/dev/null
+}
 watch_parent() {
-  while kill -0 "$parent_pid" 2>/dev/null; do sleep 1; done
+  while parent_is_alive; do sleep 1; done
   signal_tree TERM
   sleep 1
   signal_tree KILL
@@ -60,6 +68,10 @@ wait "$target_pid"
 target_status=$?
 kill "$watchdog_pid" 2>/dev/null || true
 wait "$watchdog_pid" 2>/dev/null || true
+if ! parent_is_alive; then
+  cleanup
+  exit 143
+fi
 printf '%s\\n' "$target_status" > "$status_path"
 exec 0<&- 1>&- 2>&-
 sleep 5

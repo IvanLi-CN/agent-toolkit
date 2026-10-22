@@ -1072,6 +1072,27 @@ class LifecycleTests(Fixture):
         self.error("invalid_request", self.call, "admin-reconcile", apply="false")
         self.assertEqual(len(self.runner.calls), before)
 
+    def test_reconcile_reuses_native_inventory_for_absent_tasks(self):
+        for index in range(3):
+            task = self.control._base_task(f"reconcile-{index}", index + 1)
+            task.update(
+                state="absent",
+                resources_json=json.dumps({"cpu": 0, "memory_mib": 0, "disk_gib": 0}),
+                resource_reservation_json="{}",
+                reservation_bytes=0,
+            )
+            self.store.put_task(task)
+
+        self.runner.calls.clear()
+        result = self.call("admin-reconcile")
+        self.assertTrue(result["dry_run"])
+        self.assertEqual(len(result["actions"]), 3)
+        list_calls = [
+            args for args, _, _ in self.runner.calls
+            if args[:4] == ["incus", "--project", "agents", "list"]
+        ]
+        self.assertEqual(len(list_calls), 1)
+
     def test_port_range_inventory_and_exact_collision(self):
         self.acquire()
         self.runner.proxy_inventory = [{"name": "foreign-proxy", "expanded_devices": {"proxy": {"type": "proxy", "listen": "tcp:0.0.0.0:20001-20003"}}}]

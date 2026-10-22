@@ -146,6 +146,7 @@ if [ "$parent_identity_mode" != "proc" ]; then
   if [ -n "$parent_ps_start" ]; then parent_identity_mode="ps"; fi
 fi
 target_status_path="$status_dir/target-status"
+target_start_path="$status_dir/target-start"
 target_anchor_path="$status_dir/target"
 target_pgid_path="$status_dir/target-pgid"
 target_identity_path="$status_dir/target-identity"
@@ -157,9 +158,11 @@ if command -v setsid >/dev/null 2>&1; then
   setsid sh -c '
     anchor_path="$1"
     result_path="$2"
-    shift 2
+    start_path="$3"
+    shift 3
     trap ':' HUP INT TERM
     if ! (set -C; umask 077; printf "%s\\n" "$$" > "$anchor_path") 2>/dev/null; then exit 125; fi
+    while [ ! -e "$start_path" ]; do sleep 0.01; done
     "$@" &
     target_pid=$!
     wait "$target_pid"
@@ -167,15 +170,17 @@ if command -v setsid >/dev/null 2>&1; then
     if ! (set -C; umask 077; printf "%s\\n" "$target_status" > "$result_path") 2>/dev/null; then exit 125; fi
     exec 0<&- 1>&- 2>&-
     while :; do sleep 1; done
-  ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$@" &
+  ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$target_start_path" "$@" &
 else
   set -m 2>/dev/null || true
   sh -c '
     anchor_path="$1"
     result_path="$2"
-    shift 2
+    start_path="$3"
+    shift 3
     trap ':' HUP INT TERM
     if ! (set -C; umask 077; printf "%s\\n" "$$" > "$anchor_path") 2>/dev/null; then exit 125; fi
+    while [ ! -e "$start_path" ]; do sleep 0.01; done
     "$@" &
     target_pid=$!
     wait "$target_pid"
@@ -183,7 +188,7 @@ else
     if ! (set -C; umask 077; printf "%s\\n" "$target_status" > "$result_path") 2>/dev/null; then exit 125; fi
     exec 0<&- 1>&- 2>&-
     while :; do sleep 1; done
-  ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$@" &
+  ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$target_start_path" "$@" &
 fi
 target_launcher_pid=$!
 target_pid="$target_launcher_pid"
@@ -1430,6 +1435,11 @@ terminate_supervised_tree() {
 hold_pid=""
 trap 'if [ "$termination_started" = "1" ]; then :; else if [ -n "$hold_pid" ]; then kill "$hold_pid" 2>/dev/null || true; fi; terminate_supervised_tree; exit 143; fi' HUP INT TERM
 if ! write_marker_exclusive "$ready_path" ready; then
+  cleanup_ack_enabled=0
+  terminate_supervised_tree
+  exit 125
+fi
+if ! create_marker_exclusive "$target_start_path"; then
   cleanup_ack_enabled=0
   terminate_supervised_tree
   exit 125

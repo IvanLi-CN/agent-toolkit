@@ -11,6 +11,7 @@ status_dir="$(dirname -- "$status_path")"
 supervisor_pid="$$"
 ready_path="$status_dir/ready"
 cleanup_ack_path="\${AGENT_TOOLKIT_SUPERVISOR_CLEANUP_ACK_PATH:-$status_dir/cleanup-done}"
+cleanup_failure_path="$cleanup_ack_path.failed"
 unset AGENT_TOOLKIT_SUPERVISOR_CLEANUP_ACK_PATH
 cleanup_ack_enabled=1
 captured_descendants_path="$status_dir/descendants"
@@ -30,10 +31,19 @@ parent_dead_path="$status_dir/parent-dead"
 cleanup() {
   if [ -e "$descendant_scan_truncated_path" ] || [ -e "$descendant_scan_failed_path" ] || [ -e "$snapshot_failed_path" ]; then cleanup_ack_enabled=0; fi
   cleanup_ack_created=0
+  cleanup_failure_created=0
   if [ "$cleanup_ack_enabled" = "1" ] && [ ! -e "$parent_dead_path" ]; then
-    if mkdir "$cleanup_ack_path" 2>/dev/null; then cleanup_ack_created=1; fi
+    if mkdir "$cleanup_ack_path" 2>/dev/null; then
+      cleanup_ack_created=1
+    elif mkdir "$cleanup_failure_path" 2>/dev/null; then
+      cleanup_failure_created=1
+    fi
   else
-    rmdir "$(dirname -- "$cleanup_ack_path")" 2>/dev/null || true
+    if [ ! -e "$parent_dead_path" ] && mkdir "$cleanup_failure_path" 2>/dev/null; then
+      cleanup_failure_created=1
+    else
+      rmdir "$(dirname -- "$cleanup_ack_path")" 2>/dev/null || true
+    fi
   fi
   rm -rf -- "$status_dir"
   if [ "$cleanup_ack_created" = "1" ]; then
@@ -417,11 +427,12 @@ capture_group_members() {
   captured_group_probe_attempt=0
   captured_group_probe_status=2
   while [ "$captured_group_probe_attempt" -lt 3 ]; do
-    if run_process_probe ps -eo pid=,pgid=,state= > "$captured_group_probe_path" 2>/dev/null; then
+    run_process_probe ps -eo pid=,pgid=,state= > "$captured_group_probe_path" 2>/dev/null
+    captured_group_probe_status=$?
+    if [ "$captured_group_probe_status" -eq 0 ]; then
       captured_group_probe_status=0
       break
     fi
-    captured_group_probe_status=$?
     captured_group_probe_attempt=$((captured_group_probe_attempt + 1))
     if snapshot_deadline_exceeded; then break; fi
     sleep 0.01
@@ -476,10 +487,30 @@ captured_group_can_be_signaled() {
       captured_group_live_count=$((captured_group_live_count + 1))
       continue
     fi
+    process_liveness "$group_member_pid"
+    case "$process_liveness_result" in
+      dead) continue ;;
+      live) ;;
+      *) return 2 ;;
+    esac
     expected_group_member_identity="$(captured_identity_for_pid "$group_member_pid" 2>/dev/null || true)"
     current_group_member_identity="$(process_identity "$group_member_pid" 2>/dev/null || true)"
     current_group_member_identity="$(normalize_process_identity "$current_group_member_identity" 2>/dev/null || true)"
+    if ! identity_is_valid "$current_group_member_identity"; then
+      process_liveness "$group_member_pid"
+      case "$process_liveness_result" in
+        dead) continue ;;
+        *) return 2 ;;
+      esac
+    fi
     current_group_member_pgid="$(process_group_id "$group_member_pid" 2>/dev/null || true)"
+    if [ -z "$current_group_member_pgid" ]; then
+      process_liveness "$group_member_pid"
+      case "$process_liveness_result" in
+        dead) continue ;;
+        *) return 2 ;;
+      esac
+    fi
     if [ "$current_group_member_pgid" != "$captured_group" ]; then
       return 1
     fi
@@ -505,10 +536,7 @@ captured_group_can_be_signaled() {
   done < "$captured_group_members_path" || return 2
   if [ "$captured_group_missing_member" = "1" ]; then
     if [ -z "$captured_group_owner_start" ]; then return 1; fi
-    run_process_probe awk -F'|' -v wanted="$captured_group" '$1 == wanted { leader = 1 } END { exit(leader ? 1 : 0) }' "$captured_group_members_path"
-    captured_group_orphan_status=$?
-    [ "$captured_group_orphan_status" -eq 0 ] && return 0
-    return 1
+    return 0
   fi
   [ "$captured_group_live_count" -gt 0 ]
 }
@@ -1172,18 +1200,27 @@ verify_owned_descendants() {
 }
 verify_target_group_cleanup() {
   case "$target_pgid" in ''|0|*[!0-9]*) cleanup_ack_enabled=0; return 1 ;; esac
-  capture_group_members "$target_pgid"
-  target_group_probe_status=$?
-  [ "$target_group_probe_status" -eq 0 ] || { cleanup_ack_enabled=0; return 1; }
-  while IFS='|' read -r target_group_member_pid target_group_member_state; do
+  target_group_attempt=0
+  while [ "$target_group_attempt" -lt 40 ]; do
     if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
-    [ -n "$target_group_member_pid$target_group_member_state" ] || continue
-    case "$target_group_member_state" in Z*) continue ;; esac
-    [ "$target_group_member_pid" = "$$" ] && continue
-    [ "$target_group_member_pid" = "$target_pid" ] && { cleanup_ack_enabled=0; return 1; }
-    cleanup_ack_enabled=0
-    return 1
-  done < "$captured_group_members_path" || { cleanup_ack_enabled=0; return 1; }
+    capture_group_members "$target_pgid"
+    target_group_probe_status=$?
+    [ "$target_group_probe_status" -eq 0 ] || { cleanup_ack_enabled=0; return 1; }
+    target_group_remaining=0
+    while IFS='|' read -r target_group_member_pid target_group_member_state; do
+      if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
+      [ -n "$target_group_member_pid$target_group_member_state" ] || continue
+      case "$target_group_member_state" in Z*) continue ;; esac
+      [ "$target_group_member_pid" = "$$" ] && continue
+      target_group_remaining=1
+      break
+    done < "$captured_group_members_path" || { cleanup_ack_enabled=0; return 1; }
+    [ "$target_group_remaining" = "0" ] && return 0
+    sleep 0.05
+    target_group_attempt=$((target_group_attempt + 1))
+  done
+  cleanup_ack_enabled=0
+  return 1
 }
 verify_descendant_cleanup() {
   verify_descendants_path="$status_dir/remaining-descendants"
@@ -1391,6 +1428,17 @@ async function consumeCleanupAck(path: string): Promise<boolean> {
   }
 }
 
+async function consumeCleanupFailure(path: string): Promise<boolean> {
+  try {
+    const stats = await lstat(path);
+    if (!stats.isDirectory()) return false;
+    await rmdir(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function removeCleanupAck(path: string): Promise<void> {
   let removed = false;
   try {
@@ -1418,19 +1466,18 @@ async function removeCleanupAckRoot(path: string): Promise<void> {
 
 async function waitForCleanupAck(path: string, wrapperExited: Promise<number>): Promise<boolean> {
   const deadline = Date.now() + 10_000;
-  let wrapperExitGraceDeadline: number | undefined;
+  const failurePath = `${path}.failed`;
   while (Date.now() < deadline) {
     if (await consumeCleanupAck(path)) return true;
+    if (await consumeCleanupFailure(failurePath)) return false;
     const wrapperDone = await Promise.race([
       wrapperExited.then(() => true, () => true),
       Bun.sleep(20).then(() => false),
     ]);
-    if (wrapperDone) {
-      // A POSIX shell can report exit before its TERM trap finishes creating the marker.
-      wrapperExitGraceDeadline ??= Date.now() + 500;
-      if (Date.now() >= wrapperExitGraceDeadline) return consumeCleanupAck(path);
-    }
+    if (wrapperDone) continue;
   }
+  if (await consumeCleanupAck(path)) return true;
+  await consumeCleanupFailure(failurePath);
   return false;
 }
 
@@ -1457,6 +1504,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
   const statusPath = join(directory, "status");
   const readyPath = join(directory, "ready");
   const cleanupAckPath = join(cleanupAckDirectory, "done");
+  const cleanupFailurePath = `${cleanupAckPath}.failed`;
   try {
     const child = Bun.spawn(
       ["sh", "-c", SUPERVISOR_SCRIPT, "agent-toolkit-supervisor", statusPath, ...args],
@@ -1485,6 +1533,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
       cleanup: async () => {
         await rm(directory, { recursive: true, force: true });
         await removeCleanupAck(cleanupAckPath);
+        await removeCleanupAck(cleanupFailurePath);
         await removeCleanupAckRoot(cleanupAckDirectory);
       },
     };

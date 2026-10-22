@@ -17,6 +17,7 @@ status_path="$1"
 shift
 status_dir="$(dirname -- "$status_path")"
 target_marker="\${AGENT_TOOLKIT_TARGET_MARKER:-unbound}"
+completion_proof="\${AGENT_TOOLKIT_SUPERVISOR_COMPLETION_TOKEN:-}"
 supervisor_pid="$$"
 ready_path="$status_dir/ready"
 cleanup_ack_path="\${AGENT_TOOLKIT_SUPERVISOR_CLEANUP_ACK_PATH:-$status_dir/cleanup-done}"
@@ -39,9 +40,32 @@ descendant_scan_status_path="$status_dir/descendant-scan-status"
 parent_dead_path="$status_dir/parent-dead"
 read_regular_marker() {
   marker_path="$1"
-  [ -f "$marker_path" ] || return 1
-  [ ! -L "$marker_path" ] || return 1
-  run_process_probe awk 'NR == 1 { if (length($0) > 256) exit 2; print; next } { exit 2 }' "$marker_path"
+  if ! command -v perl >/dev/null 2>&1; then return 1; fi
+  run_process_probe perl -e '
+    use strict;
+    use warnings;
+    use Fcntl qw(O_RDONLY O_NONBLOCK);
+    my ($path, $max) = @ARGV;
+    my @path_stat = lstat($path);
+    exit 1 unless @path_stat && (($path_stat[2] & 0170000) == 0100000);
+    my $nofollow = eval { Fcntl::O_NOFOLLOW() };
+    exit 1 unless defined $nofollow;
+    sysopen(my $fh, $path, O_RDONLY | O_NONBLOCK | $nofollow) or exit 1;
+    my @opened = stat($fh);
+    exit 1 unless @opened && (($opened[2] & 0170000) == 0100000);
+    exit 1 unless $opened[0] == $path_stat[0] && $opened[1] == $path_stat[1] && $opened[7] <= $max;
+    my $data = "";
+    while (length($data) <= $max) {
+      my $read = sysread($fh, my $chunk, $max + 1 - length($data));
+      exit 1 unless defined $read;
+      last if $read == 0;
+      $data .= $chunk;
+    }
+    my @final = stat($fh);
+    exit 1 unless @final && $final[0] == $opened[0] && $final[1] == $opened[1] && $final[7] == $opened[7] && length($data) == $opened[7] && length($data) <= $max;
+    binmode STDOUT;
+    print $data;
+  ' "$marker_path" 256
 }
 write_marker_exclusive() {
   marker_path="$1"
@@ -160,6 +184,7 @@ if [ "$parent_identity_mode" != "proc" ]; then
   if [ -n "$parent_ps_start" ]; then parent_identity_mode="ps"; fi
 fi
 target_status_path="$status_dir/target-status"
+target_status_writer_path="$status_dir/target-status-writer"
 completion_path="$status_dir/completed"
 target_start_path="$status_dir/target-start"
 target_anchor_path="$status_dir/target"
@@ -174,7 +199,10 @@ if command -v setsid >/dev/null 2>&1; then
     anchor_path="$1"
     result_path="$2"
     start_path="$3"
-    shift 3
+    writer_path="$4"
+    shift 4
+    completion_proof="\${AGENT_TOOLKIT_SUPERVISOR_COMPLETION_TOKEN:-}"
+    unset AGENT_TOOLKIT_SUPERVISOR_COMPLETION_TOKEN
     trap ':' HUP INT TERM
     if ! (set -C; umask 077; printf "%s\\n" "$$" > "$anchor_path") 2>/dev/null; then exit 125; fi
     while [ ! -e "$start_path" ]; do sleep 0.01; done
@@ -182,17 +210,21 @@ if command -v setsid >/dev/null 2>&1; then
     target_pid=$!
     wait "$target_pid"
     target_status=$?
+    if ! (set -C; umask 077; printf "%s\\n" "$$" > "$writer_path") 2>/dev/null; then exit 125; fi
     if ! (set -C; umask 077; printf "%s\\n" "$target_status" > "$result_path") 2>/dev/null; then exit 125; fi
     exec 0<&- 1>&- 2>&-
     while :; do sleep 1; done
-  ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$target_start_path" "$@" &
+  ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$target_start_path" "$target_status_writer_path" "$@" &
 else
   set -m 2>/dev/null || true
   sh -c '
     anchor_path="$1"
     result_path="$2"
     start_path="$3"
-    shift 3
+    writer_path="$4"
+    shift 4
+    completion_proof="\${AGENT_TOOLKIT_SUPERVISOR_COMPLETION_TOKEN:-}"
+    unset AGENT_TOOLKIT_SUPERVISOR_COMPLETION_TOKEN
     trap ':' HUP INT TERM
     if ! (set -C; umask 077; printf "%s\\n" "$$" > "$anchor_path") 2>/dev/null; then exit 125; fi
     while [ ! -e "$start_path" ]; do sleep 0.01; done
@@ -200,11 +232,13 @@ else
     target_pid=$!
     wait "$target_pid"
     target_status=$?
+    if ! (set -C; umask 077; printf "%s\\n" "$$" > "$writer_path") 2>/dev/null; then exit 125; fi
     if ! (set -C; umask 077; printf "%s\\n" "$target_status" > "$result_path") 2>/dev/null; then exit 125; fi
     exec 0<&- 1>&- 2>&-
     while :; do sleep 1; done
-  ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$target_start_path" "$@" &
+  ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$target_start_path" "$target_status_writer_path" "$@" &
 fi
+unset AGENT_TOOLKIT_SUPERVISOR_COMPLETION_TOKEN
 target_launcher_pid=$!
 target_pid="$target_launcher_pid"
 target_anchor_attempt=0
@@ -673,12 +707,12 @@ descendants_for_roots() {
   descendant_groups="$2"
   if snapshot_deadline_exceeded; then
     cleanup_ack_enabled=0
-    : > "$descendant_scan_failed_path" 2>/dev/null || true
+    create_marker_exclusive "$descendant_scan_failed_path" || true
     return 1
   fi
   if ! run_snapshot_command ps -eo pid=,ppid=,pgid= > "$descendant_scan_input_path" 2>/dev/null; then
     cleanup_ack_enabled=0
-    : > "$descendant_scan_failed_path" 2>/dev/null || true
+    create_marker_exclusive "$descendant_scan_failed_path" || true
     return 1
   fi
   if ! run_snapshot_command awk -v roots="$descendant_roots" -v groups="$descendant_groups" -v truncated_path="$descendant_scan_truncated_path" -v status_path="$descendant_scan_status_path" -v max_rows=65536 '
@@ -723,7 +757,7 @@ descendants_for_roots() {
     }
   ' < "$descendant_scan_input_path"; then
     cleanup_ack_enabled=0
-    : > "$descendant_scan_failed_path" 2>/dev/null || true
+    create_marker_exclusive "$descendant_scan_failed_path" || true
     return 1
   fi
   scan_status="$(read_regular_marker "$descendant_scan_status_path" 2>/dev/null || true)"
@@ -732,7 +766,7 @@ descendants_for_roots() {
     truncated)
       if [ ! -e "$descendant_scan_truncated_path" ]; then
         cleanup_ack_enabled=0
-        : > "$descendant_scan_failed_path" 2>/dev/null || true
+        create_marker_exclusive "$descendant_scan_failed_path" || true
         return 1
       fi
       cleanup_ack_enabled=0
@@ -740,7 +774,7 @@ descendants_for_roots() {
       ;;
     *)
       cleanup_ack_enabled=0
-      : > "$descendant_scan_failed_path" 2>/dev/null || true
+      create_marker_exclusive "$descendant_scan_failed_path" || true
       return 1
       ;;
   esac
@@ -830,14 +864,14 @@ snapshot_descendants() {
   if ! create_marker_exclusive "$snapshot_started_path"; then cleanup_ack_enabled=0; fi
   if ! descendants > "$pending_descendants_path" 2>/dev/null; then
     cleanup_ack_enabled=0
-    : > "$descendant_scan_failed_path" 2>/dev/null || true
+    create_marker_exclusive "$descendant_scan_failed_path" || true
   fi
   if [ -e "$descendant_scan_truncated_path" ] || [ -e "$descendant_scan_failed_path" ]; then
     cleanup_ack_enabled=0
-    : > "$snapshot_failed_path" 2>/dev/null || true
+    create_marker_exclusive "$snapshot_failed_path" || true
   elif ! record_descendants; then
     cleanup_ack_enabled=0
-    : > "$snapshot_failed_path" 2>/dev/null || true
+    create_marker_exclusive "$snapshot_failed_path" || true
   fi
   if ! create_marker_exclusive "$snapshot_ready_path"; then cleanup_ack_enabled=0; fi
   if ! create_marker_exclusive "$snapshot_finished_path"; then cleanup_ack_enabled=0; fi
@@ -857,7 +891,7 @@ start_snapshot() {
     snapshot_ready_observed=1
   else
     cleanup_ack_enabled=0
-    : > "$snapshot_failed_path" 2>/dev/null || true
+    create_marker_exclusive "$snapshot_failed_path" || true
   fi
 }
 wait_for_snapshot() {
@@ -1494,12 +1528,14 @@ watch_parent() {
 watch_parent </dev/null >/dev/null 2>&1 &
 watchdog_pid=$!
 target_status=""
+target_status_invalid=0
 while [ -z "$target_status" ]; do
   candidate_target_status="$(read_regular_marker "$target_status_path" 2>/dev/null || true)"
   case "$candidate_target_status" in
     ''|*[!0-9]*)
       if ! target_is_alive; then
-        target_status=143
+        target_status_invalid=1
+        target_status=125
       else
         if ! parent_is_alive; then
           cleanup_ack_enabled=0
@@ -1510,16 +1546,31 @@ while [ -z "$target_status" ]; do
         sleep 0.01
       fi
       ;;
-    *) target_status="$candidate_target_status" ;;
+    *)
+      candidate_target_writer="$(read_regular_marker "$target_status_writer_path" 2>/dev/null || true)"
+      if [ "$candidate_target_writer" = "$target_pid" ] && target_identity_matches; then
+        target_status="$candidate_target_status"
+      elif ! target_is_alive; then
+        target_status_invalid=1
+        target_status=125
+      else
+        sleep 0.01
+      fi
+      ;;
   esac
 done
+if [ "$target_status_invalid" = "1" ]; then
+  cleanup_ack_enabled=0
+  terminate_supervised_tree
+  exit 125
+fi
 if ! parent_is_alive; then
   cleanup_ack_enabled=0
   ensure_marker "$parent_dead_path" || true
   terminate_supervised_tree
   exit 143
 fi
-if ! write_marker_exclusive "$status_path" "$target_status"; then
+if ! write_marker_exclusive "$status_path" "$target_status|$completion_proof"; then
   cleanup_ack_enabled=0
   target_status=125
 elif ! write_marker_exclusive "$completion_path" complete; then
@@ -1575,11 +1626,12 @@ async function readRegularMarker(path: string, maxBytes = MAX_SUPERVISOR_MARKER_
   }
 }
 
-async function readStatus(path: string): Promise<number | undefined> {
+async function readStatus(path: string, completionToken: string): Promise<number | undefined> {
   const value = (await readRegularMarker(path))?.trim() ?? "";
-  if (/^-?\d+$/.test(value)) {
-    const status = Number(value);
-    if (Number.isInteger(status)) return status;
+  const match = /^(\d+)\|(.+)$/.exec(value);
+  if (match !== null && match[2] === completionToken) {
+    const status = Number(match[1]);
+    if (Number.isInteger(status) && status >= 0 && status <= 255) return status;
   }
   return undefined;
 }
@@ -1762,12 +1814,15 @@ async function markCleanupFailure(path: string): Promise<void> {
 async function waitForTarget(
   path: string,
   completionPath: string,
+  completionToken: string,
   wrapperExited: Promise<number>,
+  waitForCleanupAcknowledged?: () => Promise<boolean>,
   cleanupFailurePath?: string,
   rememberedReference?: () => TargetReference | undefined,
 ): Promise<number> {
+  void waitForCleanupAcknowledged?.();
   const wrapperCode = await wrapperExited;
-  const status = await readStatus(path);
+  const status = await readStatus(path, completionToken);
   const completed = (await readRegularMarker(completionPath))?.trim() === "complete";
   if (completed && status !== undefined && status === wrapperCode) return status;
   await cleanupOrphanedTarget(rememberedReference?.());
@@ -1867,6 +1922,8 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
 
   const cleanupAckDirectory = await mkdtemp(join(tmpdir(), ".agent-toolkit-dst-supervisor-ack-"));
   const targetMarker = randomUUID();
+  const completionToken = randomUUID();
+  const completionEnvName = ["AGENT_TOOLKIT_SUPERVISOR_COMPLETION", "TOKEN"].join("_");
   let directory: string;
   try {
     directory = await mkdtemp(join(tmpdir(), ".agent-toolkit-dst-supervisor-"));
@@ -1891,6 +1948,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
           AGENT_TOOLKIT_SUPERVISOR_PARENT_PID: String(process.pid),
           AGENT_TOOLKIT_SUPERVISOR_CLEANUP_ACK_PATH: cleanupAckPath,
           AGENT_TOOLKIT_TARGET_MARKER: targetMarker,
+          [completionEnvName]: completionToken,
         },
       },
     ) as Bun.Subprocess<"pipe", "pipe", "pipe">;
@@ -1903,7 +1961,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
     };
     const supervised: SupervisedChild = {
       child,
-      exited: waitForTarget(statusPath, completionPath, wrapperExited, cleanupFailurePath, () => rememberedTargetReference),
+      exited: waitForTarget(statusPath, completionPath, completionToken, wrapperExited, waitForCleanupAcknowledged, cleanupFailurePath, () => rememberedTargetReference),
       wrapperExited,
       waitForCleanupAcknowledged,
       forceCleanup: () => cleanupOrphanedTarget(rememberedTargetReference),

@@ -1376,6 +1376,35 @@ exec /bin/ps "$@"
     }
   });
 
+  test("does not accept a forged target status before the target completes", { timeout: 30_000 }, async () => {
+    if (process.platform === "win32") return;
+    const before = new Set((await readdir(tmpdir())).filter((entry) => entry.startsWith(".agent-toolkit-dst-supervisor-") && !entry.includes("ack-")));
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    try {
+      supervised = await spawnSupervised(["sh", "-c", "sleep 30"]);
+      let resolvedEntry: string | undefined;
+      for (const entry of await readdir(tmpdir())) {
+        if (before.has(entry) || !entry.startsWith(".agent-toolkit-dst-supervisor-") || entry.includes("ack-")) continue;
+        if ((await lstat(join(tmpdir(), entry, "target")).catch(() => undefined))?.isFile() === true) {
+          resolvedEntry = entry;
+          break;
+        }
+      }
+      expect(resolvedEntry).toBeString();
+      await writeFile(join(tmpdir(), resolvedEntry!, "target-status"), "0\n", "utf8");
+      const early = await Promise.race([supervised.exited, Bun.sleep(250).then(() => "pending" as const)]);
+      expect(early).toBe("pending");
+      supervised.child.kill("SIGTERM");
+      expect(await supervised.exited).toBe(SUPERVISOR_UNKNOWN_TARGET_STATUS);
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+    }
+  });
+
   test("does not trust mutable target or status markers", { timeout: 90_000 }, async () => {
     if (process.platform === "win32") return;
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-marker-canary-"));

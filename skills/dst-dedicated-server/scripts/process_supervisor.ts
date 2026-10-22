@@ -62,7 +62,7 @@ run_bounded() {
 run_process_probe() {
   # Keep ordinary probes cheap; cleanup activates the bounded path explicitly.
   if [ "\${snapshot_deadline_epoch:-0}" -gt 0 ]; then
-    run_bounded 1 "$@"
+    run_bounded 2 "$@"
   else
     "$@"
   fi
@@ -409,58 +409,108 @@ process_group_id() {
     *) printf '%s\n' "$process_group" ;;
   esac
 }
-captured_group_has_member() {
+capture_group_members() {
   captured_group="$1"
   case "$captured_group" in ''|0|*[!0-9]*) return 1 ;; esac
-  run_process_probe ps -eo pid=,pgid= 2>/dev/null | run_process_probe awk -v wanted="$captured_group" '
-    $1 ~ /^[0-9]+$/ && $2 == wanted { found = 1; exit }
-    END { exit(found ? 0 : 1) }
-  '
-}
-captured_group_is_orphaned() {
-  captured_group="$1"
-  case "$captured_group" in ''|0|*[!0-9]*) return 1 ;; esac
-  run_process_probe ps -eo pid=,pgid= 2>/dev/null | run_process_probe awk -v wanted="$captured_group" '
-    $1 ~ /^[0-9]+$/ && $2 == wanted { member = 1; if ($1 == wanted) leader = 1 }
-    END { exit(member && !leader ? 0 : 1) }
-  '
+  captured_group_probe_path="$status_dir/group-probe-$captured_group"
+  captured_group_members_path="$status_dir/group-members-$captured_group"
+  captured_group_probe_attempt=0
+  captured_group_probe_status=2
+  while [ "$captured_group_probe_attempt" -lt 3 ]; do
+    if run_process_probe ps -eo pid=,pgid=,state= > "$captured_group_probe_path" 2>/dev/null; then
+      captured_group_probe_status=0
+      break
+    fi
+    captured_group_probe_status=$?
+    captured_group_probe_attempt=$((captured_group_probe_attempt + 1))
+    if snapshot_deadline_exceeded; then break; fi
+    sleep 0.01
+  done
+  [ "$captured_group_probe_status" -eq 0 ] || return 2
+  if ! run_process_probe awk -v wanted="$captured_group" '
+    $2 != wanted { next }
+    NF != 3 || $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ || $3 !~ /^[[:alpha:]]/ { malformed = 1; next }
+    { print $1 "|" $3 }
+    END { if (malformed) exit 2 }
+  ' "$captured_group_probe_path" > "$captured_group_members_path"; then
+    return 2
+  fi
+  return 0
 }
 captured_group_has_live_process() {
   captured_group="$1"
-  case "$captured_group" in ''|0|*[!0-9]*) return 1 ;; esac
-  run_process_probe ps -eo pid=,pgid=,state= 2>/dev/null | run_process_probe awk -v wanted="$captured_group" '
-    $1 ~ /^[0-9]+$/ && $2 == wanted && $3 !~ /^Z/ { found = 1; exit }
-    END { exit(found ? 0 : 1) }
-  '
-}
-captured_group_has_live_member() {
-  wanted_group="$1"
-  [ -f "$captured_descendants_path" ] || return 1
-  while IFS='|' read -r live_member_pid live_member_identity live_member_pgid live_member_extra; do
-    [ -n "$live_member_pid$live_member_identity$live_member_pgid$live_member_extra" ] || continue
-    [ "$live_member_pgid" = "$wanted_group" ] || continue
-    [ -z "$live_member_extra" ] || continue
-    case "$live_member_pid" in ''|*[!0-9]*) continue ;; esac
-    [ "$live_member_pid" = "$$" ] && continue
-    [ "$live_member_pid" = "$target_pid" ] && continue
-    identity_is_valid "$live_member_identity" || continue
-    process_liveness "$live_member_pid"
-    [ "$process_liveness_result" = "live" ] || continue
-    live_member_current_identity="$(process_identity "$live_member_pid" 2>/dev/null || true)"
-    live_member_current_identity="$(normalize_process_identity "$live_member_current_identity" 2>/dev/null || true)"
-    live_member_current_pgid="$(process_group_id "$live_member_pid" 2>/dev/null || true)"
-    if [ "$live_member_current_identity" = "$live_member_identity" ] && [ "$live_member_current_pgid" = "$wanted_group" ]; then return 0; fi
-  done < "$captured_descendants_path"
-  return 1
+  capture_group_members "$captured_group"
+  captured_group_probe_status=$?
+  [ "$captured_group_probe_status" -eq 0 ] || return "$captured_group_probe_status"
+  run_process_probe awk -F'|' '$2 !~ /^Z/ { found = 1; exit } END { exit(found ? 0 : 1) }' "$captured_group_members_path"
 }
 captured_group_can_be_signaled() {
   captured_group_identity="$1"
   captured_group="$2"
-  if captured_group_has_live_member "$captured_group"; then return 0; fi
+  captured_group_allow_target="\${3:-}"
+  # macOS lstart is only second-resolution; never authorize a captured descendant group from it.
   case "$captured_group_identity" in
-    proc:*) captured_group_is_orphaned "$captured_group" ;;
-    *) return 1 ;;
+    ps:*) return 1 ;;
   esac
+  capture_group_members "$captured_group"
+  captured_group_probe_status=$?
+  [ "$captured_group_probe_status" -eq 0 ] || return "$captured_group_probe_status"
+  captured_group_live_count=0
+  captured_group_missing_member=0
+  captured_group_owner_start=""
+  captured_group_owner_identity="$(captured_identity_for_pid "$captured_group" 2>/dev/null || true)"
+  case "$captured_group_owner_identity" in
+    proc:*)
+      captured_group_owner_start="\${captured_group_owner_identity#proc:}"
+      case "$captured_group_owner_start" in ''|*[!0-9]*) captured_group_owner_start="" ;; esac
+      [ "$captured_group_owner_identity" = "$captured_group_identity" ] || captured_group_owner_start=""
+      ;;
+  esac
+  while IFS='|' read -r group_member_pid group_member_state; do
+    if snapshot_deadline_exceeded; then return 2; fi
+    [ -n "$group_member_pid$group_member_state" ] || continue
+    case "$group_member_pid" in ''|*[!0-9]*) return 2 ;; esac
+    case "$group_member_state" in Z*) continue ;; esac
+    if [ "$group_member_pid" = "$target_pid" ] && [ "$captured_group_allow_target" = "allow-target" ]; then
+      target_identity_matches || return 1
+      captured_group_live_count=$((captured_group_live_count + 1))
+      continue
+    fi
+    expected_group_member_identity="$(captured_identity_for_pid "$group_member_pid" 2>/dev/null || true)"
+    current_group_member_identity="$(process_identity "$group_member_pid" 2>/dev/null || true)"
+    current_group_member_identity="$(normalize_process_identity "$current_group_member_identity" 2>/dev/null || true)"
+    current_group_member_pgid="$(process_group_id "$group_member_pid" 2>/dev/null || true)"
+    if [ "$current_group_member_pgid" != "$captured_group" ]; then
+      return 1
+    fi
+    if ! identity_is_valid "$expected_group_member_identity"; then
+      case "$current_group_member_identity:$captured_group_owner_start" in
+        proc:*:*)
+          current_group_member_start="\${current_group_member_identity#proc:}"
+          case "$current_group_member_start" in
+            ''|*[!0-9]*) return 1 ;;
+            *) [ "$current_group_member_start" -gt "$captured_group_owner_start" ] || return 1 ;;
+          esac
+          captured_group_missing_member=1
+          captured_group_live_count=$((captured_group_live_count + 1))
+          continue
+          ;;
+        *) return 1 ;;
+      esac
+    fi
+    if [ "$current_group_member_identity" != "$expected_group_member_identity" ]; then
+      return 1
+    fi
+    captured_group_live_count=$((captured_group_live_count + 1))
+  done < "$captured_group_members_path" || return 2
+  if [ "$captured_group_missing_member" = "1" ]; then
+    if [ -z "$captured_group_owner_start" ]; then return 1; fi
+    run_process_probe awk -F'|' -v wanted="$captured_group" '$1 == wanted { leader = 1 } END { exit(leader ? 1 : 0) }' "$captured_group_members_path"
+    captured_group_orphan_status=$?
+    [ "$captured_group_orphan_status" -eq 0 ] && return 0
+    return 1
+  fi
+  [ "$captured_group_live_count" -gt 0 ]
 }
 descendants_for_roots() {
   descendant_roots="$1"
@@ -587,13 +637,22 @@ owned_descendants() {
       process_liveness "$captured_pid"
       case "$process_liveness_result" in
         dead)
-          if captured_group_has_member "$captured_pgid"; then
-            if captured_group_can_be_signaled "$captured_identity" "$captured_pgid"; then
-              if [ "$captured_pgid" != "$wrapper_pgid" ]; then owned_groups="$owned_groups $captured_pgid"; fi
-            else
-              cleanup_ack_enabled=0
-            fi
-          fi
+          captured_group_has_live_process "$captured_pgid"
+          captured_group_live_status=$?
+          case "$captured_group_live_status" in
+            0)
+              captured_group_can_be_signaled "$captured_identity" "$captured_pgid"
+              captured_group_signal_status=$?
+              if [ "$captured_group_signal_status" -eq 0 ]; then
+                owned_groups="$owned_groups $captured_pgid"
+              else
+                cleanup_ack_enabled=0
+                return 1
+              fi
+              ;;
+            1) ;;
+            *) cleanup_ack_enabled=0; return 1 ;;
+          esac
           continue
           ;;
         live) ;;
@@ -808,7 +867,17 @@ reconcile_captured_descendants() {
     case "$process_liveness_result" in
       dead)
         if [ "$captured_pgid" = "$reconcile_target_pgid" ]; then continue; fi
-        if captured_group_has_member "$captured_pgid" && ! captured_group_can_be_signaled "$captured_identity" "$captured_pgid"; then cleanup_ack_enabled=0; fi
+        captured_group_has_live_process "$captured_pgid"
+        captured_group_live_status=$?
+        case "$captured_group_live_status" in
+          0)
+            captured_group_can_be_signaled "$captured_identity" "$captured_pgid"
+            captured_group_signal_status=$?
+            if [ "$captured_group_signal_status" -ne 0 ]; then cleanup_ack_enabled=0; return 1; fi
+            ;;
+          1) ;;
+          *) cleanup_ack_enabled=0; return 1 ;;
+        esac
         printf '%s|%s|%s\n' "$captured_pid" "$captured_identity" "$captured_pgid" >> "$reconcile_next_path" || { cleanup_ack_enabled=0; return 1; }
         continue
         ;;
@@ -831,6 +900,7 @@ reconcile_captured_descendants() {
 signal_captured_descendants() {
   [ -f "$captured_descendants_path" ] || return 0
   while IFS='|' read -r captured_pid captured_identity captured_pgid captured_extra; do
+    if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
     case "$captured_pid" in ''|*[!0-9]*) continue ;; esac
     [ "$captured_pid" = "$$" ] && continue
     [ "$captured_pid" = "$target_pid" ] && continue
@@ -843,13 +913,21 @@ signal_captured_descendants() {
       case "$process_liveness_result" in
         dead)
           if [ "$captured_pgid" = "$wrapper_pgid" ] || [ "$captured_pgid" = "$target_pgid" ]; then continue; fi
-          if captured_group_has_member "$captured_pgid"; then
-            if captured_group_can_be_signaled "$captured_identity" "$captured_pgid" && [ "$captured_pgid" != "$wrapper_pgid" ] && [ "$captured_pgid" != "$target_pgid" ]; then
-              if ! kill -"$signal" "-$captured_pgid" 2>/dev/null; then cleanup_ack_enabled=0; fi
-            else
-              cleanup_ack_enabled=0
-            fi
-          fi
+          captured_group_has_live_process "$captured_pgid"
+          captured_group_live_status=$?
+          case "$captured_group_live_status" in
+            0)
+              captured_group_can_be_signaled "$captured_identity" "$captured_pgid"
+              captured_group_signal_status=$?
+              if [ "$captured_group_signal_status" -eq 0 ]; then
+                if ! kill -"$signal" "-$captured_pgid" 2>/dev/null; then cleanup_ack_enabled=0; fi
+              else
+                cleanup_ack_enabled=0
+              fi
+              ;;
+            1) ;;
+            *) cleanup_ack_enabled=0 ;;
+          esac
           continue
           ;;
         *) ;;
@@ -870,7 +948,14 @@ signal_captured_descendants() {
       continue
     fi
     if [ "$captured_pgid" != "$wrapper_pgid" ] && [ "$captured_pgid" != "$target_pgid" ]; then
-      if ! kill -"$signal" "-$captured_pgid" 2>/dev/null; then
+      captured_group_can_be_signaled "$captured_identity" "$captured_pgid"
+      captured_group_signal_status=$?
+      if [ "$captured_group_signal_status" -eq 0 ]; then
+        if ! kill -"$signal" "-$captured_pgid" 2>/dev/null; then
+          cleanup_ack_enabled=0
+          case "$captured_identity" in proc:*) kill -"$signal" "$captured_pid" 2>/dev/null || true ;; esac
+        fi
+      else
         cleanup_ack_enabled=0
         case "$captured_identity" in proc:*) kill -"$signal" "$captured_pid" 2>/dev/null || true ;; esac
       fi
@@ -902,6 +987,8 @@ signal_tree() {
       if [ "$current_target_pgid" = "$target_pgid" ] && [ "$current_target_pgid" != "$wrapper_pgid" ]; then
         if kill -"$signal" "-$current_target_pgid" 2>/dev/null; then
           group_signal_succeeded=1
+        else
+          cleanup_ack_enabled=0
         fi
       fi
       ;;
@@ -942,6 +1029,7 @@ captured_group_for_pid() {
 verify_captured_descendants() {
   [ -f "$captured_descendants_path" ] || { cleanup_ack_enabled=0; return 1; }
   while IFS='|' read -r captured_pid captured_identity captured_pgid captured_extra; do
+    if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
     [ -n "$captured_pid$captured_identity$captured_pgid$captured_extra" ] || continue
     case "$captured_pid" in ''|*[!0-9]*) cleanup_ack_enabled=0; return 1 ;; esac
     [ "$captured_pid" = "$$" ] && continue
@@ -951,26 +1039,57 @@ verify_captured_descendants() {
     process_liveness "$captured_pid"
     case "$process_liveness_result" in
       dead)
-        if captured_group_has_live_process "$captured_pgid"; then
-          if [ "$captured_pgid" != "$wrapper_pgid" ] && [ "$captured_pgid" != "$target_pgid" ]; then
-            if captured_group_can_be_signaled "$captured_identity" "$captured_pgid"; then
+        captured_group_has_live_process "$captured_pgid"
+        captured_group_live_status=$?
+        case "$captured_group_live_status" in
+          0)
+            if [ "$captured_pgid" = "$target_pgid" ] || [ "$captured_pgid" = "$wrapper_pgid" ]; then
+              cleanup_ack_enabled=0
+              return 1
+            elif [ "$captured_pgid" != "$wrapper_pgid" ] && [ "$captured_pgid" != "$target_pgid" ]; then
+              captured_group_can_be_signaled "$captured_identity" "$captured_pgid"
+              captured_group_signal_status=$?
+              if [ "$captured_group_signal_status" -ne 0 ]; then cleanup_ack_enabled=0; return 1; fi
               kill -KILL "-$captured_pgid" 2>/dev/null || true
             else
               cleanup_ack_enabled=0
               return 1
             fi
-          fi
-          captured_group_attempt=0
-          while [ "$captured_group_attempt" -lt 5 ] && ! snapshot_deadline_exceeded; do
-            sleep 0.05
-            if ! captured_group_has_live_process "$captured_pgid"; then break; fi
-            if [ "$captured_pgid" != "$wrapper_pgid" ] && [ "$captured_pgid" != "$target_pgid" ]; then
-              kill -KILL "-$captured_pgid" 2>/dev/null || true
-            fi
-            captured_group_attempt=$((captured_group_attempt + 1))
-          done
-          if captured_group_has_live_process "$captured_pgid"; then cleanup_ack_enabled=0; return 1; fi
-        fi
+            captured_group_attempt=0
+            while [ "$captured_group_attempt" -lt 5 ] && ! snapshot_deadline_exceeded; do
+              sleep 0.05
+              captured_group_has_live_process "$captured_pgid"
+              captured_group_live_status=$?
+              case "$captured_group_live_status" in
+                0)
+                  if [ "$captured_pgid" = "$target_pgid" ] || [ "$captured_pgid" = "$wrapper_pgid" ]; then
+                    cleanup_ack_enabled=0
+                    return 1
+                  elif [ "$captured_pgid" != "$wrapper_pgid" ] && [ "$captured_pgid" != "$target_pgid" ]; then
+                    captured_group_can_be_signaled "$captured_identity" "$captured_pgid"
+                    captured_group_signal_status=$?
+                    if [ "$captured_group_signal_status" -ne 0 ]; then cleanup_ack_enabled=0; return 1; fi
+                    kill -KILL "-$captured_pgid" 2>/dev/null || true
+                  else
+                    cleanup_ack_enabled=0
+                    return 1
+                  fi
+                  ;;
+                1) break ;;
+                *) cleanup_ack_enabled=0; return 1 ;;
+              esac
+              captured_group_attempt=$((captured_group_attempt + 1))
+            done
+            captured_group_has_live_process "$captured_pgid"
+            captured_group_live_status=$?
+            case "$captured_group_live_status" in
+              1) ;;
+              *) cleanup_ack_enabled=0; return 1 ;;
+            esac
+            ;;
+          1) ;;
+          *) cleanup_ack_enabled=0; return 1 ;;
+        esac
         continue
         ;;
       live) ;;
@@ -1014,6 +1133,7 @@ verify_owned_descendants() {
     return 1
   fi
   while read -r remaining_owned_pid; do
+    if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
     case "$remaining_owned_pid" in ''|*[!0-9]*) continue ;; esac
     [ "$remaining_owned_pid" = "$$" ] && continue
     [ "$remaining_owned_pid" = "$target_pid" ] && continue
@@ -1050,9 +1170,25 @@ verify_owned_descendants() {
     return 1
   done < "$verify_owned_path" || { cleanup_ack_enabled=0; return 1; }
 }
+verify_target_group_cleanup() {
+  case "$target_pgid" in ''|0|*[!0-9]*) cleanup_ack_enabled=0; return 1 ;; esac
+  capture_group_members "$target_pgid"
+  target_group_probe_status=$?
+  [ "$target_group_probe_status" -eq 0 ] || { cleanup_ack_enabled=0; return 1; }
+  while IFS='|' read -r target_group_member_pid target_group_member_state; do
+    if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
+    [ -n "$target_group_member_pid$target_group_member_state" ] || continue
+    case "$target_group_member_state" in Z*) continue ;; esac
+    [ "$target_group_member_pid" = "$$" ] && continue
+    [ "$target_group_member_pid" = "$target_pid" ] && { cleanup_ack_enabled=0; return 1; }
+    cleanup_ack_enabled=0
+    return 1
+  done < "$captured_group_members_path" || { cleanup_ack_enabled=0; return 1; }
+}
 verify_descendant_cleanup() {
   verify_descendants_path="$status_dir/remaining-descendants"
   verify_captured_descendants || return 1
+  verify_target_group_cleanup || return 1
   verify_owned_descendants || return 1
   if ! descendants > "$verify_descendants_path" 2>/dev/null; then
     cleanup_ack_enabled=0
@@ -1060,6 +1196,7 @@ verify_descendant_cleanup() {
   fi
   remaining_descendants=0
   while read -r remaining_pid; do
+    if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
     case "$remaining_pid" in ''|*[!0-9]*) continue ;; esac
     [ "$remaining_pid" = "$target_pid" ] && continue
     [ "$remaining_pid" = "$$" ] && continue
@@ -1089,6 +1226,7 @@ verify_descendant_cleanup() {
     return 1
   fi
   while read -r remaining_pid; do
+    if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
     case "$remaining_pid" in ''|*[!0-9]*) continue ;; esac
     [ "$remaining_pid" = "$target_pid" ] && continue
     [ "$remaining_pid" = "$$" ] && continue
@@ -1280,6 +1418,7 @@ async function removeCleanupAckRoot(path: string): Promise<void> {
 
 async function waitForCleanupAck(path: string, wrapperExited: Promise<number>): Promise<boolean> {
   const deadline = Date.now() + 10_000;
+  let wrapperExitGraceDeadline: number | undefined;
   while (Date.now() < deadline) {
     if (await consumeCleanupAck(path)) return true;
     const wrapperDone = await Promise.race([
@@ -1287,7 +1426,9 @@ async function waitForCleanupAck(path: string, wrapperExited: Promise<number>): 
       Bun.sleep(20).then(() => false),
     ]);
     if (wrapperDone) {
-      return consumeCleanupAck(path);
+      // A POSIX shell can report exit before its TERM trap finishes creating the marker.
+      wrapperExitGraceDeadline ??= Date.now() + 500;
+      if (Date.now() >= wrapperExitGraceDeadline) return consumeCleanupAck(path);
     }
   }
   return false;

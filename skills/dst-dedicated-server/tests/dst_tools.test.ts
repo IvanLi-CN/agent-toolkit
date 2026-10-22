@@ -804,7 +804,7 @@ esac
     }
   });
 
-  test("rejects an oversized remote snapshot before writing unbounded output", { timeout: 10_000 }, async () => {
+  test("rejects an oversized remote snapshot before writing unbounded output", { timeout: 30_000 }, async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-limit-"));
     const previousPath = process.env.PATH;
     try {
@@ -1006,7 +1006,7 @@ esac
     }
   });
 
-  test("kills a target process group after its leader exits", { timeout: 10_000 }, async () => {
+  test("kills a target process group after its leader exits", { timeout: 30_000 }, async () => {
     if (process.platform === "win32") return;
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-group-"));
     const marker = join(root, "descendant.pid");
@@ -1050,7 +1050,7 @@ esac
     }
   });
 
-  test("starts the cleanup acknowledgement deadline when stopping", { timeout: 20_000 }, async () => {
+  test("starts the cleanup acknowledgement deadline when stopping", { timeout: 30_000 }, async () => {
     if (process.platform === "win32") return;
     let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
     try {
@@ -1068,7 +1068,7 @@ esac
     }
   });
 
-  test("does not follow a cleanup acknowledgement symlink", { timeout: 10_000 }, async () => {
+  test("does not follow a cleanup acknowledgement symlink", { timeout: 30_000 }, async () => {
     if (process.platform === "win32") return;
     const prefix = ".agent-toolkit-dst-supervisor-ack-";
     const before = new Set((await readdir(tmpdir())).filter((entry) => entry.startsWith(prefix)));
@@ -1095,7 +1095,7 @@ esac
     }
   });
 
-  test("does not expose the cleanup acknowledgement path to the target", { timeout: 10_000 }, async () => {
+  test("does not expose the cleanup acknowledgement path to the target", { timeout: 30_000 }, async () => {
     if (process.platform === "win32") return;
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-ack-env-"));
     const marker = join(root, "target-saw-ack-path");
@@ -1122,7 +1122,7 @@ esac
     }
   });
 
-  test("cleans a descendant that leaves the target process group", { timeout: 10_000 }, async () => {
+  test("cleans a descendant that leaves the target process group", { timeout: 30_000 }, async () => {
     if (process.platform === "win32") return;
     const setsidCheck = Bun.spawnSync(["sh", "-c", "command -v setsid"], { stdout: "ignore", stderr: "ignore" });
     if (setsidCheck.exitCode !== 0) return;
@@ -1174,7 +1174,7 @@ esac
     }
   });
 
-  test("cleans an orphaned group after its captured leader exits during termination", { timeout: 15_000 }, async () => {
+  test("cleans an orphaned group after its captured leader exits during termination", { timeout: 30_000 }, async () => {
     if (process.platform === "win32") return;
     const setsidCheck = Bun.spawnSync(["sh", "-c", "command -v setsid"], { stdout: "ignore", stderr: "ignore" });
     if (setsidCheck.exitCode !== 0) return;
@@ -1289,7 +1289,7 @@ esac
     }
   });
 
-  test("fails closed when detached descendant enumeration cannot scan processes", { timeout: 15_000 }, async () => {
+  test("fails closed when detached descendant enumeration cannot scan processes", { timeout: 30_000 }, async () => {
     if (process.platform === "win32") return;
     const procRoot = await lstat("/proc").catch(() => undefined);
     if (!procRoot?.isDirectory()) return;

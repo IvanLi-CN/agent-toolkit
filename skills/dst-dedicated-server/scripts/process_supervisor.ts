@@ -2,6 +2,9 @@ import { lstat, mkdtemp, readFile, rm, rmdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
+const SUPERVISOR_CLEANUP_TIMEOUT_MS = 20_000;
+const SUPERVISOR_CLEANUP_DEADLINE_SECONDS = Math.ceil(SUPERVISOR_CLEANUP_TIMEOUT_MS / 1_000);
+
 const SUPERVISOR_SCRIPT = `
 set +e
 set +m 2>/dev/null || true
@@ -304,7 +307,7 @@ set_snapshot_deadline() {
   snapshot_now="$(date +%s 2>/dev/null || true)"
   case "$snapshot_now" in
     ''|*[!0-9]*) snapshot_deadline_epoch=1 ;;
-    *) snapshot_deadline_epoch=$((snapshot_now + 10)) ;;
+    *) snapshot_deadline_epoch=$((snapshot_now + ${SUPERVISOR_CLEANUP_DEADLINE_SECONDS})) ;;
   esac
 }
 process_identity() {
@@ -1466,7 +1469,7 @@ async function removeCleanupAckRoot(path: string): Promise<void> {
 }
 
 async function waitForCleanupAck(path: string, wrapperExited: Promise<number>): Promise<boolean> {
-  const deadline = Date.now() + 10_000;
+  const deadline = Date.now() + SUPERVISOR_CLEANUP_TIMEOUT_MS;
   const failurePath = `${path}.failed`;
   while (Date.now() < deadline) {
     if (await consumeCleanupAck(path)) return true;

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readFile, rm, rmdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -13,6 +14,7 @@ set +m 2>/dev/null || true
 status_path="$1"
 shift
 status_dir="$(dirname -- "$status_path")"
+target_marker="\${AGENT_TOOLKIT_TARGET_MARKER:-unbound}"
 supervisor_pid="$$"
 ready_path="$status_dir/ready"
 cleanup_ack_path="\${AGENT_TOOLKIT_SUPERVISOR_CLEANUP_ACK_PATH:-$status_dir/cleanup-done}"
@@ -147,7 +149,7 @@ if command -v setsid >/dev/null 2>&1; then
     printf "%s\\n" "$target_status" > "$result_path"
     exec 0<&- 1>&- 2>&-
     while :; do sleep 1; done
-  ' agent-toolkit-target "$target_anchor_path" "$target_status_path" "$@" &
+  ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$@" &
 else
   set -m 2>/dev/null || true
   sh -c '
@@ -163,7 +165,7 @@ else
     printf "%s\\n" "$target_status" > "$result_path"
     exec 0<&- 1>&- 2>&-
     while :; do sleep 1; done
-  ' agent-toolkit-target "$target_anchor_path" "$target_status_path" "$@" &
+  ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$@" &
 fi
 target_launcher_pid=$!
 target_pid="$target_launcher_pid"
@@ -540,6 +542,10 @@ captured_group_can_be_signaled() {
   captured_group_identity="$1"
   captured_group="$2"
   captured_group_allow_target="\${3:-}"
+  # Darwin's lstart is only second-resolution. A detached group has no
+  # supervisor-owned anchor after reparenting, so do not authorize a group
+  # kill from a weak ps identity that could collide with a reused PID/PGID.
+  case "$captured_group_identity" in ps:*) return 1 ;; esac
   captured_process_can_be_signaled "$captured_group_identity" || return 1
   capture_group_members "$captured_group"
   captured_group_probe_status=$?
@@ -1759,6 +1765,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
   }
 
   const cleanupAckDirectory = await mkdtemp(join(tmpdir(), ".agent-toolkit-dst-supervisor-ack-"));
+  const targetMarker = randomUUID();
   let directory: string;
   try {
     directory = await mkdtemp(join(tmpdir(), ".agent-toolkit-dst-supervisor-"));
@@ -1781,6 +1788,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
           ...process.env,
           AGENT_TOOLKIT_SUPERVISOR_PARENT_PID: String(process.pid),
           AGENT_TOOLKIT_SUPERVISOR_CLEANUP_ACK_PATH: cleanupAckPath,
+          AGENT_TOOLKIT_TARGET_MARKER: targetMarker,
         },
       },
     ) as Bun.Subprocess<"pipe", "pipe", "pipe">;

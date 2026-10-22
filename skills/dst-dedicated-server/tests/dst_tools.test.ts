@@ -30,7 +30,7 @@ function byteStream(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
   });
 }
 
-describe("DST local Bun tooling", () => {
+describe.serial("DST local Bun tooling", () => {
   test("uses an error envelope for CLI parse failures", async () => {
     const env = { ...process.env } as Record<string, string>;
     const snapshot = await runTool(join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"), ["--unknown"], env);

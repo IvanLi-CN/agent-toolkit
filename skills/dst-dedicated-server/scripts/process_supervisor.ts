@@ -277,6 +277,10 @@ target_is_alive() {
 stop_anchor() {
   refresh_target_reference
   if target_identity_matches; then
+    if [ "$target_identity_mode" = "ps" ]; then
+      cleanup_ack_enabled=0
+      return
+    fi
     anchor_pgid="$(run_process_probe ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ' || true)"
     wrapper_pgid="$(run_process_probe ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' || true)"
     case "$anchor_pgid" in
@@ -407,6 +411,12 @@ identity_is_valid() {
   case "$1" in
     *"|"*|*"
 "*) return 1 ;;
+  esac
+}
+captured_process_can_be_signaled() {
+  case "$1" in
+    proc:*) return 0 ;;
+    *) return 1 ;;
   esac
 }
 normalize_process_identity() {
@@ -829,6 +839,7 @@ quiesce_captured_descendants() {
     if [ "$current_captured_pgid" != "$captured_pgid" ]; then cleanup_ack_enabled=0; return 1; fi
     if [ "$current_captured_pgid" = "$wrapper_pgid" ]; then cleanup_ack_enabled=0; return 1; fi
     if [ -n "$target_group_for_quiesce" ] && [ "$current_captured_pgid" = "$target_group_for_quiesce" ]; then continue; fi
+    captured_process_can_be_signaled "$captured_identity" || { cleanup_ack_enabled=0; return 1; }
     if ! kill -STOP "-$current_captured_pgid" 2>/dev/null; then cleanup_ack_enabled=0; return 1; fi
   done < "$captured_descendants_path" || { cleanup_ack_enabled=0; return 1; }
 }
@@ -1045,9 +1056,14 @@ signal_tree() {
     if target_identity_matches && [ "$current_descendant_identity" = "$descendant_identity" ]; then
       current_descendant_pgid="$(process_group_id "$pid" 2>/dev/null || true)"
       if [ "$current_descendant_pgid" = "$target_pgid" ]; then
-        # A group signal can fail transiently on macOS; the same identity and
-        # captured target PGID make this member-specific fallback safe.
-        if ! kill -"$signal" "$pid" 2>/dev/null; then cleanup_ack_enabled=0; fi
+        # macOS ps identities have only second-resolution start times. If the
+        # target-group signal fails, fail closed instead of re-authorizing a
+        # captured ps:* member by PID and PGID.
+        if captured_process_can_be_signaled "$descendant_identity"; then
+          if ! kill -"$signal" "$pid" 2>/dev/null; then cleanup_ack_enabled=0; fi
+        else
+          cleanup_ack_enabled=0
+        fi
       else
         case "$descendant_identity" in ps:*) cleanup_ack_enabled=0; continue ;; esac
         kill -"$signal" "$pid" 2>/dev/null || true
@@ -1156,6 +1172,7 @@ verify_captured_descendants() {
     if [ "$captured_pgid" != "$wrapper_pgid" ] && [ "$captured_pgid" != "$target_pgid" ]; then
       kill -KILL "-$captured_pgid" 2>/dev/null || true
     else
+      captured_process_can_be_signaled "$captured_identity" || { cleanup_ack_enabled=0; return 1; }
       kill -KILL "$captured_pid" 2>/dev/null || true
     fi
     if wait_for_process_dead "$captured_pid"; then continue; fi
@@ -1265,6 +1282,7 @@ verify_descendant_cleanup() {
         cleanup_ack_enabled=0
         return 1
       fi
+      captured_process_can_be_signaled "$expected_remaining_identity" || { cleanup_ack_enabled=0; return 1; }
       remaining_descendants=1
       kill -KILL "$remaining_pid" 2>/dev/null || true
     fi

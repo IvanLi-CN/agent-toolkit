@@ -22,6 +22,7 @@ interface CommandResult {
   stderr: string;
   outputTruncated?: boolean;
   timedOut?: boolean;
+  cleanupVerified: boolean;
 }
 
 class CliError extends Error {
@@ -136,6 +137,9 @@ async function runWithStdin(
   const exitPromise = supervised.exited;
   let timedOut = false;
   let outputTruncated = false;
+  let result: CommandResult | undefined;
+  let operationError: unknown;
+  let operationFailed = false;
   let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
   const requestStop = () => {
     killProcessTree(supervised, "SIGTERM");
@@ -167,13 +171,17 @@ async function runWithStdin(
     // The supervisor remains as the verified process-group anchor while descendants drain.
     requestStop();
     const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
-    return {
+    result = {
       exitCode,
       stdout: stdout.text,
       stderr: stderr.text,
       outputTruncated: outputTruncated || stdout.truncated || stderr.truncated,
       timedOut,
+      cleanupVerified: true,
     };
+  } catch (error) {
+    operationFailed = true;
+    operationError = error;
   } finally {
     if (timeout !== undefined) clearTimeout(timeout);
     if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
@@ -186,8 +194,14 @@ async function runWithStdin(
     await Promise.race([supervised.wrapperExited.then(() => undefined, () => undefined), new Promise<void>((resolve) => setTimeout(resolve, SUPERVISOR_STOP_GRACE_MS))]);
     if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
     await supervised.cleanup();
-    if (!cleanupReady) throw new Error("supervisor_cleanup_unverified");
+    if (result !== undefined) result.cleanupVerified = cleanupReady;
+    if (!cleanupReady && operationFailed && operationError instanceof Error) {
+      operationError.message = `${operationError.message}; supervisor_cleanup_unverified`;
+    }
   }
+  if (operationFailed) throw operationError;
+  if (result === undefined) throw new Error("supervisor_command_result_missing");
+  return result;
 }
 
 function isoTimestamp(): string {
@@ -903,7 +917,12 @@ async function remoteCollect(options: SnapshotOptions, script: string): Promise<
   }
   if (connectivity.timedOut) {
     lines.push("> Remote SSH connectivity check timed out after 5s. Verify reachability and run the command interactively, then re-run this script.", "");
+    if (!connectivity.cleanupVerified) lines.splice(lines.length - 1, 0, "> Local process cleanup could not be verified; remote collection was not attempted.");
     return { text: lines.join("\n"), failed: false };
+  }
+  if (!connectivity.cleanupVerified) {
+    lines.push("> Local process cleanup could not be verified; remote collection was not attempted.", "");
+    return { text: lines.join("\n"), failed: true };
   }
   if (connectivity.exitCode !== 0) {
     lines.push("> Remote SSH failed (host down, wrong IP/port, or missing SSH key).");
@@ -924,11 +943,19 @@ async function remoteCollect(options: SnapshotOptions, script: string): Promise<
     return { text: lines.join("\n"), failed: true };
   }
   if (result.timedOut) {
-    lines.push(`> Remote collection timed out after ${REMOTE_COMMAND_TIMEOUT_MS / 1000}s.`, "");
+    lines.push(`> Remote collection timed out after ${REMOTE_COMMAND_TIMEOUT_MS / 1000}s.`);
+    if (!result.cleanupVerified) lines.push("> Local process cleanup could not be verified.");
+    lines.push("");
     return { text: lines.join("\n"), failed: true };
   }
   if (result.outputTruncated) {
-    lines.push(`> Remote collection exceeded the ${MAX_REMOTE_OUTPUT_BYTES}-byte output limit.`, "");
+    lines.push(`> Remote collection exceeded the ${MAX_REMOTE_OUTPUT_BYTES}-byte output limit.`);
+    if (!result.cleanupVerified) lines.push("> Local process cleanup could not be verified.");
+    lines.push("");
+    return { text: lines.join("\n"), failed: true };
+  }
+  if (!result.cleanupVerified) {
+    lines.push("> Remote collection completed but local process cleanup could not be verified.", "");
     return { text: lines.join("\n"), failed: true };
   }
   if (result.exitCode !== 0) {

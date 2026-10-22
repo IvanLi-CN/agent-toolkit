@@ -829,6 +829,74 @@ esac
     }
   });
 
+  test("preserves the output-limit diagnostic when cleanup acknowledgement fails", { timeout: 90_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-limit-cleanup-"));
+    const previousPath = process.env.PATH;
+    try {
+      const fakeSsh = join(root, "ssh");
+      const fakePs = join(root, "ps");
+      const trigger = join(root, "fail-process-scan");
+      await writeFile(fakeSsh, `#!/bin/sh
+case "$*" in
+  *"echo ok"*) exit 0 ;;
+  *) sleep 0.5; touch "$AGENT_TOOLKIT_TEST_PS_FAIL"; head -c $(( ${MAX_REMOTE_OUTPUT_BYTES} + 1 )) /dev/zero ;;
+esac
+`);
+      await writeFile(fakePs, `#!/bin/sh
+if [ -e "$AGENT_TOOLKIT_TEST_PS_FAIL" ]; then exit 1; fi
+exec /bin/ps "$@"
+`);
+      await chmod(fakeSsh, 0o755);
+      await chmod(fakePs, 0o755);
+      const output = join(root, "snapshot.md");
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
+        ["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", output],
+        { ...process.env, PATH: `${root}:${previousPath ?? ""}`, AGENT_TOOLKIT_TEST_PS_FAIL: trigger } as Record<string, string>,
+      );
+      expect(result.status).toBe(1);
+      const report = await readFile(output, "utf8");
+      expect(report).toContain("output limit");
+      expect(report).toContain("cleanup could not be verified");
+      expect(report).not.toContain("command could not be started");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves an SSH failure when mods cleanup acknowledgement fails", { timeout: 90_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-mods-cleanup-"));
+    const previousPath = process.env.PATH;
+    try {
+      const fakeSsh = join(root, "ssh");
+      const fakePs = join(root, "ps");
+      const trigger = join(root, "fail-process-scan");
+      await writeFile(fakeSsh, `#!/bin/sh
+cat >/dev/null
+sleep 0.5
+touch "$AGENT_TOOLKIT_TEST_PS_FAIL"
+echo "fixture SSH denied" >&2
+exit 1
+`);
+      await writeFile(fakePs, `#!/bin/sh
+if [ -e "$AGENT_TOOLKIT_TEST_PS_FAIL" ]; then exit 1; fi
+exec /bin/ps "$@"
+`);
+      await chmod(fakeSsh, 0o755);
+      await chmod(fakePs, 0o755);
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_mods_from_modoverrides.ts"),
+        ["--host", "fixture-host", "--user", "fixture-user", "--cluster", "fixture-cluster", "--shard", "Master"],
+        { ...process.env, PATH: `${root}:${previousPath ?? ""}`, AGENT_TOOLKIT_TEST_PS_FAIL: trigger } as Record<string, string>,
+      );
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("fixture SSH denied");
+      expect(result.stderr).toContain("supervisor_cleanup_unverified");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("publishes concurrent reports without partial writes or overwrites", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-publish-"));
     try {

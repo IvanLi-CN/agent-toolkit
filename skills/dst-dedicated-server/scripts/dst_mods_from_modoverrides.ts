@@ -258,7 +258,7 @@ function killProcessTree(supervised: SupervisedChild, signal: "SIGTERM" | "SIGKI
   try { supervised.child.kill(signal); } catch { /* The supervisor may already be gone. */ }
 }
 
-async function terminateAndReap(supervised: SupervisedChild): Promise<void> {
+async function terminateAndReap(supervised: SupervisedChild): Promise<boolean> {
   const observedExit = supervised.wrapperExited;
   killProcessTree(supervised, "SIGTERM");
   const cleanupReady = await supervised.waitForCleanupAcknowledged();
@@ -268,7 +268,7 @@ async function terminateAndReap(supervised: SupervisedChild): Promise<void> {
   }
   await Promise.race([observedExit, new Promise<void>((resolve) => setTimeout(resolve, SUPERVISOR_STOP_GRACE_MS))]);
   await supervised.cleanup();
-  if (!cleanupReady) throw new Error("supervisor_cleanup_unverified");
+  return cleanupReady;
 }
 
 async function readText(stream: ReadableStream<Uint8Array>, maxBytes = 64 * 1024, timeoutMs = REMOTE_COMMAND_TIMEOUT_MS): Promise<string> {
@@ -517,7 +517,10 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
         killProcessTree(supervised, "SIGTERM");
         if (forceKillTimer === undefined) forceKillTimer = setTimeout(() => killProcessTree(supervised, "SIGKILL"), SUPERVISOR_FORCE_KILL_MS);
       }, REMOTE_COMMAND_TIMEOUT_MS);
-      let summary: ShardSummary;
+      let summary: ShardSummary | undefined;
+      let operationError: unknown;
+      let operationFailed = false;
+      let cleanupReady = true;
       try {
         try {
           await child.stdin.write(script);
@@ -543,11 +546,22 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
           const detail = redactOperationalText(stderr.trim(), [parsed.host, parsed.user]);
           throw new Error(detail || `SSH collection failed for ${shard}`);
         }
+      } catch (error) {
+        operationFailed = true;
+        operationError = error;
       } finally {
         clearTimeout(timeout);
         if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
-        await terminateAndReap(supervised);
+        cleanupReady = await terminateAndReap(supervised);
       }
+      if (operationFailed) {
+        if (!cleanupReady && operationError instanceof Error) operationError.message = `${operationError.message}; supervisor_cleanup_unverified`;
+        throw operationError;
+      }
+      if (!cleanupReady) {
+        throw new Error("supervisor_cleanup_unverified");
+      }
+      if (summary === undefined) throw new Error("mod_summary_missing");
       summaries.push(summary);
       process.stdout.write(renderSummary(parsed.cluster, summary));
     }

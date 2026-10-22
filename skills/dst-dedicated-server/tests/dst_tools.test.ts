@@ -1674,9 +1674,10 @@ exec /bin/ps "$@"
       supervised = await spawnSupervised([
         "sh",
         "-c",
-        "sleep 30 & child=$!; printf '%s\\n' \"$child\" > \"$1\"; while :; do for path in /tmp/.agent-toolkit-dst-supervisor-*; do [ -f \"$path/descendants\" ] && : > \"$path/descendants\"; done; sleep 0.01; done",
+        "sleep 30 & child=$!; printf '%s\\n' \"$child\" > \"$1\"; while :; do for path in \"$2\"/.agent-toolkit-dst-supervisor-*; do [ -f \"$path/descendants\" ] && : > \"$path/descendants\"; done; sleep 0.01; done",
         "agent-toolkit-supervised-target",
         marker,
+        tmpdir(),
       ]);
       for (let attempt = 0; attempt < 40; attempt += 1) {
         try {
@@ -1702,8 +1703,6 @@ exec /bin/ps "$@"
 
   test("cleans a descendant that leaves the target process group", { timeout: 90_000 }, async () => {
     if (process.platform === "win32") return;
-    const setsidCheck = Bun.spawnSync(["sh", "-c", "command -v setsid"], { stdout: "ignore", stderr: "ignore" });
-    if (setsidCheck.exitCode !== 0) return;
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-independent-group-"));
     const marker = join(root, "detached.pid");
     let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
@@ -1720,7 +1719,7 @@ exec /bin/ps "$@"
       supervised = await spawnSupervised([
         "sh",
         "-c",
-        "setsid sh -c 'trap \"\" TERM; sleep 30' & detached=$!; printf '%s\\n' \"$detached\" > \"$1\"; while :; do sleep 1; done",
+        "perl -MPOSIX -e 'POSIX::setsid() < 0 and exit 125; exec @ARGV' -- sh -c 'trap \"\" TERM; sleep 30' & detached=$!; printf '%s\\n' \"$detached\" > \"$1\"; while :; do sleep 1; done",
         "agent-toolkit-supervised-target",
         marker,
       ]);
@@ -1754,19 +1753,17 @@ exec /bin/ps "$@"
 
   test("cleans an orphaned group after its captured leader exits during termination", { timeout: 90_000 }, async () => {
     if (process.platform === "win32") return;
-    const setsidCheck = Bun.spawnSync(["sh", "-c", "command -v setsid"], { stdout: "ignore", stderr: "ignore" });
-    if (setsidCheck.exitCode !== 0) return;
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-orphaned-group-"));
     const controllerScript = join(root, "controller.sh");
     const leaderScript = join(root, "leader.sh");
     const childScript = join(root, "child.sh");
     const leaderMarker = join(root, "leader.pid");
     const childMarker = join(root, "child.pid");
-    await writeFile(childScript, "#!/bin/sh\ntrap ':' TERM\nsleep 30\n", "utf8");
+    await writeFile(childScript, "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$1\"\ntrap ':' TERM\nsleep 30\n", "utf8");
     await chmod(childScript, 0o755);
-    await writeFile(leaderScript, "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$1\"\ntrap 'sh \"$3\" & printf \"%s\\n\" \"$!\" > \"$2\"; exit 0' TERM\nwhile :; do :; done\n", "utf8");
+    await writeFile(leaderScript, "#!/bin/sh\nsh \"$3\" \"$2\" & child=\"$!\"\nprintf '%s\\n' \"$$\" > \"$1\"\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n", "utf8");
     await chmod(leaderScript, 0o755);
-    await writeFile(controllerScript, "#!/bin/sh\nsetsid \"$1\" \"$2\" \"$3\" \"$4\" & leader=\"$!\"\ntrap 'kill -TERM \"$leader\" 2>/dev/null || true; exit 0' TERM\nwhile kill -0 \"$leader\" 2>/dev/null; do :; done\n", "utf8");
+    await writeFile(controllerScript, "#!/bin/sh\nif command -v setsid >/dev/null 2>&1; then\n  setsid \"$1\" \"$2\" \"$3\" \"$4\" & leader=\"$!\"\nelse\n  perl -MPOSIX -e '$pid=fork(); exit 125 unless defined $pid; if ($pid) { waitpid($pid, 0); exit($? >> 8); } POSIX::setsid() < 0 and exit 125; exec @ARGV or exit 127' -- \"$1\" \"$2\" \"$3\" \"$4\" & launcher=\"$!\"\n  while [ ! -s \"$2\" ] && kill -0 \"$launcher\" 2>/dev/null; do sleep 0.01; done\n  leader=\"$(cat \"$2\" 2>/dev/null || printf '%s' \"$launcher\")\"\nfi\ntrap 'kill -TERM \"$leader\" 2>/dev/null || true; exit 0' TERM\nwhile kill -0 \"$leader\" 2>/dev/null; do sleep 0.01; done\n", "utf8");
     await chmod(controllerScript, 0o755);
     let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
     let descendantPid: number | undefined;
@@ -1820,8 +1817,6 @@ exec /bin/ps "$@"
 
   test("fails closed when detached descendant enumeration is truncated", { timeout: 90_000 }, async () => {
     if (process.platform === "win32") return;
-    const setsidCheck = Bun.spawnSync(["sh", "-c", "command -v setsid"], { stdout: "ignore", stderr: "ignore" });
-    if (setsidCheck.exitCode !== 0) return;
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-descendant-cap-"));
     const pidFile = join(root, "descendants.pid");
     const readyFile = join(root, "ready");
@@ -1831,7 +1826,7 @@ exec /bin/ps "$@"
       supervised = await spawnSupervised([
         "sh",
         "-c",
-        "i=0; while [ \"$i\" -lt 1025 ]; do setsid sleep 30 & printf '%s\\n' \"$!\" >> \"$1\"; i=$((i + 1)); done; printf ready > \"$2\"; while :; do sleep 1; done",
+        "i=0; while [ \"$i\" -lt 1025 ]; do perl -MPOSIX -e 'POSIX::setsid() < 0 and exit 125; exec @ARGV' -- sleep 30 & printf '%s\\n' \"$!\" >> \"$1\"; i=$((i + 1)); done; printf ready > \"$2\"; while :; do sleep 1; done",
         "agent-toolkit-supervised-target",
         pidFile,
         readyFile,

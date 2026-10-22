@@ -953,25 +953,40 @@ exec /bin/ps "$@"
     const previousPath = process.env.PATH;
     try {
       const fakeSsh = join(root, "ssh");
-      const fakePs = join(root, "ps");
-      const trigger = join(root, "fail-process-scan");
       await writeFile(fakeSsh, `#!/bin/sh
 case "$*" in
   *"echo ok"*) exit 0 ;;
-  *) cat >/dev/null; sleep 0.5; touch "$AGENT_TOOLKIT_TEST_PS_FAIL"; echo "fixture remote command denied" >&2; exit 1 ;;
+  *)
+    cat >/dev/null
+    supervisor_pid="$(ps -o ppid= -p "$PPID" 2>/dev/null | tr -d '[:space:]')"
+    case "$supervisor_pid" in
+      ''|*[!0-9]*)
+        ancestor="$PPID"
+        attempts=0
+        while [ "$attempts" -lt 16 ]; do
+          case "$ancestor" in ''|*[!0-9]*) break ;; esac
+          command_line="$(ps -o command= -p "$ancestor" 2>/dev/null || true)"
+          case "$command_line" in *agent-toolkit-supervisor*) supervisor_pid="$ancestor"; break ;; esac
+          next_ancestor="$(ps -o ppid= -p "$ancestor" 2>/dev/null | tr -d '[:space:]')"
+          [ "$next_ancestor" = "$ancestor" ] && break
+          ancestor="$next_ancestor"
+          attempts=$((attempts + 1))
+        done
+        ;;
+    esac
+    case "$supervisor_pid" in ''|*[!0-9]*) exit 97 ;; esac
+    sleep 0.5
+    kill -KILL "$supervisor_pid" 2>/dev/null || true
+    while :; do sleep 1; done
+    ;;
 esac
 `);
-      await writeFile(fakePs, `#!/bin/sh
-if [ -e "$AGENT_TOOLKIT_TEST_PS_FAIL" ]; then printf 'malformed process row\\n'; exit 0; fi
-exec /bin/ps "$@"
-`);
       await chmod(fakeSsh, 0o755);
-      await chmod(fakePs, 0o755);
       const output = join(root, "snapshot.md");
       const result = await runTool(
         join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
         ["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", output],
-        { ...process.env, PATH: `${root}:${previousPath ?? ""}`, AGENT_TOOLKIT_TEST_PS_FAIL: trigger } as Record<string, string>,
+        { ...process.env, PATH: `${root}:${previousPath ?? ""}` } as Record<string, string>,
       );
       expect(result.status).toBe(1);
       const report = await readFile(output, "utf8");

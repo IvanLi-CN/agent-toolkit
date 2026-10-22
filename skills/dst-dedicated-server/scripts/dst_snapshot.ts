@@ -190,6 +190,7 @@ async function runWithStdin(
       timedOut,
       cleanupVerified: true,
     };
+    requestStop();
   } catch (error) {
     operationFailed = true;
     operationError = error;

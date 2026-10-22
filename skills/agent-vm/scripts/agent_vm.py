@@ -201,7 +201,7 @@ def _validate_client_artifact(sidecar: Path, artifact: dict[str, Any]) -> None:
         fail("release_metadata_invalid", "client artifact mode is invalid")
     if mode != 0o755:
         fail("release_metadata_invalid", "client artifact mode must be 0755")
-    path = sidecar.parent / relative
+    path = sidecar.parent.resolve() / relative
     try:
         info = path.lstat()
     except (FileNotFoundError, OSError) as exc:

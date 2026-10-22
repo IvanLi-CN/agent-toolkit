@@ -1392,6 +1392,8 @@ exec /bin/ps "$@"
       }
       expect(resolvedEntry).toBeString();
       await writeFile(join(tmpdir(), resolvedEntry!, "target-status"), "0\n", "utf8");
+      const forgedTargetPid = (await readFile(join(tmpdir(), resolvedEntry!, "target"), "utf8")).trim();
+      await writeFile(join(tmpdir(), resolvedEntry!, "target-status-writer"), `${forgedTargetPid}|forged\n`, "utf8");
       const early = await Promise.race([supervised.exited, Bun.sleep(250).then(() => "pending" as const)]);
       expect(early).toBe("pending");
       supervised.child.kill("SIGTERM");

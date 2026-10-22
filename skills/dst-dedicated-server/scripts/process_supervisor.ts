@@ -22,6 +22,7 @@ supervisor_pid="$$"
 ready_path="$status_dir/ready"
 cleanup_ack_path="\${AGENT_TOOLKIT_SUPERVISOR_CLEANUP_ACK_PATH:-$status_dir/cleanup-done}"
 cleanup_failure_path="$cleanup_ack_path.failed"
+cleanup_started_path="$status_dir/cleanup-started"
 unset AGENT_TOOLKIT_SUPERVISOR_CLEANUP_ACK_PATH
 cleanup_ack_enabled=1
 captured_descendants_path="$status_dir/descendants"
@@ -38,6 +39,10 @@ descendant_scan_failed_path="$status_dir/descendant-scan-failed"
 descendant_scan_input_path="$status_dir/descendant-scan-input"
 descendant_scan_status_path="$status_dir/descendant-scan-status"
 parent_dead_path="$status_dir/parent-dead"
+supervisor_no_follow=""
+if command -v perl >/dev/null 2>&1; then
+  supervisor_no_follow="$(perl -MFcntl -e 'print eval { Fcntl::O_NOFOLLOW() } // ""' 2>/dev/null || true)"
+fi
 read_regular_marker() {
   marker_path="$1"
   if ! command -v perl >/dev/null 2>&1; then return 1; fi
@@ -67,14 +72,149 @@ read_regular_marker() {
     print $data;
   ' "$marker_path" 256
 }
+safe_create_file() {
+  marker_path="$1"
+  [ -n "$supervisor_no_follow" ] || return 1
+  if ! command -v perl >/dev/null 2>&1; then return 1; fi
+  perl -e '
+    use strict;
+    use warnings;
+    use Fcntl qw(O_WRONLY O_CREAT O_EXCL);
+    my ($path, $nofollow) = @ARGV;
+    exit 1 unless defined $nofollow;
+    sysopen(my $fh, $path, O_WRONLY | O_CREAT | O_EXCL | $nofollow, 0600) or exit 1;
+    close($fh) or exit 1;
+  ' "$marker_path" "$supervisor_no_follow"
+}
+safe_write_file() {
+  marker_path="$1"
+  marker_value="$2"
+  [ -n "$supervisor_no_follow" ] || return 1
+  if ! command -v perl >/dev/null 2>&1; then return 1; fi
+  perl -e '
+    use strict;
+    use warnings;
+    use Fcntl qw(O_WRONLY O_CREAT O_EXCL);
+    my ($path, $value, $nofollow) = @ARGV;
+    exit 1 unless defined $nofollow;
+    sysopen(my $fh, $path, O_WRONLY | O_CREAT | O_EXCL | $nofollow, 0600) or exit 1;
+    print {$fh} $value, "\n" or exit 1;
+    close($fh) or exit 1;
+  ' "$marker_path" "$marker_value" "$supervisor_no_follow"
+}
+safe_append_line() {
+  marker_path="$1"
+  marker_value="$2"
+  [ -n "$supervisor_no_follow" ] || return 1
+  if ! command -v perl >/dev/null 2>&1; then return 1; fi
+  perl -e '
+    use strict;
+    use warnings;
+    use Fcntl qw(O_WRONLY O_CREAT O_EXCL O_APPEND O_NONBLOCK);
+    my ($path, $value, $nofollow) = @ARGV;
+    exit 1 unless defined $nofollow;
+    my $fh;
+    if (!sysopen($fh, $path, O_WRONLY | O_APPEND | O_NONBLOCK | $nofollow)) {
+      sysopen(my $created, $path, O_WRONLY | O_CREAT | O_EXCL | $nofollow, 0600) or exit 1;
+      close($created) or exit 1;
+      sysopen($fh, $path, O_WRONLY | O_APPEND | O_NONBLOCK | $nofollow) or exit 1;
+    }
+    print {$fh} $value, "\n" or exit 1;
+    close($fh) or exit 1;
+  ' "$marker_path" "$marker_value" "$supervisor_no_follow"
+}
+safe_emit_file() {
+  input_path="$1"
+  [ -n "$supervisor_no_follow" ] || return 1
+  if ! command -v perl >/dev/null 2>&1; then return 1; fi
+  perl -e '
+    use strict;
+    use warnings;
+    use Fcntl qw(O_RDONLY O_NONBLOCK);
+    my ($path, $nofollow) = @ARGV;
+    exit 1 unless defined $nofollow;
+    sysopen(my $fh, $path, O_RDONLY | O_NONBLOCK | $nofollow) or exit 1;
+    my @stat = stat($fh);
+    exit 1 unless @stat && (($stat[2] & 0170000) == 0100000);
+    binmode STDOUT;
+    while (1) {
+      my $read = sysread($fh, my $chunk, 65536);
+      exit 1 unless defined $read;
+      last if $read == 0;
+      print STDOUT $chunk or exit 1;
+    }
+    close($fh) or exit 1;
+  ' "$input_path" "$supervisor_no_follow"
+}
+safe_capture_command() {
+  output_path="$1"
+  shift
+  [ -n "$supervisor_no_follow" ] || return 1
+  rm -f -- "$output_path" 2>/dev/null || return 1
+  if ! command -v perl >/dev/null 2>&1; then return 1; fi
+  perl -e '
+    use strict;
+    use warnings;
+    use Fcntl qw(O_WRONLY O_CREAT O_EXCL);
+    my ($path, $nofollow) = splice @ARGV, 0, 2;
+    exit 1 unless defined $nofollow;
+    sysopen(my $fh, $path, O_WRONLY | O_CREAT | O_EXCL | $nofollow, 0600) or exit 1;
+    open(STDOUT, ">&", $fh) or exit 1;
+    exec @ARGV or exit 127;
+  ' "$output_path" "$supervisor_no_follow" "$@"
+}
+safe_capture_command_with_input() {
+  output_path="$1"
+  input_path="$2"
+  shift 2
+  [ -n "$supervisor_no_follow" ] || return 1
+  rm -f -- "$output_path" 2>/dev/null || return 1
+  if ! command -v perl >/dev/null 2>&1; then return 1; fi
+  perl -e '
+    use strict;
+    use warnings;
+    use Fcntl qw(O_RDONLY O_WRONLY O_CREAT O_EXCL O_NONBLOCK);
+    my ($output, $input, $nofollow) = splice @ARGV, 0, 3;
+    exit 1 unless defined $nofollow;
+    sysopen(my $in, $input, O_RDONLY | O_NONBLOCK | $nofollow) or exit 1;
+    my @stat = stat($in);
+    exit 1 unless @stat && (($stat[2] & 0170000) == 0100000);
+    sysopen(my $out, $output, O_WRONLY | O_CREAT | O_EXCL | $nofollow, 0600) or exit 1;
+    open(STDIN, "<&", $in) or exit 1;
+    open(STDOUT, ">&", $out) or exit 1;
+    exec @ARGV or exit 127;
+  ' "$output_path" "$input_path" "$supervisor_no_follow" "$@"
+}
+safe_capture_stdin() {
+  output_path="$1"
+  [ -n "$supervisor_no_follow" ] || return 1
+  rm -f -- "$output_path" 2>/dev/null || return 1
+  if ! command -v perl >/dev/null 2>&1; then return 1; fi
+  perl -e '
+    use strict;
+    use warnings;
+    use Fcntl qw(O_WRONLY O_CREAT O_EXCL);
+    my ($path, $nofollow) = @ARGV;
+    exit 1 unless defined $nofollow;
+    sysopen(my $fh, $path, O_WRONLY | O_CREAT | O_EXCL | $nofollow, 0600) or exit 1;
+    binmode STDIN;
+    while (1) {
+      my $read = sysread(STDIN, my $chunk, 65536);
+      exit 1 unless defined $read;
+      last if $read == 0;
+      print {$fh} $chunk or exit 1;
+    }
+    close($fh) or exit 1;
+  ' "$output_path" "$supervisor_no_follow"
+}
 write_marker_exclusive() {
   marker_path="$1"
   marker_value="$2"
-  (set -C; umask 077; printf '%s\\n' "$marker_value" > "$marker_path") 2>/dev/null
+  safe_write_file "$marker_path" "$marker_value"
 }
 create_marker_exclusive() {
   marker_path="$1"
-  (set -C; umask 077; : > "$marker_path") 2>/dev/null
+  safe_create_file "$marker_path"
 }
 ensure_marker() {
   marker_path="$1"
@@ -190,6 +330,7 @@ target_start_path="$status_dir/target-start"
 target_anchor_path="$status_dir/target"
 target_pgid_path="$status_dir/target-pgid"
 target_identity_path="$status_dir/target-identity"
+target_reference_proof_path="$status_dir/target-reference-proof"
 target_pgid=""
 target_pid=""
 group_quiescence_required=0
@@ -200,21 +341,27 @@ if command -v setsid >/dev/null 2>&1; then
     result_path="$2"
     start_path="$3"
     writer_path="$4"
-    shift 4
-    completion_proof="\${AGENT_TOOLKIT_SUPERVISOR_COMPLETION_TOKEN:-}"
-    unset AGENT_TOOLKIT_SUPERVISOR_COMPLETION_TOKEN
+    completion_proof="$5"
+    supervisor_no_follow="$6"
+    shift 6
+    write_target_marker() {
+      marker_path="$1"
+      marker_value="$2"
+      [ -n "$supervisor_no_follow" ] || return 1
+      perl -e "use strict; use warnings; use Fcntl qw(O_WRONLY O_CREAT O_EXCL); my (\\$path, \\$value, \\$nofollow) = @ARGV; sysopen(my \\$fh, \\$path, O_WRONLY | O_CREAT | O_EXCL | \\$nofollow, 0600) or exit 1; print {\\$fh} \\$value, chr(10) or exit 1; close(\\$fh) or exit 1;" "$marker_path" "$marker_value" "$supervisor_no_follow"
+    }
     trap ':' HUP INT TERM
-    if ! (set -C; umask 077; printf "%s\\n" "$$" > "$anchor_path") 2>/dev/null; then exit 125; fi
+    if ! write_target_marker "$anchor_path" "$$"; then exit 125; fi
     while [ ! -e "$start_path" ]; do sleep 0.01; done
     "$@" &
     target_pid=$!
     wait "$target_pid"
     target_status=$?
-    if ! (set -C; umask 077; printf "%s\\n" "$$" > "$writer_path") 2>/dev/null; then exit 125; fi
-    if ! (set -C; umask 077; printf "%s\\n" "$target_status" > "$result_path") 2>/dev/null; then exit 125; fi
+    if ! write_target_marker "$writer_path" "$$|$completion_proof"; then exit 125; fi
+    if ! write_target_marker "$result_path" "$target_status"; then exit 125; fi
     exec 0<&- 1>&- 2>&-
     while :; do sleep 1; done
-  ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$target_start_path" "$target_status_writer_path" "$@" &
+  ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$target_start_path" "$target_status_writer_path" "$completion_proof" "$supervisor_no_follow" "$@" &
 else
   set -m 2>/dev/null || true
   sh -c '
@@ -222,21 +369,27 @@ else
     result_path="$2"
     start_path="$3"
     writer_path="$4"
-    shift 4
-    completion_proof="\${AGENT_TOOLKIT_SUPERVISOR_COMPLETION_TOKEN:-}"
-    unset AGENT_TOOLKIT_SUPERVISOR_COMPLETION_TOKEN
+    completion_proof="$5"
+    supervisor_no_follow="$6"
+    shift 6
+    write_target_marker() {
+      marker_path="$1"
+      marker_value="$2"
+      [ -n "$supervisor_no_follow" ] || return 1
+      perl -e "use strict; use warnings; use Fcntl qw(O_WRONLY O_CREAT O_EXCL); my (\\$path, \\$value, \\$nofollow) = @ARGV; sysopen(my \\$fh, \\$path, O_WRONLY | O_CREAT | O_EXCL | \\$nofollow, 0600) or exit 1; print {\\$fh} \\$value, chr(10) or exit 1; close(\\$fh) or exit 1;" "$marker_path" "$marker_value" "$supervisor_no_follow"
+    }
     trap ':' HUP INT TERM
-    if ! (set -C; umask 077; printf "%s\\n" "$$" > "$anchor_path") 2>/dev/null; then exit 125; fi
+    if ! write_target_marker "$anchor_path" "$$"; then exit 125; fi
     while [ ! -e "$start_path" ]; do sleep 0.01; done
     "$@" &
     target_pid=$!
     wait "$target_pid"
     target_status=$?
-    if ! (set -C; umask 077; printf "%s\\n" "$$" > "$writer_path") 2>/dev/null; then exit 125; fi
-    if ! (set -C; umask 077; printf "%s\\n" "$target_status" > "$result_path") 2>/dev/null; then exit 125; fi
+    if ! write_target_marker "$writer_path" "$$|$completion_proof"; then exit 125; fi
+    if ! write_target_marker "$result_path" "$target_status"; then exit 125; fi
     exec 0<&- 1>&- 2>&-
     while :; do sleep 1; done
-  ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$target_start_path" "$target_status_writer_path" "$@" &
+  ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$target_start_path" "$target_status_writer_path" "$completion_proof" "$supervisor_no_follow" "$@" &
 fi
 unset AGENT_TOOLKIT_SUPERVISOR_COMPLETION_TOKEN
 target_launcher_pid=$!
@@ -312,6 +465,7 @@ record_target_reference() {
     ps) write_marker_exclusive "$target_identity_path" "$target_ps_start" ;;
     *) return 1 ;;
   esac
+  write_marker_exclusive "$target_reference_proof_path" "$completion_proof"
 }
 if ! record_target_reference; then
   cleanup_ack_enabled=0
@@ -581,7 +735,7 @@ capture_group_members() {
   captured_group_probe_attempt=0
   captured_group_probe_status=2
   while [ "$captured_group_probe_attempt" -lt 3 ]; do
-    run_process_probe ps -eo pid=,pgid=,state= > "$captured_group_probe_path" 2>/dev/null
+    safe_capture_command "$captured_group_probe_path" ps -eo pid=,pgid=,state=
     captured_group_probe_status=$?
     if [ "$captured_group_probe_status" -eq 0 ]; then
       captured_group_probe_status=0
@@ -592,12 +746,12 @@ capture_group_members() {
     sleep 0.01
   done
   [ "$captured_group_probe_status" -eq 0 ] || return 2
-  if ! run_process_probe awk -v wanted="$captured_group" '
+  if ! safe_capture_command_with_input "$captured_group_members_path" "$captured_group_probe_path" awk -v wanted="$captured_group" '
     $2 != wanted { next }
     NF != 3 || $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ || $3 !~ /^[[:alpha:]]/ { malformed = 1; next }
     { print $1 "|" $3 }
     END { if (malformed) exit 2 }
-  ' "$captured_group_probe_path" > "$captured_group_members_path"; then
+  ' "$captured_group_probe_path"; then
     return 2
   fi
   return 0
@@ -705,17 +859,23 @@ captured_group_can_be_signaled() {
 descendants_for_roots() {
   descendant_roots="$1"
   descendant_groups="$2"
+  if ! rm -f "$descendant_scan_status_path" "$descendant_scan_truncated_path" 2>/dev/null; then
+    cleanup_ack_enabled=0
+    create_marker_exclusive "$descendant_scan_failed_path" || true
+    return 1
+  fi
   if snapshot_deadline_exceeded; then
     cleanup_ack_enabled=0
     create_marker_exclusive "$descendant_scan_failed_path" || true
     return 1
   fi
-  if ! run_snapshot_command ps -eo pid=,ppid=,pgid= > "$descendant_scan_input_path" 2>/dev/null; then
+  if ! safe_capture_command "$descendant_scan_input_path" ps -eo pid=,ppid=,pgid=; then
     cleanup_ack_enabled=0
     create_marker_exclusive "$descendant_scan_failed_path" || true
     return 1
   fi
-  if ! run_snapshot_command awk -v roots="$descendant_roots" -v groups="$descendant_groups" -v truncated_path="$descendant_scan_truncated_path" -v status_path="$descendant_scan_status_path" -v max_rows=65536 '
+  descendant_scan_output_path="$status_dir/descendant-scan-output"
+  safe_capture_command_with_input "$descendant_scan_output_path" "$descendant_scan_input_path" awk -v roots="$descendant_roots" -v groups="$descendant_groups" -v max_rows=65536 '
     BEGIN {
       root_count = split(roots, root_values, " ")
       for (root_index = 1; root_index <= root_count; root_index++) {
@@ -751,20 +911,21 @@ descendants_for_roots() {
     }
     END {
       if (overflow || malformed) exit 2
-      if (truncated) { print "1" > truncated_path; close(truncated_path) }
-      print (truncated ? "truncated" : "ok") > status_path
-      close(status_path)
+      if (truncated) exit 3
+      exit 0
     }
-  ' < "$descendant_scan_input_path"; then
-    cleanup_ack_enabled=0
-    create_marker_exclusive "$descendant_scan_failed_path" || true
-    return 1
-  fi
-  scan_status="$(read_regular_marker "$descendant_scan_status_path" 2>/dev/null || true)"
-  case "$scan_status" in
-    ok) return 0 ;;
-    truncated)
-      if [ ! -e "$descendant_scan_truncated_path" ]; then
+  '
+  descendant_scan_status_code=$?
+  case "$descendant_scan_status_code" in
+    0)
+      if ! write_marker_exclusive "$descendant_scan_status_path" ok || ! safe_emit_file "$descendant_scan_output_path"; then
+        cleanup_ack_enabled=0
+        create_marker_exclusive "$descendant_scan_failed_path" || true
+        return 1
+      fi
+      ;;
+    3)
+      if ! create_marker_exclusive "$descendant_scan_truncated_path" || ! write_marker_exclusive "$descendant_scan_status_path" truncated || ! safe_emit_file "$descendant_scan_output_path"; then
         cleanup_ack_enabled=0
         create_marker_exclusive "$descendant_scan_failed_path" || true
         return 1
@@ -862,7 +1023,7 @@ owned_descendants() {
 }
 snapshot_descendants() {
   if ! create_marker_exclusive "$snapshot_started_path"; then cleanup_ack_enabled=0; fi
-  if ! descendants > "$pending_descendants_path" 2>/dev/null; then
+  if ! descendants | safe_capture_stdin "$pending_descendants_path" 2>/dev/null || [ "$cleanup_ack_enabled" != "1" ]; then
     cleanup_ack_enabled=0
     create_marker_exclusive "$descendant_scan_failed_path" || true
   fi
@@ -886,7 +1047,7 @@ start_snapshot() {
   snapshot_ready_observed=0
   if ! rm -f "$snapshot_started_path" "$snapshot_ready_path" "$snapshot_finished_path" "$snapshot_failed_path" 2>/dev/null; then cleanup_ack_enabled=0; fi
   snapshot_pid=""
-  snapshot_descendants > "$status_dir/snapshot-output-$snapshot_generation" 2> "$status_dir/snapshot-error-$snapshot_generation" || cleanup_ack_enabled=0
+  snapshot_descendants >/dev/null 2>/dev/null || cleanup_ack_enabled=0
   if [ -e "$snapshot_ready_path" ] && [ ! -e "$snapshot_failed_path" ]; then
     snapshot_ready_observed=1
   else
@@ -938,14 +1099,14 @@ record_descendants() {
       cleanup_ack_enabled=0
       return 1
     fi
-    if ! printf '%s\n' "$captured_record" >> "$captured_descendants_path"; then cleanup_ack_enabled=0; return 1; fi
+    if ! safe_append_line "$captured_descendants_path" "$captured_record"; then cleanup_ack_enabled=0; return 1; fi
     captured_count=$((captured_count + 1))
   done < "$record_pending_path" || { cleanup_ack_enabled=0; return 1; }
 }
 capture_owned_descendants() {
   if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
   owned_pending_path="$status_dir/owned-descendant-pids-$snapshot_generation-$ownership_round"
-  if ! owned_descendants > "$owned_pending_path" 2>/dev/null; then
+  if ! owned_descendants | safe_capture_stdin "$owned_pending_path" 2>/dev/null || [ "$cleanup_ack_enabled" != "1" ]; then
     cleanup_ack_enabled=0
     return 1
   fi
@@ -987,7 +1148,7 @@ quiesce_captured_descendants() {
     if [ -n "$target_group_for_quiesce" ] && [ "$current_captured_pgid" = "$target_group_for_quiesce" ]; then continue; fi
     captured_process_can_be_signaled "$captured_identity" || { cleanup_ack_enabled=0; return 1; }
     if ! kill -STOP "-$current_captured_pgid" 2>/dev/null; then cleanup_ack_enabled=0; return 1; fi
-    if ! printf '%s|%s\\n' "$current_captured_pgid" "$captured_identity" >> "$quiesced_groups_path"; then cleanup_ack_enabled=0; return 1; fi
+    if ! safe_append_line "$quiesced_groups_path" "$current_captured_pgid|$captured_identity"; then cleanup_ack_enabled=0; return 1; fi
   done < "$captured_descendants_path" || { cleanup_ack_enabled=0; return 1; }
 }
 prepare_kill_ownership() {
@@ -1046,7 +1207,7 @@ reconcile_captured_descendants() {
     observed_reconcile_target_pgid="$(process_group_id "$target_pid" 2>/dev/null || true)"
     [ -n "$observed_reconcile_target_pgid" ] && reconcile_target_pgid="$observed_reconcile_target_pgid"
   fi
-  if ! descendants > "$reconcile_pending_path" 2>/dev/null; then
+  if ! descendants | safe_capture_stdin "$reconcile_pending_path" 2>/dev/null || [ "$cleanup_ack_enabled" != "1" ]; then
     cleanup_ack_enabled=0
     return 1
   fi
@@ -1073,7 +1234,7 @@ reconcile_captured_descendants() {
           1) ;;
           *) cleanup_ack_enabled=0; return 1 ;;
         esac
-        printf '%s|%s|%s\n' "$captured_pid" "$captured_identity" "$captured_pgid" >> "$reconcile_next_path" || { cleanup_ack_enabled=0; return 1; }
+        safe_append_line "$reconcile_next_path" "$captured_pid|$captured_identity|$captured_pgid" || { cleanup_ack_enabled=0; return 1; }
         continue
         ;;
       live) ;;
@@ -1082,7 +1243,7 @@ reconcile_captured_descendants() {
     current_captured_identity="$(process_identity "$captured_pid" 2>/dev/null || true)"
     current_captured_identity="$(normalize_process_identity "$current_captured_identity" 2>/dev/null || true)"
     if captured_identity_matches "$captured_identity" "$current_captured_identity"; then
-      printf '%s|%s|%s\n' "$captured_pid" "$captured_identity" "$captured_pgid" >> "$reconcile_next_path" || { cleanup_ack_enabled=0; return 1; }
+      safe_append_line "$reconcile_next_path" "$captured_pid|$captured_identity|$captured_pgid" || { cleanup_ack_enabled=0; return 1; }
       continue
     fi
     if ! awk -v pid="$captured_pid" '$1 == pid { found = 1; exit } END { exit(found ? 0 : 1) }' "$reconcile_pending_path" >/dev/null 2>&1; then
@@ -1340,7 +1501,7 @@ verify_captured_descendants() {
 }
 verify_owned_descendants() {
   verify_owned_path="$status_dir/remaining-owned-descendants"
-  if ! owned_descendants > "$verify_owned_path" 2>/dev/null; then
+  if ! owned_descendants | safe_capture_stdin "$verify_owned_path" 2>/dev/null || [ "$cleanup_ack_enabled" != "1" ]; then
     cleanup_ack_enabled=0
     return 1
   fi
@@ -1411,7 +1572,7 @@ verify_descendant_cleanup() {
   verify_captured_descendants || return 1
   verify_target_group_cleanup || return 1
   verify_owned_descendants || return 1
-  if ! descendants > "$verify_descendants_path" 2>/dev/null; then
+  if ! descendants | safe_capture_stdin "$verify_descendants_path" 2>/dev/null || [ "$cleanup_ack_enabled" != "1" ]; then
     cleanup_ack_enabled=0
     return 1
   fi
@@ -1444,7 +1605,7 @@ verify_descendant_cleanup() {
     fi
   done < "$verify_descendants_path"
   if [ "$remaining_descendants" = "1" ]; then sleep 0.05; fi
-  if ! descendants > "$verify_descendants_path" 2>/dev/null; then
+  if ! descendants | safe_capture_stdin "$verify_descendants_path" 2>/dev/null || [ "$cleanup_ack_enabled" != "1" ]; then
     cleanup_ack_enabled=0
     return 1
   fi
@@ -1472,6 +1633,7 @@ stop_watchdog() {
 terminate_supervised_tree() {
   if [ "$termination_started" = "1" ]; then return 0; fi
   termination_started=1
+  ensure_marker "$cleanup_started_path" || cleanup_ack_enabled=0
   signal_tree TERM
   sleep 0.25
   signal_tree KILL
@@ -1483,16 +1645,6 @@ terminate_supervised_tree() {
 }
 hold_pid=""
 trap 'if [ "$termination_started" = "1" ]; then :; else if [ -n "$hold_pid" ]; then kill "$hold_pid" 2>/dev/null || true; fi; terminate_supervised_tree; exit 143; fi' HUP INT TERM
-if ! write_marker_exclusive "$ready_path" ready; then
-  cleanup_ack_enabled=0
-  terminate_supervised_tree
-  exit 125
-fi
-if ! create_marker_exclusive "$target_start_path"; then
-  cleanup_ack_enabled=0
-  terminate_supervised_tree
-  exit 125
-fi
 parent_is_alive() {
   if [ "$parent_identity_mode" = "proc" ] && [ -r "/proc/$parent_pid/stat" ]; then
     parent_identity="$(run_watchdog_probe awk '{ sub(/.*\\) /, ""); print $1 " " $20 }' "/proc/$parent_pid/stat" 2>/dev/null || true)"
@@ -1527,6 +1679,16 @@ watch_parent() {
 }
 watch_parent </dev/null >/dev/null 2>&1 &
 watchdog_pid=$!
+if ! write_marker_exclusive "$ready_path" ready; then
+  cleanup_ack_enabled=0
+  terminate_supervised_tree
+  exit 125
+fi
+if ! create_marker_exclusive "$target_start_path"; then
+  cleanup_ack_enabled=0
+  terminate_supervised_tree
+  exit 125
+fi
 target_status=""
 target_status_invalid=0
 while [ -z "$target_status" ]; do
@@ -1548,7 +1710,7 @@ while [ -z "$target_status" ]; do
       ;;
     *)
       candidate_target_writer="$(read_regular_marker "$target_status_writer_path" 2>/dev/null || true)"
-      if [ "$candidate_target_writer" = "$target_pid" ] && target_identity_matches; then
+      if [ "$candidate_target_writer" = "$target_pid|$completion_proof" ] && target_identity_matches; then
         target_status="$candidate_target_status"
       elif ! target_is_alive; then
         target_status_invalid=1
@@ -1653,13 +1815,15 @@ interface TargetReference {
   identity: string;
 }
 
-async function readTargetReference(statusPath: string): Promise<TargetReference | undefined> {
+async function readTargetReference(statusPath: string, completionToken: string): Promise<TargetReference | undefined> {
   const directory = dirname(statusPath);
-  const [pid, pgid, identity] = await Promise.all([
+  const [pid, pgid, identity, proof] = await Promise.all([
     readNumericMarker(join(directory, "target")),
     readNumericMarker(join(directory, "target-pgid")),
     readRegularMarker(join(directory, "target-identity")),
+    readRegularMarker(join(directory, "target-reference-proof")),
   ]);
+  if (proof?.trim() !== completionToken) return undefined;
   const normalizedIdentity = identity?.trim() ?? "";
   if (pid !== undefined && pgid !== undefined && normalizedIdentity.length > 0) {
     const currentPgid = currentProcessGroup(pid);
@@ -1682,24 +1846,25 @@ async function processStartTime(pid: number): Promise<string | undefined> {
   }
 }
 
-const POSIX_PS = "/bin/ps";
+const POSIX_PS = Bun.which("ps") ?? undefined;
 
 function macProcessIdentity(pid: number): string | undefined {
+  if (POSIX_PS === undefined) return undefined;
   const result = Bun.spawnSync([
     "sh",
     "-c",
     `
 pid="$1"
-start="$(LC_ALL=C /bin/ps -o lstart= -p "$pid" 2>/dev/null | awk '
+start="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | awk '
   $1 ~ /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat)$/ &&
   $2 ~ /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$/ &&
   $3 ~ /^[0-9][0-9]*$/ &&
   $4 ~ /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/ &&
   $5 ~ /^[0-9][0-9][0-9][0-9]$/ { print $1, $2, $3, $4, $5; exit }
 ')"
-ppid="$(/bin/ps -o ppid= -p "$pid" 2>/dev/null | awk 'NR == 1 { gsub(/[[:space:]]/, ""); if ($0 ~ /^[0-9]+$/) print; exit }')"
-pgid="$(/bin/ps -o pgid= -p "$pid" 2>/dev/null | awk 'NR == 1 { gsub(/[[:space:]]/, ""); if ($0 ~ /^[0-9]+$/) print; exit }')"
-command_hash="$(/bin/ps -o command= -p "$pid" 2>/dev/null | cksum | awk 'NR == 1 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { print $1 ":" $2; exit }')"
+ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | awk 'NR == 1 { gsub(/[[:space:]]/, ""); if ($0 ~ /^[0-9]+$/) print; exit }')"
+pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | awk 'NR == 1 { gsub(/[[:space:]]/, ""); if ($0 ~ /^[0-9]+$/) print; exit }')"
+command_hash="$(ps -o command= -p "$pid" 2>/dev/null | cksum | awk 'NR == 1 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { print $1 ":" $2; exit }')"
 if [ -n "$start" ] && [ -n "$ppid" ] && [ -n "$pgid" ] && [ -n "$command_hash" ]; then
   printf 'ps:%s;ppid=%s;pgid=%s;cmd=%s\\n' "$start" "$ppid" "$pgid" "$command_hash"
 fi
@@ -1716,23 +1881,6 @@ async function currentProcessIdentity(pid: number): Promise<string | undefined> 
   const start = await processStartTime(pid);
   if (start !== undefined) return `proc:${start}`;
   return macProcessIdentity(pid);
-}
-
-async function discoverTargetReference(targetMarker: string): Promise<TargetReference | undefined> {
-  const marker = `agent-toolkit-target-${targetMarker}`;
-  const result = Bun.spawnSync([POSIX_PS, "-axo", "pid=,pgid=,command="]);
-  if (result.exitCode !== 0) return undefined;
-  for (const line of decodeSpawnOutput(result.stdout).split("\n")) {
-    const match = /^\s*([0-9]+)\s+([0-9]+)\s+(.+)$/.exec(line);
-    if (match === null || !match[3]!.includes(marker)) continue;
-    const pid = Number(match[1]);
-    const pgid = Number(match[2]);
-    if (!Number.isInteger(pid) || !Number.isInteger(pgid) || pid === process.pid || pgid === process.pid) continue;
-    const currentPgid = currentProcessGroup(pid);
-    const identity = await currentProcessIdentity(pid);
-    if (currentPgid === pgid && identity !== undefined) return { pid, pgid, identity };
-  }
-  return undefined;
 }
 
 function psIdentityFields(identity: string): { start: string; ppid: string; pgid: string; commandHash: string } | undefined {
@@ -1753,6 +1901,7 @@ function processIdentityMatches(expected: string, current: string): boolean {
 }
 
 function currentProcessGroup(pid: number): number | undefined {
+  if (POSIX_PS === undefined) return undefined;
   const result = Bun.spawnSync([POSIX_PS, "-o", "pgid=", "-p", String(pid)]);
   if (result.exitCode !== 0) return undefined;
   const value = decodeSpawnOutput(result.stdout).trim();
@@ -1760,6 +1909,7 @@ function currentProcessGroup(pid: number): number | undefined {
 }
 
 function processGroupHasLiveProcess(pgid: number): boolean | undefined {
+  if (POSIX_PS === undefined) return undefined;
   const result = Bun.spawnSync([POSIX_PS, "-axo", "pid=,pgid=,state="]);
   if (result.exitCode !== 0) return undefined;
   for (const line of decodeSpawnOutput(result.stdout).split("\n")) {
@@ -1891,15 +2041,27 @@ async function removeCleanupAckRoot(path: string): Promise<void> {
   try { await rmdir(path); } catch { /* The marker consumer may already have removed the private root. */ }
 }
 
-async function waitForCleanupAck(path: string): Promise<boolean> {
+async function waitForCleanupAck(path: string, cleanupStartedPath: string, wrapperExited: Promise<number>): Promise<boolean> {
   // The shell keeps the cleanup work bounded to the shared budget. Allow a
   // short, separate window for its success/failure marker to become visible
   // before the caller force-kills a still-running supervisor.
-  const deadline = Date.now() + SUPERVISOR_CLEANUP_TIMEOUT_MS + SUPERVISOR_CLEANUP_ACK_SETTLE_MS;
   const failurePath = `${path}.failed`;
-  while (Date.now() < deadline) {
+  let deadline: number | undefined;
+  const wrapperDone = wrapperExited.then(() => true, () => true);
+  while (deadline === undefined || Date.now() < deadline) {
     if (await consumeCleanupAck(path)) return true;
     if (await consumeCleanupFailure(failurePath)) return false;
+    if (deadline === undefined && (await readRegularMarker(cleanupStartedPath)) !== undefined) {
+      deadline = Date.now() + SUPERVISOR_CLEANUP_TIMEOUT_MS + SUPERVISOR_CLEANUP_ACK_SETTLE_MS;
+    } else if (deadline === undefined && await Promise.race([wrapperDone, Bun.sleep(20).then(() => false)])) {
+      const settleDeadline = Date.now() + SUPERVISOR_CLEANUP_ACK_SETTLE_MS;
+      while (Date.now() < settleDeadline) {
+        if (await consumeCleanupAck(path)) return true;
+        if (await consumeCleanupFailure(failurePath)) return false;
+        await Bun.sleep(20);
+      }
+      return false;
+    }
     await Bun.sleep(20);
   }
   if (await consumeCleanupAck(path)) return true;
@@ -1920,6 +2082,9 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
     };
   }
 
+  if (Bun.which("perl") === null) throw new Error("supervisor_requires_perl");
+  if (POSIX_PS === undefined) throw new Error("supervisor_requires_ps");
+
   const cleanupAckDirectory = await mkdtemp(join(tmpdir(), ".agent-toolkit-dst-supervisor-ack-"));
   const targetMarker = randomUUID();
   const completionToken = randomUUID();
@@ -1936,6 +2101,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
   const readyPath = join(directory, "ready");
   const cleanupAckPath = join(cleanupAckDirectory, "done");
   const cleanupFailurePath = `${cleanupAckPath}.failed`;
+  const cleanupStartedPath = join(directory, "cleanup-started");
   try {
     const child = Bun.spawn(
       ["sh", "-c", SUPERVISOR_SCRIPT, "agent-toolkit-supervisor", statusPath, ...args],
@@ -1956,7 +2122,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
     let rememberedTargetReference: TargetReference | undefined;
     let cleanupAckPromise: Promise<boolean> | undefined;
     const waitForCleanupAcknowledged = (): Promise<boolean> => {
-      cleanupAckPromise ??= waitForCleanupAck(cleanupAckPath);
+      cleanupAckPromise ??= waitForCleanupAck(cleanupAckPath, cleanupStartedPath, wrapperExited);
       return cleanupAckPromise;
     };
     const supervised: SupervisedChild = {
@@ -1973,7 +2139,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
       },
     };
     const ready = await waitForReady(readyPath, wrapperExited);
-    rememberedTargetReference = await readTargetReference(statusPath) ?? await discoverTargetReference(targetMarker);
+    rememberedTargetReference = await readTargetReference(statusPath, completionToken);
     if (!ready) {
       await cleanupOrphanedTarget(rememberedTargetReference);
       try { child.kill("SIGTERM"); } catch { /* The wrapper may already be gone. */ }

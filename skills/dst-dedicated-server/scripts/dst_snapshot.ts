@@ -939,20 +939,32 @@ async function remoteCollect(options: SnapshotOptions, script: string): Promise<
   }
   if (connectivity.timedOut) {
     if (connectivity.exitCode === SUPERVISOR_UNKNOWN_TARGET_STATUS) {
-      lines.push("> Local process supervisor exited before recording the SSH result; remote collection was not attempted.", "");
+      lines.push("> Remote SSH connectivity check timed out after 5s; local process supervisor exited before recording the SSH result; remote collection was not attempted.", "");
+      if (!connectivity.cleanupVerified) lines.splice(lines.length - 1, 0, "> Local process cleanup could not be verified.");
+      const detail = renderReportInline(connectivity.stderr.trim(), [options.host, options.user]);
+      if (detail.length > 0) lines.splice(lines.length - 1, 0, `> Reason: ${detail}`);
       return { text: lines.join("\n"), failed: true };
     }
     lines.push("> Remote SSH connectivity check timed out after 5s. Verify reachability and run the command interactively, then re-run this script.", "");
-    if (!connectivity.cleanupVerified) lines.splice(lines.length - 1, 0, "> Local process cleanup could not be verified; remote collection was not attempted.");
+    if (!connectivity.cleanupVerified) {
+      lines.splice(lines.length - 1, 0, "> Local process cleanup could not be verified; remote collection was not attempted.");
+      const detail = renderReportInline(connectivity.stderr.trim(), [options.host, options.user]);
+      if (detail.length > 0) lines.splice(lines.length - 1, 0, `> Reason: ${detail}`);
+      return { text: lines.join("\n"), failed: true };
+    }
     return { text: lines.join("\n"), failed: false };
   }
   if (connectivity.exitCode === SUPERVISOR_UNKNOWN_TARGET_STATUS) {
     lines.push("> Local process supervisor exited before recording the SSH result; remote collection was not attempted.", "");
+    const detail = renderReportInline(connectivity.stderr.trim(), [options.host, options.user]);
+    if (detail.length > 0) lines.splice(lines.length - 1, 0, `> Reason: ${detail}`);
     return { text: lines.join("\n"), failed: true };
   }
   if (connectivity.exitCode !== 0) {
     if (!connectivity.cleanupVerified) {
       lines.push("> Local process supervisor exited before recording the SSH result, or cleanup could not be verified; remote collection was not attempted.", "");
+      const detail = renderReportInline(connectivity.stderr.trim(), [options.host, options.user]);
+      if (detail.length > 0) lines.splice(lines.length - 1, 0, `> Reason: ${detail}`);
       return { text: lines.join("\n"), failed: true };
     }
     lines.push("> Remote SSH failed (host down, wrong IP/port, or missing SSH key).");

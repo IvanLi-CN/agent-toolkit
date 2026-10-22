@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, mkdtemp, readFile, rm, rmdir } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, mkdir, mkdtemp, open, readFile, rm, rmdir, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -7,6 +8,7 @@ const SUPERVISOR_CLEANUP_TIMEOUT_MS = 60_000;
 const SUPERVISOR_CLEANUP_ACK_SETTLE_MS = 15_000;
 const SUPERVISOR_CLEANUP_DEADLINE_SECONDS = Math.ceil(SUPERVISOR_CLEANUP_TIMEOUT_MS / 1_000);
 export const SUPERVISOR_UNKNOWN_TARGET_STATUS = 125;
+const MAX_SUPERVISOR_MARKER_BYTES = 256;
 
 const SUPERVISOR_SCRIPT = `
 set +e
@@ -35,6 +37,12 @@ descendant_scan_failed_path="$status_dir/descendant-scan-failed"
 descendant_scan_input_path="$status_dir/descendant-scan-input"
 descendant_scan_status_path="$status_dir/descendant-scan-status"
 parent_dead_path="$status_dir/parent-dead"
+read_regular_marker() {
+  marker_path="$1"
+  [ -f "$marker_path" ] || return 1
+  [ ! -L "$marker_path" ] || return 1
+  run_process_probe awk 'NR == 1 { if (length($0) > 256) exit 2; print; next } { exit 2 }' "$marker_path"
+}
 cleanup() {
   if [ -e "$descendant_scan_truncated_path" ] || [ -e "$descendant_scan_failed_path" ] || [ -e "$snapshot_failed_path" ]; then cleanup_ack_enabled=0; fi
   cleanup_ack_created=0
@@ -171,7 +179,7 @@ target_launcher_pid=$!
 target_pid="$target_launcher_pid"
 target_anchor_attempt=0
 while [ "$target_anchor_attempt" -lt 500 ]; do
-  candidate_target_pid="$(cat "$target_anchor_path" 2>/dev/null || true)"
+  candidate_target_pid="$(read_regular_marker "$target_anchor_path" 2>/dev/null || true)"
   case "$candidate_target_pid" in
     ''|*[!0-9]*) sleep 0.01; target_anchor_attempt=$((target_anchor_attempt + 1)) ;;
     *) target_pid="$candidate_target_pid"; break ;;
@@ -246,38 +254,6 @@ if ! record_target_reference; then
   cleanup
   exit 143
 fi
-refresh_target_reference() {
-  target_reference_attempt=0
-  while [ "$target_reference_attempt" -lt 100 ]; do
-    candidate_target_pid="$(cat "$target_anchor_path" 2>/dev/null || true)"
-    case "$candidate_target_pid" in
-      ''|*[!0-9]*)
-        sleep 0.01
-        target_reference_attempt=$((target_reference_attempt + 1))
-        ;;
-      *)
-        if [ "$candidate_target_pid" != "$target_pid" ]; then
-          target_pid="$candidate_target_pid"
-          target_pgid=""
-          capture_target_identity || true
-        elif [ "$target_identity_mode" = "unknown" ]; then
-          capture_target_identity || true
-        fi
-        break
-        ;;
-    esac
-  done
-  case "$target_pgid" in
-    ''|*[!0-9]*)
-      observed_target_pgid="$(run_process_probe ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ' || true)"
-      case "$observed_target_pgid" in
-        ''|*[!0-9]*) ;;
-        *) target_pgid="$observed_target_pgid" ;;
-      esac
-      ;;
-  esac
-  record_target_reference || cleanup_ack_enabled=0
-}
 target_identity_matches() {
   if [ "$target_identity_mode" = "proc" ] && [ -r "/proc/$target_pid/stat" ]; then
     current_target_start="$(run_process_probe awk '{ sub(/.*\\) /, ""); print $20 }' "/proc/$target_pid/stat" 2>/dev/null || true)"
@@ -301,7 +277,6 @@ target_is_alive() {
   kill -0 "$target_pid" 2>/dev/null
 }
 stop_anchor() {
-  refresh_target_reference
   if target_identity_matches; then
     anchor_pgid="$(run_process_probe ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ' || true)"
     wrapper_pgid="$(run_process_probe ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' || true)"
@@ -439,6 +414,9 @@ captured_process_can_be_signaled() {
   case "$1" in
     proc:*) return 0 ;;
     ps:*';ppid='*';pgid='*';cmd='*)
+      # Darwin has only second-resolution start times. Permit a ps identity
+      # only when its original parent was the fixed target or a captured child.
+      [ "$1" = "$target_ps_start" ] && return 0
       captured_ps_identity="\${1#ps:}"
       captured_ps_ppid="\${captured_ps_identity#*;ppid=}"
       captured_ps_ppid="\${captured_ps_ppid%%;pgid=*}"
@@ -448,7 +426,18 @@ captured_process_can_be_signaled() {
       case "$captured_ps_ppid" in ''|*[!0-9]*) return 1 ;; esac
       case "$captured_ps_pgid" in ''|*[!0-9]*) return 1 ;; esac
       case "$captured_ps_command_hash" in ''|*[!0-9:]*) return 1 ;; esac
-      return 0
+      case "$captured_ps_ppid" in
+        "$target_pid") return 0 ;;
+        0|1)
+          captured_group_for_pid "$captured_pid" 2>/dev/null | awk -v target="$target_pgid" '$0 == target { found = 1; exit } END { exit(found ? 0 : 1) }' >/dev/null 2>&1 && return 0
+          return 1
+          ;;
+        ''|*[!0-9]*) return 1 ;;
+      esac
+      if [ -f "$captured_descendants_path" ] && awk -F'|' -v pid="$captured_ps_ppid" '$1 == pid { found = 1; exit } END { exit(found ? 0 : 1) }' "$captured_descendants_path" >/dev/null 2>&1; then
+        return 0
+      fi
+      return 1
       ;;
     *) return 1 ;;
   esac
@@ -542,10 +531,6 @@ captured_group_can_be_signaled() {
   captured_group_identity="$1"
   captured_group="$2"
   captured_group_allow_target="\${3:-}"
-  # Darwin's lstart is only second-resolution. A detached group has no
-  # supervisor-owned anchor after reparenting, so do not authorize a group
-  # kill from a weak ps identity that could collide with a reused PID/PGID.
-  case "$captured_group_identity" in ps:*) return 1 ;; esac
   captured_process_can_be_signaled "$captured_group_identity" || return 1
   capture_group_members "$captured_group"
   captured_group_probe_status=$?
@@ -693,7 +678,7 @@ descendants_for_roots() {
     : > "$descendant_scan_failed_path" 2>/dev/null || true
     return 1
   fi
-  scan_status="$(cat "$descendant_scan_status_path" 2>/dev/null || true)"
+  scan_status="$(read_regular_marker "$descendant_scan_status_path" 2>/dev/null || true)"
   case "$scan_status" in
     ok) return 0 ;;
     truncated)
@@ -1451,7 +1436,7 @@ watch_parent </dev/null >/dev/null 2>&1 &
 watchdog_pid=$!
 target_status=""
 while [ -z "$target_status" ]; do
-  candidate_target_status="$(cat "$target_status_path" 2>/dev/null || true)"
+  candidate_target_status="$(read_regular_marker "$target_status_path" 2>/dev/null || true)"
   case "$candidate_target_status" in
     ''|*[!0-9]*)
       if ! target_is_alive; then
@@ -1495,15 +1480,37 @@ export interface SupervisedChild {
   cleanup(): Promise<void>;
 }
 
-async function readStatus(path: string): Promise<number | undefined> {
+async function readRegularMarker(path: string, maxBytes = MAX_SUPERVISOR_MARKER_BYTES): Promise<string | undefined> {
+  let handle: FileHandle | undefined;
   try {
-    const value = (await readFile(path, "utf8")).trim();
-    if (/^-?\d+$/.test(value)) {
-      const status = Number(value);
-      if (Number.isInteger(status)) return status;
+    const metadata = await lstat(path);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) return undefined;
+    const flags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
+    handle = await open(path, flags);
+    const openedMetadata = await handle.stat();
+    if (!openedMetadata.isFile() || openedMetadata.size > maxBytes) return undefined;
+    const buffer = new Uint8Array(maxBytes + 1);
+    let offset = 0;
+    while (offset < buffer.byteLength) {
+      const result = await handle.read(buffer, offset, buffer.byteLength - offset, offset);
+      if (result.bytesRead === 0) break;
+      offset += result.bytesRead;
     }
+    const finalMetadata = await handle.stat();
+    if (offset > maxBytes || finalMetadata.size !== openedMetadata.size || offset !== openedMetadata.size) return undefined;
+    return new TextDecoder().decode(buffer.subarray(0, offset));
   } catch {
-    // The target may still be running or the status file may be between writes.
+    return undefined;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+async function readStatus(path: string): Promise<number | undefined> {
+  const value = (await readRegularMarker(path))?.trim() ?? "";
+  if (/^-?\d+$/.test(value)) {
+    const status = Number(value);
+    if (Number.isInteger(status)) return status;
   }
   return undefined;
 }
@@ -1514,12 +1521,8 @@ function decodeSpawnOutput(output: Uint8Array | string | undefined): string {
 }
 
 async function readNumericMarker(path: string): Promise<number | undefined> {
-  try {
-    const value = (await readFile(path, "utf8")).trim();
-    if (/^[1-9][0-9]*$/.test(value)) return Number(value);
-  } catch {
-    // The wrapper may have been killed before writing its anchor metadata.
-  }
+  const value = (await readRegularMarker(path))?.trim() ?? "";
+  if (/^[1-9][0-9]*$/.test(value)) return Number(value);
   return undefined;
 }
 
@@ -1529,16 +1532,21 @@ interface TargetReference {
   identity: string;
 }
 
-async function readTargetReference(statusPath: string): Promise<TargetReference | undefined> {
+async function readTargetReference(statusPath: string, targetMarker?: string): Promise<TargetReference | undefined> {
   const directory = dirname(statusPath);
   const [pid, pgid, identity] = await Promise.all([
     readNumericMarker(join(directory, "target")),
     readNumericMarker(join(directory, "target-pgid")),
-    readFile(join(directory, "target-identity"), "utf8").catch(() => ""),
+    readRegularMarker(join(directory, "target-identity")),
   ]);
-  const normalizedIdentity = identity.trim();
-  if (pid === undefined || pgid === undefined || normalizedIdentity.length === 0) return undefined;
-  return { pid, pgid, identity: normalizedIdentity };
+  const normalizedIdentity = identity?.trim() ?? "";
+  if (pid !== undefined) {
+    const resolvedPgid = pgid ?? currentProcessGroup(pid);
+    const resolvedIdentity = normalizedIdentity.length > 0 ? normalizedIdentity : await currentProcessIdentity(pid);
+    if (resolvedPgid !== undefined && resolvedIdentity !== undefined) return { pid, pgid: resolvedPgid, identity: resolvedIdentity };
+  }
+  if (targetMarker !== undefined) return discoverTargetReference(targetMarker);
+  return undefined;
 }
 
 async function processStartTime(pid: number): Promise<string | undefined> {
@@ -1588,6 +1596,23 @@ async function currentProcessIdentity(pid: number): Promise<string | undefined> 
   return macProcessIdentity(pid);
 }
 
+async function discoverTargetReference(targetMarker: string): Promise<TargetReference | undefined> {
+  const marker = `agent-toolkit-target-${targetMarker}`;
+  const result = Bun.spawnSync([POSIX_PS, "-axo", "pid=,pgid=,command="]);
+  if (result.exitCode !== 0) return undefined;
+  for (const line of decodeSpawnOutput(result.stdout).split("\n")) {
+    const match = /^\s*([0-9]+)\s+([0-9]+)\s+(.+)$/.exec(line);
+    if (match === null || !match[3]!.includes(marker)) continue;
+    const pid = Number(match[1]);
+    const pgid = Number(match[2]);
+    if (!Number.isInteger(pid) || !Number.isInteger(pgid) || pid === process.pid || pgid === process.pid) continue;
+    const currentPgid = currentProcessGroup(pid);
+    const identity = await currentProcessIdentity(pid);
+    if (currentPgid === pgid && identity !== undefined) return { pid, pgid, identity };
+  }
+  return undefined;
+}
+
 function psIdentityFields(identity: string): { start: string; ppid: string; pgid: string; commandHash: string } | undefined {
   const match = /^ps:(.*);ppid=([0-9]+);pgid=([0-9]+);cmd=([0-9]+:[0-9]+)$/.exec(identity);
   if (match === null) return undefined;
@@ -1612,9 +1637,9 @@ function currentProcessGroup(pid: number): number | undefined {
   return /^[1-9][0-9]*$/.test(value) ? Number(value) : undefined;
 }
 
-async function cleanupOrphanedTarget(statusPath: string, rememberedReference?: TargetReference): Promise<boolean> {
+async function cleanupOrphanedTarget(statusPath: string, rememberedReference?: TargetReference, targetMarker?: string): Promise<boolean> {
   if (process.platform === "win32") return false;
-  const reference = rememberedReference ?? await readTargetReference(statusPath);
+  const reference = rememberedReference ?? (targetMarker === undefined ? undefined : await discoverTargetReference(targetMarker));
   const targetPid = reference?.pid;
   const targetPgid = reference?.pgid;
   if (targetPid === undefined || targetPgid === undefined || targetPid === process.pid) {
@@ -1639,7 +1664,13 @@ async function markCleanupFailure(path: string): Promise<void> {
   await mkdir(path).catch(() => undefined);
 }
 
-async function waitForTarget(path: string, wrapperExited: Promise<number>, cleanupFailurePath?: string): Promise<number> {
+async function waitForTarget(
+  path: string,
+  wrapperExited: Promise<number>,
+  cleanupFailurePath?: string,
+  targetMarker?: string,
+  rememberedReference?: () => TargetReference | undefined,
+): Promise<number> {
   const wrapperResult = wrapperExited.then((code) => ({ code }));
   while (true) {
     const status = await readStatus(path);
@@ -1651,7 +1682,7 @@ async function waitForTarget(path: string, wrapperExited: Promise<number>, clean
       await Bun.sleep(20);
       const delayedStatus = await readStatus(path);
       if (delayedStatus !== undefined) return delayedStatus;
-      await cleanupOrphanedTarget(path);
+      await cleanupOrphanedTarget(path, rememberedReference?.(), targetMarker);
       if (cleanupFailurePath !== undefined) await markCleanupFailure(cleanupFailurePath);
       return SUPERVISOR_UNKNOWN_TARGET_STATUS;
     }
@@ -1661,11 +1692,7 @@ async function waitForTarget(path: string, wrapperExited: Promise<number>, clean
 async function waitForReady(path: string, wrapperExited: Promise<number>): Promise<boolean> {
   const deadline = Date.now() + 7_500;
   while (Date.now() < deadline) {
-    try {
-      if ((await readFile(path, "utf8")).trim() === "ready") return true;
-    } catch {
-      // The wrapper may have completed before the readiness marker was observed.
-    }
+    if ((await readRegularMarker(path))?.trim() === "ready") return true;
     const wrapperDone = await Promise.race([
       wrapperExited.then(() => true, () => true),
       Bun.sleep(20).then(() => false),
@@ -1801,10 +1828,10 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
     };
     const supervised: SupervisedChild = {
       child,
-      exited: waitForTarget(statusPath, wrapperExited, cleanupFailurePath),
+      exited: waitForTarget(statusPath, wrapperExited, cleanupFailurePath, targetMarker, () => rememberedTargetReference),
       wrapperExited,
       waitForCleanupAcknowledged,
-      forceCleanup: () => cleanupOrphanedTarget(statusPath, rememberedTargetReference),
+      forceCleanup: () => cleanupOrphanedTarget(statusPath, rememberedTargetReference, targetMarker),
       cleanup: async () => {
         await rm(directory, { recursive: true, force: true });
         await removeCleanupAck(cleanupAckPath);
@@ -1814,16 +1841,17 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
     };
     const ready = await waitForReady(readyPath, wrapperExited);
     if (!ready) {
-      await cleanupOrphanedTarget(statusPath);
+      await cleanupOrphanedTarget(statusPath, undefined, targetMarker);
       try { child.kill("SIGTERM"); } catch { /* The wrapper may already be gone. */ }
       const cleanupReady = await waitForCleanupAcknowledged();
       if (!cleanupReady) {
         try { child.kill("SIGKILL"); } catch { /* The wrapper may already be gone. */ }
       }
       await wrapperExited;
+      await cleanupOrphanedTarget(statusPath, undefined, targetMarker);
       throw new Error("supervisor_not_ready");
     }
-    rememberedTargetReference = await readTargetReference(statusPath);
+    rememberedTargetReference = await discoverTargetReference(targetMarker) ?? await readTargetReference(statusPath, targetMarker);
     return supervised;
   } catch (error) {
     await rm(directory, { recursive: true, force: true });

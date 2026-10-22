@@ -669,6 +669,45 @@ esac
     }
   });
 
+  test("fails a snapshot when an SSH timeout cannot verify cleanup", { timeout: 90_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-ssh-timeout-cleanup-"));
+    const previousPath = process.env.PATH;
+    try {
+      const fakeSsh = join(root, "ssh");
+      const fakePs = join(root, "ps");
+      const trigger = join(root, "fail-process-scan");
+      await writeFile(fakeSsh, `#!/bin/sh
+case "$*" in
+  *"echo ok"*) sleep 0.5; touch "$AGENT_TOOLKIT_TEST_PS_FAIL"; sleep 30 ;;
+  *) cat >/dev/null; exit 0 ;;
+esac
+`);
+      await writeFile(fakePs, `#!/bin/sh
+if [ -e "$AGENT_TOOLKIT_TEST_PS_FAIL" ]; then
+  case "$*" in
+    *"-eo pid=,pgid=,state="*|*"-eo pid=,ppid=,pgid="*) printf 'malformed process row\\n'; exit 0 ;;
+  esac
+fi
+exec /bin/ps "$@"
+`);
+      await chmod(fakeSsh, 0o755);
+      await chmod(fakePs, 0o755);
+      const output = join(root, "snapshot.md");
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
+        ["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", output],
+        { ...process.env, PATH: `${root}:${previousPath ?? ""}`, AGENT_TOOLKIT_TEST_PS_FAIL: trigger } as Record<string, string>,
+      );
+      expect(result.status).toBe(1);
+      const report = await readFile(output, "utf8");
+      expect(report).toContain("Remote SSH connectivity check timed out");
+      expect(report).toContain("cleanup could not be verified");
+      expect(report).not.toContain("Remote collection command failed");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("fails a snapshot when the supervisor exits before recording SSH status", { timeout: 30_000 }, async () => {
     if (process.platform === "win32") return;
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-status-missing-"));
@@ -941,6 +980,7 @@ exec /bin/ps "$@"
       expect(result.status).toBe(1);
       const report = await readFile(output, "utf8");
       expect(report).toContain("supervisor exited before recording the SSH result");
+      expect(report).toContain("fixture SSH connectivity denied");
       expect(report).not.toContain("Remote SSH failed");
       expect(report).not.toContain("command could not be started");
     } finally {
@@ -1315,6 +1355,52 @@ exec /bin/ps "$@"
       if (targetChildPid !== undefined && isAlive(targetChildPid)) {
         try { process.kill(targetChildPid, "SIGKILL"); } catch { /* The target may already be gone. */ }
       }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not trust mutable target or status markers", { timeout: 90_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-marker-canary-"));
+    const canary = join(root, "canary");
+    await writeFile(canary, "sentinel\n", "utf8");
+    try {
+      for (const markerName of ["target", "status"]) {
+        const before = new Set((await readdir(tmpdir())).filter((entry) => entry.startsWith(".agent-toolkit-dst-supervisor-") && !entry.includes("ack-")));
+        let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+        try {
+          supervised = await spawnSupervised(["sh", "-c", "sleep 30"]);
+          let resolvedEntry: string | undefined;
+          for (const entry of await readdir(tmpdir())) {
+            if (before.has(entry) || !entry.startsWith(".agent-toolkit-dst-supervisor-") || entry.includes("ack-")) continue;
+            if ((await lstat(join(tmpdir(), entry, "target")).catch(() => undefined))?.isFile() === true) {
+              resolvedEntry = entry;
+              break;
+            }
+          }
+          expect(resolvedEntry).toBeString();
+          const markerPath = join(tmpdir(), resolvedEntry!, markerName);
+          await rm(markerPath, { force: true });
+          if (markerName === "target") {
+            await symlink(canary, markerPath);
+          } else {
+            expect(Bun.spawnSync(["mkfifo", markerPath]).exitCode).toBe(0);
+          }
+          supervised.child.kill("SIGTERM");
+          const cleanupVerified = await supervised.waitForCleanupAcknowledged();
+          expect(typeof cleanupVerified).toBe("boolean");
+          await supervised.wrapperExited;
+          await Promise.race([supervised.exited, Bun.sleep(10_000).then(() => { throw new Error("supervisor marker read timed out"); })]);
+          expect(await readFile(canary, "utf8")).toBe("sentinel\n");
+        } finally {
+          if (supervised !== undefined) {
+            try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+            await supervised.wrapperExited.catch(() => undefined);
+            await supervised.cleanup();
+          }
+        }
+      }
+    } finally {
       await rm(root, { recursive: true, force: true });
     }
   });

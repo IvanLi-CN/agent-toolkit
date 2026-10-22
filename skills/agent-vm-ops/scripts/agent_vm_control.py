@@ -5017,7 +5017,10 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
                         ):
                             repair_required = True
                         if apply and repair_required:
-                            native_exists = task["instance_name"] in absent_native_instance_names()
+                            native_exists = any(
+                                native.get("name") == task["instance_name"]
+                                for native in self.incus.list_instances()
+                            )
                             if native_exists:
                                 raise ControlError(
                                     "resource_unverified",

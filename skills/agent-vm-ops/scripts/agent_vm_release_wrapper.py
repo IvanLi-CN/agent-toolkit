@@ -116,7 +116,7 @@ def _absolute_path(value: Any, label: str) -> Path:
     return path
 
 
-def _require_root_owned_path(path: Path, label: str, *, regular: bool = False) -> None:
+def _require_root_owned_path(path: Path, label: str, *, regular: bool = False, allow_symlink: bool = False) -> None:
     """Reject symlinked or writable-by-others configuration boundaries."""
     current = Path(path.anchor)
     for part in path.parts[1:]:
@@ -128,6 +128,8 @@ def _require_root_owned_path(path: Path, label: str, *, regular: bool = False) -
         except OSError:
             _fail("wrapper_config_invalid", f"cannot inspect {label}")
         if stat.S_ISLNK(info.st_mode):
+            if current == path and allow_symlink and info.st_uid == 0:
+                return
             _fail("wrapper_config_invalid", f"{label} contains a symlink")
         if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022:
             _fail("wrapper_config_invalid", f"{label} is not root-owned and private")
@@ -204,7 +206,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
             if _paths_overlap(left, right):
                 _fail("wrapper_config_invalid", "wrapper paths must not overlap", {"left": str(left), "right": str(right)})
     for key, configured_path in ((key, config[key]) for key in config if isinstance(config[key], Path)):
-        _require_root_owned_path(configured_path, key)
+        _require_root_owned_path(configured_path, key, allow_symlink=key in {"current_link", "previous_link"})
     return config
 
 

@@ -67,6 +67,7 @@ async function readBounded(
   onLimit: () => void,
   onTimeout: () => void,
   timeoutMs: number,
+  stopPromise?: Promise<unknown>,
 ): Promise<{ text: string; truncated: boolean }> {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
@@ -74,13 +75,22 @@ async function readBounded(
   let remaining = maxBytes;
   let truncated = false;
   let cancelPromise: Promise<void> | undefined;
+  let stopRequested = false;
   const cancelReader = (): Promise<void> => {
     if (cancelPromise === undefined) cancelPromise = reader.cancel().catch(() => undefined);
     return cancelPromise;
   };
+  const stopWatcher = stopPromise?.then(() => {
+    stopRequested = true;
+    return cancelReader();
+  }, () => {
+    stopRequested = true;
+    return cancelReader();
+  });
   const deadline = Date.now() + timeoutMs;
   try {
     while (true) {
+      if (stopRequested) break;
       const remainingMs = deadline - Date.now();
       if (remainingMs <= 0) {
         onTimeout();
@@ -121,6 +131,7 @@ async function readBounded(
     }
     return { text: text + decoder.decode(), truncated };
   } finally {
+    void stopWatcher;
     if (cancelPromise !== undefined) await cancelPromise;
     reader.releaseLock();
   }
@@ -140,8 +151,10 @@ async function runWithStdin(
   let result: CommandResult | undefined;
   let operationError: unknown;
   let operationFailed = false;
+  let stopRequested = false;
   let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
   const requestStop = () => {
+    stopRequested = true;
     killProcessTree(supervised, "SIGTERM");
     if (forceKillTimer === undefined) forceKillTimer = setTimeout(() => killProcessTree(supervised, "SIGKILL"), SUPERVISOR_FORCE_KILL_MS);
   };
@@ -161,15 +174,13 @@ async function runWithStdin(
       timedOut = true;
       requestStop();
     };
-    const stdoutPromise = readBounded(child.stdout, maxOutputBytes, stopForLimit, stopForReadTimeout, timeoutMs);
-    const stderrPromise = readBounded(child.stderr, maxOutputBytes, stopForLimit, stopForReadTimeout, timeoutMs);
+    const stdoutPromise = readBounded(child.stdout, maxOutputBytes, stopForLimit, stopForReadTimeout, timeoutMs, exitPromise);
+    const stderrPromise = readBounded(child.stderr, maxOutputBytes, stopForLimit, stopForReadTimeout, timeoutMs, exitPromise);
     timeout = setTimeout(() => {
       timedOut = true;
       requestStop();
     }, timeoutMs);
     const exitCode = await exitPromise;
-    // The supervisor remains as the verified process-group anchor while descendants drain.
-    requestStop();
     const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
     result = {
       exitCode,
@@ -184,15 +195,26 @@ async function runWithStdin(
     operationError = error;
   } finally {
     if (timeout !== undefined) clearTimeout(timeout);
-    if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
-    requestStop();
+    if (forceKillTimer !== undefined) {
+      clearTimeout(forceKillTimer);
+      forceKillTimer = undefined;
+    }
+    let naturalCleanupTimer: ReturnType<typeof setTimeout> | undefined;
+    if (operationFailed || stopRequested) requestStop();
+    else naturalCleanupTimer = setTimeout(requestStop, SUPERVISOR_FORCE_KILL_MS);
     const cleanupReady = await supervised.waitForCleanupAcknowledged();
+    if (naturalCleanupTimer !== undefined) clearTimeout(naturalCleanupTimer);
     await Promise.race([supervised.wrapperExited.then(() => undefined, () => undefined), new Promise<void>((resolve) => setTimeout(resolve, SUPERVISOR_STOP_GRACE_MS))]);
-    if (!cleanupReady || !(await Promise.race([supervised.wrapperExited.then(() => true, () => true), Bun.sleep(0).then(() => false)]))) {
+    const wrapperExited = await Promise.race([supervised.wrapperExited.then(() => true, () => true), Bun.sleep(0).then(() => false)]);
+    if (!cleanupReady || !wrapperExited) {
+      if (!cleanupReady) await supervised.forceCleanup();
       killProcessTree(supervised, "SIGKILL");
     }
     await Promise.race([supervised.wrapperExited.then(() => undefined, () => undefined), new Promise<void>((resolve) => setTimeout(resolve, SUPERVISOR_STOP_GRACE_MS))]);
-    if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
+    if (forceKillTimer !== undefined) {
+      clearTimeout(forceKillTimer);
+      forceKillTimer = undefined;
+    }
     await supervised.cleanup();
     if (result !== undefined) result.cleanupVerified = cleanupReady;
     if (!cleanupReady && operationFailed && operationError instanceof Error) {
@@ -916,6 +938,10 @@ async function remoteCollect(options: SnapshotOptions, script: string): Promise<
     return { text: lines.join("\n"), failed: true };
   }
   if (connectivity.timedOut) {
+    if (connectivity.exitCode === SUPERVISOR_UNKNOWN_TARGET_STATUS) {
+      lines.push("> Local process supervisor exited before recording the SSH result; remote collection was not attempted.", "");
+      return { text: lines.join("\n"), failed: true };
+    }
     lines.push("> Remote SSH connectivity check timed out after 5s. Verify reachability and run the command interactively, then re-run this script.", "");
     if (!connectivity.cleanupVerified) lines.splice(lines.length - 1, 0, "> Local process cleanup could not be verified; remote collection was not attempted.");
     return { text: lines.join("\n"), failed: false };
@@ -925,10 +951,13 @@ async function remoteCollect(options: SnapshotOptions, script: string): Promise<
     return { text: lines.join("\n"), failed: true };
   }
   if (connectivity.exitCode !== 0) {
+    if (!connectivity.cleanupVerified) {
+      lines.push("> Local process supervisor exited before recording the SSH result, or cleanup could not be verified; remote collection was not attempted.", "");
+      return { text: lines.join("\n"), failed: true };
+    }
     lines.push("> Remote SSH failed (host down, wrong IP/port, or missing SSH key).");
     const detail = renderReportInline(connectivity.stderr.trim(), [options.host, options.user]);
     if (detail.length > 0) lines.push(`> Reason: ${detail}`);
-    if (!connectivity.cleanupVerified) lines.push("> Local process cleanup could not be verified.");
     lines.push("> Next step: verify reachability and run the configured SSH target interactively, then re-run this script.", "");
     return { text: lines.join("\n"), failed: false };
   }
@@ -948,6 +977,10 @@ async function remoteCollect(options: SnapshotOptions, script: string): Promise<
     return { text: lines.join("\n"), failed: true };
   }
   if (result.timedOut) {
+    if (result.exitCode === SUPERVISOR_UNKNOWN_TARGET_STATUS) {
+      lines.push("> Local process supervisor exited before recording the remote collection result; remote collection was not completed.", "");
+      return { text: lines.join("\n"), failed: true };
+    }
     lines.push(`> Remote collection timed out after ${REMOTE_COMMAND_TIMEOUT_MS / 1000}s.`);
     if (!result.cleanupVerified) lines.push("> Local process cleanup could not be verified.");
     lines.push("");
@@ -965,10 +998,13 @@ async function remoteCollect(options: SnapshotOptions, script: string): Promise<
     return { text: lines.join("\n"), failed: true };
   }
   if (result.exitCode !== 0) {
+    if (!result.cleanupVerified) {
+      lines.push("> Local process supervisor exited before recording the remote collection result, or cleanup could not be verified; remote collection was not completed.", "");
+      return { text: lines.join("\n"), failed: true };
+    }
     lines.push("> Remote collection command failed.");
     const detail = renderReportInline(result.stderr.trim(), [options.host, options.user]);
     if (detail.length > 0) lines.push(`> Reason: ${detail}`);
-    if (!result.cleanupVerified) lines.push("> Local process cleanup could not be verified.");
     lines.push("");
     return { text: lines.join("\n"), failed: true };
   }

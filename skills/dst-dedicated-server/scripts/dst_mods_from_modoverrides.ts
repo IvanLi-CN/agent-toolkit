@@ -8,6 +8,7 @@ import { spawnSupervised, type SupervisedChild } from "./process_supervisor.ts";
 export const MAX_MOD_OVERRIDE_BYTES = 1024 * 1024;
 const SUPERVISOR_STOP_GRACE_MS = 250;
 const SUPERVISOR_FORCE_KILL_MS = 6_000;
+const SUPERVISOR_STREAM_DRAIN_MS = 250;
 
 export type ModState = "true" | "false" | "unknown";
 
@@ -263,7 +264,9 @@ async function terminateAndReap(supervised: SupervisedChild): Promise<boolean> {
   killProcessTree(supervised, "SIGTERM");
   const cleanupReady = await supervised.waitForCleanupAcknowledged();
   await Promise.race([observedExit, new Promise<void>((resolve) => setTimeout(resolve, SUPERVISOR_STOP_GRACE_MS))]);
-  if (!cleanupReady || !(await Promise.race([observedExit.then(() => true, () => true), Bun.sleep(0).then(() => false)]))) {
+  const wrapperExited = await Promise.race([observedExit.then(() => true, () => true), Bun.sleep(0).then(() => false)]);
+  if (!cleanupReady || !wrapperExited) {
+    if (!cleanupReady) await supervised.forceCleanup();
     killProcessTree(supervised, "SIGKILL");
   }
   await Promise.race([observedExit, new Promise<void>((resolve) => setTimeout(resolve, SUPERVISOR_STOP_GRACE_MS))]);
@@ -271,16 +274,24 @@ async function terminateAndReap(supervised: SupervisedChild): Promise<boolean> {
   return cleanupReady;
 }
 
-async function readText(stream: ReadableStream<Uint8Array>, maxBytes = 64 * 1024, timeoutMs = REMOTE_COMMAND_TIMEOUT_MS): Promise<string> {
+async function readText(stream: ReadableStream<Uint8Array>, maxBytes = 64 * 1024, timeoutMs = REMOTE_COMMAND_TIMEOUT_MS, stopPromise?: Promise<unknown>): Promise<string> {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let text = "";
   let remaining = maxBytes;
   let cancelPromise: Promise<void> | undefined;
+  let stopRequested = false;
   const cancelReader = (): Promise<void> => {
     if (cancelPromise === undefined) cancelPromise = reader.cancel().catch(() => undefined);
     return cancelPromise;
   };
+  const stopWatcher = stopPromise?.then(() => {
+    stopRequested = true;
+    return cancelReader();
+  }, () => {
+    stopRequested = true;
+    return cancelReader();
+  });
   const readWithDeadline = async () => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     type ReadResult = Awaited<ReturnType<typeof reader.read>>;
@@ -300,6 +311,7 @@ async function readText(stream: ReadableStream<Uint8Array>, maxBytes = 64 * 1024
   };
   try {
     while (true) {
+      if (stopRequested) break;
       const { done, value } = await readWithDeadline();
       if (done) break;
       if (remaining <= 0) {
@@ -317,6 +329,7 @@ async function readText(stream: ReadableStream<Uint8Array>, maxBytes = 64 * 1024
     }
     return text + decoder.decode();
   } finally {
+    void stopWatcher;
     await cancelReader();
     reader.releaseLock();
   }
@@ -328,6 +341,7 @@ export async function parseRemoteResponseStream(
   filePath: string,
   stream: ReadableStream<Uint8Array>,
   timeoutMs = REMOTE_COMMAND_TIMEOUT_MS,
+  stopPromise?: Promise<unknown>,
 ): Promise<ShardSummary> {
   const reader = stream.getReader();
   const headerBytes: number[] = [];
@@ -342,6 +356,7 @@ export async function parseRemoteResponseStream(
     return cancelPromise;
   };
   const deadline = Date.now() + timeoutMs;
+  const stopSignal = stopPromise?.then(() => ({ kind: "stopped" as const }), () => ({ kind: "stopped" as const }));
 
   const consumeBody = (bytes: Uint8Array): void => {
     if (bytes.byteLength === 0) return;
@@ -363,7 +378,7 @@ export async function parseRemoteResponseStream(
         throw new Error(`remote mod collection timed out after ${timeoutMs / 1000}s`);
       }
       type ReadResult = Awaited<ReturnType<typeof reader.read>>;
-      const result = await new Promise<{ kind: "data"; value: ReadResult } | { kind: "timeout" }>((resolve, reject) => {
+      const readResult = new Promise<{ kind: "data"; value: ReadResult } | { kind: "timeout" }>((resolve, reject) => {
         const timer = setTimeout(() => resolve({ kind: "timeout" }), remainingMs);
         reader.read().then(
           (value) => {
@@ -376,6 +391,27 @@ export async function parseRemoteResponseStream(
           },
         );
       });
+      let result: { kind: "data"; value: ReadResult } | { kind: "timeout" };
+      if (stopSignal === undefined) {
+        result = await readResult;
+      } else {
+        const raced = await Promise.race([readResult, stopSignal]);
+        if (raced.kind === "stopped") {
+          const drained = await Promise.race([
+            readResult,
+            Bun.sleep(SUPERVISOR_STREAM_DRAIN_MS).then(() => ({ kind: "drain_timeout" as const })),
+          ]);
+          if (drained.kind === "drain_timeout") {
+            await cancelReader();
+            if (header === "MISSING" || (header?.startsWith("PRESENT ") === true && bodyRemaining === 0)) break;
+            if (header?.startsWith("PRESENT ") === true) throw new Error("remote mod collection returned a truncated file");
+            throw new Error("remote mod collection returned an invalid response");
+          }
+          result = drained;
+        } else {
+          result = raced;
+        }
+      }
       if (result.kind === "timeout") {
         await cancelReader();
         throw new Error(`remote mod collection timed out after ${timeoutMs / 1000}s`);
@@ -508,8 +544,8 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
       const supervised = await startRemote(parsed, shard);
       const child = supervised.child;
       const filePath = "modoverrides.lua";
-      const stderrPromise = readText(child.stderr);
       const exitPromise = supervised.exited;
+      const stderrPromise = readText(child.stderr, 64 * 1024, REMOTE_COMMAND_TIMEOUT_MS, exitPromise);
       let timedOut = false;
       let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
       const timeout = setTimeout(() => {
@@ -529,7 +565,7 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
           if ((error as NodeJS.ErrnoException).code !== "EPIPE") throw error;
         }
         try {
-          summary = await parseRemoteResponseStream(parsed.cluster, shard, filePath, child.stdout);
+          summary = await parseRemoteResponseStream(parsed.cluster, shard, filePath, child.stdout, REMOTE_COMMAND_TIMEOUT_MS, exitPromise);
         } catch (error) {
           killProcessTree(supervised, "SIGTERM");
           if (forceKillTimer === undefined) forceKillTimer = setTimeout(() => killProcessTree(supervised, "SIGKILL"), SUPERVISOR_FORCE_KILL_MS);

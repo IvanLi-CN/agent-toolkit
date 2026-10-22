@@ -50,16 +50,18 @@ cleanup() {
       rmdir "$(dirname -- "$cleanup_ack_path")" 2>/dev/null || true
     fi
   fi
-  rm -rf -- "$status_dir"
-  if [ "$cleanup_ack_created" = "1" ]; then
+  if [ "$cleanup_ack_created" = "1" ] || [ "$cleanup_failure_created" = "1" ]; then
+    cleanup_marker_path="$cleanup_ack_path"
+    [ "$cleanup_failure_created" = "1" ] && cleanup_marker_path="$cleanup_failure_path"
     cleanup_ack_wait=0
-    while [ -d "$cleanup_ack_path" ] && [ "$cleanup_ack_wait" -lt 120 ]; do
+    while [ -d "$cleanup_marker_path" ] && [ "$cleanup_ack_wait" -lt 120 ]; do
       sleep 0.05
       cleanup_ack_wait=$((cleanup_ack_wait + 1))
     done
-    rmdir "$cleanup_ack_path" 2>/dev/null || true
+    rmdir "$cleanup_marker_path" 2>/dev/null || true
     rmdir "$(dirname -- "$cleanup_ack_path")" 2>/dev/null || true
   fi
+  rm -rf -- "$status_dir"
 }
 run_bounded() {
   bounded_seconds="$1"
@@ -941,7 +943,10 @@ prepare_kill_ownership() {
     fi
   fi
   if ! quiesce_captured_descendants; then return 1; fi
-  group_quiescence_required=1
+  group_quiescence_required=0
+  if awk -F'|' '$2 ~ /^ps:/ { found = 1; exit } END { exit(found ? 0 : 1) }' "$captured_descendants_path" 2>/dev/null; then
+    group_quiescence_required=1
+  fi
   ownership_previous_count="$(wc -l < "$captured_descendants_path" 2>/dev/null | tr -d '[:space:]' || true)"
   case "$ownership_previous_count" in ''|*[!0-9]*) cleanup_ack_enabled=0; return 1 ;; esac
   ownership_round=0
@@ -1480,6 +1485,7 @@ export interface SupervisedChild {
   exited: Promise<number>;
   wrapperExited: Promise<number>;
   waitForCleanupAcknowledged: () => Promise<boolean>;
+  forceCleanup: () => Promise<boolean>;
   cleanup(): Promise<void>;
 }
 
@@ -1511,6 +1517,24 @@ async function readNumericMarker(path: string): Promise<number | undefined> {
   return undefined;
 }
 
+interface TargetReference {
+  pid: number;
+  pgid: number;
+  identity: string;
+}
+
+async function readTargetReference(statusPath: string): Promise<TargetReference | undefined> {
+  const directory = dirname(statusPath);
+  const [pid, pgid, identity] = await Promise.all([
+    readNumericMarker(join(directory, "target")),
+    readNumericMarker(join(directory, "target-pgid")),
+    readFile(join(directory, "target-identity"), "utf8").catch(() => ""),
+  ]);
+  const normalizedIdentity = identity.trim();
+  if (pid === undefined || pgid === undefined || normalizedIdentity.length === 0) return undefined;
+  return { pid, pgid, identity: normalizedIdentity };
+}
+
 async function processStartTime(pid: number): Promise<string | undefined> {
   try {
     const stat = await readFile(`/proc/${pid}/stat`, "utf8");
@@ -1522,22 +1546,24 @@ async function processStartTime(pid: number): Promise<string | undefined> {
   }
 }
 
+const POSIX_PS = "/bin/ps";
+
 function macProcessIdentity(pid: number): string | undefined {
   const result = Bun.spawnSync([
     "sh",
     "-c",
     `
 pid="$1"
-start="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | awk '
+start="$(LC_ALL=C /bin/ps -o lstart= -p "$pid" 2>/dev/null | awk '
   $1 ~ /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat)$/ &&
   $2 ~ /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$/ &&
   $3 ~ /^[0-9][0-9]*$/ &&
   $4 ~ /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/ &&
   $5 ~ /^[0-9][0-9][0-9][0-9]$/ { print $1, $2, $3, $4, $5; exit }
 ')"
-ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | awk 'NR == 1 { gsub(/[[:space:]]/, ""); if ($0 ~ /^[0-9]+$/) print; exit }')"
-pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | awk 'NR == 1 { gsub(/[[:space:]]/, ""); if ($0 ~ /^[0-9]+$/) print; exit }')"
-command_hash="$(ps -o command= -p "$pid" 2>/dev/null | cksum | awk 'NR == 1 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { print $1 ":" $2; exit }')"
+ppid="$(/bin/ps -o ppid= -p "$pid" 2>/dev/null | awk 'NR == 1 { gsub(/[[:space:]]/, ""); if ($0 ~ /^[0-9]+$/) print; exit }')"
+pgid="$(/bin/ps -o pgid= -p "$pid" 2>/dev/null | awk 'NR == 1 { gsub(/[[:space:]]/, ""); if ($0 ~ /^[0-9]+$/) print; exit }')"
+command_hash="$(/bin/ps -o command= -p "$pid" 2>/dev/null | cksum | awk 'NR == 1 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { print $1 ":" $2; exit }')"
 if [ -n "$start" ] && [ -n "$ppid" ] && [ -n "$pgid" ] && [ -n "$command_hash" ]; then
   printf 'ps:%s;ppid=%s;pgid=%s;cmd=%s\\n' "$start" "$ppid" "$pgid" "$command_hash"
 fi
@@ -1574,24 +1600,27 @@ function processIdentityMatches(expected: string, current: string): boolean {
 }
 
 function currentProcessGroup(pid: number): number | undefined {
-  const result = Bun.spawnSync(["ps", "-o", "pgid=", "-p", String(pid)]);
+  const result = Bun.spawnSync([POSIX_PS, "-o", "pgid=", "-p", String(pid)]);
   if (result.exitCode !== 0) return undefined;
   const value = decodeSpawnOutput(result.stdout).trim();
   return /^[1-9][0-9]*$/.test(value) ? Number(value) : undefined;
 }
 
-async function cleanupOrphanedTarget(statusPath: string): Promise<boolean> {
+async function cleanupOrphanedTarget(statusPath: string, rememberedReference?: TargetReference): Promise<boolean> {
   if (process.platform === "win32") return false;
-  const directory = dirname(statusPath);
-  const targetPid = await readNumericMarker(join(directory, "target"));
-  const targetPgid = await readNumericMarker(join(directory, "target-pgid"));
-  if (targetPid === undefined || targetPgid === undefined || targetPid === process.pid) return false;
+  const reference = rememberedReference ?? await readTargetReference(statusPath);
+  const targetPid = reference?.pid;
+  const targetPgid = reference?.pgid;
+  if (targetPid === undefined || targetPgid === undefined || targetPid === process.pid) {
+    return false;
+  }
   const currentPgid = currentProcessGroup(process.pid);
   if (currentPgid === undefined || currentPgid === targetPgid) return false;
-  const expectedIdentity = (await readFile(join(directory, "target-identity"), "utf8").catch(() => "")).trim();
+  const expectedIdentity = reference?.identity ?? "";
   const currentIdentity = await currentProcessIdentity(targetPid);
   if (expectedIdentity.length === 0 || currentIdentity === undefined || !processIdentityMatches(expectedIdentity, currentIdentity)) return false;
-  if (currentProcessGroup(targetPid) !== targetPgid) return false;
+  const observedPgid = currentProcessGroup(targetPid);
+  if (observedPgid !== targetPgid) return false;
   try {
     process.kill(-targetPgid, "SIGKILL");
   } catch {
@@ -1702,8 +1731,13 @@ async function waitForCleanupAck(path: string, wrapperExited: Promise<number>): 
       Bun.sleep(20).then(() => false),
     ]);
     if (wrapperDone) {
-      await Bun.sleep(20);
-      continue;
+      const settleDeadline = Date.now() + SUPERVISOR_CLEANUP_ACK_SETTLE_MS;
+      while (Date.now() < settleDeadline) {
+        if (await consumeCleanupAck(path)) return true;
+        if (await consumeCleanupFailure(failurePath)) return false;
+        await Bun.sleep(20);
+      }
+      return false;
     }
   }
   if (await consumeCleanupAck(path)) return true;
@@ -1719,6 +1753,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
       exited: child.exited,
       wrapperExited: child.exited,
       waitForCleanupAcknowledged: () => Promise.resolve(true),
+      forceCleanup: () => Promise.resolve(false),
       cleanup: async () => undefined,
     };
   }
@@ -1750,6 +1785,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
       },
     ) as Bun.Subprocess<"pipe", "pipe", "pipe">;
     const wrapperExited = child.exited;
+    let rememberedTargetReference: TargetReference | undefined;
     let cleanupAckPromise: Promise<boolean> | undefined;
     const waitForCleanupAcknowledged = (): Promise<boolean> => {
       cleanupAckPromise ??= waitForCleanupAck(cleanupAckPath, wrapperExited);
@@ -1760,6 +1796,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
       exited: waitForTarget(statusPath, wrapperExited, cleanupFailurePath),
       wrapperExited,
       waitForCleanupAcknowledged,
+      forceCleanup: () => cleanupOrphanedTarget(statusPath, rememberedTargetReference),
       cleanup: async () => {
         await rm(directory, { recursive: true, force: true });
         await removeCleanupAck(cleanupAckPath);
@@ -1769,6 +1806,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
     };
     const ready = await waitForReady(readyPath, wrapperExited);
     if (!ready) {
+      await cleanupOrphanedTarget(statusPath);
       try { child.kill("SIGTERM"); } catch { /* The wrapper may already be gone. */ }
       const cleanupReady = await waitForCleanupAcknowledged();
       if (!cleanupReady) {
@@ -1777,6 +1815,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
       await wrapperExited;
       throw new Error("supervisor_not_ready");
     }
+    rememberedTargetReference = await readTargetReference(statusPath);
     return supervised;
   } catch (error) {
     await rm(directory, { recursive: true, force: true });

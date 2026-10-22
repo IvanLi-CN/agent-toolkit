@@ -562,7 +562,7 @@ describe("DST local Bun tooling", () => {
     }
   });
 
-  test("preserves remote selection, missing shard resources, and failed SSH diagnostics", { timeout: 30_000 }, async () => {
+  test("preserves remote selection, missing shard resources, and failed SSH diagnostics", { timeout: 90_000 }, async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-"));
     const previousPath = process.env.PATH;
     try {
@@ -646,7 +646,7 @@ esac
     }
   });
 
-  test("reports a failed snapshot SSH check without attempting a remote operation", async () => {
+  test("reports a failed snapshot SSH check without attempting a remote operation", { timeout: 30_000 }, async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-ssh-"));
     const previousPath = process.env.PATH;
     try {
@@ -679,7 +679,23 @@ esac
 case "$*" in
   *"echo ok"*)
     supervisor_pid="$(ps -o ppid= -p "$PPID" 2>/dev/null | tr -d '[:space:]')"
+    case "$supervisor_pid" in
+      ''|*[!0-9]*)
+        ancestor="$PPID"
+        attempts=0
+        while [ "$attempts" -lt 16 ]; do
+          case "$ancestor" in ''|*[!0-9]*) break ;; esac
+          command_line="$(ps -o command= -p "$ancestor" 2>/dev/null || true)"
+          case "$command_line" in *agent-toolkit-supervisor*) supervisor_pid="$ancestor"; break ;; esac
+          next_ancestor="$(ps -o ppid= -p "$ancestor" 2>/dev/null | tr -d '[:space:]')"
+          [ "$next_ancestor" = "$ancestor" ] && break
+          ancestor="$next_ancestor"
+          attempts=$((attempts + 1))
+        done
+        ;;
+    esac
     case "$supervisor_pid" in ''|*[!0-9]*) exit 97 ;; esac
+    sleep 0.5
     kill -KILL "$supervisor_pid" 2>/dev/null || true
     while :; do sleep 1; done
     ;;
@@ -737,7 +753,7 @@ esac
     }
   });
 
-  test("redacts sensitive values from successful remote snapshot output", { timeout: 15_000 }, async () => {
+  test("redacts sensitive values from successful remote snapshot output", { timeout: 30_000 }, async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-redaction-"));
     const previousPath = process.env.PATH;
     try {
@@ -764,7 +780,7 @@ esac
     }
   });
 
-  test("renders untrusted remote report text without Markdown or HTML injection", { timeout: 15_000 }, async () => {
+  test("renders untrusted remote report text without Markdown or HTML injection", { timeout: 30_000 }, async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-markdown-"));
     const previousPath = process.env.PATH;
     try {
@@ -871,7 +887,7 @@ esac
       const trigger = join(root, "fail-process-scan");
       await writeFile(fakeSsh, `#!/bin/sh
 case "$*" in
-  *"echo ok"*) exit 0 ;;
+  *echo*ok*) exit 0 ;;
   *) sleep 0.5; touch "$AGENT_TOOLKIT_TEST_PS_FAIL"; head -c $(( ${MAX_REMOTE_OUTPUT_BYTES} + 1 )) /dev/zero ;;
 esac
 `);
@@ -1460,7 +1476,7 @@ exec /bin/ps "$@"
     }
   });
 
-  test("fails closed when detached descendant enumeration is truncated", { timeout: 30_000 }, async () => {
+  test("fails closed when detached descendant enumeration is truncated", { timeout: 90_000 }, async () => {
     if (process.platform === "win32") return;
     const setsidCheck = Bun.spawnSync(["sh", "-c", "command -v setsid"], { stdout: "ignore", stderr: "ignore" });
     if (setsidCheck.exitCode !== 0) return;

@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 const SUPERVISOR_CLEANUP_TIMEOUT_MS = 60_000;
 const SUPERVISOR_CLEANUP_ACK_SETTLE_MS = 5_000;
 const SUPERVISOR_CLEANUP_DEADLINE_SECONDS = Math.ceil(SUPERVISOR_CLEANUP_TIMEOUT_MS / 1_000);
+export const SUPERVISOR_UNKNOWN_TARGET_STATUS = 125;
 
 const SUPERVISOR_SCRIPT = `
 set +e
@@ -99,13 +100,12 @@ ps_identity_for_pid() {
     $5 ~ /^[0-9][0-9][0-9][0-9]$/ { print $1, $2, $3, $4, $5; exit }
   ')"
   ps_identity_pgid="$($ps_identity_runner ps -o pgid= -p "$ps_identity_pid" 2>/dev/null | $ps_identity_runner awk 'NR == 1 { gsub(/[[:space:]]/, ""); if ($0 ~ /^[0-9]+$/) print; exit }')"
-  ps_identity_ppid="$($ps_identity_runner ps -o ppid= -p "$ps_identity_pid" 2>/dev/null | $ps_identity_runner awk 'NR == 1 { gsub(/[[:space:]]/, ""); if ($0 ~ /^[0-9]+$/) print; exit }')"
   ps_identity_command_hash="$($ps_identity_runner ps -o command= -p "$ps_identity_pid" 2>/dev/null | $ps_identity_runner cksum | $ps_identity_runner awk 'NR == 1 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { print $1 ":" $2; exit }')"
-  # macOS does not expose /proc start ticks. Binding the second-resolution
-  # start time to the current parent, group, and command prevents a detached
-  # process from being re-authorized after it is reparented.
-  if [ -n "$ps_identity_start" ] && [ -n "$ps_identity_pgid" ] && [ -n "$ps_identity_ppid" ] && [ -n "$ps_identity_command_hash" ]; then
-    printf 'ps:%s;ppid=%s;pgid=%s;cmd=%s\n' "$ps_identity_start" "$ps_identity_ppid" "$ps_identity_pgid" "$ps_identity_command_hash"
+  # macOS does not expose /proc start ticks. Bind the second-resolution start
+  # time to the process group and command; descendants may be reparented while
+  # the supervisor is terminating their detached group.
+  if [ -n "$ps_identity_start" ] && [ -n "$ps_identity_pgid" ] && [ -n "$ps_identity_command_hash" ]; then
+    printf 'ps:%s;pgid=%s;cmd=%s\n' "$ps_identity_start" "$ps_identity_pgid" "$ps_identity_command_hash"
     return 0
   fi
   return 1
@@ -416,14 +416,11 @@ identity_is_valid() {
 captured_process_can_be_signaled() {
   case "$1" in
     proc:*) return 0 ;;
-    ps:*';ppid='*';pgid='*';cmd='*)
+    ps:*';pgid='*';cmd='*)
       captured_ps_identity="\${1#ps:}"
-      captured_ps_ppid="\${captured_ps_identity#*;ppid=}"
-      captured_ps_ppid="\${captured_ps_ppid%%;pgid=*}"
       captured_ps_pgid="\${captured_ps_identity#*;pgid=}"
       captured_ps_pgid="\${captured_ps_pgid%%;cmd=*}"
       captured_ps_command_hash="\${captured_ps_identity#*;cmd=}"
-      case "$captured_ps_ppid" in ''|*[!0-9]*) return 1 ;; esac
       case "$captured_ps_pgid" in ''|*[!0-9]*) return 1 ;; esac
       case "$captured_ps_command_hash" in ''|*[!0-9:]*) return 1 ;; esac
       return 0
@@ -1435,7 +1432,7 @@ async function waitForTarget(path: string, wrapperExited: Promise<number>): Prom
     const status = await readStatus(path);
     if (status !== undefined) return status;
     const event = await Promise.race([Bun.sleep(20).then(() => undefined), wrapperResult]);
-    if (event !== undefined) return (await readStatus(path)) ?? event.code;
+    if (event !== undefined) return (await readStatus(path)) ?? SUPERVISOR_UNKNOWN_TARGET_STATUS;
   }
 }
 

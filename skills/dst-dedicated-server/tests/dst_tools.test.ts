@@ -13,7 +13,7 @@ import {
   type ShardSummary,
 } from "../scripts/dst_mods_from_modoverrides.ts";
 import { main as snapshotMain, MAX_LOCAL_DIRECTORY_ENTRIES, MAX_LOCAL_LOG_LISTING_ENTRIES, MAX_REMOTE_OUTPUT_BYTES, redactOperationalText, redactSensitiveText, safeTail } from "../scripts/dst_snapshot.ts";
-import { spawnSupervised } from "../scripts/process_supervisor.ts";
+import { spawnSupervised, SUPERVISOR_UNKNOWN_TARGET_STATUS } from "../scripts/process_supervisor.ts";
 
 async function runTool(script: string, args: string[], env: Record<string, string>): Promise<{ status: number; stdout: string; stderr: string }> {
   const child = Bun.spawn([process.execPath, script, ...args], { env, stdout: "pipe", stderr: "pipe" });
@@ -1199,6 +1199,23 @@ exec /bin/ps "$@"
       supervised.child.kill("SIGTERM");
       expect(await supervised.waitForCleanupAcknowledged()).toBe(true);
       await supervised.wrapperExited;
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+    }
+  });
+
+  test("fails closed when the supervisor exits before recording target status", { timeout: 30_000 }, async () => {
+    if (process.platform === "win32") return;
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    try {
+      supervised = await spawnSupervised(["sh", "-c", "sleep 30"]);
+      supervised.child.kill("SIGKILL");
+      expect(await supervised.exited).toBe(SUPERVISOR_UNKNOWN_TARGET_STATUS);
+      await supervised.wrapperExited.catch(() => undefined);
     } finally {
       if (supervised !== undefined) {
         try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }

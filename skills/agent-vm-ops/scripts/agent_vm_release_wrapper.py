@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import io
 import json
@@ -139,9 +141,9 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
     if isinstance(owner_uid, bool) or not isinstance(owner_uid, int) or owner_uid < 0:
         _fail("wrapper_config_invalid", "owner_uid must be a non-negative integer")
     config["owner_uid"] = owner_uid
-    config["require_drained"] = raw.get("require_drained", True)
-    if not isinstance(config["require_drained"], bool):
-        _fail("wrapper_config_invalid", "require_drained must be a boolean")
+    if raw.get("require_drained", True) is not True:
+        _fail("wrapper_config_invalid", "release activation must require admission drain")
+    config["require_drained"] = True
     unit_names = raw.get("unit_names", list(FIXED_UNIT_NAMES))
     if not isinstance(unit_names, list) or not all(isinstance(item, str) for item in unit_names) or sorted(unit_names) != list(FIXED_UNIT_NAMES):
         _fail("wrapper_config_invalid", "unit_names must equal the fixed systemd unit set")
@@ -164,6 +166,35 @@ def _mkdir_private(path: Path, mode: int = 0o700) -> None:
         os.chmod(path, mode)
     except OSError as exc:
         _fail("wrapper_io_error", f"cannot prepare private directory: {path.name}")
+
+
+@contextmanager
+def _release_lock(config: Mapping[str, Any]):
+    """Serialize all root-owned release staging and activation transitions."""
+    lock_root = Path(config["state_root"])
+    _mkdir_private(lock_root)
+    lock_path = lock_root / ".release-wrapper.lock"
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        _fail("wrapper_lock_unavailable", "cannot open the release transaction lock")
+    try:
+        try:
+            os.fchmod(descriptor, 0o600)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        except OSError as exc:
+            _fail("wrapper_lock_unavailable", "cannot acquire the release transaction lock")
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
 
 
 def _safe_member_path(name: str) -> Path:
@@ -319,7 +350,7 @@ def _verify_python_syntax(root: Path, manifest: Mapping[str, Any]) -> None:
             _fail("python_syntax_invalid", f"Python artifact cannot be compiled: {item['path']}")
 
 
-def verify_transaction(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:
+def _verify_transaction(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:
     transaction = _load_transaction(config, transaction_id)
     if transaction.get("release_id") != release_id:
         _fail("transaction_conflict", "transaction is bound to another release")
@@ -349,33 +380,36 @@ def verify_transaction(config: Mapping[str, Any], transaction_id: str, release_i
     return checked
 
 
+def verify_transaction(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:
+    with _release_lock(config):
+        return _verify_transaction(config, transaction_id, release_id)
+
+
 def stage(config: Mapping[str, Any], transaction_id: str, release_id: str, payload: bytes) -> dict[str, Any]:
     transaction_id = _safe_id(transaction_id, "transaction_id")
     release_id = _release_id(release_id)
-    destination = _transaction_dir(config, transaction_id)
-    if destination.exists():
-        _fail("transaction_exists", "transaction staging directory already exists")
-    temporary = destination.with_name("." + transaction_id + ".staging")
-    if temporary.exists():
-        _fail("transaction_exists", "temporary transaction staging directory already exists")
-    try:
-        safe_extract_archive(payload, temporary)
-        manifest = load_manifest(temporary / MANIFEST_NAME)
-        if manifest["release_id"] != release_id:
-            _fail("release_mismatch", "staged manifest does not match requested release")
-        _write_json(temporary / ".wrapper-state.json", {"transaction_id": transaction_id, "release_id": release_id, "staged": True})
-        os.replace(temporary, destination)
-    except ManifestError as exc:
-        _fail(exc.code, exc.message, exc.detail)
-    except WrapperError:
+    with _release_lock(config):
+        destination = _transaction_dir(config, transaction_id)
+        if destination.exists():
+            _fail("transaction_exists", "transaction staging directory already exists")
+        temporary = destination.with_name("." + transaction_id + ".staging")
         if temporary.exists():
-            shutil.rmtree(temporary, ignore_errors=True)
-        raise
-    except OSError as exc:
-        if temporary.exists():
-            shutil.rmtree(temporary, ignore_errors=True)
-        _fail("wrapper_io_error", "cannot commit staged release")
-    return {"staged": True, "transaction_id": transaction_id, "release_id": release_id}
+            _fail("transaction_exists", "temporary transaction staging directory already exists")
+        try:
+            safe_extract_archive(payload, temporary)
+            manifest = load_manifest(temporary / MANIFEST_NAME)
+            if manifest["release_id"] != release_id:
+                _fail("release_mismatch", "staged manifest does not match requested release")
+            _write_json(temporary / ".wrapper-state.json", {"transaction_id": transaction_id, "release_id": release_id, "staged": True})
+            os.replace(temporary, destination)
+        except ManifestError as exc:
+            _fail(exc.code, exc.message, exc.detail)
+        except OSError as exc:
+            _fail("wrapper_io_error", "cannot commit staged release")
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary, ignore_errors=True)
+        return {"staged": True, "transaction_id": transaction_id, "release_id": release_id}
 
 
 def _current_target(link: Path, release_root: Path | None = None) -> Path | None:
@@ -590,9 +624,14 @@ def _install_release_files(config: Mapping[str, Any], release_root: Path, manife
 
 
 def activate(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:
+    with _release_lock(config):
+        return _activate_unlocked(config, transaction_id, release_id)
+
+
+def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:
     transaction_id = _safe_id(transaction_id, "transaction_id")
     release_id = _release_id(release_id)
-    verified = verify_transaction(config, transaction_id, release_id)
+    verified = _verify_transaction(config, transaction_id, release_id)
     _ensure_drained(config)
     activation_path = Path(config["state_root"]) / (transaction_id + ".activation.json")
     if activation_path.exists() or activation_path.is_symlink():
@@ -691,6 +730,11 @@ def activate(config: Mapping[str, Any], transaction_id: str, release_id: str) ->
 
 
 def rollback(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:
+    with _release_lock(config):
+        return _rollback_unlocked(config, transaction_id, release_id)
+
+
+def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:
     transaction_id = _safe_id(transaction_id, "transaction_id")
     release_id = _release_id(release_id)
     activation_path = Path(config["state_root"]) / (transaction_id + ".activation.json")
@@ -793,7 +837,6 @@ def status(config: Mapping[str, Any]) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agent-vm-release-wrapper")
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     subparsers = parser.add_subparsers(dest="action", required=True)
     stage_parser = subparsers.add_parser("stage")
     stage_parser.add_argument("--transaction-id", required=True)
@@ -814,7 +857,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        config = load_config(args.config)
+        config = load_config(DEFAULT_CONFIG_PATH)
         if args.action == "stage":
             payload = sys.stdin.buffer.read(MAX_ARCHIVE_BYTES + 1)
             result = stage(config, args.transaction_id, args.release_id, payload)

@@ -267,6 +267,8 @@ def validate_manifest(value: Any) -> dict[str, Any]:
     actions: dict[str, dict[str, Any]] = {}
     for action, raw_spec in raw_actions.items():
         action_name = _require_string(action, "action", re.compile(r"^[a-z][a-z0-9-]{0,63}$"))
+        if action_name not in ACTION_NAMES:
+            raise _error("manifest_action_unsupported", f"manifest declares an unsupported action: {action_name}")
         spec = _require_mapping(raw_spec, f"actions.{action_name}")
         expected = {"request", "response", "client_to_control", "control_to_client"}
         if set(spec) != expected:
@@ -338,8 +340,22 @@ def load_manifest(path: Path) -> dict[str, Any]:
 
 def _resolve_regular(root: Path, relative_path: str) -> Path:
     candidate = root / Path(*PurePosixPath(relative_path).parts)
+    cursor = root
+    parts = PurePosixPath(relative_path).parts
+    for index, part in enumerate(parts):
+        cursor = cursor / part
+        try:
+            info = cursor.lstat()
+        except FileNotFoundError as exc:
+            raise _error("artifact_missing", f"artifact is missing: {relative_path}") from exc
+        except OSError as exc:
+            raise _error("artifact_unverified", f"artifact cannot be inspected: {relative_path}") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise _error("artifact_unverified", f"artifact path contains a symlink: {relative_path}")
+        if index < len(parts) - 1 and not stat.S_ISDIR(info.st_mode):
+            raise _error("artifact_unverified", f"artifact path contains a non-directory parent: {relative_path}")
     try:
-        candidate.relative_to(root)
+        candidate.resolve().relative_to(root)
     except ValueError as exc:
         raise _error("artifact_path_invalid", "artifact escapes bundle root") from exc
     try:
@@ -502,6 +518,8 @@ def check_compatibility(
     peer_release = peer_map.get("release_id", LEGACY_RELEASE_ID)
     if not isinstance(peer_release, str) or not peer_release:
         raise _error("compatibility_invalid", "compatibility.release_id must be a string")
+    if peer_release != LEGACY_RELEASE_ID and RELEASE_ID_RE.fullmatch(peer_release) is None:
+        raise _error("compatibility_invalid", "compatibility.release_id must be a Git revision or legacy-protocol-4")
     if peer_release == checked["release_id"]:
         return []
     return [warning("compatible_release", action, "peer release differs but the requested operation is explicitly compatible", {"peer_release": peer_release, "control_release": checked["release_id"]})]

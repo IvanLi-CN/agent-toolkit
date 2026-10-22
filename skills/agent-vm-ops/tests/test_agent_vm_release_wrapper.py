@@ -38,12 +38,15 @@ class WrapperTests(unittest.TestCase):
             "unit_dir": str(self.root / "units"),
             "state_root": str(self.root / "wrapper-state"),
             "owner_uid": uid,
-            "require_drained": False,
+            "require_drained": True,
         }
         self.config_path = self.root / "wrapper.json"
         self.config_path.write_text(json.dumps(self.config), encoding="utf-8")
         self.loaded = WRAPPER.load_config(self.config_path)
         self.payload = self.bundle.read_bytes()
+        self.drain_patch = mock.patch.object(WRAPPER, "_ensure_drained")
+        self.drain_patch.start()
+        self.addCleanup(self.drain_patch.stop)
 
     def test_unsafe_archive_members_are_rejected(self):
         output = io.BytesIO()
@@ -54,6 +57,29 @@ class WrapperTests(unittest.TestCase):
         with self.assertRaises(WRAPPER.WrapperError) as failure:
             WRAPPER.safe_extract_archive(output.getvalue(), self.root / "unsafe")
         self.assertEqual(failure.exception.code, "unsafe_archive")
+
+    def test_manifest_failure_removes_temporary_staging(self):
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w") as archive:
+            member = tarfile.TarInfo("agent_vm.py")
+            member.mode = 0o755
+            member.size = 7
+            archive.addfile(member, io.BytesIO(b"client\n"))
+        with self.assertRaises(WRAPPER.WrapperError) as failure:
+            WRAPPER.stage(self.loaded, "tx-manifest", "b" * 40, output.getvalue())
+        self.assertEqual(failure.exception.code, "manifest_missing")
+        self.assertFalse((Path(self.loaded["staging_root"]) / ".tx-manifest.staging").exists())
+
+    def test_wrapper_config_and_cli_cannot_disable_or_redirect_activation(self):
+        invalid = dict(self.config)
+        invalid["require_drained"] = False
+        invalid_path = self.root / "invalid-wrapper.json"
+        invalid_path.write_text(json.dumps(invalid), encoding="utf-8")
+        with self.assertRaises(WRAPPER.WrapperError) as failure:
+            WRAPPER.load_config(invalid_path)
+        self.assertEqual(failure.exception.code, "wrapper_config_invalid")
+        with self.assertRaises(SystemExit):
+            WRAPPER.build_parser().parse_args(["--config", str(invalid_path), "status"])
 
     def test_stage_verify_and_activate_only_install_fixed_targets(self):
         staged = WRAPPER.stage(self.loaded, "tx-one", "b" * 40, self.payload)

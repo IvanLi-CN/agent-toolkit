@@ -67,6 +67,20 @@ class ManifestContractTests(unittest.TestCase):
                         MANIFEST.verify_bundle(self.root, value)
                 self.assertEqual(failure.exception.code, code)
 
+        outside = self.root.parent / (self.root.name + "-outside")
+        outside.mkdir()
+        self.addCleanup(lambda: outside.rmdir())
+        external_client = outside / "agent_vm.py"
+        external_client.write_bytes(b"client\n")
+        external_client.chmod(0o755)
+        self.addCleanup(external_client.unlink)
+        value = copy.deepcopy(self.manifest)
+        value["artifacts"][0]["path"] = "nested/agent_vm.py"
+        (self.root / "nested").symlink_to(outside, target_is_directory=True)
+        with self.assertRaises(MANIFEST.ManifestError) as failure:
+            MANIFEST.verify_bundle(self.root, value)
+        self.assertEqual(failure.exception.code, "artifact_unverified")
+
     def test_revision_protocol_and_window_are_explicit(self):
         for field, value, code in (
             ("source_revision", "short", "manifest_invalid"),
@@ -91,6 +105,13 @@ class ManifestContractTests(unittest.TestCase):
         with self.assertRaises(MANIFEST.ManifestError):
             MANIFEST.validate_manifest(value_copy)
 
+        unsupported = copy.deepcopy(self.manifest)
+        unsupported["actions"]["future-action"] = copy.deepcopy(unsupported["actions"]["status"])
+        unsupported["client_view"]["actions"] = unsupported["actions"]
+        with self.assertRaises(MANIFEST.ManifestError) as failure:
+            MANIFEST.validate_manifest(unsupported)
+        self.assertEqual(failure.exception.code, "manifest_action_unsupported")
+
     def test_legacy_capability_warns_but_unknown_action_does_not_parse(self):
         capability = MANIFEST.legacy_capability("status")
         warnings = MANIFEST.check_compatibility(MANIFEST.legacy_manifest(), "status", capability)
@@ -99,6 +120,11 @@ class ManifestContractTests(unittest.TestCase):
         with self.assertRaises(MANIFEST.ManifestError) as failure:
             MANIFEST.legacy_capability("future-action")
         self.assertEqual(failure.exception.code, "unknown_action")
+
+        invalid_peer = dict(capability, release_id="not-a-git-revision")
+        with self.assertRaises(MANIFEST.ManifestError) as failure:
+            MANIFEST.check_compatibility(MANIFEST.legacy_manifest(), "status", invalid_peer)
+        self.assertEqual(failure.exception.code, "compatibility_invalid")
 
     def test_missing_runtime_manifest_is_an_explicit_legacy_warning(self):
         manifest, present, verified, warnings = MANIFEST.load_runtime_manifest(self.root / "missing.json")

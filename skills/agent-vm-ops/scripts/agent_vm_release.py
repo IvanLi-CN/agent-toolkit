@@ -71,6 +71,7 @@ DEFAULT_POLL_SECONDS = 1.0
 MAX_TIMEOUT_SECONDS = 300
 MAX_POLL_SECONDS = 1.0
 CONTROL_TRANSITION_STATES = {"preparing", "closing", "deleting", "failed"}
+KNOWN_TASK_STATES = {"absent", "cached", "preparing", "active", "closing", "deleting", "failed"}
 SOURCE_ARTIFACTS = (
     ("agent_vm.py", "skills/agent-vm/scripts/agent_vm.py", "client", 0o755),
     ("agent_vm_control.py", "skills/agent-vm-ops/scripts/agent_vm_control.py", "control", 0o755),
@@ -438,7 +439,9 @@ class ReleasePublisher:
     def _healthy(metrics: Mapping[str, Any], doctor: Mapping[str, Any]) -> bool:
         pending = metrics.get("pending_operations")
         task_states = metrics.get("task_states")
-        if pending != [] or not isinstance(task_states, Mapping):
+        if metrics.get("draining") is not True or pending != [] or not isinstance(task_states, Mapping):
+            return False
+        if any(state not in KNOWN_TASK_STATES for state in task_states):
             return False
         for state in CONTROL_TRANSITION_STATES:
             count = task_states.get(state, 0)
@@ -453,6 +456,10 @@ class ReleasePublisher:
             last = self._control(manifest, "admin-metrics")
             pending = last.get("pending_operations")
             states = last.get("task_states")
+            if last.get("draining") is not True:
+                _fail("drain_unverified", "admission drain was not confirmed during convergence", {"draining": last.get("draining")})
+            if isinstance(states, Mapping) and any(state not in KNOWN_TASK_STATES for state in states):
+                _fail("state_unverified", "control returned an unknown task state during convergence", {"task_states": states})
             converged = False
             if pending == [] and isinstance(states, Mapping):
                 converged = all(
@@ -581,11 +588,19 @@ class ReleasePublisher:
             temporary.cleanup()
         transaction = transaction_id or ("tx-" + uuid.uuid4().hex)
         session = self.session_id or ("release-" + transaction)
-        self._wrapper("stage", transaction, manifest["release_id"], payload)
-        self._wrapper("verify", transaction, manifest["release_id"])
-        self._control(manifest, "drain-enter", session=session, write=True)
+        staged = self._wrapper("stage", transaction, manifest["release_id"], payload)
+        if staged.get("staged") is not True:
+            _fail("stage_unverified", "remote wrapper did not confirm staging")
+        verified = self._wrapper("verify", transaction, manifest["release_id"])
+        if verified.get("verified") is not True:
+            _fail("verification_unverified", "remote wrapper did not confirm release verification")
+        drain = self._control(manifest, "drain-enter", session=session, write=True)
+        if drain.get("draining") is not True:
+            _fail("drain_unverified", "control did not confirm admission drain")
         self._wait_for_convergence(manifest, timeout, poll)
         activation = self._wrapper("activate", transaction, manifest["release_id"])
+        if activation.get("activated") is not True:
+            _fail("activation_unverified", "remote wrapper did not confirm activation")
         try:
             self._health(manifest)
         except ReleaseError as health_error:

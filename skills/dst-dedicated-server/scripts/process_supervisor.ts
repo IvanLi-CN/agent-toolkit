@@ -2,7 +2,7 @@ import { lstat, mkdtemp, readFile, rm, rmdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-const SUPERVISOR_CLEANUP_TIMEOUT_MS = 20_000;
+const SUPERVISOR_CLEANUP_TIMEOUT_MS = 60_000;
 const SUPERVISOR_CLEANUP_DEADLINE_SECONDS = Math.ceil(SUPERVISOR_CLEANUP_TIMEOUT_MS / 1_000);
 
 const SUPERVISOR_SCRIPT = `

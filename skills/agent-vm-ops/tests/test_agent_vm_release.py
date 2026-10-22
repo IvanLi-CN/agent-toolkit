@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -153,6 +154,12 @@ class ReleasePublisherTests(unittest.TestCase):
             RELEASE.build_parser().parse_args(common + ["--wrapper", RELEASE.CANONICAL_REMOTE_WRAPPER]).wrapper,
             RELEASE.CANONICAL_REMOTE_WRAPPER,
         )
+
+    def test_ssh_status_wrapper_uses_status_command_without_action_arguments(self):
+        transport = RELEASE.SSHTransport()
+        with mock.patch.object(transport, "_run", return_value={}) as run:
+            transport.wrapper("staging-control", RELEASE.CANONICAL_REMOTE_WRAPPER, "status", "tx", "e" * 40)
+        run.assert_called_once_with("staging-control", [RELEASE.CANONICAL_REMOTE_WRAPPER, "status"], None)
 
     def test_health_rejects_malformed_boolean_values(self):
         transport = FakeTransport(malformed_health=True)

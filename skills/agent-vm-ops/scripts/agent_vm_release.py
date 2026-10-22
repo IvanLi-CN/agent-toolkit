@@ -587,7 +587,10 @@ class SSHTransport:
         return self._parse(process, command[0])
 
     def wrapper(self, host: str, wrapper_path: str, action: str, transaction_id: str, release_id: str, payload: bytes | None = None) -> Mapping[str, Any]:
-        return self._run(host, [wrapper_path, action, "--transaction-id", transaction_id, "--release-id", release_id], payload)
+        command = [wrapper_path, action]
+        if action != "status":
+            command.extend(["--transaction-id", transaction_id, "--release-id", release_id])
+        return self._run(host, command, payload)
 
     def control(self, host: str, remote_control: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
         response = self._run(host, ["python3", remote_control], json.dumps(dict(request), sort_keys=True).encode())

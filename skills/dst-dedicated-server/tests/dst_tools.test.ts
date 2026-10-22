@@ -1405,6 +1405,43 @@ exec /bin/ps "$@"
     }
   });
 
+  test("rejects a status marker symlink before publication", { timeout: 90_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-status-canary-"));
+    const canary = join(root, "canary");
+    await writeFile(canary, "sentinel\n", "utf8");
+    const before = new Set((await readdir(tmpdir())).filter((entry) => entry.startsWith(".agent-toolkit-dst-supervisor-") && !entry.includes("ack-")));
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    try {
+      supervised = await spawnSupervised(["sh", "-c", "sleep 1"]);
+      let resolvedEntry: string | undefined;
+      for (const entry of await readdir(tmpdir())) {
+        if (before.has(entry) || !entry.startsWith(".agent-toolkit-dst-supervisor-") || entry.includes("ack-")) continue;
+        if ((await lstat(join(tmpdir(), entry, "target")).catch(() => undefined))?.isFile() === true) {
+          resolvedEntry = entry;
+          break;
+        }
+      }
+      expect(resolvedEntry).toBeString();
+      const markerPath = join(tmpdir(), resolvedEntry!, "status");
+      await rm(markerPath, { force: true });
+      await symlink(canary, markerPath);
+      const result = await Promise.race([
+        supervised.exited,
+        Bun.sleep(10_000).then(() => { throw new Error("supervisor status marker read timed out"); }),
+      ]);
+      expect(result).toBe(SUPERVISOR_UNKNOWN_TARGET_STATUS);
+      expect(await readFile(canary, "utf8")).toBe("sentinel\n");
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("does not follow a cleanup acknowledgement symlink", { timeout: 90_000 }, async () => {
     if (process.platform === "win32") return;
     const prefix = ".agent-toolkit-dst-supervisor-ack-";

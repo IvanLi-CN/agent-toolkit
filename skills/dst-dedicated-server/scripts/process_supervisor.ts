@@ -46,16 +46,62 @@ cleanup() {
     rmdir "$(dirname -- "$cleanup_ack_path")" 2>/dev/null || true
   fi
 }
+run_bounded() {
+  bounded_seconds="$1"
+  shift
+  if command -v perl >/dev/null 2>&1; then
+    perl -e 'my $seconds = shift @ARGV; alarm $seconds; exec @ARGV or exit 127' "$bounded_seconds" "$@"
+    return $?
+  fi
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$bounded_seconds" "$@"
+    return $?
+  fi
+  return 125
+}
+run_process_probe() {
+  # Keep ordinary probes cheap; cleanup activates the bounded path explicitly.
+  if [ "\${snapshot_deadline_epoch:-0}" -gt 0 ]; then
+    run_bounded 1 "$@"
+  else
+    "$@"
+  fi
+}
+run_watchdog_probe() {
+  run_bounded 1 "$@"
+}
+run_snapshot_command() {
+  run_process_probe "$@"
+}
+ps_identity_for_pid() {
+  ps_identity_pid="$1"
+  ps_identity_runner=run_process_probe
+  [ "\${2:-}" = "watchdog" ] && ps_identity_runner=run_watchdog_probe
+  ps_identity_start="$(LC_ALL=C $ps_identity_runner ps -o lstart= -p "$ps_identity_pid" 2>/dev/null | $ps_identity_runner awk '
+    $1 ~ /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat)$/ &&
+    $2 ~ /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$/ &&
+    $3 ~ /^[0-9][0-9]*$/ &&
+    $4 ~ /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/ &&
+    $5 ~ /^[0-9][0-9][0-9][0-9]$/ { print $1, $2, $3, $4, $5; exit }
+  ')"
+  ps_identity_pgid="$($ps_identity_runner ps -o pgid= -p "$ps_identity_pid" 2>/dev/null | $ps_identity_runner awk 'NR == 1 { gsub(/[[:space:]]/, ""); if ($0 ~ /^[0-9]+$/) print; exit }')"
+  ps_identity_command_hash="$($ps_identity_runner ps -o command= -p "$ps_identity_pid" 2>/dev/null | $ps_identity_runner cksum | $ps_identity_runner awk 'NR == 1 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { print $1 ":" $2; exit }')"
+  if [ -n "$ps_identity_start" ] && [ -n "$ps_identity_pgid" ] && [ -n "$ps_identity_command_hash" ]; then
+    printf 'ps:%s;pgid=%s;cmd=%s\n' "$ps_identity_start" "$ps_identity_pgid" "$ps_identity_command_hash"
+    return 0
+  fi
+  return 1
+}
 parent_pid="\${AGENT_TOOLKIT_SUPERVISOR_PARENT_PID:-\$PPID}"
 parent_starttime=""
 parent_identity_mode="unknown"
 parent_ps_start=""
 if [ -r "/proc/$parent_pid/stat" ]; then
-  parent_starttime="$(awk '{ sub(/.*\\) /, ""); print $20 }' "/proc/$parent_pid/stat" 2>/dev/null || true)"
+  parent_starttime="$(run_process_probe awk '{ sub(/.*\\) /, ""); print $20 }' "/proc/$parent_pid/stat" 2>/dev/null || true)"
   if [ -n "$parent_starttime" ]; then parent_identity_mode="proc"; fi
 fi
 if [ "$parent_identity_mode" != "proc" ]; then
-  parent_ps_start="$(ps -o lstart= -p "$parent_pid" 2>/dev/null | awk 'NR == 1 { sub(/^[ \t]*/, ""); sub(/[ \t]*$/, ""); print; exit }')"
+  parent_ps_start="$(ps_identity_for_pid "$parent_pid" 2>/dev/null || true)"
   if [ -n "$parent_ps_start" ]; then parent_identity_mode="ps"; fi
 fi
 target_status_path="$status_dir/target-status"
@@ -107,7 +153,7 @@ done
 if [ -z "$target_pid" ]; then target_pid="$target_launcher_pid"; fi
 target_pgid_attempt=0
 while [ "$target_pgid_attempt" -lt 100 ]; do
-  observed_target_pgid="$(ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ' || true)"
+  observed_target_pgid="$(run_process_probe ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ' || true)"
   case "$observed_target_pgid" in
     ''|*[!0-9]*) sleep 0.01; target_pgid_attempt=$((target_pgid_attempt + 1)) ;;
     *) target_pgid="$observed_target_pgid"; break ;;
@@ -118,13 +164,13 @@ capture_target_identity() {
   target_starttime=""
   target_ps_start=""
   if [ -r "/proc/$target_pid/stat" ]; then
-    target_starttime="$(awk '{ sub(/.*\\) /, ""); print $20 }' "/proc/$target_pid/stat" 2>/dev/null || true)"
+    target_starttime="$(run_process_probe awk '{ sub(/.*\\) /, ""); print $20 }' "/proc/$target_pid/stat" 2>/dev/null || true)"
     if [ -n "$target_starttime" ]; then
       target_identity_mode="proc"
       return 0
     fi
   fi
-  target_ps_start="$(ps -o lstart= -p "$target_pid" 2>/dev/null | awk 'NR == 1 { sub(/^[ \\t]*/, ""); sub(/[ \\t]*$/, ""); print; exit }')"
+  target_ps_start="$(ps_identity_for_pid "$target_pid" 2>/dev/null || true)"
   if [ -n "$target_ps_start" ]; then
     target_identity_mode="ps"
     return 0
@@ -184,7 +230,7 @@ refresh_target_reference() {
   done
   case "$target_pgid" in
     ''|*[!0-9]*)
-      observed_target_pgid="$(ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ' || true)"
+      observed_target_pgid="$(run_process_probe ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ' || true)"
       case "$observed_target_pgid" in
         ''|*[!0-9]*) ;;
         *) target_pgid="$observed_target_pgid" ;;
@@ -194,12 +240,12 @@ refresh_target_reference() {
 }
 target_identity_matches() {
   if [ "$target_identity_mode" = "proc" ] && [ -r "/proc/$target_pid/stat" ]; then
-    current_target_start="$(awk '{ sub(/.*\\) /, ""); print $20 }' "/proc/$target_pid/stat" 2>/dev/null || true)"
+    current_target_start="$(run_process_probe awk '{ sub(/.*\\) /, ""); print $20 }' "/proc/$target_pid/stat" 2>/dev/null || true)"
     [ -n "$current_target_start" ] && [ "$current_target_start" = "$target_starttime" ]
     return
   fi
   if [ "$target_identity_mode" = "ps" ]; then
-    current_target_ps_start="$(ps -o lstart= -p "$target_pid" 2>/dev/null | awk 'NR == 1 { sub(/^[ \\t]*/, ""); sub(/[ \\t]*$/, ""); print; exit }')"
+    current_target_ps_start="$(ps_identity_for_pid "$target_pid" 2>/dev/null || true)"
     [ -n "$current_target_ps_start" ] && [ "$current_target_ps_start" = "$target_ps_start" ]
     return
   fi
@@ -208,7 +254,7 @@ target_identity_matches() {
 target_is_alive() {
   if ! target_identity_matches; then return 1; fi
   if [ -r "/proc/$target_pid/stat" ]; then
-    target_state="$(awk '{ sub(/.*\) /, ""); print $1 }' "/proc/$target_pid/stat" 2>/dev/null || true)"
+    target_state="$(run_process_probe awk '{ sub(/.*\) /, ""); print $1 }' "/proc/$target_pid/stat" 2>/dev/null || true)"
     [ -n "$target_state" ] && [ "$target_state" != "Z" ] && kill -0 "$target_pid" 2>/dev/null
     return
   fi
@@ -217,8 +263,8 @@ target_is_alive() {
 stop_anchor() {
   refresh_target_reference
   if target_identity_matches; then
-    anchor_pgid="$(ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ' || true)"
-    wrapper_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' || true)"
+    anchor_pgid="$(run_process_probe ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ' || true)"
+    wrapper_pgid="$(run_process_probe ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' || true)"
     case "$anchor_pgid" in
       ''|*[!0-9]*) ;;
       *)
@@ -235,26 +281,6 @@ stop_anchor() {
     if ! wait_for_process_dead "$target_pid"; then cleanup_ack_enabled=0; fi
   fi
 }
-run_bounded() {
-  bounded_seconds="$1"
-  shift
-  if command -v perl >/dev/null 2>&1; then
-    perl -e 'my $seconds = shift @ARGV; alarm $seconds; exec @ARGV or exit 127' "$bounded_seconds" "$@"
-    return $?
-  fi
-  if command -v timeout >/dev/null 2>&1; then
-    timeout "$bounded_seconds" "$@"
-    return $?
-  fi
-  return 125
-}
-run_snapshot_command() {
-  if [ "\${snapshot_deadline_epoch:-0}" -gt 0 ]; then
-    run_bounded 1 "$@"
-  else
-    "$@"
-  fi
-}
 snapshot_deadline_exceeded() {
   [ "\${snapshot_deadline_epoch:-0}" -gt 0 ] || return 1
   snapshot_now="$(date +%s 2>/dev/null || true)"
@@ -267,7 +293,7 @@ set_snapshot_deadline() {
   snapshot_now="$(date +%s 2>/dev/null || true)"
   case "$snapshot_now" in
     ''|*[!0-9]*) snapshot_deadline_epoch=1 ;;
-    *) snapshot_deadline_epoch=$((snapshot_now + 3)) ;;
+    *) snapshot_deadline_epoch=$((snapshot_now + 10)) ;;
   esac
 }
 process_identity() {
@@ -279,16 +305,9 @@ process_identity() {
       return 0
     fi
   fi
-  process_ps_start="$(LC_ALL=C run_snapshot_command ps -o lstart= -p "$process_id" 2>/dev/null | run_snapshot_command awk '
-    $1 ~ /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat)$/ &&
-    $2 ~ /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$/ &&
-    $3 ~ /^[0-9][0-9]*$/ &&
-    $4 ~ /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/ &&
-    $5 ~ /^[0-9][0-9][0-9][0-9]$/ { print $1, $2, $3, $4, $5; exit }
-  ')"
-  if [ -n "$process_ps_start" ]; then
-    process_ps_start="$(printf '%s\n' "$process_ps_start" | run_snapshot_command awk 'NR == 1 { print $1, $2, $3, $4, $5; exit }')"
-    printf 'ps:%s\n' "$process_ps_start"
+  process_ps_identity="$(ps_identity_for_pid "$process_id" 2>/dev/null || true)"
+  if [ -n "$process_ps_identity" ]; then
+    printf '%s\n' "$process_ps_identity"
     return 0
   fi
   return 1
@@ -352,6 +371,7 @@ wait_for_process_dead() {
   process_wait_pid="$1"
   process_wait_attempt=0
   while [ "$process_wait_attempt" -lt 20 ]; do
+    if snapshot_deadline_exceeded; then return 1; fi
     process_liveness "$process_wait_pid"
     case "$process_liveness_result" in
       dead) return 0 ;;
@@ -360,6 +380,7 @@ wait_for_process_dead() {
     esac
     process_wait_attempt=$((process_wait_attempt + 1))
   done
+  if snapshot_deadline_exceeded; then return 1; fi
   process_liveness "$process_wait_pid"
   [ "$process_liveness_result" = "dead" ]
 }
@@ -369,12 +390,12 @@ identity_is_valid() {
     *) return 1 ;;
   esac
   case "$1" in
-    *"
+    *"|"*|*"
 "*) return 1 ;;
   esac
 }
 normalize_process_identity() {
-  normalized_identity="$(printf '%s\n' "$1" | awk '/^(proc|ps):/ { print; exit }')"
+  normalized_identity="$(printf '%s\n' "$1" | run_process_probe awk '/^(proc|ps):/ { print; exit }')"
   if identity_is_valid "$normalized_identity"; then
     printf '%s\n' "$normalized_identity"
   else
@@ -382,10 +403,63 @@ normalize_process_identity() {
   fi
 }
 process_group_id() {
-  process_group="$(run_snapshot_command ps -o pgid= -p "$1" 2>/dev/null | run_snapshot_command awk '{ gsub(/[[:space:]]/, ""); if ($0 ~ /^[1-9][0-9]*$/) { print; exit } }')"
+  process_group="$(run_process_probe ps -o pgid= -p "$1" 2>/dev/null | run_process_probe awk '{ gsub(/[[:space:]]/, ""); if ($0 ~ /^[1-9][0-9]*$/) { print; exit } }')"
   case "$process_group" in
     ''|0|*[!0-9]*) return 1 ;;
     *) printf '%s\n' "$process_group" ;;
+  esac
+}
+captured_group_has_member() {
+  captured_group="$1"
+  case "$captured_group" in ''|0|*[!0-9]*) return 1 ;; esac
+  run_process_probe ps -eo pid=,pgid= 2>/dev/null | run_process_probe awk -v wanted="$captured_group" '
+    $1 ~ /^[0-9]+$/ && $2 == wanted { found = 1; exit }
+    END { exit(found ? 0 : 1) }
+  '
+}
+captured_group_is_orphaned() {
+  captured_group="$1"
+  case "$captured_group" in ''|0|*[!0-9]*) return 1 ;; esac
+  run_process_probe ps -eo pid=,pgid= 2>/dev/null | run_process_probe awk -v wanted="$captured_group" '
+    $1 ~ /^[0-9]+$/ && $2 == wanted { member = 1; if ($1 == wanted) leader = 1 }
+    END { exit(member && !leader ? 0 : 1) }
+  '
+}
+captured_group_has_live_process() {
+  captured_group="$1"
+  case "$captured_group" in ''|0|*[!0-9]*) return 1 ;; esac
+  run_process_probe ps -eo pid=,pgid=,state= 2>/dev/null | run_process_probe awk -v wanted="$captured_group" '
+    $1 ~ /^[0-9]+$/ && $2 == wanted && $3 !~ /^Z/ { found = 1; exit }
+    END { exit(found ? 0 : 1) }
+  '
+}
+captured_group_has_live_member() {
+  wanted_group="$1"
+  [ -f "$captured_descendants_path" ] || return 1
+  while IFS='|' read -r live_member_pid live_member_identity live_member_pgid live_member_extra; do
+    [ -n "$live_member_pid$live_member_identity$live_member_pgid$live_member_extra" ] || continue
+    [ "$live_member_pgid" = "$wanted_group" ] || continue
+    [ -z "$live_member_extra" ] || continue
+    case "$live_member_pid" in ''|*[!0-9]*) continue ;; esac
+    [ "$live_member_pid" = "$$" ] && continue
+    [ "$live_member_pid" = "$target_pid" ] && continue
+    identity_is_valid "$live_member_identity" || continue
+    process_liveness "$live_member_pid"
+    [ "$process_liveness_result" = "live" ] || continue
+    live_member_current_identity="$(process_identity "$live_member_pid" 2>/dev/null || true)"
+    live_member_current_identity="$(normalize_process_identity "$live_member_current_identity" 2>/dev/null || true)"
+    live_member_current_pgid="$(process_group_id "$live_member_pid" 2>/dev/null || true)"
+    if [ "$live_member_current_identity" = "$live_member_identity" ] && [ "$live_member_current_pgid" = "$wanted_group" ]; then return 0; fi
+  done < "$captured_descendants_path"
+  return 1
+}
+captured_group_can_be_signaled() {
+  captured_group_identity="$1"
+  captured_group="$2"
+  if captured_group_has_live_member "$captured_group"; then return 0; fi
+  case "$captured_group_identity" in
+    proc:*) captured_group_is_orphaned "$captured_group" ;;
+    *) return 1 ;;
   esac
 }
 descendants_for_roots() {
@@ -509,9 +583,19 @@ owned_descendants() {
       case "$captured_pgid" in ''|0|*[!0-9]*) cleanup_ack_enabled=0; return 1 ;; esac
       owned_roots="$owned_roots $captured_pid"
       if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
+      if [ "$captured_pgid" = "$wrapper_pgid" ] || [ "$captured_pgid" = "$target_pgid" ]; then continue; fi
       process_liveness "$captured_pid"
       case "$process_liveness_result" in
-        dead) continue ;;
+        dead)
+          if captured_group_has_member "$captured_pgid"; then
+            if captured_group_can_be_signaled "$captured_identity" "$captured_pgid"; then
+              if [ "$captured_pgid" != "$wrapper_pgid" ]; then owned_groups="$owned_groups $captured_pgid"; fi
+            else
+              cleanup_ack_enabled=0
+            fi
+          fi
+          continue
+          ;;
         live) ;;
         *) cleanup_ack_enabled=0; return 1 ;;
       esac
@@ -640,7 +724,9 @@ quiesce_captured_descendants() {
     case "$captured_pgid" in ''|0|*[!0-9]*) cleanup_ack_enabled=0; return 1 ;; esac
     process_liveness "$captured_pid"
     case "$process_liveness_result" in
-      dead) continue ;;
+      dead)
+        continue
+        ;;
       live) ;;
       *) cleanup_ack_enabled=0; return 1 ;;
     esac
@@ -722,7 +808,7 @@ reconcile_captured_descendants() {
     case "$process_liveness_result" in
       dead)
         if [ "$captured_pgid" = "$reconcile_target_pgid" ]; then continue; fi
-        cleanup_ack_enabled=0
+        if captured_group_has_member "$captured_pgid" && ! captured_group_can_be_signaled "$captured_identity" "$captured_pgid"; then cleanup_ack_enabled=0; fi
         printf '%s|%s|%s\n' "$captured_pid" "$captured_identity" "$captured_pgid" >> "$reconcile_next_path" || { cleanup_ack_enabled=0; return 1; }
         continue
         ;;
@@ -754,7 +840,20 @@ signal_captured_descendants() {
     current_captured_identity="$(normalize_process_identity "$current_captured_identity" 2>/dev/null || true)"
     if ! identity_is_valid "$current_captured_identity"; then
       process_liveness "$captured_pid"
-      case "$process_liveness_result" in dead) continue ;; esac
+      case "$process_liveness_result" in
+        dead)
+          if [ "$captured_pgid" = "$wrapper_pgid" ] || [ "$captured_pgid" = "$target_pgid" ]; then continue; fi
+          if captured_group_has_member "$captured_pgid"; then
+            if captured_group_can_be_signaled "$captured_identity" "$captured_pgid" && [ "$captured_pgid" != "$wrapper_pgid" ] && [ "$captured_pgid" != "$target_pgid" ]; then
+              if ! kill -"$signal" "-$captured_pgid" 2>/dev/null; then cleanup_ack_enabled=0; fi
+            else
+              cleanup_ack_enabled=0
+            fi
+          fi
+          continue
+          ;;
+        *) ;;
+      esac
       cleanup_ack_enabled=0
       continue
     fi
@@ -788,11 +887,11 @@ signal_tree() {
   fi
   start_snapshot
   snapshot_ready_before_signal="$snapshot_ready_observed"
-  wrapper_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' || true)"
+  wrapper_pgid="$(run_process_probe ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' || true)"
   current_target_pgid=""
   group_signal_succeeded=0
   if target_identity_matches; then
-    current_target_pgid="$(ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ' || true)"
+    current_target_pgid="$(run_process_probe ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ' || true)"
   fi
   if [ "$signal" = "KILL" ] && [ "$snapshot_ready_before_signal" = "1" ] && [ ! -e "$snapshot_failed_path" ]; then
     prepare_kill_ownership || cleanup_ack_enabled=0
@@ -810,7 +909,7 @@ signal_tree() {
   wait_for_snapshot
   if [ -e "$descendant_scan_truncated_path" ] || [ -e "$descendant_scan_failed_path" ] || [ -e "$snapshot_failed_path" ] || [ "$snapshot_ready_before_signal" != "1" ]; then cleanup_ack_enabled=0; fi
   if [ "$signal" = "KILL" ] && [ "$snapshot_ready_before_signal" = "1" ] && [ ! -e "$snapshot_failed_path" ]; then signal_captured_descendants; fi
-  if [ "$group_signal_succeeded" = "1" ] || ! target_identity_matches; then snapshot_deadline_epoch=0; return; fi
+  if [ "$group_signal_succeeded" = "1" ] || ! target_identity_matches; then return; fi
   for pid in $(descendants); do
     [ "$pid" = "$$" ] && continue
     process_liveness "$pid"
@@ -829,7 +928,6 @@ signal_tree() {
     fi
   done
   if [ -e "$descendant_scan_truncated_path" ] || [ -e "$descendant_scan_failed_path" ] || [ -e "$snapshot_failed_path" ]; then cleanup_ack_enabled=0; fi
-  snapshot_deadline_epoch=0
 }
 captured_identity_for_pid() {
   captured_lookup_pid="$1"
@@ -852,7 +950,29 @@ verify_captured_descendants() {
     case "$captured_pgid" in ''|0|*[!0-9]*) cleanup_ack_enabled=0; return 1 ;; esac
     process_liveness "$captured_pid"
     case "$process_liveness_result" in
-      dead) continue ;;
+      dead)
+        if captured_group_has_live_process "$captured_pgid"; then
+          if [ "$captured_pgid" != "$wrapper_pgid" ] && [ "$captured_pgid" != "$target_pgid" ]; then
+            if captured_group_can_be_signaled "$captured_identity" "$captured_pgid"; then
+              kill -KILL "-$captured_pgid" 2>/dev/null || true
+            else
+              cleanup_ack_enabled=0
+              return 1
+            fi
+          fi
+          captured_group_attempt=0
+          while [ "$captured_group_attempt" -lt 5 ] && ! snapshot_deadline_exceeded; do
+            sleep 0.05
+            if ! captured_group_has_live_process "$captured_pgid"; then break; fi
+            if [ "$captured_pgid" != "$wrapper_pgid" ] && [ "$captured_pgid" != "$target_pgid" ]; then
+              kill -KILL "-$captured_pgid" 2>/dev/null || true
+            fi
+            captured_group_attempt=$((captured_group_attempt + 1))
+          done
+          if captured_group_has_live_process "$captured_pgid"; then cleanup_ack_enabled=0; return 1; fi
+        fi
+        continue
+        ;;
       live) ;;
       *) cleanup_ack_enabled=0; return 1 ;;
     esac
@@ -997,13 +1117,14 @@ terminate_supervised_tree() {
   verify_descendant_cleanup
   stop_anchor
   stop_watchdog
+  snapshot_deadline_epoch=0
   cleanup
 }
 hold_pid=""
 trap 'if [ "$termination_started" = "1" ]; then :; else if [ -n "$hold_pid" ]; then kill "$hold_pid" 2>/dev/null || true; fi; terminate_supervised_tree; exit 143; fi' HUP INT TERM
 parent_is_alive() {
   if [ "$parent_identity_mode" = "proc" ] && [ -r "/proc/$parent_pid/stat" ]; then
-    parent_identity="$(awk '{ sub(/.*\\) /, ""); print $1 " " $20 }' "/proc/$parent_pid/stat" 2>/dev/null || true)"
+    parent_identity="$(run_watchdog_probe awk '{ sub(/.*\\) /, ""); print $1 " " $20 }' "/proc/$parent_pid/stat" 2>/dev/null || true)"
     parent_state="\${parent_identity%% *}"
     current_starttime="\${parent_identity#* }"
     [ "$parent_state" != "Z" ] && [ -n "$parent_state" ] && {
@@ -1012,8 +1133,8 @@ parent_is_alive() {
     return
   fi
   if [ "$parent_identity_mode" = "ps" ]; then
-    current_ps_start="$(ps -o lstart= -p "$parent_pid" 2>/dev/null | awk 'NR == 1 { sub(/^[ \t]*/, ""); sub(/[ \t]*$/, ""); print; exit }')"
-    current_ps_state="$(ps -o state= -p "$parent_pid" 2>/dev/null | awk 'NR == 1 { gsub(/[[:space:]]/, ""); print; exit }')"
+    current_ps_start="$(ps_identity_for_pid "$parent_pid" watchdog 2>/dev/null || true)"
+    current_ps_state="$(run_watchdog_probe ps -o state= -p "$parent_pid" 2>/dev/null | run_watchdog_probe awk 'NR == 1 { gsub(/[[:space:]]/, ""); print; exit }')"
     [ -n "$current_ps_start" ] && [ "$current_ps_start" = "$parent_ps_start" ] && [ "$current_ps_state" != "Z" ]
     return
   fi
@@ -1158,7 +1279,7 @@ async function removeCleanupAckRoot(path: string): Promise<void> {
 }
 
 async function waitForCleanupAck(path: string, wrapperExited: Promise<number>): Promise<boolean> {
-  const deadline = Date.now() + 5_000;
+  const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
     if (await consumeCleanupAck(path)) return true;
     const wrapperDone = await Promise.race([

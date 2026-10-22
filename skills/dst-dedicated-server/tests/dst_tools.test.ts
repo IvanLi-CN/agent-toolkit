@@ -1174,6 +1174,72 @@ esac
     }
   });
 
+  test("cleans an orphaned group after its captured leader exits during termination", { timeout: 15_000 }, async () => {
+    if (process.platform === "win32") return;
+    const setsidCheck = Bun.spawnSync(["sh", "-c", "command -v setsid"], { stdout: "ignore", stderr: "ignore" });
+    if (setsidCheck.exitCode !== 0) return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-orphaned-group-"));
+    const controllerScript = join(root, "controller.sh");
+    const leaderScript = join(root, "leader.sh");
+    const childScript = join(root, "child.sh");
+    const leaderMarker = join(root, "leader.pid");
+    const childMarker = join(root, "child.pid");
+    await writeFile(childScript, "#!/bin/sh\ntrap ':' TERM\nsleep 30\n", "utf8");
+    await chmod(childScript, 0o755);
+    await writeFile(leaderScript, "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$1\"\ntrap 'sh \"$3\" & printf \"%s\\n\" \"$!\" > \"$2\"; exit 0' TERM\nwhile :; do :; done\n", "utf8");
+    await chmod(leaderScript, 0o755);
+    await writeFile(controllerScript, "#!/bin/sh\nsetsid \"$1\" \"$2\" \"$3\" \"$4\" & leader=\"$!\"\ntrap 'kill -TERM \"$leader\" 2>/dev/null || true; exit 0' TERM\nwhile kill -0 \"$leader\" 2>/dev/null; do :; done\n", "utf8");
+    await chmod(controllerScript, 0o755);
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    let descendantPid: number | undefined;
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    try {
+      supervised = await spawnSupervised(["sh", controllerScript, leaderScript, leaderMarker, childMarker, childScript]);
+      let leaderPid: number | undefined;
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        try {
+          leaderPid = Number((await readFile(leaderMarker, "utf8")).trim());
+          break;
+        } catch {
+          await Bun.sleep(25);
+        }
+      }
+      expect(Number.isInteger(leaderPid)).toBe(true);
+      expect(leaderPid === undefined ? false : isAlive(leaderPid)).toBe(true);
+      supervised.child.kill("SIGTERM");
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(true);
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        try {
+          descendantPid = Number((await readFile(childMarker, "utf8")).trim());
+          break;
+        } catch {
+          await Bun.sleep(25);
+        }
+      }
+      expect(Number.isInteger(descendantPid)).toBe(true);
+      await supervised.wrapperExited;
+      for (let attempt = 0; attempt < 30 && descendantPid !== undefined && isAlive(descendantPid); attempt += 1) await Bun.sleep(100);
+      expect(descendantPid === undefined ? false : isAlive(descendantPid)).toBe(false);
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (descendantPid !== undefined && isAlive(descendantPid)) {
+        try { process.kill(descendantPid, "SIGKILL"); } catch { /* The descendant may have exited. */ }
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("fails closed when detached descendant enumeration is truncated", { timeout: 30_000 }, async () => {
     if (process.platform === "win32") return;
     const setsidCheck = Bun.spawnSync(["sh", "-c", "command -v setsid"], { stdout: "ignore", stderr: "ignore" });

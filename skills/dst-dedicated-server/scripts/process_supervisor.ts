@@ -99,9 +99,13 @@ ps_identity_for_pid() {
     $5 ~ /^[0-9][0-9][0-9][0-9]$/ { print $1, $2, $3, $4, $5; exit }
   ')"
   ps_identity_pgid="$($ps_identity_runner ps -o pgid= -p "$ps_identity_pid" 2>/dev/null | $ps_identity_runner awk 'NR == 1 { gsub(/[[:space:]]/, ""); if ($0 ~ /^[0-9]+$/) print; exit }')"
+  ps_identity_ppid="$($ps_identity_runner ps -o ppid= -p "$ps_identity_pid" 2>/dev/null | $ps_identity_runner awk 'NR == 1 { gsub(/[[:space:]]/, ""); if ($0 ~ /^[0-9]+$/) print; exit }')"
   ps_identity_command_hash="$($ps_identity_runner ps -o command= -p "$ps_identity_pid" 2>/dev/null | $ps_identity_runner cksum | $ps_identity_runner awk 'NR == 1 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { print $1 ":" $2; exit }')"
-  if [ -n "$ps_identity_start" ] && [ -n "$ps_identity_pgid" ] && [ -n "$ps_identity_command_hash" ]; then
-    printf 'ps:%s;pgid=%s;cmd=%s\n' "$ps_identity_start" "$ps_identity_pgid" "$ps_identity_command_hash"
+  # macOS does not expose /proc start ticks. Binding the second-resolution
+  # start time to the current parent, group, and command prevents a detached
+  # process from being re-authorized after it is reparented.
+  if [ -n "$ps_identity_start" ] && [ -n "$ps_identity_pgid" ] && [ -n "$ps_identity_ppid" ] && [ -n "$ps_identity_command_hash" ]; then
+    printf 'ps:%s;ppid=%s;pgid=%s;cmd=%s\n' "$ps_identity_start" "$ps_identity_ppid" "$ps_identity_pgid" "$ps_identity_command_hash"
     return 0
   fi
   return 1
@@ -260,7 +264,7 @@ target_identity_matches() {
   fi
   if [ "$target_identity_mode" = "ps" ]; then
     current_target_ps_start="$(ps_identity_for_pid "$target_pid" 2>/dev/null || true)"
-    [ -n "$current_target_ps_start" ] && [ "$current_target_ps_start" = "$target_ps_start" ]
+    [ -n "$current_target_ps_start" ] && [ "$current_target_ps_start" = "$target_ps_start" ] && captured_process_can_be_signaled "$current_target_ps_start"
     return
   fi
   return 1
@@ -277,10 +281,6 @@ target_is_alive() {
 stop_anchor() {
   refresh_target_reference
   if target_identity_matches; then
-    if [ "$target_identity_mode" = "ps" ]; then
-      cleanup_ack_enabled=0
-      return
-    fi
     anchor_pgid="$(run_process_probe ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ' || true)"
     wrapper_pgid="$(run_process_probe ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' || true)"
     case "$anchor_pgid" in
@@ -416,6 +416,18 @@ identity_is_valid() {
 captured_process_can_be_signaled() {
   case "$1" in
     proc:*) return 0 ;;
+    ps:*';ppid='*';pgid='*';cmd='*)
+      captured_ps_identity="\${1#ps:}"
+      captured_ps_ppid="\${captured_ps_identity#*;ppid=}"
+      captured_ps_ppid="\${captured_ps_ppid%%;pgid=*}"
+      captured_ps_pgid="\${captured_ps_identity#*;pgid=}"
+      captured_ps_pgid="\${captured_ps_pgid%%;cmd=*}"
+      captured_ps_command_hash="\${captured_ps_identity#*;cmd=}"
+      case "$captured_ps_ppid" in ''|*[!0-9]*) return 1 ;; esac
+      case "$captured_ps_pgid" in ''|*[!0-9]*) return 1 ;; esac
+      case "$captured_ps_command_hash" in ''|*[!0-9:]*) return 1 ;; esac
+      return 0
+      ;;
     *) return 1 ;;
   esac
 }
@@ -474,10 +486,7 @@ captured_group_can_be_signaled() {
   captured_group_identity="$1"
   captured_group="$2"
   captured_group_allow_target="\${3:-}"
-  # macOS lstart is only second-resolution; never authorize a captured descendant group from it.
-  case "$captured_group_identity" in
-    ps:*) return 1 ;;
-  esac
+  captured_process_can_be_signaled "$captured_group_identity" || return 1
   capture_group_members "$captured_group"
   captured_group_probe_status=$?
   [ "$captured_group_probe_status" -eq 0 ] || return "$captured_group_probe_status"
@@ -839,6 +848,7 @@ quiesce_captured_descendants() {
     if [ "$current_captured_pgid" != "$captured_pgid" ]; then cleanup_ack_enabled=0; return 1; fi
     if [ "$current_captured_pgid" = "$wrapper_pgid" ]; then cleanup_ack_enabled=0; return 1; fi
     if [ -n "$target_group_for_quiesce" ] && [ "$current_captured_pgid" = "$target_group_for_quiesce" ]; then continue; fi
+    captured_process_can_be_signaled "$captured_identity" || { cleanup_ack_enabled=0; return 1; }
     if ! kill -STOP "-$current_captured_pgid" 2>/dev/null; then cleanup_ack_enabled=0; return 1; fi
   done < "$captured_descendants_path" || { cleanup_ack_enabled=0; return 1; }
 }
@@ -1169,6 +1179,7 @@ verify_captured_descendants() {
       return 1
     fi
     if [ "$captured_pgid" != "$wrapper_pgid" ] && [ "$captured_pgid" != "$target_pgid" ]; then
+      captured_group_can_be_signaled "$captured_identity" "$captured_pgid" || { cleanup_ack_enabled=0; return 1; }
       kill -KILL "-$captured_pgid" 2>/dev/null || true
     else
       captured_process_can_be_signaled "$captured_identity" || { cleanup_ack_enabled=0; return 1; }

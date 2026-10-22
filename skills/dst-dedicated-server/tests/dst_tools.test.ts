@@ -843,7 +843,7 @@ case "$*" in
 esac
 `);
       await writeFile(fakePs, `#!/bin/sh
-if [ -e "$AGENT_TOOLKIT_TEST_PS_FAIL" ]; then exit 1; fi
+if [ -e "$AGENT_TOOLKIT_TEST_PS_FAIL" ]; then printf 'malformed process row\\n'; exit 0; fi
 exec /bin/ps "$@"
 `);
       await chmod(fakeSsh, 0o755);
@@ -857,6 +857,78 @@ exec /bin/ps "$@"
       expect(result.status).toBe(1);
       const report = await readFile(output, "utf8");
       expect(report).toContain("output limit");
+      expect(report).toContain("cleanup could not be verified");
+      expect(report).not.toContain("command could not be started");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves an SSH connectivity failure when cleanup acknowledgement fails", { timeout: 90_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-connectivity-cleanup-"));
+    const previousPath = process.env.PATH;
+    try {
+      const fakeSsh = join(root, "ssh");
+      const fakePs = join(root, "ps");
+      const trigger = join(root, "fail-process-scan");
+      await writeFile(fakeSsh, `#!/bin/sh
+case "$*" in
+  *"echo ok"*) sleep 0.5; touch "$AGENT_TOOLKIT_TEST_PS_FAIL"; echo "fixture SSH connectivity denied" >&2; exit 1 ;;
+  *) cat >/dev/null; exit 0 ;;
+esac
+`);
+      await writeFile(fakePs, `#!/bin/sh
+if [ -e "$AGENT_TOOLKIT_TEST_PS_FAIL" ]; then printf 'malformed process row\\n'; exit 0; fi
+exec /bin/ps "$@"
+`);
+      await chmod(fakeSsh, 0o755);
+      await chmod(fakePs, 0o755);
+      const output = join(root, "snapshot.md");
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
+        ["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", output],
+        { ...process.env, PATH: `${root}:${previousPath ?? ""}`, AGENT_TOOLKIT_TEST_PS_FAIL: trigger } as Record<string, string>,
+      );
+      expect(result.status).toBe(0);
+      const report = await readFile(output, "utf8");
+      expect(report).toContain("Remote SSH failed");
+      expect(report).toContain("fixture SSH connectivity denied");
+      expect(report).toContain("cleanup could not be verified");
+      expect(report).not.toContain("command could not be started");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves a remote command failure when cleanup acknowledgement fails", { timeout: 90_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-command-cleanup-"));
+    const previousPath = process.env.PATH;
+    try {
+      const fakeSsh = join(root, "ssh");
+      const fakePs = join(root, "ps");
+      const trigger = join(root, "fail-process-scan");
+      await writeFile(fakeSsh, `#!/bin/sh
+case "$*" in
+  *"echo ok"*) exit 0 ;;
+  *) cat >/dev/null; sleep 0.5; touch "$AGENT_TOOLKIT_TEST_PS_FAIL"; echo "fixture remote command denied" >&2; exit 1 ;;
+esac
+`);
+      await writeFile(fakePs, `#!/bin/sh
+if [ -e "$AGENT_TOOLKIT_TEST_PS_FAIL" ]; then printf 'malformed process row\\n'; exit 0; fi
+exec /bin/ps "$@"
+`);
+      await chmod(fakeSsh, 0o755);
+      await chmod(fakePs, 0o755);
+      const output = join(root, "snapshot.md");
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
+        ["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", output],
+        { ...process.env, PATH: `${root}:${previousPath ?? ""}`, AGENT_TOOLKIT_TEST_PS_FAIL: trigger } as Record<string, string>,
+      );
+      expect(result.status).toBe(1);
+      const report = await readFile(output, "utf8");
+      expect(report).toContain("Remote collection command failed");
+      expect(report).toContain("fixture remote command denied");
       expect(report).toContain("cleanup could not be verified");
       expect(report).not.toContain("command could not be started");
     } finally {
@@ -879,7 +951,7 @@ echo "fixture SSH denied" >&2
 exit 1
 `);
       await writeFile(fakePs, `#!/bin/sh
-if [ -e "$AGENT_TOOLKIT_TEST_PS_FAIL" ]; then exit 1; fi
+if [ -e "$AGENT_TOOLKIT_TEST_PS_FAIL" ]; then printf 'malformed process row\\n'; exit 0; fi
 exec /bin/ps "$@"
 `);
       await chmod(fakeSsh, 0o755);

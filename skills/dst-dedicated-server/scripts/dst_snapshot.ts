@@ -920,16 +920,17 @@ async function remoteCollect(options: SnapshotOptions, script: string): Promise<
     if (!connectivity.cleanupVerified) lines.splice(lines.length - 1, 0, "> Local process cleanup could not be verified; remote collection was not attempted.");
     return { text: lines.join("\n"), failed: false };
   }
-  if (!connectivity.cleanupVerified) {
-    lines.push("> Local process cleanup could not be verified; remote collection was not attempted.", "");
-    return { text: lines.join("\n"), failed: true };
-  }
   if (connectivity.exitCode !== 0) {
     lines.push("> Remote SSH failed (host down, wrong IP/port, or missing SSH key).");
     const detail = renderReportInline(connectivity.stderr.trim(), [options.host, options.user]);
     if (detail.length > 0) lines.push(`> Reason: ${detail}`);
+    if (!connectivity.cleanupVerified) lines.push("> Local process cleanup could not be verified.");
     lines.push("> Next step: verify reachability and run the configured SSH target interactively, then re-run this script.", "");
     return { text: lines.join("\n"), failed: false };
+  }
+  if (!connectivity.cleanupVerified) {
+    lines.push("> Local process cleanup could not be verified; remote collection was not attempted.", "");
+    return { text: lines.join("\n"), failed: true };
   }
 
   let result: CommandResult;
@@ -954,15 +955,16 @@ async function remoteCollect(options: SnapshotOptions, script: string): Promise<
     lines.push("");
     return { text: lines.join("\n"), failed: true };
   }
-  if (!result.cleanupVerified) {
-    lines.push("> Remote collection completed but local process cleanup could not be verified.", "");
-    return { text: lines.join("\n"), failed: true };
-  }
   if (result.exitCode !== 0) {
     lines.push("> Remote collection command failed.");
     const detail = renderReportInline(result.stderr.trim(), [options.host, options.user]);
     if (detail.length > 0) lines.push(`> Reason: ${detail}`);
+    if (!result.cleanupVerified) lines.push("> Local process cleanup could not be verified.");
     lines.push("");
+    return { text: lines.join("\n"), failed: true };
+  }
+  if (!result.cleanupVerified) {
+    lines.push("> Remote collection completed but local process cleanup could not be verified.", "");
     return { text: lines.join("\n"), failed: true };
   }
   lines.push(renderReportCodeBlock(result.stdout.trimEnd(), [options.host, options.user, homedir()]), "");

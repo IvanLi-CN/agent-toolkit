@@ -38,6 +38,8 @@ from urllib.parse import quote, urlencode
 
 PROTOCOL_VERSION = 4
 MEMORY_SETTLE_SECONDS = 45
+TRANSITIONAL_ADMISSION_WAIT_SECONDS = 30
+TRANSITIONAL_ADMISSION_POLL_SECONDS = 0.25
 GUEST_READINESS_BUDGET_SECONDS = 300
 GUEST_READINESS_DIAGNOSTIC_SECONDS = 120
 DIAGNOSTIC_COMMAND_TIMEOUT_SECONDS = 5
@@ -2961,6 +2963,42 @@ class Control:
             self.store.put_task(record)
             return record
 
+    def _reserve_resources_with_transition_wait(
+        self,
+        task: Mapping[str, Any],
+        resources: Mapping[str, int],
+        *,
+        admission_epoch: str | None = None,
+    ) -> dict[str, Any]:
+        """Wait for an unrelated native cleanup to leave the admission fence.
+
+        Lease expiry cleanup is deliberately outside the global admission lock
+        while it performs native Incus work. A new acquire may therefore observe
+        a short-lived transitional instance even though the durable state is
+        healthy. Keep the same operation pending during that narrow window;
+        every other unverified condition still fails closed immediately.
+        """
+        started = time.monotonic()
+        attempts = 0
+        while True:
+            try:
+                return self._reserve_resources(task, resources, admission_epoch=admission_epoch)
+            except ControlError as exc:
+                if (exc.code != "resource_unverified"
+                        or exc.message != "transitional native instance blocks admission"):
+                    raise
+                elapsed = time.monotonic() - started
+                remaining = TRANSITIONAL_ADMISSION_WAIT_SECONDS - elapsed
+                if remaining <= 0:
+                    detail = dict(exc.detail) if isinstance(exc.detail, Mapping) else {}
+                    detail.update({
+                        "admission_wait_seconds": round(max(0.0, elapsed), 3),
+                        "admission_retry_count": attempts,
+                    })
+                    raise ControlError(exc.code, exc.message, detail) from exc
+                attempts += 1
+                time.sleep(min(TRANSITIONAL_ADMISSION_POLL_SECONDS, remaining))
+
     def _reserve_native(self, task: Mapping[str, Any], cost: int, *, inventory: set[int] | None = None,
                         ssh_port: int | None = None) -> dict[str, Any]:
         facts = self._storage_headroom(cost)
@@ -3948,7 +3986,7 @@ class Control:
         # The deadline/timer exists before either starting the guest or exposing NAT.
         task["lease_expires_at"] = iso_time(self.now() + dt.timedelta(seconds=self.config["initial_lease_seconds"]))
         reserved = {key: max(old[key], resources[key]) for key in old} if cached else resources
-        task = self._reserve_resources(task, reserved, admission_epoch=admission_epoch)
+        task = self._reserve_resources_with_transition_wait(task, reserved, admission_epoch=admission_epoch)
         completed = []
         phase = "reservation"
         stage_timings: dict[str, Any] = {}

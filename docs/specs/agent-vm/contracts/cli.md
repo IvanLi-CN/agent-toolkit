@@ -40,7 +40,7 @@ Unknown flags and command layouts must be rejected; callers should use `--help` 
 
 Session-scoped requests contain `protocol`, `action` and `session_id`; the sessionless read-only `admin-metrics` request omits `session_id` and `operation_id`. Mutations also contain `generation` and `operation_id`. Success envelopes contain `ok`, `protocol`, `server_time`, `action`, `session_id`, `generation`, `operation_id`, `outcome` and `result`. Error diagnostics are JSON on stderr with a nonzero exit status. A transport timeout reports the operation ID without claiming whether the mutation completed. A state-database failure reports `sqlite_unavailable` with `phase`, SQLite code/name, SQL operation category and `state_committed`; `null` means a commit result is unknown and the original operation remains subject to status/reconciliation.
 
-Acquire, restart and restart-capable resize use a longer bounded transport timeout. No command implicitly renews a lease. Retry an uncertain mutation only with the original operation ID and generation after inspecting status or reconciliation.
+Acquire, restart and restart-capable resize use a longer bounded transport timeout. Acquire may spend a separate bounded wait for an unrelated native lease-expiry cleanup to leave its transitional state; this wait keeps the same operation ID and does not create a second intent. No command implicitly renews a lease. Retry an uncertain mutation only with the original operation ID and generation after inspecting status or reconciliation.
 
 ## SSH and ports
 

@@ -1593,6 +1593,113 @@ exec /bin/ps "$@"
     }
   });
 
+  test("cleans a target through the supervisor fallback path", { timeout: 30_000 }, async () => {
+    if (process.platform === "win32") return;
+    const previousDisableSetsid = process.env.AGENT_TOOLKIT_SUPERVISOR_DISABLE_SETSID;
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    process.env.AGENT_TOOLKIT_SUPERVISOR_DISABLE_SETSID = "1";
+    try {
+      supervised = await spawnSupervised(["sh", "-c", "sleep 30"]);
+      supervised.child.kill("SIGTERM");
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(true);
+      await supervised.wrapperExited;
+    } finally {
+      if (previousDisableSetsid === undefined) delete process.env.AGENT_TOOLKIT_SUPERVISOR_DISABLE_SETSID;
+      else process.env.AGENT_TOOLKIT_SUPERVISOR_DISABLE_SETSID = previousDisableSetsid;
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+    }
+  });
+
+  test("cleans the authenticated target group after its anchor dies", { timeout: 30_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-anchor-loss-"));
+    const marker = join(root, "child.pid");
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    let childPid: number | undefined;
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    try {
+      supervised = await spawnSupervised([
+        "sh",
+        "-c",
+        "sleep 30 & child=$!; printf '%s\\n' \"$child\" > \"$1\"; kill -KILL \"$PPID\"; wait",
+        "agent-toolkit-supervised-target",
+        marker,
+      ]);
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        try {
+          childPid = Number((await readFile(marker, "utf8")).trim());
+          if (Number.isInteger(childPid) && childPid > 0) break;
+        } catch {
+          // The target may still be writing its child marker.
+        }
+        await Bun.sleep(25);
+      }
+      expect(childPid).toBeDefined();
+      expect(isAlive(childPid!)).toBe(true);
+      await supervised.exited;
+      await supervised.waitForCleanupAcknowledged();
+      await supervised.wrapperExited;
+      for (let attempt = 0; attempt < 40 && isAlive(childPid!); attempt += 1) await Bun.sleep(25);
+      expect(isAlive(childPid!)).toBe(false);
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (childPid !== undefined && isAlive(childPid)) {
+        try { process.kill(childPid, "SIGKILL"); } catch { /* The child may already have exited. */ }
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fails closed when the target truncates the descendant ledger", { timeout: 30_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-ledger-canary-"));
+    const marker = join(root, "child.pid");
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    try {
+      supervised = await spawnSupervised([
+        "sh",
+        "-c",
+        "sleep 30 & child=$!; printf '%s\\n' \"$child\" > \"$1\"; while :; do for path in /tmp/.agent-toolkit-dst-supervisor-*; do [ -f \"$path/descendants\" ] && : > \"$path/descendants\"; done; sleep 0.01; done",
+        "agent-toolkit-supervised-target",
+        marker,
+      ]);
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        try {
+          if ((await readFile(marker, "utf8")).trim().length > 0) break;
+        } catch {
+          // The target may still be writing its child marker.
+        }
+        await Bun.sleep(25);
+      }
+      await Bun.sleep(100);
+      supervised.child.kill("SIGTERM");
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(false);
+      await supervised.wrapperExited;
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("cleans a descendant that leaves the target process group", { timeout: 90_000 }, async () => {
     if (process.platform === "win32") return;
     const setsidCheck = Bun.spawnSync(["sh", "-c", "command -v setsid"], { stdout: "ignore", stderr: "ignore" });

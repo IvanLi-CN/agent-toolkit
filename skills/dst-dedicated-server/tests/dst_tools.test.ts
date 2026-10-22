@@ -717,22 +717,18 @@ exec /bin/ps "$@"
       await writeFile(fakeSsh, `#!/bin/sh
 case "$*" in
   *"echo ok"*)
-    supervisor_pid="$(ps -o ppid= -p "$PPID" 2>/dev/null | tr -d '[:space:]')"
-    case "$supervisor_pid" in
-      ''|*[!0-9]*)
-        ancestor="$PPID"
-        attempts=0
-        while [ "$attempts" -lt 16 ]; do
-          case "$ancestor" in ''|*[!0-9]*) break ;; esac
-          command_line="$(ps -o command= -p "$ancestor" 2>/dev/null || true)"
-          case "$command_line" in *agent-toolkit-supervisor*) supervisor_pid="$ancestor"; break ;; esac
-          next_ancestor="$(ps -o ppid= -p "$ancestor" 2>/dev/null | tr -d '[:space:]')"
-          [ "$next_ancestor" = "$ancestor" ] && break
-          ancestor="$next_ancestor"
-          attempts=$((attempts + 1))
-        done
-        ;;
-    esac
+    supervisor_pid=""
+    ancestor="$PPID"
+    attempts=0
+    while [ "$attempts" -lt 16 ]; do
+      case "$ancestor" in ''|*[!0-9]*) break ;; esac
+      command_line="$(ps -o command= -p "$ancestor" 2>/dev/null || true)"
+      case "$command_line" in *agent-toolkit-supervisor*) supervisor_pid="$ancestor"; break ;; esac
+      next_ancestor="$(ps -o ppid= -p "$ancestor" 2>/dev/null | tr -d '[:space:]')"
+      [ "$next_ancestor" = "$ancestor" ] && break
+      ancestor="$next_ancestor"
+      attempts=$((attempts + 1))
+    done
     case "$supervisor_pid" in ''|*[!0-9]*) exit 97 ;; esac
     sleep 0.5
     kill -KILL "$supervisor_pid" 2>/dev/null || true
@@ -998,22 +994,18 @@ case "$*" in
   *"echo ok"*) sleep 0.5; exit 0 ;;
   *)
     cat >/dev/null
-    supervisor_pid="$(ps -o ppid= -p "$PPID" 2>/dev/null | tr -d '[:space:]')"
-    case "$supervisor_pid" in
-      ''|*[!0-9]*)
-        ancestor="$PPID"
-        attempts=0
-        while [ "$attempts" -lt 16 ]; do
-          case "$ancestor" in ''|*[!0-9]*) break ;; esac
-          command_line="$(ps -o command= -p "$ancestor" 2>/dev/null || true)"
-          case "$command_line" in *agent-toolkit-supervisor*) supervisor_pid="$ancestor"; break ;; esac
-          next_ancestor="$(ps -o ppid= -p "$ancestor" 2>/dev/null | tr -d '[:space:]')"
-          [ "$next_ancestor" = "$ancestor" ] && break
-          ancestor="$next_ancestor"
-          attempts=$((attempts + 1))
-        done
-        ;;
-    esac
+    supervisor_pid=""
+    ancestor="$PPID"
+    attempts=0
+    while [ "$attempts" -lt 16 ]; do
+      case "$ancestor" in ''|*[!0-9]*) break ;; esac
+      command_line="$(ps -o command= -p "$ancestor" 2>/dev/null || true)"
+      case "$command_line" in *agent-toolkit-supervisor*) supervisor_pid="$ancestor"; break ;; esac
+      next_ancestor="$(ps -o ppid= -p "$ancestor" 2>/dev/null | tr -d '[:space:]')"
+      [ "$next_ancestor" = "$ancestor" ] && break
+      ancestor="$next_ancestor"
+      attempts=$((attempts + 1))
+    done
     case "$supervisor_pid" in ''|*[!0-9]*) exit 97 ;; esac
     sleep 0.5
     kill -KILL "$supervisor_pid" 2>/dev/null || true
@@ -1407,6 +1399,60 @@ exec /bin/ps "$@"
         await supervised.wrapperExited.catch(() => undefined);
         await supervised.cleanup();
       }
+    }
+  });
+
+  test("does not accept a forged target status when process probing fails", { timeout: 30_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-ps-failure-"));
+    const failProbe = join(root, "fail-process-probe");
+    const fakePs = join(root, "ps");
+    const previousPath = process.env.PATH;
+    const previousFailurePath = process.env.AGENT_TOOLKIT_TEST_PS_FAIL;
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    try {
+      await writeFile(fakePs, `#!/bin/sh
+if [ -e "$AGENT_TOOLKIT_TEST_PS_FAIL" ]; then exit 1; fi
+exec /bin/ps "$@"
+`);
+      await chmod(fakePs, 0o755);
+      process.env.PATH = `${root}:${previousPath ?? ""}`;
+      process.env.AGENT_TOOLKIT_TEST_PS_FAIL = failProbe;
+      const before = new Set((await readdir(tmpdir())).filter((entry) => entry.startsWith(".agent-toolkit-dst-supervisor-") && !entry.includes("ack-")));
+      supervised = await spawnSupervised(["sh", "-c", 'sleep 0.5; touch "$1"; sleep 30', "agent-toolkit-supervised-target", failProbe]);
+      let resolvedEntry: string | undefined;
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        for (const entry of await readdir(tmpdir())) {
+          if (before.has(entry) || !entry.startsWith(".agent-toolkit-dst-supervisor-") || entry.includes("ack-")) continue;
+          if ((await lstat(join(tmpdir(), entry, "target")).catch(() => undefined))?.isFile() === true) {
+            resolvedEntry = entry;
+            break;
+          }
+        }
+        if (resolvedEntry !== undefined && (await lstat(failProbe).catch(() => undefined))?.isFile() === true) break;
+        await Bun.sleep(25);
+      }
+      expect(resolvedEntry).toBeString();
+      expect((await lstat(failProbe)).isFile()).toBe(true);
+      const statusDirectory = join(tmpdir(), resolvedEntry!);
+      const forgedTargetPid = (await readFile(join(statusDirectory, "target"), "utf8")).trim();
+      await writeFile(join(statusDirectory, "target-status"), "0\n", "utf8");
+      await writeFile(join(statusDirectory, "target-status-writer"), `${forgedTargetPid}\n`, "utf8");
+      const early = await Promise.race([supervised.exited, Bun.sleep(250).then(() => "pending" as const)]);
+      expect(early).toBe("pending");
+      supervised.child.kill("SIGTERM");
+      expect(await supervised.exited).toBe(SUPERVISOR_UNKNOWN_TARGET_STATUS);
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      if (previousFailurePath === undefined) delete process.env.AGENT_TOOLKIT_TEST_PS_FAIL;
+      else process.env.AGENT_TOOLKIT_TEST_PS_FAIL = previousFailurePath;
+      await rm(root, { recursive: true, force: true });
     }
   });
 

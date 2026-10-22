@@ -75,22 +75,13 @@ async function readBounded(
   let remaining = maxBytes;
   let truncated = false;
   let cancelPromise: Promise<void> | undefined;
-  let stopRequested = false;
   const cancelReader = (): Promise<void> => {
     if (cancelPromise === undefined) cancelPromise = reader.cancel().catch(() => undefined);
     return cancelPromise;
   };
-  const stopWatcher = stopPromise?.then(() => {
-    stopRequested = true;
-    return cancelReader();
-  }, () => {
-    stopRequested = true;
-    return cancelReader();
-  });
   const deadline = Date.now() + timeoutMs;
   try {
     while (true) {
-      if (stopRequested) break;
       const remainingMs = deadline - Date.now();
       if (remainingMs <= 0) {
         onTimeout();
@@ -98,22 +89,31 @@ async function readBounded(
         break;
       }
       type ReadResult = Awaited<ReturnType<typeof reader.read>>;
-      const result = await new Promise<{ kind: "data"; value: ReadResult } | { kind: "timeout" }>((resolve, reject) => {
-        const timer = setTimeout(() => resolve({ kind: "timeout" }), remainingMs);
+      type ReadOutcome = { kind: "data"; value: ReadResult } | { kind: "timeout" } | { kind: "stopped" };
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeoutPromise = new Promise<ReadOutcome>((resolve) => {
+        timer = setTimeout(() => resolve({ kind: "timeout" }), remainingMs);
+      });
+      const readPromise = new Promise<ReadOutcome>((resolve, reject) => {
         reader.read().then(
-          (value) => {
-            clearTimeout(timer);
-            resolve({ kind: "data", value });
-          },
+          (value) => resolve({ kind: "data", value }),
           (error) => {
-            clearTimeout(timer);
             reject(error);
           },
         );
       });
+      const stopPromiseResult = stopPromise?.then(() => ({ kind: "stopped" } as ReadOutcome), () => ({ kind: "stopped" } as ReadOutcome));
+      const result = await Promise.race([readPromise, timeoutPromise, ...(stopPromiseResult === undefined ? [] : [stopPromiseResult])]);
+      if (timer !== undefined) clearTimeout(timer);
+      if (result.kind === "stopped") {
+        await cancelReader();
+        await Promise.race([readPromise, Bun.sleep(100).then(() => undefined)]);
+        break;
+      }
       if (result.kind === "timeout") {
         onTimeout();
         await cancelReader();
+        await Promise.race([readPromise, Bun.sleep(100).then(() => undefined)]);
         break;
       }
       const { done, value } = result.value;
@@ -131,7 +131,6 @@ async function readBounded(
     }
     return { text: text + decoder.decode(), truncated };
   } finally {
-    void stopWatcher;
     if (cancelPromise !== undefined) await cancelPromise;
     reader.releaseLock();
   }
@@ -216,6 +215,10 @@ async function runWithStdin(
       forceKillTimer = undefined;
     }
     await supervised.cleanup();
+    await Promise.all([
+      child.stdout.cancel().catch(() => undefined),
+      child.stderr.cancel().catch(() => undefined),
+    ]);
     if (result !== undefined) result.cleanupVerified = cleanupReady;
     if (!cleanupReady && operationFailed && operationError instanceof Error) {
       operationError.message = `${operationError.message}; supervisor_cleanup_unverified`;

@@ -1,14 +1,20 @@
 import { randomUUID } from "node:crypto";
-import { constants } from "node:fs";
+import { close as closeFileDescriptorCallback, constants } from "node:fs";
 import { lstat, mkdir, mkdtemp, open, readFile, rm, rmdir, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 const SUPERVISOR_CLEANUP_TIMEOUT_MS = 60_000;
 const SUPERVISOR_CLEANUP_ACK_SETTLE_MS = 15_000;
+const SUPERVISOR_UNEXPECTED_EXIT_SETTLE_MS = 250;
 const SUPERVISOR_CLEANUP_DEADLINE_SECONDS = Math.ceil(SUPERVISOR_CLEANUP_TIMEOUT_MS / 1_000);
+const SUPERVISOR_STATUS_PIPE_TIMEOUT_MS = 2_000;
 export const SUPERVISOR_UNKNOWN_TARGET_STATUS = 125;
 const MAX_SUPERVISOR_MARKER_BYTES = 256;
+
+function closeFileDescriptor(fd: number): Promise<void> {
+  return new Promise((resolve) => closeFileDescriptorCallback(fd, () => resolve()));
+}
 
 const SUPERVISOR_SCRIPT = `
 set +e
@@ -323,7 +329,6 @@ if [ "$parent_identity_mode" != "proc" ]; then
 fi
 target_status_path="$status_dir/target-status"
 target_status_writer_path="$status_dir/target-status-writer"
-target_child_path="$status_dir/target-child"
 completion_path="$status_dir/completed"
 target_start_path="$status_dir/target-start"
 target_anchor_path="$status_dir/target"
@@ -339,9 +344,10 @@ if command -v setsid >/dev/null 2>&1; then
     result_path="$2"
     start_path="$3"
     writer_path="$4"
-    child_path="$5"
+    done_path="$5"
     supervisor_no_follow="$6"
     shift 6
+    publication_path="$(dirname -- "$result_path")/status"
     write_target_marker() {
       marker_path="$1"
       marker_value="$2"
@@ -351,16 +357,18 @@ if command -v setsid >/dev/null 2>&1; then
     trap ':' HUP INT TERM
     if ! write_target_marker "$anchor_path" "$$"; then exit 125; fi
     while [ ! -e "$start_path" ]; do sleep 0.01; done
-    "$@" &
+    "$@" 3>&- &
     target_pid=$!
-    if ! write_target_marker "$child_path" "$target_pid"; then exit 125; fi
     wait "$target_pid"
     target_status=$?
     if ! write_target_marker "$writer_path" "$$"; then exit 125; fi
     if ! write_target_marker "$result_path" "$target_status"; then exit 125; fi
-    exec 0<&- 1>&- 2>&-
+    if ! write_target_marker "$publication_path" "$target_status"; then exit 125; fi
+    if ! printf "%s\\n" "$target_status" >&3; then exit 125; fi
+    if ! write_target_marker "$done_path" complete; then exit 125; fi
+    exec 3>&-
     while :; do sleep 1; done
-  ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$target_start_path" "$target_status_writer_path" "$target_child_path" "$supervisor_no_follow" "$@" &
+  ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$target_start_path" "$target_status_writer_path" "$completion_path" "$supervisor_no_follow" "$@" &
 else
   set -m 2>/dev/null || true
   sh -c '
@@ -368,9 +376,10 @@ else
     result_path="$2"
     start_path="$3"
     writer_path="$4"
-    child_path="$5"
+    done_path="$5"
     supervisor_no_follow="$6"
     shift 6
+    publication_path="$(dirname -- "$result_path")/status"
     write_target_marker() {
       marker_path="$1"
       marker_value="$2"
@@ -380,28 +389,26 @@ else
     trap ':' HUP INT TERM
     if ! write_target_marker "$anchor_path" "$$"; then exit 125; fi
     while [ ! -e "$start_path" ]; do sleep 0.01; done
-    "$@" &
+    "$@" 3>&- &
     target_pid=$!
-    if ! write_target_marker "$child_path" "$target_pid"; then exit 125; fi
     wait "$target_pid"
     target_status=$?
     if ! write_target_marker "$writer_path" "$$"; then exit 125; fi
     if ! write_target_marker "$result_path" "$target_status"; then exit 125; fi
-    exec 0<&- 1>&- 2>&-
+    if ! write_target_marker "$publication_path" "$target_status"; then exit 125; fi
+    if ! printf "%s\\n" "$target_status" >&3; then exit 125; fi
+    if ! write_target_marker "$done_path" complete; then exit 125; fi
+    exec 3>&-
     while :; do sleep 1; done
-  ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$target_start_path" "$target_status_writer_path" "$target_child_path" "$supervisor_no_follow" "$@" &
+  ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$target_start_path" "$target_status_writer_path" "$completion_path" "$supervisor_no_follow" "$@" &
 fi
 target_launcher_pid=$!
+# The shell owns this PID; the target can discover and mutate marker files but
+# cannot change the value used for process-group authorization.
 target_pid="$target_launcher_pid"
-target_anchor_attempt=0
-while [ "$target_anchor_attempt" -lt 500 ]; do
-  candidate_target_pid="$(read_regular_marker "$target_anchor_path" 2>/dev/null || true)"
-  case "$candidate_target_pid" in
-    ''|*[!0-9]*) sleep 0.01; target_anchor_attempt=$((target_anchor_attempt + 1)) ;;
-    *) target_pid="$candidate_target_pid"; break ;;
-  esac
-done
-if [ -z "$target_pid" ]; then target_pid="$target_launcher_pid"; fi
+# The supervisor never reads the status pipe. Only the anchor owns its write
+# end, and the target command receives an explicitly closed fd 3.
+exec 3>&- || true
 target_pgid_attempt=0
 while [ "$target_pgid_attempt" -lt 100 ]; do
   observed_target_pgid="$(run_process_probe ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ' || true)"
@@ -491,22 +498,6 @@ target_is_alive() {
     return
   fi
   kill -0 "$target_pid" 2>/dev/null
-}
-target_child_state() {
-  if ! target_identity_matches; then printf 'unknown\\n'; return 0; fi
-  child_pid="$(read_regular_marker "$target_child_path" 2>/dev/null || true)"
-  case "$child_pid" in
-    ''|*[!0-9]*) printf 'unknown\\n'; return 0 ;;
-  esac
-  run_bounded 2 ps -o pid=,ppid=,pgid=,state= -p "$child_pid" 2>/dev/null | run_bounded 1 awk -v child="$child_pid" -v parent="$target_pid" -v group="$target_pgid" '
-    $1 == child {
-      found = 1
-      if ($2 != parent || $3 != group) print "unknown"
-      else if ($4 ~ /^Z/) print "gone"
-      else print "live"
-    }
-    END { if (!found) print "gone" }
-  '
 }
 stop_anchor() {
   if target_identity_matches; then
@@ -1393,7 +1384,10 @@ signal_tree() {
   wait_for_snapshot
   if [ -e "$descendant_scan_truncated_path" ] || [ -e "$descendant_scan_failed_path" ] || [ -e "$snapshot_failed_path" ] || [ "$snapshot_ready_before_signal" != "1" ]; then cleanup_ack_enabled=0; fi
   if [ "$signal" = "KILL" ] && [ "$snapshot_ready_before_signal" = "1" ] && [ ! -e "$snapshot_failed_path" ]; then signal_captured_descendants; fi
-  if [ "$group_signal_succeeded" = "1" ] || ! target_identity_matches; then return; fi
+  # If the anchor died before the group signal, retain the captured target
+  # group and descendant snapshot as the cleanup roots. Returning here would
+  # leave descendants alive precisely when the identity probe is unavailable.
+  if [ "$group_signal_succeeded" = "1" ]; then return; fi
   signal_descendants_path="$status_dir/signal-descendants"
   if ! descendants "$signal_descendants_path"; then cleanup_ack_enabled=0; return; fi
   while read -r pid; do
@@ -1730,40 +1724,28 @@ if ! create_marker_exclusive "$target_start_path"; then
   terminate_supervised_tree
   exit 125
 fi
-target_status=""
+snapshot_probe_count=0
+start_snapshot || true
 target_status_invalid=0
-while [ -z "$target_status" ]; do
-  candidate_target_status="$(read_regular_marker "$target_status_path" 2>/dev/null || true)"
-  case "$candidate_target_status" in
-    ''|*[!0-9]*)
-      if ! target_is_alive; then
-        target_status_invalid=1
-        target_status=125
-      else
-        if ! parent_is_alive; then
-          cleanup_ack_enabled=0
-          ensure_marker "$parent_dead_path" || true
-          terminate_supervised_tree
-          exit 143
-        fi
-        sleep 0.01
-      fi
-      ;;
-    *)
-      candidate_target_writer="$(read_regular_marker "$target_status_writer_path" 2>/dev/null || true)"
-      candidate_target_child_state="$(target_child_state 2>/dev/null || true)"
-      if [ "$candidate_target_writer" = "$target_pid" ] && [ "$candidate_target_child_state" = "gone" ] && target_identity_matches; then
-        target_status="$candidate_target_status"
-      elif ! target_is_alive; then
-        target_status_invalid=1
-        target_status=125
-      else
-        sleep 0.01
-      fi
-      ;;
-  esac
+while [ ! -e "$completion_path" ]; do
+  if ! target_is_alive; then
+    target_status_invalid=1
+    break
+  fi
+  if ! parent_is_alive; then
+    cleanup_ack_enabled=0
+    ensure_marker "$parent_dead_path" || true
+    terminate_supervised_tree
+    exit 143
+  fi
+  snapshot_probe_count=$((snapshot_probe_count + 1))
+  if [ "$snapshot_probe_count" -ge 5 ]; then
+    start_snapshot || true
+    snapshot_probe_count=0
+  fi
+  sleep 0.01
 done
-if [ "$target_status_invalid" = "1" ]; then
+if [ "$target_status_invalid" = "1" ] || [ "$(read_regular_marker "$completion_path" 2>/dev/null || true)" != "complete" ]; then
   cleanup_ack_enabled=0
   terminate_supervised_tree
   exit 125
@@ -1774,23 +1756,13 @@ if ! parent_is_alive; then
   terminate_supervised_tree
   exit 143
 fi
-if ! write_marker_exclusive "$status_path" "$target_status"; then
-  cleanup_ack_enabled=0
-  target_status=125
-elif ! write_marker_exclusive "$completion_path" complete; then
-  cleanup_ack_enabled=0
-  target_status=125
-fi
 exec 0<&- 1>/dev/null 2>/dev/null
 # The target exit code is the wrapper's authenticated result. Run the
 # potentially slower process-tree verification independently so short-lived
 # commands are not reported as timed out while cleanup is still in progress.
 (trap ':' HUP INT TERM; terminate_supervised_tree) </dev/null >/dev/null 2>/dev/null &
 cleanup_pid="$!"
-case "$target_status" in
-  ''|*[!0-9]*) exit 125 ;;
-  *) exit "$target_status" ;;
-esac
+exit 0
 `;
 
 export interface SupervisedChild {
@@ -1834,13 +1806,6 @@ async function markCleanupFailure(path: string): Promise<void> {
   await mkdir(path).catch(() => undefined);
 }
 
-async function readStatus(path: string): Promise<number | undefined> {
-  const value = (await readRegularMarker(path))?.trim() ?? "";
-  if (!/^[0-9]+$/.test(value)) return undefined;
-  const status = Number(value);
-  return Number.isInteger(status) && status >= 0 && status <= 255 ? status : undefined;
-}
-
 function decodeSpawnOutput(output: Uint8Array | string | undefined): string {
   if (output === undefined) return "";
   return typeof output === "string" ? output : new TextDecoder().decode(output);
@@ -1849,6 +1814,40 @@ function decodeSpawnOutput(output: Uint8Array | string | undefined): string {
 async function readNumericMarker(path: string): Promise<number | undefined> {
   const value = (await readRegularMarker(path))?.trim() ?? "";
   return /^[1-9][0-9]*$/.test(value) ? Number(value) : undefined;
+}
+
+async function readStatusPipe(fd: number): Promise<number | undefined> {
+  const reader = Bun.file(fd).stream().getReader();
+  const decoder = new TextDecoder();
+  let value = "";
+  try {
+    const deadline = Date.now() + SUPERVISOR_STATUS_PIPE_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      const remainingMs = deadline - Date.now();
+      const readPromise = reader.read();
+      const result = await Promise.race([
+        readPromise.then((read) => ({ kind: "data" as const, read })),
+        Bun.sleep(remainingMs).then(() => ({ kind: "timeout" as const })),
+      ]);
+      if (result.kind === "timeout") {
+        await reader.cancel().catch(() => undefined);
+        await Promise.race([readPromise, Bun.sleep(100).then(() => undefined)]);
+        return undefined;
+      }
+      if (result.read.done) break;
+      value += decoder.decode(result.read.value ?? new Uint8Array(), { stream: true });
+    }
+    value += decoder.decode();
+    const normalized = value.trim();
+    if (!/^[0-9]+$/.test(normalized)) return undefined;
+    const status = Number(normalized);
+    return Number.isInteger(status) && status >= 0 && status <= 255 ? status : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    reader.releaseLock();
+    await closeFileDescriptor(fd);
+  }
 }
 
 interface TargetReference {
@@ -1870,9 +1869,24 @@ async function processStartTime(pid: number): Promise<string | undefined> {
 
 const POSIX_PS = Bun.which("ps") ?? undefined;
 
-function macProcessIdentity(pid: number): string | undefined {
+async function boundedCommandOutput(command: string[], timeoutMs = 2_000): Promise<{ exitCode: number; stdout: string } | undefined> {
+  const child = Bun.spawn(command, { stdout: "pipe", stderr: "ignore" });
+  const result = await Promise.race([
+    child.exited.then(async (exitCode) => ({
+      exitCode,
+      stdout: await new Response(child.stdout as ReadableStream<Uint8Array>).text(),
+    })),
+    Bun.sleep(timeoutMs).then(() => undefined),
+  ]);
+  if (result !== undefined) return result;
+  try { child.kill("SIGKILL"); } catch { /* The probe may already be gone. */ }
+  await child.exited.catch(() => undefined);
+  return undefined;
+}
+
+async function macProcessIdentity(pid: number): Promise<string | undefined> {
   if (POSIX_PS === undefined) return undefined;
-  const result = Bun.spawnSync([
+  const result = await boundedCommandOutput([
     "sh",
     "-c",
     `
@@ -1894,14 +1908,14 @@ fi
     "agent-toolkit-process-identity",
     String(pid),
   ]);
-  if (result.exitCode !== 0) return undefined;
-  const identity = decodeSpawnOutput(result.stdout).trim();
+  if (result === undefined || result.exitCode !== 0) return undefined;
+  const identity = result.stdout.trim();
   return identity.startsWith("ps:") ? identity : undefined;
 }
 
 async function currentProcessIdentity(pid: number): Promise<string | undefined> {
   const start = await processStartTime(pid);
-  return start === undefined ? macProcessIdentity(pid) : `proc:${start}`;
+  return start === undefined ? await macProcessIdentity(pid) : `proc:${start}`;
 }
 
 function psIdentityFields(identity: string): { start: string; ppid: string; pgid: string; commandHash: string } | undefined {
@@ -1921,19 +1935,19 @@ function processIdentityMatches(expected: string, current: string): boolean {
     && (currentFields.ppid === "0" || currentFields.ppid === "1");
 }
 
-function currentProcessGroup(pid: number): number | undefined {
+async function currentProcessGroup(pid: number): Promise<number | undefined> {
   if (POSIX_PS === undefined) return undefined;
-  const result = Bun.spawnSync([POSIX_PS, "-o", "pgid=", "-p", String(pid)]);
-  if (result.exitCode !== 0) return undefined;
-  const value = decodeSpawnOutput(result.stdout).trim();
+  const result = await boundedCommandOutput([POSIX_PS, "-o", "pgid=", "-p", String(pid)]);
+  if (result === undefined || result.exitCode !== 0) return undefined;
+  const value = result.stdout.trim();
   return /^[1-9][0-9]*$/.test(value) ? Number(value) : undefined;
 }
 
-function currentProcessParent(pid: number): number | undefined {
+async function currentProcessParent(pid: number): Promise<number | undefined> {
   if (POSIX_PS === undefined) return undefined;
-  const result = Bun.spawnSync([POSIX_PS, "-o", "ppid=", "-p", String(pid)]);
-  if (result.exitCode !== 0) return undefined;
-  const value = decodeSpawnOutput(result.stdout).trim();
+  const result = await boundedCommandOutput([POSIX_PS, "-o", "ppid=", "-p", String(pid)]);
+  if (result === undefined || result.exitCode !== 0) return undefined;
+  const value = result.stdout.trim();
   return /^[1-9][0-9]*$/.test(value) ? Number(value) : undefined;
 }
 
@@ -1946,8 +1960,8 @@ async function readTargetReference(statusPath: string, wrapperPid: number): Prom
   ]);
   const normalizedIdentity = identity?.trim() ?? "";
   if (pid === undefined || pgid === undefined || normalizedIdentity.length === 0) return undefined;
-  if (currentProcessParent(pid) !== wrapperPid) return undefined;
-  const currentPgid = currentProcessGroup(pid);
+  if (await currentProcessParent(pid) !== wrapperPid) return undefined;
+  const currentPgid = await currentProcessGroup(pid);
   const currentIdentity = await currentProcessIdentity(pid);
   if (currentPgid !== pgid || currentIdentity === undefined || !processIdentityMatches(normalizedIdentity, currentIdentity)) return undefined;
   return { pid, pgid, identity: normalizedIdentity };
@@ -1994,11 +2008,11 @@ async function cleanupOrphanedTarget(rememberedReference?: TargetReference): Pro
   const targetPid = reference.pid;
   const targetPgid = reference.pgid;
   if (targetPid === undefined || targetPgid === undefined || targetPid === process.pid) return false;
-  const currentPgid = currentProcessGroup(process.pid);
+  const currentPgid = await currentProcessGroup(process.pid);
   if (currentPgid === undefined || currentPgid === targetPgid) return false;
   const currentIdentity = await currentProcessIdentity(targetPid);
   if (reference.identity.length === 0 || currentIdentity === undefined || !processIdentityMatches(reference.identity, currentIdentity)) return false;
-  if (currentProcessGroup(targetPid) !== targetPgid) return false;
+  if (await currentProcessGroup(targetPid) !== targetPgid) return false;
   try {
     process.kill(-targetPgid, "SIGKILL");
   } catch {
@@ -2009,8 +2023,7 @@ async function cleanupOrphanedTarget(rememberedReference?: TargetReference): Pro
 
 async function waitForTarget(
   parentDeadPath: string,
-  statusPath: string,
-  completionPath: string,
+  statusFd: number | undefined,
   wrapperExited: Promise<number>,
   waitForCleanupAcknowledged?: () => Promise<boolean>,
   cleanupFailurePath?: string,
@@ -2018,9 +2031,8 @@ async function waitForTarget(
 ): Promise<number> {
   void waitForCleanupAcknowledged?.();
   const wrapperCode = await wrapperExited;
-  const status = await readStatus(statusPath);
-  const completed = (await readRegularMarker(completionPath))?.trim() === "complete";
-  if (completed && status !== undefined && status === wrapperCode && await readRegularMarker(parentDeadPath) === undefined) {
+  const status = statusFd === undefined ? undefined : await readStatusPipe(statusFd);
+  if (wrapperCode === 0 && status !== undefined && await readRegularMarker(parentDeadPath) === undefined) {
     return status;
   }
   await cleanupOrphanedTarget(rememberedReference?.());
@@ -2108,7 +2120,7 @@ async function settleSupervisorDirectory(path: string, wrapperExited: Promise<nu
   if (settled) await removeSupervisorDirectory(path);
 }
 
-async function waitForCleanupAck(path: string, cleanupStartedPath: string, wrapperExited: Promise<number>, statusDirectory: string): Promise<boolean> {
+async function waitForCleanupAck(path: string, cleanupStartedPath: string, wrapperExited: Promise<number>, wrapperExitCode: Promise<number>, statusDirectory: string): Promise<boolean> {
   // The shell keeps the cleanup work bounded to the shared budget. Allow a
   // short, separate window for its success/failure marker to become visible
   // before the caller force-kills a still-running supervisor.
@@ -2127,7 +2139,9 @@ async function waitForCleanupAck(path: string, cleanupStartedPath: string, wrapp
     if (deadline === undefined && (await readRegularMarker(cleanupStartedPath)) !== undefined) {
       deadline = Date.now() + SUPERVISOR_CLEANUP_TIMEOUT_MS + SUPERVISOR_CLEANUP_ACK_SETTLE_MS;
     } else if (deadline === undefined && await Promise.race([wrapperDone, Bun.sleep(20).then(() => false)])) {
-      const settleDeadline = Date.now() + SUPERVISOR_CLEANUP_ACK_SETTLE_MS;
+      const cleanupStarted = await readRegularMarker(cleanupStartedPath);
+      const exitCode = await wrapperExitCode;
+      const settleDeadline = Date.now() + (exitCode === 0 && cleanupStarted === undefined ? SUPERVISOR_CLEANUP_ACK_SETTLE_MS : SUPERVISOR_UNEXPECTED_EXIT_SETTLE_MS);
       while (Date.now() < settleDeadline) {
         if (await consumeCleanupAck(path)) {
           await settleSupervisorDirectory(statusDirectory, wrapperExited);
@@ -2183,13 +2197,12 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
   const cleanupAckPath = join(cleanupAckDirectory, "done");
   const cleanupFailurePath = `${cleanupAckPath}.failed`;
   const cleanupStartedPath = join(directory, "cleanup-started");
+  let statusFdForCleanup: number | undefined;
   try {
     const child = Bun.spawn(
       ["sh", "-c", SUPERVISOR_SCRIPT, "agent-toolkit-supervisor", statusPath, ...args],
       {
-        stdin: "pipe",
-        stdout: "pipe",
-        stderr: "pipe",
+        stdio: ["pipe", "pipe", "pipe", "pipe"],
         env: {
           ...process.env,
           AGENT_TOOLKIT_SUPERVISOR_PARENT_PID: String(process.pid),
@@ -2197,17 +2210,24 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
           AGENT_TOOLKIT_TARGET_MARKER: targetMarker,
         },
       },
-    ) as Bun.Subprocess<"pipe", "pipe", "pipe">;
+    ) as Bun.Subprocess<"pipe", "pipe", "pipe"> & { stdio: [null, null, null, number | null] };
+    statusFdForCleanup = typeof child.stdio[3] === "number" ? child.stdio[3] : undefined;
+    if (statusFdForCleanup === undefined) {
+      try { child.kill("SIGKILL"); } catch { /* The wrapper may already be gone. */ }
+      await child.exited.catch(() => undefined);
+      throw new Error("supervisor_status_pipe_unavailable");
+    }
+    const statusFd = statusFdForCleanup;
     const wrapperExited = child.exited;
     let rememberedTargetReference: TargetReference | undefined;
     let cleanupAckPromise: Promise<boolean> | undefined;
     const waitForCleanupAcknowledged = (): Promise<boolean> => {
-      cleanupAckPromise ??= waitForCleanupAck(cleanupAckPath, cleanupStartedPath, wrapperExited, directory);
+      cleanupAckPromise ??= waitForCleanupAck(cleanupAckPath, cleanupStartedPath, wrapperExited, wrapperExited, directory);
       return cleanupAckPromise;
     };
     const supervised: SupervisedChild = {
       child,
-      exited: waitForTarget(join(directory, "parent-dead"), statusPath, join(directory, "completed"), wrapperExited, waitForCleanupAcknowledged, cleanupFailurePath, () => rememberedTargetReference),
+      exited: waitForTarget(join(directory, "parent-dead"), statusFd, wrapperExited, waitForCleanupAcknowledged, cleanupFailurePath, () => rememberedTargetReference),
       wrapperExited,
       waitForCleanupAcknowledged,
       forceCleanup: async () => {
@@ -2231,11 +2251,13 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
         try { child.kill("SIGKILL"); } catch { /* The wrapper may already be gone. */ }
       }
       await wrapperExited;
+      await supervised.exited.catch(() => undefined);
       throw new Error("supervisor_not_ready");
     }
     rememberedTargetReference = await readTargetReference(statusPath, child.pid);
     return supervised;
   } catch (error) {
+    if (statusFdForCleanup !== undefined) await closeFileDescriptor(statusFdForCleanup);
     await rm(directory, { recursive: true, force: true });
     await rm(cleanupAckDirectory, { recursive: true, force: true });
     throw error;

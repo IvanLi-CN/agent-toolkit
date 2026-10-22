@@ -839,7 +839,6 @@ quiesce_captured_descendants() {
     if [ "$current_captured_pgid" != "$captured_pgid" ]; then cleanup_ack_enabled=0; return 1; fi
     if [ "$current_captured_pgid" = "$wrapper_pgid" ]; then cleanup_ack_enabled=0; return 1; fi
     if [ -n "$target_group_for_quiesce" ] && [ "$current_captured_pgid" = "$target_group_for_quiesce" ]; then continue; fi
-    captured_process_can_be_signaled "$captured_identity" || { cleanup_ack_enabled=0; return 1; }
     if ! kill -STOP "-$current_captured_pgid" 2>/dev/null; then cleanup_ack_enabled=0; return 1; fi
   done < "$captured_descendants_path" || { cleanup_ack_enabled=0; return 1; }
 }

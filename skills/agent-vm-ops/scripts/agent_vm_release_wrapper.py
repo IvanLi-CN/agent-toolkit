@@ -56,6 +56,7 @@ except ModuleNotFoundError:
 DEFAULT_CONFIG_PATH = Path("/etc/agent-vm-native/release-wrapper.json")
 CANONICAL_CONTROL_PATH = Path("/opt/agent-vm-native/agent_vm_control.py")
 CANONICAL_UNIT_DIR = Path("/etc/systemd/system")
+RELEASE_FENCE_PATH = Path("/run/agent-vm-native/release-activation.fence")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 RELEASE_ID_RE = re.compile(r"^[0-9a-f]{40}$")
 MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
@@ -158,6 +159,10 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
     config["require_drained"] = True
     if config["control_path"] != CANONICAL_CONTROL_PATH or config["unit_dir"] != CANONICAL_UNIT_DIR:
         _fail("wrapper_config_invalid", "control_path and unit_dir must use the fixed activation targets")
+    configured_fence = _absolute_path(raw.get("fence_path", str(RELEASE_FENCE_PATH)), "fence_path")
+    if configured_fence != RELEASE_FENCE_PATH:
+        _fail("wrapper_config_invalid", "fence_path must use the fixed activation fence")
+    config["fence_path"] = RELEASE_FENCE_PATH
     unit_names = raw.get("unit_names", list(FIXED_UNIT_NAMES))
     if not isinstance(unit_names, list) or not all(isinstance(item, str) for item in unit_names) or sorted(unit_names) != list(FIXED_UNIT_NAMES):
         _fail("wrapper_config_invalid", "unit_names must equal the fixed systemd unit set")
@@ -170,7 +175,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
     if _paths_overlap(config["current_link"], config["previous_link"]):
         _fail("wrapper_config_invalid", "current and previous links must be distinct")
     protected = tuple(config[key] for key in (
-        "release_root", "staging_root", "state_root", "current_link", "previous_link", "control_path", "unit_dir",
+        "release_root", "staging_root", "state_root", "current_link", "previous_link", "control_path", "unit_dir", "fence_path",
     ))
     for index, left in enumerate(protected):
         for right in protected[index + 1:]:
@@ -307,6 +312,53 @@ def _fsync_tree(root: Path) -> None:
         _fsync_directory(root, "activation_failed")
     except OSError:
         _fail("activation_failed", "cannot persist copied release files")
+
+
+@contextmanager
+def _activation_fence(config: Mapping[str, Any], transaction_id: str, release_id: str):
+    """Keep control-plane drain exit fenced for the whole activation window."""
+    path = Path(config.get("fence_path", RELEASE_FENCE_PATH))
+    _mkdir_private(path.parent, 0o755)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        info = None
+    except OSError:
+        _fail("release_fence_unverified", "release activation fence cannot be inspected")
+    if info is not None:
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+            _fail("release_fence_unverified", "release activation fence is not a private regular file")
+        existing = _read_json(path, "release_fence_unverified")
+        if (
+            existing.get("format") != 1
+            or existing.get("transaction_id") != transaction_id
+            or existing.get("release_id") != release_id
+        ):
+            _fail("release_activation_in_progress", "another release activation fence is active")
+    else:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump({"format": 1, "transaction_id": transaction_id, "release_id": release_id}, handle, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            _fsync_directory(path.parent)
+        except FileExistsError:
+            _fail("release_activation_in_progress", "another release activation fence is active")
+        except OSError:
+            _fail("release_fence_unavailable", "release activation fence cannot be created")
+    try:
+        yield
+    finally:
+        try:
+            path.unlink()
+            _fsync_directory(path.parent)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            _fail("release_fence_cleanup_failed", "release activation fence could not be cleared")
 
 
 def _write_json(path: Path, value: Mapping[str, Any], mode: int = 0o600) -> None:
@@ -716,7 +768,8 @@ def _install_release_files(config: Mapping[str, Any], release_root: Path, manife
 
 def activate(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:
     with _release_lock(config):
-        return _activate_unlocked(config, transaction_id, release_id)
+        with _activation_fence(config, transaction_id, release_id):
+            return _activate_unlocked(config, transaction_id, release_id)
 
 
 def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:
@@ -766,6 +819,8 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         "transaction_id": transaction_id,
         "release_id": release_id,
         "previous_release_id": previous_id,
+        "old_current_release_id": old_current.name if old_current else None,
+        "old_previous_release_id": old_previous.name if old_previous else None,
         "manifest_sha256": verified["manifest_sha256"],
         "activated": False,
         "activation_phase": "prepared",
@@ -777,12 +832,12 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         _install_release_files(config, release_dir, manifest)
         record["activation_phase"] = "files-installed"
         _write_json(activation_path, record)
+        _atomic_symlink(release_dir, current_link)
+        record["activation_phase"] = "current-pointer-updated"
+        _write_json(activation_path, record)
         if old_current is not None:
             _atomic_symlink(old_current, previous_link)
         record["activation_phase"] = "previous-pointer-updated"
-        _write_json(activation_path, record)
-        _atomic_symlink(release_dir, current_link)
-        record["activation_phase"] = "current-pointer-updated"
         _write_json(activation_path, record)
         _daemon_reload()
         record["activation_phase"] = "daemon-reloaded"
@@ -824,7 +879,8 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
 
 def rollback(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:
     with _release_lock(config):
-        return _rollback_unlocked(config, transaction_id, release_id)
+        with _activation_fence(config, transaction_id, release_id):
+            return _rollback_unlocked(config, transaction_id, release_id)
 
 
 def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:
@@ -855,17 +911,38 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         _fail("rollback_unavailable", "no previous verified release is retained")
     previous_dir = Path(config["release_root"]) / previous_id
     previous_manifest = _verify_retained_release(config, previous_dir)
-    _ensure_drained(config)
     current_link = Path(config["current_link"])
     previous_link = Path(config["previous_link"])
-    old_current = _current_target(current_link, Path(config["release_root"]))
-    old_previous = _current_target(previous_link, Path(config["release_root"]))
-    if old_current is not None and old_current == old_previous:
+    actual_current = _current_target(current_link, Path(config["release_root"]))
+    actual_previous = _current_target(previous_link, Path(config["release_root"]))
+    old_current_id = record.get("old_current_release_id")
+    old_previous_id = record.get("old_previous_release_id")
+    if record.get("activated") is True:
+        old_current_id = old_current_id or previous_id
+    elif not isinstance(old_current_id, str):
+        _fail("rollback_unavailable", "interrupted activation has no retained current pointer record")
+    for value, label in ((old_current_id, "old_current_release_id"), (old_previous_id, "old_previous_release_id")):
+        if value is not None and (not isinstance(value, str) or RELEASE_ID_RE.fullmatch(value) is None):
+            _fail("rollback_unavailable", f"{label} is invalid")
+    if old_current_id == old_previous_id:
         _fail("activation_unverified", "current and previous pointers must not target the same release")
-    if old_current is not None:
-        _verify_retained_release(config, old_current)
-    if old_previous is not None:
-        _verify_retained_release(config, old_previous)
+    if old_current_id != previous_id:
+        _fail("rollback_unavailable", "retained current release does not match the activation record")
+    if old_current_id is not None:
+        _verify_retained_release(config, Path(config["release_root"]) / old_current_id)
+    if old_previous_id is not None:
+        _verify_retained_release(config, Path(config["release_root"]) / old_previous_id)
+    if record.get("activated") is True:
+        if actual_current is None or actual_current.name != release_id:
+            _fail("rollback_stale", "rollback transaction is no longer the active release")
+    else:
+        allowed_current = {release_id, old_current_id}
+        allowed_previous = {None, old_current_id, old_previous_id, release_id}
+        if actual_current is None or actual_current.name not in allowed_current:
+            _fail("rollback_stale", "interrupted rollback transaction no longer matches release pointers")
+        if actual_previous is not None and actual_previous.name not in allowed_previous:
+            _fail("rollback_stale", "interrupted rollback transaction no longer matches release pointers")
+    _ensure_drained(config)
     target_snapshot = _snapshot_targets(config)
     record["rollback_attempts"] = 1
     record["rollback_started"] = True
@@ -876,8 +953,13 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
     try:
         _install_release_files(config, previous_dir, previous_manifest)
         _atomic_symlink(previous_dir, current_link)
-        if old_current is not None:
-            _atomic_symlink(old_current, previous_link)
+        if record.get("activated") is True:
+            _atomic_symlink(Path(config["release_root"]) / release_id, previous_link)
+        else:
+            _restore_pointer(
+                previous_link,
+                Path(config["release_root"]) / old_previous_id if old_previous_id is not None else None,
+            )
         _daemon_reload()
     except WrapperError as failure:
         try:
@@ -885,8 +967,8 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
                 config,
                 current_link,
                 previous_link,
-                old_current,
-                old_previous,
+                actual_current,
+                actual_previous,
                 target_snapshot,
             )
         except WrapperError as restore_error:
@@ -916,8 +998,8 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
                 config,
                 current_link,
                 previous_link,
-                old_current,
-                old_previous,
+                actual_current,
+                actual_previous,
                 target_snapshot,
             )
         except WrapperError as restore_error:
@@ -932,7 +1014,11 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         except WrapperError:
             pass
         raise record_error
-    return {"rolled_back": True, "release_id": previous_id, "previous_release_id": old_current.name if old_current else None}
+    return {
+        "rolled_back": True,
+        "release_id": previous_id,
+        "previous_release_id": release_id if record.get("activated") is True else None,
+    }
 
 
 def status(config: Mapping[str, Any]) -> dict[str, Any]:

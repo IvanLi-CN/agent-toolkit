@@ -49,6 +49,7 @@ class WrapperTests(unittest.TestCase):
             "owner_uid": uid,
             "require_drained": True,
             "unit_names": tuple(WRAPPER.FIXED_UNIT_NAMES),
+            "fence_path": self.root / "release-activation.fence",
         })
         self.payload = self.bundle.read_bytes()
         self.drain_patch = mock.patch.object(WRAPPER, "_ensure_drained")
@@ -194,6 +195,25 @@ class WrapperTests(unittest.TestCase):
         with self.assertRaises(WRAPPER.WrapperError) as failure:
             WRAPPER.rollback(self.loaded, "tx-second", "d" * 40)
         self.assertEqual(failure.exception.code, "rollback_already_attempted")
+
+    def test_stale_rollback_cannot_downgrade_a_newer_release(self):
+        first = self.root / "stale-first.tar"
+        second = self.root / "stale-second.tar"
+        third = self.root / "stale-third.tar"
+        RELEASE.build_release(ROOT, first, "5" * 40)
+        RELEASE.build_release(ROOT, second, "6" * 40)
+        RELEASE.build_release(ROOT, third, "7" * 40)
+        with mock.patch.object(WRAPPER.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")):
+            WRAPPER.stage(self.loaded, "tx-stale-first", "5" * 40, first.read_bytes())
+            WRAPPER.activate(self.loaded, "tx-stale-first", "5" * 40)
+            WRAPPER.stage(self.loaded, "tx-stale-second", "6" * 40, second.read_bytes())
+            WRAPPER.activate(self.loaded, "tx-stale-second", "6" * 40)
+            WRAPPER.stage(self.loaded, "tx-stale-third", "7" * 40, third.read_bytes())
+            WRAPPER.activate(self.loaded, "tx-stale-third", "7" * 40)
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER.rollback(self.loaded, "tx-stale-second", "6" * 40)
+        self.assertEqual(failure.exception.code, "rollback_stale")
+        self.assertEqual(Path(self.loaded["current_link"]).resolve().name, "7" * 40)
 
     def test_interrupted_activation_record_can_be_rolled_back_once(self):
         first = self.root / "interrupted-first.tar"

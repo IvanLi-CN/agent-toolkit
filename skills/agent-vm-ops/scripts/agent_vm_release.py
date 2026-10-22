@@ -374,7 +374,13 @@ def _remove_local_staging(path: Path) -> None:
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         _fail("local_client_recovery_failed", "local client staging path is not a directory")
     try:
-        shutil.rmtree(path)
+        allowed = {"agent_vm.py", CLIENT_SIDECAR_NAME}
+        for child in path.iterdir():
+            child_info = child.lstat()
+            if child.name not in allowed or stat.S_ISLNK(child_info.st_mode) or not stat.S_ISREG(child_info.st_mode):
+                _fail("local_client_recovery_failed", "local client staging directory contains an unexpected entry")
+            child.unlink()
+        path.rmdir()
     except OSError:
         _fail("local_client_recovery_failed", "cannot remove local client staging directory")
 
@@ -465,15 +471,20 @@ def _recover_local_client_install(client_path: Path, sidecar_path: Path) -> None
             expected_digest = state.get("sha256")
             if not isinstance(expected_digest, str):
                 _fail("local_client_recovery_failed", "local client recovery marker has no previous checksum")
+            expected_mode = state.get("mode", 0o755 if key == "client" else 0o644)
+            if isinstance(expected_mode, bool) or not isinstance(expected_mode, int) or expected_mode not in {0o755, 0o644}:
+                _fail("local_client_recovery_failed", "local client recovery marker has an invalid previous mode")
             if backup.exists() or backup.is_symlink():
+                _verify_local_install_file(backup, digest=expected_digest, mode=expected_mode, label=f"backup {key}")
                 _remove_local_path(destination)
                 try:
                     os.replace(backup, destination)
                     _fsync_directory(destination.parent)
                 except OSError:
                     _fail("local_client_recovery_failed", f"cannot restore previous local client file: {destination.name}")
-            elif not destination.is_file() or sha256_file(destination) != expected_digest:
-                _fail("local_client_recovery_failed", f"previous local client file is unavailable: {destination.name}")
+                _verify_local_install_file(destination, digest=expected_digest, mode=expected_mode, label=key)
+            else:
+                _verify_local_install_file(destination, digest=expected_digest, mode=expected_mode, label=key)
         else:
             _remove_local_path(destination)
     _remove_local_staging(staged_dir)
@@ -700,7 +711,7 @@ class ReleasePublisher:
                         _fail("local_client_target_invalid", f"cannot inspect local client target: {destination.name}")
                     if stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
                         _fail("local_client_target_invalid", f"local client target is not a regular file: {destination.name}")
-                    previous[key] = {"exists": True, "sha256": sha256_file(destination)}
+                    previous[key] = {"exists": True, "sha256": sha256_file(destination), "mode": stat.S_IMODE(info.st_mode)}
                 else:
                     previous[key] = {"exists": False}
             record_path = client_path.parent / LOCAL_INSTALL_RECORD_NAME

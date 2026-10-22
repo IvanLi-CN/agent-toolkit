@@ -72,6 +72,7 @@ DIAGNOSTIC_LOG_LIMIT = 8192
 DIAGNOSTIC_LOG_TRUNCATION_MARKER = "\n[TRUNCATED BY DIAGNOSTIC LIMIT]"
 DEFAULT_CONFIG_PATH = Path("/etc/agent-vm-native/config.json")
 DEFAULT_TIMER_DIR = Path("/etc/systemd/system")
+DEFAULT_RELEASE_FENCE_PATH = Path("/run/agent-vm-native/release-activation.fence")
 DEFAULT_RELEASE_MANIFEST_PATH = Path(__file__).resolve().with_name("release-manifest.json")
 REQUIRED_ENVIRONMENT_FIELDS = (
     "project",
@@ -102,7 +103,7 @@ TASK_STATES = frozenset(("absent", "cached", "preparing", "active", "closing", "
 def runtime_artifact_paths(config: Mapping[str, Any], manifest_path: Path, manifest: Mapping[str, Any]) -> dict[str, Path]:
     return {
         item["path"]: (
-            Path(str(config["timer_dir"])) / Path(item["path"]).name
+            DEFAULT_TIMER_DIR / Path(item["path"]).name
             if item["role"] == "unit"
             else manifest_path.parent / Path(*PurePosixPath(item["path"]).parts)
         )
@@ -347,6 +348,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
         "resize_cost_bytes": 1024**3,
         "required_guest_tools": ["python3", "sshd", "rsync", "docker", "growpart"],
         "timer_dir": str(DEFAULT_TIMER_DIR),
+        "release_fence_path": str(DEFAULT_RELEASE_FENCE_PATH),
     }
     config.update(raw)
     missing = [field for field in REQUIRED_ENVIRONMENT_FIELDS if field not in raw or raw[field] in (None, "")]
@@ -393,6 +395,11 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
     config["storage_path"] = require_nonempty_string(config["storage_path"], "storage_path")
     config["state_db"] = require_nonempty_string(config["state_db"], "state_db")
     config["timer_dir"] = require_nonempty_string(config["timer_dir"], "timer_dir")
+    config["release_fence_path"] = require_nonempty_string(config["release_fence_path"], "release_fence_path")
+    if not config["release_fence_path"].startswith("/"):
+        raise ControlError("config_invalid", "release_fence_path must be absolute")
+    if Path(config["release_fence_path"]) != DEFAULT_RELEASE_FENCE_PATH:
+        raise ControlError("config_invalid", "release_fence_path must use the fixed activation fence")
     return config
 
 
@@ -1578,6 +1585,7 @@ class Control:
         self.runner = runner or CommandRunner()
         configured_manifest = self.config.get("release_manifest_path")
         self.release_manifest_path = Path(str(configured_manifest)) if configured_manifest else DEFAULT_RELEASE_MANIFEST_PATH
+        self.release_fence_path = Path(str(self.config.get("release_fence_path", DEFAULT_RELEASE_FENCE_PATH)))
         self.release_manifest: dict[str, Any] | None = None
         self.release_manifest_present = False
         self.release_artifacts_verified = True
@@ -1647,6 +1655,17 @@ class Control:
             verified=self.release_artifacts_verified,
             legacy=self.release_manifest is None,
         )
+
+    def _release_activation_fenced(self) -> bool:
+        try:
+            info = self.release_fence_path.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise ControlError("release_fence_unverified", "release activation fence cannot be inspected") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise ControlError("release_fence_unverified", "release activation fence is not a regular file")
+        return True
 
     @staticmethod
     def _merge_warnings(*groups: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -4878,6 +4897,11 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
             # run. Commit the exit only after reacquiring admission.lock and
             # rechecking the fence, with the same order as acquire.
             with self._admission_lock():
+                if self._release_activation_fenced():
+                    raise ControlError(
+                        "release_activation_in_progress",
+                        "drain exit is blocked while release activation is fenced",
+                    )
                 if self.store.get_meta("draining") == "1":
                     with self._global_lock():
                         self.store.set_meta("admission_epoch", uuid.uuid4().hex)

@@ -147,7 +147,9 @@ class ReleasePublisherTests(unittest.TestCase):
         backup_client = RELEASE._local_backup_path(target)
         backup_sidecar = RELEASE._local_backup_path(sidecar)
         target.write_bytes(b"old-client")
+        target.chmod(0o755)
         sidecar.write_bytes(b"old-sidecar")
+        sidecar.chmod(0o644)
         old_client_digest = RELEASE.sha256_file(target)
         old_sidecar_digest = RELEASE.sha256_file(sidecar)
         os.replace(target, backup_client)
@@ -199,6 +201,66 @@ class ReleasePublisherTests(unittest.TestCase):
             RELEASE._recover_local_client_install(target, sidecar)
         self.assertEqual(failure.exception.code, "local_client_recovery_failed")
         self.assertTrue((target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME).exists())
+        self.assertTrue(staged_dir.exists())
+
+    def test_corrupt_local_backup_is_rejected_and_retained(self):
+        target = self.root / "corrupt" / "agent_vm.py"
+        target.parent.mkdir(parents=True)
+        sidecar = target.with_name("client-release.json")
+        target.write_bytes(b"old-client")
+        target.chmod(0o755)
+        sidecar.write_bytes(b"old-sidecar")
+        sidecar.chmod(0o644)
+        backup_client = RELEASE._local_backup_path(target)
+        backup_sidecar = RELEASE._local_backup_path(sidecar)
+        os.replace(target, backup_client)
+        os.replace(sidecar, backup_sidecar)
+        backup_client.write_bytes(b"tampered")
+        staged_dir = target.parent / "agent-vm-client-corrupt"
+        staged_dir.mkdir()
+        record = {
+            "format": 1,
+            "phase": "installing",
+            "client_path": str(target),
+            "sidecar_path": str(sidecar),
+            "backup_client": str(backup_client),
+            "backup_sidecar": str(backup_sidecar),
+            "staged_dir": str(staged_dir),
+            "previous": {
+                "client": {"exists": True, "sha256": RELEASE.sha256_file(target) if target.exists() else "0" * 64, "mode": 0o755},
+                "sidecar": {"exists": True, "sha256": RELEASE.sha256_file(backup_sidecar), "mode": 0o644},
+            },
+        }
+        RELEASE._write_json(target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME, record, 0o600)
+        with self.assertRaises(RELEASE.ReleaseError) as failure:
+            RELEASE._recover_local_client_install(target, sidecar)
+        self.assertEqual(failure.exception.code, "local_client_recovery_failed")
+        self.assertTrue(backup_client.exists())
+        self.assertTrue((target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME).exists())
+
+    def test_unexpected_local_staging_entries_are_not_recursively_deleted(self):
+        target = self.root / "staging-boundary" / "agent_vm.py"
+        target.parent.mkdir(parents=True)
+        sidecar = target.with_name("client-release.json")
+        staged_dir = target.parent / "agent-vm-client-unrelated"
+        staged_dir.mkdir()
+        protected = staged_dir / "unrelated.txt"
+        protected.write_text("keep", encoding="utf-8")
+        record = {
+            "format": 1,
+            "phase": "installing",
+            "client_path": str(target),
+            "sidecar_path": str(sidecar),
+            "backup_client": str(RELEASE._local_backup_path(target)),
+            "backup_sidecar": str(RELEASE._local_backup_path(sidecar)),
+            "staged_dir": str(staged_dir),
+            "previous": {"client": {"exists": False}, "sidecar": {"exists": False}},
+        }
+        RELEASE._write_json(target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME, record, 0o600)
+        with self.assertRaises(RELEASE.ReleaseError) as failure:
+            RELEASE._recover_local_client_install(target, sidecar)
+        self.assertEqual(failure.exception.code, "local_client_recovery_failed")
+        self.assertTrue(protected.exists())
         self.assertTrue(staged_dir.exists())
 
 

@@ -59,6 +59,15 @@ class ConfigurationTests(unittest.TestCase):
                 CONTROL.load_config(path)
         self.assertEqual(error.exception.code, "config_invalid")
 
+    def test_release_units_use_fixed_systemd_directory_not_dynamic_timer_dir(self):
+        manifest = {"artifacts": [{"path": "systemd/agent-vm-native-age-gc.service", "role": "unit"}]}
+        paths = CONTROL.runtime_artifact_paths(
+            {"timer_dir": "/var/lib/agent-vm-native/generated-timers"},
+            Path("/opt/agent-vm-native/release-manifest.json"),
+            manifest,
+        )
+        self.assertEqual(paths["systemd/agent-vm-native-age-gc.service"], CONTROL.DEFAULT_TIMER_DIR / "agent-vm-native-age-gc.service")
+
 
 class NativeCommands(CONTROL.CommandRunner):
     """Model the subprocess protocol, including ownership and native devices."""
@@ -359,6 +368,20 @@ class LifecycleTests(Fixture):
         replay = self.control.dispatch(request)
         self.assertEqual(replay["outcome"], "replayed")
         self.assertEqual({item["code"] for item in replay["warnings"]}, codes)
+
+    def test_drain_exit_stays_closed_while_release_activation_is_fenced(self):
+        self.store.set_meta("draining", "1")
+        fence = self.root / "release-activation.fence"
+        fence.write_text(json.dumps({"format": 1, "transaction_id": "tx", "release_id": "a" * 40}), encoding="utf-8")
+        self.control.release_fence_path = fence
+        healthy = {"ready": True, "resources": {"verified": True}, "instances": {"verified": True}, "capacity": {}}
+        with mock.patch.object(self.control, "doctor", return_value=healthy):
+            self.error(
+                "release_activation_in_progress",
+                self.control.drain_exit,
+                {"operation_id": "drain-exit-fenced"},
+                None,
+            )
 
     def test_incompatible_request_is_rejected_before_journal_or_native_effect(self):
         request = self.request("acquire", operation="incompatible-request", public_key=KEY)

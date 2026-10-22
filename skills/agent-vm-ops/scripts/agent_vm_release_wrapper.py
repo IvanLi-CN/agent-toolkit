@@ -114,9 +114,11 @@ def _absolute_path(value: Any, label: str) -> Path:
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:
-    left_resolved = left.resolve(strict=False)
-    right_resolved = right.resolve(strict=False)
-    return left_resolved == right_resolved or left_resolved in right_resolved.parents or right_resolved in left_resolved.parents
+    # Compare configured path entries without following a current/previous
+    # symlink into release_root.  Pointer targets are verified separately.
+    left_absolute = Path(os.path.abspath(left))
+    right_absolute = Path(os.path.abspath(right))
+    return left_absolute == right_absolute or left_absolute in right_absolute.parents or right_absolute in left_absolute.parents
 
 
 def _read_json(path: Path, code: str) -> dict[str, Any]:

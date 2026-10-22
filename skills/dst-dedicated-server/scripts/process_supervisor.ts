@@ -1,12 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { close as closeFileDescriptorCallback, constants } from "node:fs";
-import { lstat, mkdir, mkdtemp, open, readFile, rm, rmdir, type FileHandle } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, readFile, rm, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 const SUPERVISOR_CLEANUP_TIMEOUT_MS = 60_000;
 const SUPERVISOR_CLEANUP_ACK_SETTLE_MS = 15_000;
 const SUPERVISOR_UNEXPECTED_EXIT_SETTLE_MS = 250;
+const SUPERVISOR_ORPHAN_CLEANUP_TIMEOUT_MS = 5_000;
 const SUPERVISOR_CLEANUP_DEADLINE_SECONDS = Math.ceil(SUPERVISOR_CLEANUP_TIMEOUT_MS / 1_000);
 const SUPERVISOR_STATUS_PIPE_TIMEOUT_MS = 2_000;
 export const SUPERVISOR_UNKNOWN_TARGET_STATUS = 125;
@@ -25,11 +26,10 @@ status_dir="$(dirname -- "$status_path")"
 target_marker="\${AGENT_TOOLKIT_TARGET_MARKER:-unbound}"
 supervisor_pid="$$"
 ready_path="$status_dir/ready"
-cleanup_ack_path="\${AGENT_TOOLKIT_SUPERVISOR_CLEANUP_ACK_PATH:-$status_dir/cleanup-done}"
-cleanup_failure_path="$cleanup_ack_path.failed"
 cleanup_started_path="$status_dir/cleanup-started"
-unset AGENT_TOOLKIT_SUPERVISOR_CLEANUP_ACK_PATH
 cleanup_ack_enabled=1
+cleanup_ack_result=1
+cleanup_ack_sent=0
 captured_descendants_path="$status_dir/descendants"
 pending_descendants_path="$status_dir/descendant-pids"
 snapshot_started_path="$status_dir/snapshot-started"
@@ -119,13 +119,23 @@ safe_append_line() {
     use Fcntl qw(O_WRONLY O_CREAT O_EXCL O_APPEND O_NONBLOCK);
     my ($path, $value, $nofollow) = @ARGV;
     exit 1 unless defined $nofollow;
+    my @path_stat = lstat($path);
+    if (@path_stat) {
+      exit 1 unless (($path_stat[2] & 0170000) == 0100000) && $path_stat[7] <= 1048576;
+    }
     my $fh;
     if (!sysopen($fh, $path, O_WRONLY | O_APPEND | O_NONBLOCK | $nofollow)) {
       sysopen(my $created, $path, O_WRONLY | O_CREAT | O_EXCL | $nofollow, 0600) or exit 1;
       close($created) or exit 1;
       sysopen($fh, $path, O_WRONLY | O_APPEND | O_NONBLOCK | $nofollow) or exit 1;
     }
+    my @opened = stat($fh);
+    exit 1 unless @opened && (($opened[2] & 0170000) == 0100000);
+    exit 1 if @path_stat && ($opened[0] != $path_stat[0] || $opened[1] != $path_stat[1]);
+    exit 1 if $opened[7] > 1048576;
     print {$fh} $value, "\n" or exit 1;
+    my @final = stat($fh);
+    exit 1 unless @final && (($final[2] & 0170000) == 0100000) && $final[0] == $opened[0] && $final[1] == $opened[1] && $final[7] <= 1048576;
     close($fh) or exit 1;
   ' "$marker_path" "$marker_value" "$supervisor_no_follow"
 }
@@ -230,40 +240,17 @@ ensure_marker() {
 }
 cleanup() {
   if [ -e "$descendant_scan_truncated_path" ] || [ -e "$descendant_scan_failed_path" ] || [ -e "$snapshot_failed_path" ]; then cleanup_ack_enabled=0; fi
-  cleanup_ack_created=0
-  cleanup_failure_created=0
-  if [ "$cleanup_ack_enabled" = "1" ] && [ ! -e "$parent_dead_path" ]; then
-    if mkdir "$cleanup_ack_path" 2>/dev/null; then
-      cleanup_ack_created=1
-    elif mkdir "$cleanup_failure_path" 2>/dev/null; then
-      cleanup_failure_created=1
-    fi
-  else
-    if [ ! -e "$parent_dead_path" ] && mkdir "$cleanup_failure_path" 2>/dev/null; then
-      cleanup_failure_created=1
-    else
-      rmdir "$(dirname -- "$cleanup_ack_path")" 2>/dev/null || true
-    fi
-  fi
-  if [ "$cleanup_ack_created" = "1" ] || [ "$cleanup_failure_created" = "1" ]; then
-    cleanup_marker_path="$cleanup_ack_path"
-    [ "$cleanup_failure_created" = "1" ] && cleanup_marker_path="$cleanup_failure_path"
-    if command -v parent_is_alive >/dev/null 2>&1; then
-      cleanup_wait=0
-      while [ -d "$cleanup_marker_path" ] && [ "$cleanup_wait" -lt 1500 ]; do
-        if [ -e "$parent_dead_path" ] || ! parent_is_alive; then
-          ensure_marker "$parent_dead_path" || true
-          break
-        fi
-        sleep 0.05
-        cleanup_wait=$((cleanup_wait + 1))
-      done
-    fi
-  fi
   if [ -e "$parent_dead_path" ]; then
     rm -rf -- "$status_dir"
-    rmdir "$(dirname -- "$cleanup_ack_path")" 2>/dev/null || true
   fi
+  if [ "$cleanup_ack_sent" = "1" ]; then return; fi
+  cleanup_ack_sent=1
+  if [ "$cleanup_ack_enabled" = "1" ] && [ "$cleanup_ack_result" = "1" ] && [ ! -e "$parent_dead_path" ]; then
+    printf '1\n' >&4 2>/dev/null || true
+  else
+    printf '0\n' >&4 2>/dev/null || true
+  fi
+  exec 4>&-
 }
 run_bounded() {
   bounded_seconds="$1"
@@ -336,6 +323,7 @@ target_pgid_path="$status_dir/target-pgid"
 target_identity_path="$status_dir/target-identity"
 target_pgid=""
 target_pid=""
+authorized_descendant_records=""
 group_quiescence_required=0
 quiesced_groups_path="$status_dir/quiesced-groups"
 if command -v setsid >/dev/null 2>&1; then
@@ -357,7 +345,7 @@ if command -v setsid >/dev/null 2>&1; then
     trap ':' HUP INT TERM
     if ! write_target_marker "$anchor_path" "$$"; then exit 125; fi
     while [ ! -e "$start_path" ]; do sleep 0.01; done
-    "$@" 3>&- &
+    "$@" 3>&- 4>&- &
     target_pid=$!
     wait "$target_pid"
     target_status=$?
@@ -389,7 +377,7 @@ else
     trap ':' HUP INT TERM
     if ! write_target_marker "$anchor_path" "$$"; then exit 125; fi
     while [ ! -e "$start_path" ]; do sleep 0.01; done
-    "$@" 3>&- &
+    "$@" 3>&- 4>&- &
     target_pid=$!
     wait "$target_pid"
     target_status=$?
@@ -732,6 +720,49 @@ process_group_id() {
     *) printf '%s\n' "$process_group" ;;
   esac
 }
+process_parent_id() {
+  process_parent_pid="$1"
+  if [ -r "/proc/$process_parent_pid/stat" ]; then
+    process_parent_value="$(run_snapshot_command awk '{ sub(/.*\\) /, ""); print $4 }' "/proc/$process_parent_pid/stat" 2>/dev/null || true)"
+  else
+    process_parent_value="$(run_process_probe ps -o ppid= -p "$process_parent_pid" 2>/dev/null | run_process_probe awk 'NR == 1 { gsub(/[[:space:]]/, ""); if ($0 ~ /^[0-9]+$/) print; exit }')"
+  fi
+  case "$process_parent_value" in
+    ''|*[!0-9]*) return 1 ;;
+    *) printf '%s\n' "$process_parent_value" ;;
+  esac
+}
+process_is_target_descendant() {
+  candidate_pid="$1"
+  ancestry_seen=" "
+  ancestry_attempt=0
+  while [ "$ancestry_attempt" -lt 32 ]; do
+    [ "$candidate_pid" = "$target_pid" ] && return 0
+    case "$candidate_pid" in ''|0|1|*[!0-9]*) return 1 ;; esac
+    case "$ancestry_seen" in *" $candidate_pid "*) return 1 ;; esac
+    ancestry_seen="$ancestry_seen$candidate_pid "
+    candidate_parent="$(process_parent_id "$candidate_pid" 2>/dev/null || true)"
+    case "$candidate_parent" in ''|0|1|*[!0-9]*) return 1 ;; esac
+    candidate_pid="$candidate_parent"
+    ancestry_attempt=$((ancestry_attempt + 1))
+  done
+  return 1
+}
+authorized_record_exists() {
+  authorized_candidate="$(printf '%s\n' "$1" | tr ' ' '%')"
+  for authorized_record in $authorized_descendant_records; do
+    [ "$authorized_record" = "$authorized_candidate" ] && return 0
+  done
+  return 1
+}
+authorize_descendant_record() {
+  authorized_new_record="$(printf '%s\n' "$1" | tr ' ' '%')"
+  authorized_record_exists "$authorized_new_record" && return 0
+  authorized_descendant_records="$authorized_descendant_records $authorized_new_record"
+}
+validate_authorized_record() {
+  authorized_record_exists "$1|$2|$3" || { cleanup_ack_enabled=0; return 1; }
+}
 capture_group_members() {
   captured_group="$1"
   case "$captured_group" in ''|0|*[!0-9]*) return 1 ;; esac
@@ -957,17 +988,16 @@ descendants() {
   target_groups=""
   if target_identity_matches; then
     target_roots="$target_pid"
+    # While the target is alive, ancestry is the authorization source. A
+    # process that merely joins the target's group must not become killable.
   else
     process_liveness "$target_pid"
     case "$process_liveness_result" in
       dead)
-        case "$target_pgid" in
-          ''|0|*[!0-9]*) cleanup_ack_enabled=0; return 1 ;;
-          *)
-            [ "$target_pgid" != "$wrapper_pgid" ] || { cleanup_ack_enabled=0; return 1; }
-            target_groups="$target_pgid"
-            ;;
-        esac
+        # Once the target is gone, only already captured and authorized
+        # descendants may be reconciled. Do not re-authorize a reused PGID.
+        target_roots=""
+        target_groups=""
         ;;
       *) cleanup_ack_enabled=0; return 1 ;;
     esac
@@ -994,13 +1024,9 @@ owned_descendants() {
     process_liveness "$target_pid"
     case "$process_liveness_result" in
       dead)
-        case "$target_pgid" in
-          ''|0|*[!0-9]*) cleanup_ack_enabled=0; return 1 ;;
-          *)
-            [ "$target_pgid" != "$wrapper_pgid" ] || { cleanup_ack_enabled=0; return 1; }
-            owned_groups="$target_pgid"
-            ;;
-        esac
+        # A dead target's PGID may already have been reused. Existing
+        # authorized records below are the only safe roots in this state.
+        owned_groups=""
         ;;
       *) cleanup_ack_enabled=0; return 1 ;;
     esac
@@ -1012,6 +1038,7 @@ owned_descendants() {
       [ -z "$captured_extra" ] || { cleanup_ack_enabled=0; return 1; }
       identity_is_valid "$captured_identity" || { cleanup_ack_enabled=0; return 1; }
       case "$captured_pgid" in ''|0|*[!0-9]*) cleanup_ack_enabled=0; return 1 ;; esac
+      validate_authorized_record "$captured_pid" "$captured_identity" "$captured_pgid" || return 1
       owned_roots="$owned_roots $captured_pid"
       if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
       if [ "$captured_pgid" = "$wrapper_pgid" ] || [ "$captured_pgid" = "$target_pgid" ]; then continue; fi
@@ -1119,8 +1146,21 @@ record_descendants() {
       esac
     fi
     captured_record="$captured_pid|$captured_identity|$captured_pgid"
+    if target_identity_matches; then
+      if ! process_is_target_descendant "$captured_pid"; then
+        cleanup_ack_enabled=0
+        return 1
+      fi
+    elif ! authorized_record_exists "$captured_record"; then
+      cleanup_ack_enabled=0
+      return 1
+    fi
     existing_captured_record="$(awk -F'|' -v pid="$captured_pid" '$1 == pid { print; exit }' "$captured_descendants_path" 2>/dev/null || true)"
     if [ -n "$existing_captured_record" ]; then
+      if ! authorized_record_exists "$existing_captured_record"; then
+        cleanup_ack_enabled=0
+        return 1
+      fi
       existing_captured_identity="\${existing_captured_record#*|}"
       existing_captured_identity="\${existing_captured_identity%%|*}"
       if captured_identity_matches "$existing_captured_identity" "$captured_identity"; then
@@ -1129,7 +1169,11 @@ record_descendants() {
       cleanup_ack_enabled=0
       return 1
     fi
-    if ! safe_append_line "$captured_descendants_path" "$captured_record"; then cleanup_ack_enabled=0; return 1; fi
+    if ! safe_append_line "$captured_descendants_path" "$captured_record"; then
+      cleanup_ack_enabled=0
+      return 1
+    fi
+    authorize_descendant_record "$captured_record"
     captured_count=$((captured_count + 1))
   done < "$record_pending_path" || { cleanup_ack_enabled=0; return 1; }
 }
@@ -1161,6 +1205,7 @@ quiesce_captured_descendants() {
     [ -z "$captured_extra" ] || { cleanup_ack_enabled=0; return 1; }
     identity_is_valid "$captured_identity" || { cleanup_ack_enabled=0; return 1; }
     case "$captured_pgid" in ''|0|*[!0-9]*) cleanup_ack_enabled=0; return 1 ;; esac
+    validate_authorized_record "$captured_pid" "$captured_identity" "$captured_pgid" || return 1
     process_liveness "$captured_pid"
     case "$process_liveness_result" in
       dead)
@@ -1249,6 +1294,7 @@ reconcile_captured_descendants() {
     [ -z "$captured_extra" ] || { cleanup_ack_enabled=0; return 1; }
     identity_is_valid "$captured_identity" || { cleanup_ack_enabled=0; return 1; }
     case "$captured_pgid" in ''|0|*[!0-9]*) cleanup_ack_enabled=0; return 1 ;; esac
+    validate_authorized_record "$captured_pid" "$captured_identity" "$captured_pgid" || return 1
     process_liveness "$captured_pid"
     case "$process_liveness_result" in
       dead)
@@ -1292,6 +1338,7 @@ signal_captured_descendants() {
     [ "$captured_pid" = "$target_pid" ] && continue
     [ -z "$captured_extra" ] || { cleanup_ack_enabled=0; continue; }
     case "$captured_pgid" in ''|0|*[!0-9]*) cleanup_ack_enabled=0; continue ;; esac
+    validate_authorized_record "$captured_pid" "$captured_identity" "$captured_pgid" || continue
     current_captured_identity="$(process_identity "$captured_pid" 2>/dev/null || true)"
     current_captured_identity="$(normalize_process_identity "$current_captured_identity" 2>/dev/null || true)"
     if ! identity_is_valid "$current_captured_identity"; then
@@ -1442,6 +1489,7 @@ verify_captured_descendants() {
     [ "$captured_pid" = "$target_pid" ] && continue
     [ -z "$captured_extra" ] || { cleanup_ack_enabled=0; return 1; }
     case "$captured_pgid" in ''|0|*[!0-9]*) cleanup_ack_enabled=0; return 1 ;; esac
+    validate_authorized_record "$captured_pid" "$captured_identity" "$captured_pgid" || return 1
     process_liveness "$captured_pid"
     case "$process_liveness_result" in
       dead)
@@ -1707,7 +1755,6 @@ watch_parent() {
     wait "$watch_sleep_pid" 2>/dev/null || true
     watch_sleep_pid=""
   done
-  cleanup_ack_enabled=0
   ensure_marker "$parent_dead_path" || true
   kill -TERM "$supervisor_pid" 2>/dev/null || true
   exit 0
@@ -1733,7 +1780,6 @@ while [ ! -e "$completion_path" ]; do
     break
   fi
   if ! parent_is_alive; then
-    cleanup_ack_enabled=0
     ensure_marker "$parent_dead_path" || true
     terminate_supervised_tree
     exit 143
@@ -1746,12 +1792,11 @@ while [ ! -e "$completion_path" ]; do
   sleep 0.01
 done
 if [ "$target_status_invalid" = "1" ] || [ "$(read_regular_marker "$completion_path" 2>/dev/null || true)" != "complete" ]; then
-  cleanup_ack_enabled=0
+  cleanup_ack_result=0
   terminate_supervised_tree
   exit 125
 fi
 if ! parent_is_alive; then
-  cleanup_ack_enabled=0
   ensure_marker "$parent_dead_path" || true
   terminate_supervised_tree
   exit 143
@@ -1802,10 +1847,6 @@ async function readRegularMarker(path: string, maxBytes = MAX_SUPERVISOR_MARKER_
   }
 }
 
-async function markCleanupFailure(path: string): Promise<void> {
-  await mkdir(path).catch(() => undefined);
-}
-
 function decodeSpawnOutput(output: Uint8Array | string | undefined): string {
   if (output === undefined) return "";
   return typeof output === "string" ? output : new TextDecoder().decode(output);
@@ -1816,12 +1857,15 @@ async function readNumericMarker(path: string): Promise<number | undefined> {
   return /^[1-9][0-9]*$/.test(value) ? Number(value) : undefined;
 }
 
-async function readStatusPipe(fd: number): Promise<number | undefined> {
+async function readStatusPipe(fd: number, timeoutMs = SUPERVISOR_STATUS_PIPE_TIMEOUT_MS): Promise<number | undefined> {
   const reader = Bun.file(fd).stream().getReader();
   const decoder = new TextDecoder();
   let value = "";
+  const cancelReader = (): void => {
+    try { void reader.cancel().catch(() => undefined); } catch { /* The pipe may already be closed. */ }
+  };
   try {
-    const deadline = Date.now() + SUPERVISOR_STATUS_PIPE_TIMEOUT_MS;
+    const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       const remainingMs = deadline - Date.now();
       const readPromise = reader.read();
@@ -1830,8 +1874,7 @@ async function readStatusPipe(fd: number): Promise<number | undefined> {
         Bun.sleep(remainingMs).then(() => ({ kind: "timeout" as const })),
       ]);
       if (result.kind === "timeout") {
-        await reader.cancel().catch(() => undefined);
-        await Promise.race([readPromise, Bun.sleep(100).then(() => undefined)]);
+        cancelReader();
         return undefined;
       }
       if (result.read.done) break;
@@ -1845,7 +1888,8 @@ async function readStatusPipe(fd: number): Promise<number | undefined> {
   } catch {
     return undefined;
   } finally {
-    reader.releaseLock();
+    cancelReader();
+    try { reader.releaseLock(); } catch { /* The pipe may still be closing. */ }
     await closeFileDescriptor(fd);
   }
 }
@@ -1992,11 +2036,12 @@ async function processGroupHasLiveProcess(pgid: number): Promise<boolean | undef
 }
 
 async function waitForProcessGroupGone(pgid: number): Promise<boolean> {
-  for (let attempt = 0; attempt < 40; attempt += 1) {
+  const deadline = Date.now() + SUPERVISOR_ORPHAN_CLEANUP_TIMEOUT_MS;
+  while (Date.now() < deadline) {
     const live = await processGroupHasLiveProcess(pgid);
     if (live === false) return true;
     if (live === undefined) return false;
-    await Bun.sleep(25);
+    await Bun.sleep(Math.min(25, Math.max(0, deadline - Date.now())));
   }
   return (await processGroupHasLiveProcess(pgid)) === false;
 }
@@ -2025,18 +2070,14 @@ async function waitForTarget(
   parentDeadPath: string,
   statusFd: number | undefined,
   wrapperExited: Promise<number>,
-  waitForCleanupAcknowledged?: () => Promise<boolean>,
-  cleanupFailurePath?: string,
   rememberedReference?: () => TargetReference | undefined,
 ): Promise<number> {
-  void waitForCleanupAcknowledged?.();
   const wrapperCode = await wrapperExited;
   const status = statusFd === undefined ? undefined : await readStatusPipe(statusFd);
   if (wrapperCode === 0 && status !== undefined && await readRegularMarker(parentDeadPath) === undefined) {
     return status;
   }
   await cleanupOrphanedTarget(rememberedReference?.());
-  if (cleanupFailurePath !== undefined) await markCleanupFailure(cleanupFailurePath);
   return SUPERVISOR_UNKNOWN_TARGET_STATUS;
 }
 
@@ -2051,54 +2092,6 @@ async function waitForReady(path: string, wrapperExited: Promise<number>): Promi
     if (wrapperDone) return false;
   }
   return false;
-}
-
-async function consumeCleanupAck(path: string): Promise<boolean> {
-  try {
-    const stats = await lstat(path);
-    if (!stats.isDirectory()) return false;
-    await rmdir(path);
-    try { await rmdir(dirname(path)); } catch { /* The private acknowledgement root may already be gone. */ }
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function consumeCleanupFailure(path: string): Promise<boolean> {
-  try {
-    const stats = await lstat(path);
-    if (!stats.isDirectory()) return false;
-    await rmdir(path);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function removeCleanupAck(path: string): Promise<void> {
-  let removed = false;
-  try {
-    await rmdir(path);
-    removed = true;
-  } catch {
-    // The marker may be a file or a symlink left by an interrupted run.
-  }
-  if (!removed) {
-    try {
-      await rm(path, { force: true });
-      removed = true;
-    } catch {
-      // Never recursively remove an unexpected marker path.
-    }
-  }
-  if (removed) {
-    try { await rmdir(dirname(path)); } catch { /* The private acknowledgement root may already be gone. */ }
-  }
-}
-
-async function removeCleanupAckRoot(path: string): Promise<void> {
-  try { await rmdir(path); } catch { /* The marker consumer may already have removed the private root. */ }
 }
 
 async function removeSupervisorDirectory(path: string): Promise<void> {
@@ -2120,51 +2113,23 @@ async function settleSupervisorDirectory(path: string, wrapperExited: Promise<nu
   if (settled) await removeSupervisorDirectory(path);
 }
 
-async function waitForCleanupAck(path: string, cleanupStartedPath: string, wrapperExited: Promise<number>, wrapperExitCode: Promise<number>, statusDirectory: string): Promise<boolean> {
-  // The shell keeps the cleanup work bounded to the shared budget. Allow a
-  // short, separate window for its success/failure marker to become visible
-  // before the caller force-kills a still-running supervisor.
-  const failurePath = `${path}.failed`;
-  let deadline: number | undefined;
-  const wrapperDone = wrapperExited.then(() => true, () => true);
-  while (deadline === undefined || Date.now() < deadline) {
-    if (await consumeCleanupAck(path)) {
-      await settleSupervisorDirectory(statusDirectory, wrapperExited);
-      return true;
-    }
-    if (await consumeCleanupFailure(failurePath)) {
-      await settleSupervisorDirectory(statusDirectory, wrapperExited);
-      return false;
-    }
-    if (deadline === undefined && (await readRegularMarker(cleanupStartedPath)) !== undefined) {
-      deadline = Date.now() + SUPERVISOR_CLEANUP_TIMEOUT_MS + SUPERVISOR_CLEANUP_ACK_SETTLE_MS;
-    } else if (deadline === undefined && await Promise.race([wrapperDone, Bun.sleep(20).then(() => false)])) {
-      const cleanupStarted = await readRegularMarker(cleanupStartedPath);
-      const exitCode = await wrapperExitCode;
-      const settleDeadline = Date.now() + (exitCode === 0 && cleanupStarted === undefined ? SUPERVISOR_CLEANUP_ACK_SETTLE_MS : SUPERVISOR_UNEXPECTED_EXIT_SETTLE_MS);
-      while (Date.now() < settleDeadline) {
-        if (await consumeCleanupAck(path)) {
-          await settleSupervisorDirectory(statusDirectory, wrapperExited);
-          return true;
-        }
-        if (await consumeCleanupFailure(failurePath)) {
-          await settleSupervisorDirectory(statusDirectory, wrapperExited);
-          return false;
-        }
-        await Bun.sleep(20);
-      }
-      return false;
-    }
-    await Bun.sleep(20);
+async function waitForCleanupAck(fd: number, cleanupStartedPath: string, wrapperExited: Promise<number>, statusDirectory: string): Promise<boolean> {
+  const wrapperResult = await Promise.race([
+    wrapperExited.then((code) => ({ done: true as const, code })),
+    Bun.sleep(20).then(() => ({ done: false as const })),
+  ]);
+  let timeoutMs = SUPERVISOR_CLEANUP_TIMEOUT_MS + SUPERVISOR_CLEANUP_ACK_SETTLE_MS;
+  if (wrapperResult.done) {
+    const cleanupStarted = await readRegularMarker(cleanupStartedPath);
+    timeoutMs = wrapperResult.code === 0 && cleanupStarted === undefined
+      ? SUPERVISOR_CLEANUP_ACK_SETTLE_MS
+      : cleanupStarted !== undefined
+        ? SUPERVISOR_CLEANUP_ACK_SETTLE_MS
+        : SUPERVISOR_UNEXPECTED_EXIT_SETTLE_MS;
   }
-  if (await consumeCleanupAck(path)) {
-    await settleSupervisorDirectory(statusDirectory, wrapperExited);
-    return true;
-  }
-  if (await consumeCleanupFailure(failurePath)) {
-    await settleSupervisorDirectory(statusDirectory, wrapperExited);
-  }
-  return false;
+  const acknowledgement = await readStatusPipe(fd, timeoutMs);
+  await settleSupervisorDirectory(statusDirectory, wrapperExited);
+  return acknowledgement === 1;
 }
 
 export async function spawnSupervised(args: string[]): Promise<SupervisedChild> {
@@ -2183,64 +2148,69 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
   if (Bun.which("perl") === null) throw new Error("supervisor_requires_perl");
   if (Bun.which("ps") === null) throw new Error("supervisor_requires_ps");
 
-  const cleanupAckDirectory = await mkdtemp(join(tmpdir(), ".agent-toolkit-dst-supervisor-ack-"));
   const targetMarker = randomUUID();
   let directory: string;
   try {
     directory = await mkdtemp(join(tmpdir(), ".agent-toolkit-dst-supervisor-"));
   } catch (error) {
-    await rm(cleanupAckDirectory, { recursive: true, force: true });
     throw error;
   }
   const statusPath = join(directory, "status");
   const readyPath = join(directory, "ready");
-  const cleanupAckPath = join(cleanupAckDirectory, "done");
-  const cleanupFailurePath = `${cleanupAckPath}.failed`;
   const cleanupStartedPath = join(directory, "cleanup-started");
   let statusFdForCleanup: number | undefined;
+  let cleanupFdForParent: number | undefined;
   try {
     const child = Bun.spawn(
       ["sh", "-c", SUPERVISOR_SCRIPT, "agent-toolkit-supervisor", statusPath, ...args],
       {
-        stdio: ["pipe", "pipe", "pipe", "pipe"],
+        stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"],
         env: {
           ...process.env,
           AGENT_TOOLKIT_SUPERVISOR_PARENT_PID: String(process.pid),
-          AGENT_TOOLKIT_SUPERVISOR_CLEANUP_ACK_PATH: cleanupAckPath,
           AGENT_TOOLKIT_TARGET_MARKER: targetMarker,
         },
       },
-    ) as Bun.Subprocess<"pipe", "pipe", "pipe"> & { stdio: [null, null, null, number | null] };
+    ) as Bun.Subprocess<"pipe", "pipe", "pipe"> & { stdio: [null, null, null, number | null, number | null] };
     statusFdForCleanup = typeof child.stdio[3] === "number" ? child.stdio[3] : undefined;
-    if (statusFdForCleanup === undefined) {
+    cleanupFdForParent = typeof child.stdio[4] === "number" ? child.stdio[4] : undefined;
+    if (statusFdForCleanup === undefined || cleanupFdForParent === undefined) {
       try { child.kill("SIGKILL"); } catch { /* The wrapper may already be gone. */ }
       await child.exited.catch(() => undefined);
-      throw new Error("supervisor_status_pipe_unavailable");
+      throw new Error("supervisor_control_pipe_unavailable");
     }
     const statusFd = statusFdForCleanup;
+    const cleanupFd = cleanupFdForParent;
     const wrapperExited = child.exited;
     let rememberedTargetReference: TargetReference | undefined;
     let cleanupAckPromise: Promise<boolean> | undefined;
     const waitForCleanupAcknowledged = (): Promise<boolean> => {
-      cleanupAckPromise ??= waitForCleanupAck(cleanupAckPath, cleanupStartedPath, wrapperExited, wrapperExited, directory);
+      cleanupAckPromise ??= waitForCleanupAck(cleanupFd, cleanupStartedPath, wrapperExited, directory).finally(() => {
+        cleanupFdForParent = undefined;
+      });
       return cleanupAckPromise;
     };
     const supervised: SupervisedChild = {
       child,
-      exited: waitForTarget(join(directory, "parent-dead"), statusFd, wrapperExited, waitForCleanupAcknowledged, cleanupFailurePath, () => rememberedTargetReference),
+      exited: waitForTarget(join(directory, "parent-dead"), statusFd, wrapperExited, () => rememberedTargetReference),
       wrapperExited,
       waitForCleanupAcknowledged,
       forceCleanup: async () => {
         try { child.kill("SIGKILL"); } catch { /* The wrapper may already be gone. */ }
         await wrapperExited.catch(() => undefined);
+        if (cleanupFdForParent !== undefined) {
+          await closeFileDescriptor(cleanupFdForParent);
+          cleanupFdForParent = undefined;
+        }
         return cleanupOrphanedTarget(rememberedTargetReference);
       },
       cleanup: async () => {
         await cleanupOrphanedTarget(rememberedTargetReference);
         await rm(directory, { recursive: true, force: true });
-        await removeCleanupAck(cleanupAckPath);
-        await removeCleanupAck(cleanupFailurePath);
-        await removeCleanupAckRoot(cleanupAckDirectory);
+        if (cleanupFdForParent !== undefined) {
+          await closeFileDescriptor(cleanupFdForParent);
+          cleanupFdForParent = undefined;
+        }
       },
     };
     const ready = await waitForReady(readyPath, wrapperExited);
@@ -2258,8 +2228,8 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
     return supervised;
   } catch (error) {
     if (statusFdForCleanup !== undefined) await closeFileDescriptor(statusFdForCleanup);
+    if (cleanupFdForParent !== undefined) await closeFileDescriptor(cleanupFdForParent);
     await rm(directory, { recursive: true, force: true });
-    await rm(cleanupAckDirectory, { recursive: true, force: true });
     throw error;
   }
 }

@@ -77,7 +77,7 @@ async function readBounded(
   let cancelPromise: Promise<void> | undefined;
   const cancelReader = (): Promise<void> => {
     if (cancelPromise === undefined) cancelPromise = reader.cancel().catch(() => undefined);
-    return cancelPromise;
+    return Promise.race([cancelPromise, Bun.sleep(100).then(() => undefined)]);
   };
   const deadline = Date.now() + timeoutMs;
   try {
@@ -131,9 +131,13 @@ async function readBounded(
     }
     return { text: text + decoder.decode(), truncated };
   } finally {
-    if (cancelPromise !== undefined) await cancelPromise;
-    reader.releaseLock();
+    if (cancelPromise !== undefined) await Promise.race([cancelPromise, Bun.sleep(100).then(() => undefined)]);
+    try { reader.releaseLock(); } catch { /* The stream may still be closing after cancellation. */ }
   }
+}
+
+async function cancelStream(stream: ReadableStream<Uint8Array>): Promise<void> {
+  try { await stream.cancel().catch(() => undefined); } catch { /* The stream may already be detached. */ }
 }
 
 async function runWithStdin(
@@ -201,7 +205,15 @@ async function runWithStdin(
     let naturalCleanupTimer: ReturnType<typeof setTimeout> | undefined;
     if (operationFailed || stopRequested) requestStop();
     else naturalCleanupTimer = setTimeout(requestStop, SUPERVISOR_FORCE_KILL_MS);
-    const cleanupReady = await supervised.waitForCleanupAcknowledged();
+    let cleanupReady: boolean;
+    if (stopRequested) {
+      // An aborted command must not start a second reader on the cleanup pipe.
+      // Force cleanup owns the wrapper and the target reference in this path.
+      cleanupReady = false;
+      await supervised.forceCleanup();
+    } else {
+      cleanupReady = await supervised.waitForCleanupAcknowledged();
+    }
     if (naturalCleanupTimer !== undefined) clearTimeout(naturalCleanupTimer);
     await Promise.race([supervised.wrapperExited.then(() => undefined, () => undefined), new Promise<void>((resolve) => setTimeout(resolve, SUPERVISOR_STOP_GRACE_MS))]);
     const wrapperExited = await Promise.race([supervised.wrapperExited.then(() => true, () => true), Bun.sleep(0).then(() => false)]);
@@ -216,8 +228,8 @@ async function runWithStdin(
     }
     await supervised.cleanup();
     await Promise.all([
-      child.stdout.cancel().catch(() => undefined),
-      child.stderr.cancel().catch(() => undefined),
+      cancelStream(child.stdout),
+      cancelStream(child.stderr),
     ]);
     if (result !== undefined) result.cleanupVerified = cleanupReady;
     if (!cleanupReady && operationFailed && operationError instanceof Error) {

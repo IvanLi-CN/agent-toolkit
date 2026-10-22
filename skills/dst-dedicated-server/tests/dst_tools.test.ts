@@ -923,7 +923,7 @@ esac
       await writeFile(fakeSsh, `#!/bin/sh
 case "$*" in
   *echo*ok*) exit 0 ;;
-  *) sleep 0.5; touch "$AGENT_TOOLKIT_TEST_PS_FAIL"; head -c $(( ${MAX_REMOTE_OUTPUT_BYTES} + 1 )) /dev/zero ;;
+  *) cat >/dev/null; sleep 0.5; touch "$AGENT_TOOLKIT_TEST_PS_FAIL"; head -c $(( ${MAX_REMOTE_OUTPUT_BYTES} + 1 )) /dev/zero ;;
 esac
 `);
       await writeFile(fakePs, `#!/bin/sh
@@ -1539,23 +1539,23 @@ exec /bin/ps "$@"
     }
   });
 
-  test("does not follow a cleanup acknowledgement symlink", { timeout: 90_000 }, async () => {
+  test("does not expose the cleanup control pipe to the target", { timeout: 90_000 }, async () => {
     if (process.platform === "win32") return;
-    const prefix = ".agent-toolkit-dst-supervisor-ack-";
-    const before = new Set((await readdir(tmpdir())).filter((entry) => entry.startsWith(prefix)));
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-ack-canary-"));
-    const canary = join(root, "canary");
-    await writeFile(canary, "sentinel\n", "utf8");
+    const forged = join(root, "forged");
     let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
     try {
-      supervised = await spawnSupervised(["sh", "-c", "sleep 30"]);
-      const ackRoot = (await readdir(tmpdir())).find((entry) => entry.startsWith(prefix) && !before.has(entry));
-      expect(ackRoot).toBeString();
-      await symlink(canary, join(tmpdir(), ackRoot!, "done"));
+      supervised = await spawnSupervised([
+        "sh",
+        "-c",
+        "if printf forged >&4 2>/dev/null; then printf wrote > \"$1\"; fi; sleep 30",
+        "agent-toolkit-supervised-target",
+        forged,
+      ]);
+      expect(await lstat(forged).catch(() => undefined)).toBeUndefined();
       supervised.child.kill("SIGTERM");
-      expect(await supervised.waitForCleanupAcknowledged()).toBe(false);
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(true);
       await supervised.wrapperExited;
-      expect(await readFile(canary, "utf8")).toBe("sentinel\n");
     } finally {
       if (supervised !== undefined) {
         try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }

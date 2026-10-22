@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 const SUPERVISOR_CLEANUP_TIMEOUT_MS = 60_000;
-const SUPERVISOR_CLEANUP_ACK_SETTLE_MS = 5_000;
+const SUPERVISOR_CLEANUP_ACK_SETTLE_MS = 15_000;
 const SUPERVISOR_CLEANUP_DEADLINE_SECONDS = Math.ceil(SUPERVISOR_CLEANUP_TIMEOUT_MS / 1_000);
 export const SUPERVISOR_UNKNOWN_TARGET_STATUS = 125;
 

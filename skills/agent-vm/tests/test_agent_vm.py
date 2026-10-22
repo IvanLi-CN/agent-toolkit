@@ -123,9 +123,12 @@ class SessionContractTests(unittest.TestCase):
             journal = operations / (hashlib.sha256(operation_id.encode()).hexdigest() + ".json")
             journal.write_text(json.dumps({"request": request, "outcome": "pending"}), encoding="utf-8")
             result = CLI.control_request("drain-enter", session=session, write=True, operation_id=operation_id)
+            saved = json.loads(journal.read_text(encoding="utf-8"))
         sent = json.loads(run.call_args.kwargs["input"])
         self.assertEqual(sent["compatibility"]["release_id"], "a" * 40)
         self.assertEqual(result["operation_id"], operation_id)
+        self.assertEqual(saved["outcome"], "success")
+        self.assertEqual(saved["response"]["operation_id"], operation_id)
 
     def test_present_invalid_sidecar_fails_before_ssh(self):
         with tempfile.TemporaryDirectory() as directory:

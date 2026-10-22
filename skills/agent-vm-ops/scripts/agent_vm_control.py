@@ -2400,7 +2400,7 @@ class Control:
                 self.store.record_operation(operation_id, action, session_id, request["generation"],
                                             {"outcome": "pending", "_request_digest": digest})
         try:
-            result = self._dispatch_action(action, dict(request), session_id)
+            result = self._dispatch_action(action, dict(request), session_id, compatibility_warnings)
         except ControlError as exc:
             try:
                 if operation_id and is_write:
@@ -2460,13 +2460,18 @@ class Control:
         return response
 
     def _dispatch_action(
-        self, action: str, request: dict[str, Any], session_id: str | None
+        self,
+        action: str,
+        request: dict[str, Any],
+        session_id: str | None,
+        compatibility_warnings: Iterable[Mapping[str, Any]] = (),
     ) -> dict[str, Any]:
+        if action == "renew":
+            return self.renew(request, session_id, compatibility_warnings)
         handlers: dict[str, Callable[..., dict[str, Any]]] = {
             "doctor": self.doctor,
             "status": self.status,
             "acquire": self.acquire,
-            "renew": self.renew,
             "release": self.release,
             "destroy": self.destroy,
             "restart": self.restart,
@@ -4247,7 +4252,12 @@ class Control:
             raise ControlError(exc.code, exc.message, detail) from exc
 
 
-    def renew(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:
+    def renew(
+        self,
+        request: Mapping[str, Any],
+        session_id: str | None,
+        compatibility_warnings: Iterable[Mapping[str, Any]] = (),
+    ) -> dict[str, Any]:
         assert session_id is not None
         with self._global_lock(), self.store.transaction():
             task = self._task_for_session(session_id)
@@ -4261,6 +4271,9 @@ class Control:
             response = {"ok": True, "protocol": PROTOCOL_VERSION, "server_time": iso_time(self.now()),
                         "action": "renew", "session_id": session_id, "generation": request["generation"],
                         "operation_id": request["operation_id"], "outcome": "success", "result": result,
+                        "response": self._response_compatibility(),
+                        "release": self._release_metadata(),
+                        "warnings": self._merge_warnings(compatibility_warnings),
                         "_request_digest": hashlib.sha256(json.dumps(dict(request), sort_keys=True).encode()).hexdigest()}
             self.store.record_operation(request["operation_id"], "renew", session_id, request["generation"], response)
         self._schedule_expiry(task)

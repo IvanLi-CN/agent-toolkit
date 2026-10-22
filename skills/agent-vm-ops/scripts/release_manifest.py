@@ -294,8 +294,19 @@ def validate_manifest(value: Any) -> dict[str, Any]:
         )
 
     raw_actions = _require_mapping(root["actions"], "actions")
-    if not raw_actions:
-        raise _error("manifest_invalid", "actions must not be empty")
+    unsupported_actions = set(raw_actions) - set(ACTION_NAMES)
+    if unsupported_actions:
+        raise _error(
+            "manifest_action_unsupported",
+            "manifest declares an unsupported action",
+            {"actions": sorted(unsupported_actions)},
+        )
+    if set(raw_actions) != set(ACTION_NAMES):
+        raise _error(
+            "manifest_action_set_invalid",
+            "manifest action set differs from the fixed control surface",
+            {"expected": list(ACTION_NAMES), "actual": sorted(raw_actions)},
+        )
     actions: dict[str, dict[str, Any]] = {}
     for action, raw_spec in raw_actions.items():
         action_name = _require_string(action, "action", re.compile(r"^[a-z][a-z0-9-]{0,63}$"))

@@ -18,12 +18,15 @@ import agent_vm_release as RELEASE  # noqa: E402
 
 
 class FakeTransport:
-    def __init__(self, *, fail_health_once=False, pending=False, drain_enter=True, unknown_state=False):
+    def __init__(self, *, fail_health_once=False, pending=False, drain_enter=True, unknown_state=False,
+                 malformed_health=False, malformed_reconcile=False):
         self.calls = []
         self.fail_health_once = fail_health_once
         self.pending = pending
         self.drain_enter = drain_enter
         self.unknown_state = unknown_state
+        self.malformed_health = malformed_health
+        self.malformed_reconcile = malformed_reconcile
         self.health_checks = 0
 
     def wrapper(self, host, wrapper_path, action, transaction_id, release_id, payload=None):
@@ -42,17 +45,25 @@ class FakeTransport:
         self.calls.append(("control", request["action"], request.get("operation_id")))
         action = request["action"]
         if action == "admin-metrics":
-            return {"ok": True, "result": {
+            result = {
                 "up": True,
                 "draining": True,
                 "pending_operations": [{"operation_id": "pending"}] if self.pending else [],
                 "task_states": {"unknown": 1} if self.unknown_state else {"active": 1},
-            }}
+            }
+            if self.malformed_health:
+                result["up"] = "true"
+            return {"ok": True, "result": result}
         if action == "doctor":
             self.health_checks += 1
             ready = not self.fail_health_once or self.health_checks > 1
-            return {"ok": True, "result": {"ready": ready, "issues": [] if ready else ["injected"]}}
+            result = {"ready": ready, "issues": [] if ready else ["injected"]}
+            if self.malformed_health:
+                result["ready"] = "true"
+            return {"ok": True, "result": result}
         if action == "admin-reconcile":
+            if self.malformed_reconcile:
+                return {"ok": True, "result": {"dry_run": False, "actions": [{"action": "unknown"}]}}
             return {"ok": True, "result": {"dry_run": True, "actions": []}}
         return {"ok": True, "result": {"draining": self.drain_enter if action == "drain-enter" else action != "drain-exit"}}
 
@@ -110,6 +121,32 @@ class ReleasePublisherTests(unittest.TestCase):
                 client_target=self.root / "client" / "agent_vm.py",
             )
         self.assertEqual(failure.exception.code, "remote_control_invalid")
+        with self.assertRaises(RELEASE.ReleaseError) as wrapper_failure:
+            RELEASE.ReleasePublisher(
+                bundle=self.bundle,
+                control_host="staging-control",
+                wrapper_path="/tmp/other-wrapper",
+                client_target=self.root / "client" / "agent_vm.py",
+            )
+        self.assertEqual(wrapper_failure.exception.code, "wrapper_path_invalid")
+
+    def test_health_rejects_malformed_boolean_values(self):
+        transport = FakeTransport(malformed_health=True)
+        publisher = self.publisher(transport)
+        temporary, _, manifest = RELEASE._open_bundle(self.bundle)
+        temporary.cleanup()
+        with self.assertRaises(RELEASE.ReleaseError) as failure:
+            publisher._health(manifest)
+        self.assertEqual(failure.exception.code, "remote_health_failed")
+
+    def test_health_rejects_malformed_reconcile_result(self):
+        transport = FakeTransport(malformed_reconcile=True)
+        publisher = self.publisher(transport)
+        temporary, _, manifest = RELEASE._open_bundle(self.bundle)
+        temporary.cleanup()
+        with self.assertRaises(RELEASE.ReleaseError) as failure:
+            publisher._health(manifest)
+        self.assertEqual(failure.exception.code, "remote_reconcile_failed")
 
     def test_convergence_timeout_does_not_activate_or_exit_drain(self):
         transport = FakeTransport(pending=True)

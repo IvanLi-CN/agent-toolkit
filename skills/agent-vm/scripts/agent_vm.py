@@ -19,7 +19,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 import uuid
 
 
@@ -427,6 +427,34 @@ def _append_warning(warnings: list[dict[str, Any]], item: dict[str, Any]) -> Non
         warnings.append(item)
 
 
+def _finalize_local_operation(path: Path, request: Mapping[str, Any], response: Mapping[str, Any]) -> None:
+    temporary = path.with_name("." + path.name + ".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump({"request": dict(request), "outcome": "success", "response": dict(response)}, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fchmod(handle.fileno(), 0o600)
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError:
+        try:
+            if temporary.exists():
+                temporary.unlink()
+        except OSError:
+            pass
+        fail(
+            "local_journal_update_failed",
+            "remote operation succeeded but the local operation journal could not be finalized",
+            {"operation_id": request.get("operation_id")},
+        )
+
+
 def control_request(action: str, *, session: str | None, generation: int | None = None,
                     write: bool = False, operation_id: str | None = None,
                     fields: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -438,6 +466,7 @@ def control_request(action: str, *, session: str | None, generation: int | None 
     if fields: request.update(fields)
     metadata, local_warnings = load_client_release_metadata()
     request["compatibility"] = client_capability(action, metadata)
+    op_path: Path | None = None
     if write:
         directory = local_session_dir(session) / "operations"
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -504,6 +533,8 @@ def control_request(action: str, *, session: str | None, generation: int | None 
     if "release" not in response:
         _append_warning(warnings, _client_warning("legacy_control_release", "control response did not identify a release", action))
     response["warnings"] = warnings
+    if write and op_path is not None:
+        _finalize_local_operation(op_path, request, response)
     return response
 
 

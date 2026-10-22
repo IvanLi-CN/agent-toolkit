@@ -95,6 +95,12 @@ class ManifestContractTests(unittest.TestCase):
             MANIFEST.validate_manifest(missing_view)
         self.assertEqual(failure.exception.code, "manifest_invalid")
 
+        missing_action = copy.deepcopy(self.manifest)
+        del missing_action["actions"]["status"]
+        with self.assertRaises(MANIFEST.ManifestError) as failure:
+            MANIFEST.validate_manifest(missing_action)
+        self.assertEqual(failure.exception.code, "manifest_action_set_invalid")
+
     def test_revision_protocol_and_window_are_explicit(self):
         for field, value, code in (
             ("source_revision", "short", "manifest_invalid"),

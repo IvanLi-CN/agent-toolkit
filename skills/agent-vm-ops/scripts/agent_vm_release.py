@@ -37,6 +37,7 @@ try:
         ManifestError,
         build_manifest,
         default_operations,
+        legacy_manifest,
         load_manifest,
         sha256_file,
         verify_client_sidecar,
@@ -53,6 +54,7 @@ except ModuleNotFoundError:
         ManifestError,
         build_manifest,
         default_operations,
+        legacy_manifest,
         load_manifest,
         sha256_file,
         verify_client_sidecar,
@@ -73,8 +75,17 @@ DEFAULT_POLL_SECONDS = 1.0
 MAX_TIMEOUT_SECONDS = 300
 MAX_POLL_SECONDS = 1.0
 CANONICAL_REMOTE_CONTROL = "/opt/agent-vm-native/agent_vm_control.py"
+CANONICAL_REMOTE_WRAPPER = "/usr/local/sbin/agent-vm-release-wrapper"
 CONTROL_TRANSITION_STATES = {"preparing", "closing", "deleting", "failed"}
 KNOWN_TASK_STATES = {"absent", "cached", "preparing", "active", "closing", "deleting", "failed"}
+RECONCILE_ACTIONS = {
+    "inspect",
+    "verify-absent-resources",
+    "finish-delete",
+    "close-incomplete-or-expired",
+    "rearm-current-expiry",
+    "stop-unexpected-running-cache",
+}
 SOURCE_ARTIFACTS = (
     ("agent_vm.py", "skills/agent-vm/scripts/agent_vm.py", "client", 0o755),
     ("agent_vm_control.py", "skills/agent-vm-ops/scripts/agent_vm_control.py", "control", 0o755),
@@ -615,6 +626,8 @@ class ReleasePublisher:
     def __post_init__(self) -> None:
         if self.remote_control != CANONICAL_REMOTE_CONTROL:
             _fail("remote_control_invalid", "release publisher uses the fixed control target")
+        if self.wrapper_path != CANONICAL_REMOTE_WRAPPER:
+            _fail("wrapper_path_invalid", "release publisher uses the fixed wrapper target")
 
     def _transport(self) -> ReleaseTransport:
         return self.transport or SSHTransport()
@@ -673,17 +686,36 @@ class ReleasePublisher:
 
     @staticmethod
     def _healthy(metrics: Mapping[str, Any], doctor: Mapping[str, Any]) -> bool:
+        if not isinstance(metrics, Mapping) or not isinstance(doctor, Mapping):
+            return False
+        if metrics.get("up") is not True or metrics.get("draining") is not True:
+            return False
         pending = metrics.get("pending_operations")
         task_states = metrics.get("task_states")
-        if metrics.get("draining") is not True or pending != [] or not isinstance(task_states, Mapping):
+        if not isinstance(pending, list) or any(not isinstance(item, Mapping) for item in pending):
+            return False
+        if pending != [] or not isinstance(task_states, Mapping):
             return False
         if any(state not in KNOWN_TASK_STATES for state in task_states):
+            return False
+        if any(isinstance(count, bool) or not isinstance(count, int) or count < 0 for count in task_states.values()):
             return False
         for state in CONTROL_TRANSITION_STATES:
             count = task_states.get(state, 0)
             if isinstance(count, bool) or not isinstance(count, int) or count < 0 or count:
                 return False
-        return bool(metrics.get("up")) and bool(doctor.get("ready")) and not doctor.get("issues")
+        issues = doctor.get("issues")
+        return doctor.get("ready") is True and isinstance(issues, list) and not issues
+
+    @staticmethod
+    def _reconcile_healthy(value: Mapping[str, Any]) -> bool:
+        actions = value.get("actions") if isinstance(value, Mapping) else None
+        if not isinstance(value, Mapping) or value.get("dry_run") is not True or not isinstance(actions, list):
+            return False
+        for item in actions:
+            if not isinstance(item, Mapping) or item.get("action") not in RECONCILE_ACTIONS or "error" in item:
+                return False
+        return True
 
     def _wait_for_convergence(self, manifest: Mapping[str, Any], timeout: float, poll: float) -> dict[str, Any]:
         deadline = self.monotonic() + timeout
@@ -721,11 +753,7 @@ class ReleasePublisher:
         metrics = self._control(manifest, "admin-metrics")
         reconcile = self._control(manifest, "admin-reconcile", fields={"apply": False})
         actions = reconcile.get("actions")
-        reconcile_ok = (
-            reconcile.get("dry_run") is True
-            and isinstance(actions, list)
-            and all(isinstance(item, Mapping) and "error" not in item for item in actions)
-        )
+        reconcile_ok = self._reconcile_healthy(reconcile)
         if not self._healthy(metrics, doctor):
             _fail("remote_health_failed", "remote control health or timer checks failed", {
                 "doctor": {"ready": doctor.get("ready"), "issues": doctor.get("issues")},
@@ -896,7 +924,11 @@ class ReleasePublisher:
         except ReleaseError as health_error:
             try:
                 rollback_result = self._wrapper("rollback", transaction, manifest["release_id"])
-                self._health(manifest)
+                # The wrapper has switched the control files back to the
+                # retained previous release.  Validate that peer through the
+                # explicit protocol-4 legacy contract, not the failed bundle's
+                # release-specific action window.
+                self._health(legacy_manifest())
             except ReleaseError as rollback_error:
                 raise ReleaseError("rollback_failed", "remote health failed and the single rollback did not restore verified health", {
                     "health_error": health_error.as_dict(),
@@ -946,6 +978,12 @@ class ReleasePublisher:
                 "rollback_release_mismatch",
                 "remote rollback target does not match the supplied previous release bundle",
                 {"expected": manifest["release_id"], "actual": result.get("release_id")},
+            )
+        if result.get("previous_release_id") not in {None, release_id}:
+            _fail(
+                "rollback_release_mismatch",
+                "remote rollback record does not identify the requested active release",
+                {"expected": release_id, "actual": result.get("previous_release_id")},
             )
         self._health(manifest)
         try:

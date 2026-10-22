@@ -924,6 +924,24 @@ class LifecycleTests(Fixture):
         self.assertEqual(after, self.call("status")["lease_expires_at"])
         self.assertEqual(CONTROL.parse_time(after)-CONTROL.parse_time(first["lease_expires_at"]), dt.timedelta(minutes=15))
 
+    def test_renew_journal_persists_compatibility_warning_and_response_metadata(self):
+        self.acquire()
+        request = self.request("renew", operation="renew-warning")
+        first = self.control.dispatch(request)
+        replay = self.control.dispatch(request)
+        self.assertEqual(replay["outcome"], "replayed")
+        self.assertEqual(
+            {item["code"] for item in first["warnings"]},
+            {item["code"] for item in replay["warnings"]},
+        )
+        saved = self.store.operation("renew-warning")
+        self.assertEqual(saved["outcome"], "success")
+        self.assertEqual(saved["response"], {"schema": 1, "semantic_revision": 1})
+        self.assertEqual(
+            {item["code"] for item in saved["warnings"]},
+            {item["code"] for item in first["warnings"]},
+        )
+
     def test_operation_payload_conflict_and_crash_are_explicit(self):
         self.acquire()
         request = self.request("port-add", name="web", vm_port=8080)

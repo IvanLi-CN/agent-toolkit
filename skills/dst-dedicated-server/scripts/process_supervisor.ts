@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 const SUPERVISOR_CLEANUP_TIMEOUT_MS = 60_000;
+const SUPERVISOR_CLEANUP_ACK_SETTLE_MS = 5_000;
 const SUPERVISOR_CLEANUP_DEADLINE_SECONDS = Math.ceil(SUPERVISOR_CLEANUP_TIMEOUT_MS / 1_000);
 
 const SUPERVISOR_SCRIPT = `
@@ -1476,7 +1477,10 @@ async function removeCleanupAckRoot(path: string): Promise<void> {
 }
 
 async function waitForCleanupAck(path: string, wrapperExited: Promise<number>): Promise<boolean> {
-  const deadline = Date.now() + SUPERVISOR_CLEANUP_TIMEOUT_MS;
+  // The shell keeps the cleanup work bounded to the shared budget. Allow a
+  // short, separate window for its success/failure marker to become visible
+  // before the caller force-kills a still-running supervisor.
+  const deadline = Date.now() + SUPERVISOR_CLEANUP_TIMEOUT_MS + SUPERVISOR_CLEANUP_ACK_SETTLE_MS;
   const failurePath = `${path}.failed`;
   while (Date.now() < deadline) {
     if (await consumeCleanupAck(path)) return true;

@@ -28,14 +28,9 @@ supervisor_pid="$$"
 ready_path="$status_dir/ready"
 cleanup_started_path="$status_dir/cleanup-started"
 cleanup_ack_enabled=1
-supervisor_private_dir="$status_dir/.supervisor-private"
-if ! (umask 077 && mkdir -m 700 "$supervisor_private_dir") 2>/dev/null; then
-  supervisor_private_dir=""
-  cleanup_ack_enabled=0
-fi
-captured_descendants_read_path="$status_dir/descendants"
-captured_group_members_read_path=""
-quiesced_groups_read_path=""
+captured_descendants_read_data=""
+captured_group_members_read_data=""
+quiesced_groups_read_data=""
 cleanup_ack_result=1
 cleanup_ack_sent=0
 captured_descendants_path="$status_dir/descendants"
@@ -176,6 +171,7 @@ safe_copy_file() {
       last if $read == 0;
       print {$out} $chunk or exit 1;
       $copied += $read;
+      exit 1 if $copied > 1048576;
     }
     my @final_in = stat($in);
     exit 1 unless @final_in && $final_in[0] == $in_stat[0] && $final_in[1] == $in_stat[1]
@@ -188,38 +184,23 @@ safe_copy_file() {
 }
 safe_read_snapshot() {
   snapshot_input_path="$1"
-  [ -n "$supervisor_private_dir" ] || return 1
-  snapshot_nonce="$(perl -e 'print $$, "-", time, "-", int(rand(2147483647))' 2>/dev/null || true)"
-  [ -n "$snapshot_nonce" ] || return 1
-  snapshot_output_path="$supervisor_private_dir/read-$snapshot_nonce"
-  safe_copy_file "$snapshot_input_path" "$snapshot_output_path" || return 1
-  printf '%s\n' "$snapshot_output_path"
-}
-validate_captured_ledger() {
   [ -n "$supervisor_no_follow" ] || return 1
-  if [ ! -e "$captured_descendants_path" ]; then
-    [ "$authorized_descendant_count" -eq 0 ] || return 1
-    [ -n "$supervisor_private_dir" ] || return 1
-    captured_descendants_read_path="$supervisor_private_dir/empty-ledger"
-    [ -e "$captured_descendants_read_path" ] || safe_create_file "$captured_descendants_read_path" || return 1
-    return
-  fi
-  captured_descendants_read_path="$(safe_read_snapshot "$captured_descendants_path" 2>/dev/null || true)"
-  [ -n "$captured_descendants_read_path" ] || return 1
-  run_snapshot_command perl -e '
+  if ! command -v perl >/dev/null 2>&1; then return 1; fi
+  perl -e '
     use strict;
     use warnings;
     use Fcntl qw(O_RDONLY O_NONBLOCK);
-    my ($path, $expected_count, @expected) = @ARGV;
+    my ($path, $nofollow) = @ARGV;
+    exit 1 unless defined $nofollow;
+    $SIG{ALRM} = sub { exit 124 };
+    alarm 2;
     my @path_stat = lstat($path);
     exit 1 unless @path_stat && (($path_stat[2] & 0170000) == 0100000) && $path_stat[7] <= 1048576;
-    my $nofollow = eval { Fcntl::O_NOFOLLOW() };
-    exit 1 unless defined $nofollow;
     sysopen(my $fh, $path, O_RDONLY | O_NONBLOCK | $nofollow) or exit 1;
     my @opened = stat($fh);
     exit 1 unless @opened && (($opened[2] & 0170000) == 0100000)
       && $opened[0] == $path_stat[0] && $opened[1] == $path_stat[1]
-      && $opened[7] == $path_stat[7];
+      && $opened[7] == $path_stat[7] && $opened[7] <= 1048576;
     my $data = "";
     while (1) {
       my $read = sysread($fh, my $chunk, 65536);
@@ -230,8 +211,26 @@ validate_captured_ledger() {
     }
     my @final = stat($fh);
     exit 1 unless @final && $final[0] == $opened[0] && $final[1] == $opened[1]
-      && $final[7] == $opened[7] && length($data) == $opened[7];
+      && $final[7] == $opened[7] && length($data) == $opened[7] && length($data) <= 1048576;
     close($fh) or exit 1;
+    binmode STDOUT;
+    print $data;
+  ' "$snapshot_input_path" "$supervisor_no_follow"
+}
+validate_captured_ledger() {
+  [ -n "$supervisor_no_follow" ] || return 1
+  if [ ! -e "$captured_descendants_path" ]; then
+    [ "$authorized_descendant_count" -eq 0 ] || return 1
+    captured_descendants_read_data=""
+    return
+  fi
+  captured_descendants_read_data="$(safe_read_snapshot "$captured_descendants_path" 2>/dev/null)" || return 1
+  printf '%s' "$captured_descendants_read_data" | run_snapshot_command perl -e '
+    use strict;
+    use warnings;
+    my ($expected_count, @expected) = @ARGV;
+    local $/;
+    my $data = <STDIN> // "";
     my @lines = split(/\n/, $data, -1);
     pop @lines if @lines && $lines[-1] eq "";
     my %expected = map { $_ => 1 } @expected;
@@ -246,7 +245,7 @@ validate_captured_ledger() {
     for my $record (@expected) {
       exit 1 unless ($seen{$record} // 0) == 1;
     }
-  ' "$captured_descendants_read_path" "$authorized_descendant_count" $authorized_descendant_records
+  ' "$authorized_descendant_count" $authorized_descendant_records || return 1
 }
 safe_capture_command() {
   output_path="$1"
@@ -452,8 +451,11 @@ if command -v setsid >/dev/null 2>&1 && [ "\${AGENT_TOOLKIT_SUPERVISOR_DISABLE_S
     while :; do sleep 1; done
   ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$target_start_path" "$target_status_writer_path" "$completion_path" "$supervisor_no_follow" "$@" &
 else
-  set -m 2>/dev/null || true
-  sh -c '
+  # The external setsid utility may be absent or deliberately disabled in
+  # tests, but Perl is already a supervisor prerequisite. Use POSIX::setsid
+  # through Perl so the fallback keeps the same isolated process-group
+  # contract instead of relying on non-interactive shell job control.
+  perl -MPOSIX -e 'POSIX::setsid() < 0 and exit 125; exec @ARGV or exit 127' -- sh -c '
     anchor_path="$1"
     result_path="$2"
     start_path="$3"
@@ -491,12 +493,21 @@ target_pid="$target_launcher_pid"
 # The supervisor never reads the status pipe. Only the anchor owns its write
 # end, and the target command receives an explicitly closed fd 3.
 exec 3>&- || true
+wrapper_pgid="$(run_process_probe ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' || true)"
 target_pgid_attempt=0
 while [ "$target_pgid_attempt" -lt 100 ]; do
   observed_target_pgid="$(run_process_probe ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ' || true)"
   case "$observed_target_pgid" in
     ''|*[!0-9]*) sleep 0.01; target_pgid_attempt=$((target_pgid_attempt + 1)) ;;
-    *) target_pgid="$observed_target_pgid"; break ;;
+    *)
+      if [ -n "$wrapper_pgid" ] && [ "$observed_target_pgid" = "$wrapper_pgid" ]; then
+        sleep 0.01
+        target_pgid_attempt=$((target_pgid_attempt + 1))
+      else
+        target_pgid="$observed_target_pgid"
+        break
+      fi
+      ;;
   esac
 done
 capture_target_identity() {
@@ -751,7 +762,7 @@ captured_process_can_be_signaled() {
             "$target_pid") [ "$captured_expected_pgid" = "$captured_ps_pgid" ] && return 0 ;;
             0|1|''|*[!0-9]*) return 1 ;;
             *)
-              if [ -f "$captured_descendants_read_path" ] && awk -F'|' -v pid="$captured_expected_ppid" '$1 == pid { found = 1; exit } END { exit(found ? 0 : 1) }' "$captured_descendants_read_path" >/dev/null 2>&1; then
+              if printf '%s' "$captured_descendants_read_data" | awk -F'|' -v pid="$captured_expected_ppid" '$1 == pid { found = 1; exit } END { exit(found ? 0 : 1) }' >/dev/null 2>&1; then
                 [ "$captured_expected_pgid" = "$captured_ps_pgid" ] && return 0
               fi
               ;;
@@ -760,7 +771,7 @@ captured_process_can_be_signaled() {
           ;;
         ''|*[!0-9]*) return 1 ;;
       esac
-      if [ -f "$captured_descendants_read_path" ] && awk -F'|' -v pid="$captured_ps_ppid" '$1 == pid { found = 1; exit } END { exit(found ? 0 : 1) }' "$captured_descendants_read_path" >/dev/null 2>&1; then
+      if printf '%s' "$captured_descendants_read_data" | awk -F'|' -v pid="$captured_ps_ppid" '$1 == pid { found = 1; exit } END { exit(found ? 0 : 1) }' >/dev/null 2>&1; then
         return 0
       fi
       return 1
@@ -912,8 +923,7 @@ capture_group_members() {
   ' "$captured_group_probe_path"; then
     return 2
   fi
-  captured_group_members_read_path="$(safe_read_snapshot "$captured_group_members_path" 2>/dev/null || true)"
-  [ -n "$captured_group_members_read_path" ] || return 2
+  captured_group_members_read_data="$(safe_read_snapshot "$captured_group_members_path" 2>/dev/null)" || return 2
   return 0
 }
 captured_group_has_live_process() {
@@ -921,7 +931,7 @@ captured_group_has_live_process() {
   capture_group_members "$captured_group"
   captured_group_probe_status=$?
   [ "$captured_group_probe_status" -eq 0 ] || return "$captured_group_probe_status"
-  run_process_probe awk -F'|' '$2 !~ /^Z/ { found = 1; exit } END { exit(found ? 0 : 1) }' "$captured_group_members_read_path"
+  printf '%s' "$captured_group_members_read_data" | run_process_probe awk -F'|' '$2 !~ /^Z/ { found = 1; exit } END { exit(found ? 0 : 1) }'
 }
 captured_group_can_be_signaled() {
   captured_group_identity="$1"
@@ -1026,13 +1036,16 @@ captured_group_can_be_signaled() {
         T*|t*) ;;
         *) return 1 ;;
       esac
-      quiesced_groups_read_path="$(safe_read_snapshot "$quiesced_groups_path" 2>/dev/null || true)"
-      if [ -n "$quiesced_groups_read_path" ] && awk -F'|' -v group="$captured_group" -v identity="$expected_group_member_identity" '$1 == group && $2 == identity { found = 1; exit } END { exit(found ? 0 : 1) }' "$quiesced_groups_read_path" 2>/dev/null; then
+      quiesced_groups_read_data="$(safe_read_snapshot "$quiesced_groups_path" 2>/dev/null || true)"
+      if printf '%s' "$quiesced_groups_read_data" | awk -F'|' -v group="$captured_group" -v identity="$expected_group_member_identity" '$1 == group && $2 == identity { found = 1; exit } END { exit(found ? 0 : 1) }' 2>/dev/null; then
         captured_group_anchor_count=$((captured_group_anchor_count + 1))
       fi
     fi
     captured_group_live_count=$((captured_group_live_count + 1))
-  done < "$captured_group_members_read_path" || return 2
+  done <<EOF
+$captured_group_members_read_data
+EOF
+  [ "$?" -eq 0 ] || return 2
   if [ "$group_quiescence_required" = "1" ] && [ "$captured_group_anchor_count" -eq 0 ]; then return 1; fi
   if [ "$captured_group_missing_member" = "1" ]; then
     if [ -z "$captured_group_owner_start" ]; then return 1; fi
@@ -1181,7 +1194,7 @@ owned_descendants() {
       *) cleanup_ack_enabled=0; return 1 ;;
     esac
   fi
-  if [ -f "$captured_descendants_read_path" ]; then
+  if [ "$authorized_descendant_count" -gt 0 ]; then
     while IFS='|' read -r captured_pid captured_identity captured_pgid captured_extra; do
       [ -n "$captured_pid$captured_identity$captured_pgid$captured_extra" ] || continue
       case "$captured_pid" in ''|*[!0-9]*) cleanup_ack_enabled=0; return 1 ;; esac
@@ -1224,7 +1237,10 @@ owned_descendants() {
         return 1
       fi
       if [ "$captured_pgid" != "$wrapper_pgid" ]; then owned_groups="$owned_groups $captured_pgid"; fi
-    done < "$captured_descendants_read_path" || { cleanup_ack_enabled=0; return 1; }
+    done <<EOF
+$captured_descendants_read_data
+EOF
+    [ "$?" -eq 0 ] || { cleanup_ack_enabled=0; return 1; }
   fi
   descendants_for_roots "$owned_roots" "$owned_groups" "$descendant_result_path"
 }
@@ -1272,8 +1288,7 @@ record_descendants() {
   if ! validate_captured_ledger; then cleanup_ack_enabled=0; return 1; fi
   captured_count="$authorized_descendant_count"
   [ -f "$record_pending_path" ] || { cleanup_ack_enabled=0; return 1; }
-  record_pending_read_path="$(safe_read_snapshot "$record_pending_path" 2>/dev/null || true)"
-  [ -n "$record_pending_read_path" ] || { cleanup_ack_enabled=0; return 1; }
+  record_pending_read_data="$(safe_read_snapshot "$record_pending_path" 2>/dev/null)" || { cleanup_ack_enabled=0; return 1; }
   while read -r captured_pid; do
     if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
     case "$captured_pid" in ''|*[!0-9]*) continue ;; esac
@@ -1356,7 +1371,11 @@ EOF
     fi
     authorize_descendant_record "$captured_record"
     captured_count=$((captured_count + 1))
-  done < "$record_pending_read_path" || { cleanup_ack_enabled=0; return 1; }
+  done <<EOF
+$record_pending_read_data
+EOF
+  [ "$?" -eq 0 ] || { cleanup_ack_enabled=0; return 1; }
+  captured_descendants_read_data="$(safe_read_snapshot "$captured_descendants_path" 2>/dev/null)" || { cleanup_ack_enabled=0; return 1; }
 }
 capture_owned_descendants() {
   if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
@@ -1377,7 +1396,7 @@ capture_owned_descendants() {
 }
 quiesce_captured_descendants() {
   if ! validate_captured_ledger; then cleanup_ack_enabled=0; return 1; fi
-  [ -f "$captured_descendants_read_path" ] || return 0
+  [ "$authorized_descendant_count" -gt 0 ] || return 0
   while IFS='|' read -r captured_pid captured_identity captured_pgid captured_extra; do
     if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
     [ -n "$captured_pid$captured_identity$captured_pgid$captured_extra" ] || continue
@@ -1406,7 +1425,10 @@ quiesce_captured_descendants() {
     captured_process_can_be_signaled "$captured_identity" || { cleanup_ack_enabled=0; return 1; }
     if ! kill -STOP "-$current_captured_pgid" 2>/dev/null; then cleanup_ack_enabled=0; return 1; fi
     if ! safe_append_line "$quiesced_groups_path" "$current_captured_pgid|$captured_identity"; then cleanup_ack_enabled=0; return 1; fi
-  done < "$captured_descendants_read_path" || { cleanup_ack_enabled=0; return 1; }
+  done <<EOF
+$captured_descendants_read_data
+EOF
+  [ "$?" -eq 0 ] || { cleanup_ack_enabled=0; return 1; }
 }
 prepare_kill_ownership() {
   if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
@@ -1435,7 +1457,7 @@ prepare_kill_ownership() {
   fi
   if ! quiesce_captured_descendants; then return 1; fi
   group_quiescence_required=0
-  if awk -F'|' '$2 ~ /^ps:/ { found = 1; exit } END { exit(found ? 0 : 1) }' "$captured_descendants_read_path" 2>/dev/null; then
+  if printf '%s' "$captured_descendants_read_data" | awk -F'|' '$2 ~ /^ps:/ { found = 1; exit } END { exit(found ? 0 : 1) }' 2>/dev/null; then
     group_quiescence_required=1
   fi
   ownership_previous_count="$authorized_descendant_count"
@@ -1456,7 +1478,7 @@ prepare_kill_ownership() {
 reconcile_captured_descendants() {
   if ! validate_captured_ledger; then cleanup_ack_enabled=0; return 1; fi
   [ "$authorized_descendant_count" -eq 0 ] && return 0
-  [ -f "$captured_descendants_read_path" ] || return 0
+  [ "$authorized_descendant_count" -gt 0 ] || return 0
   if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
   reconcile_pending_path="$status_dir/reconcile-target-descendants"
   reconcile_next_path="$status_dir/descendants-reconciled"
@@ -1469,8 +1491,7 @@ reconcile_captured_descendants() {
     cleanup_ack_enabled=0
     return 1
   fi
-  reconcile_pending_read_path="$(safe_read_snapshot "$reconcile_pending_path" 2>/dev/null || true)"
-  [ -n "$reconcile_pending_read_path" ] || { cleanup_ack_enabled=0; return 1; }
+  reconcile_pending_read_data="$(safe_read_snapshot "$reconcile_pending_path" 2>/dev/null)" || { cleanup_ack_enabled=0; return 1; }
   if ! create_marker_exclusive "$reconcile_next_path"; then cleanup_ack_enabled=0; return 1; fi
   while IFS='|' read -r captured_pid captured_identity captured_pgid captured_extra; do
     if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
@@ -1510,17 +1531,20 @@ reconcile_captured_descendants() {
       safe_append_line "$reconcile_next_path" "$captured_pid|$captured_identity|$captured_pgid" || { cleanup_ack_enabled=0; return 1; }
       continue
     fi
-    if ! awk -v pid="$captured_pid" '$1 == pid { found = 1; exit } END { exit(found ? 0 : 1) }' "$reconcile_pending_read_path" >/dev/null 2>&1; then
+    if ! printf '%s' "$reconcile_pending_read_data" | awk -v pid="$captured_pid" '$1 == pid { found = 1; exit } END { exit(found ? 0 : 1) }' >/dev/null 2>&1; then
       cleanup_ack_enabled=0
       return 1
     fi
-  done < "$captured_descendants_read_path" || { cleanup_ack_enabled=0; return 1; }
+  done <<EOF
+$captured_descendants_read_data
+EOF
+  [ "$?" -eq 0 ] || { cleanup_ack_enabled=0; return 1; }
   if ! mv -f -- "$reconcile_next_path" "$captured_descendants_path" 2>/dev/null; then cleanup_ack_enabled=0; return 1; fi
 }
 signal_captured_descendants() {
   if ! validate_captured_ledger; then cleanup_ack_enabled=0; return 1; fi
   [ "$authorized_descendant_count" -eq 0 ] && return 0
-  [ -f "$captured_descendants_read_path" ] || return 0
+  [ "$authorized_descendant_count" -gt 0 ] || return 0
   while IFS='|' read -r captured_pid captured_identity captured_pgid captured_extra; do
     if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
     case "$captured_pid" in ''|*[!0-9]*) continue ;; esac
@@ -1585,7 +1609,10 @@ signal_captured_descendants() {
     else
       case "$captured_identity" in proc:*) kill -"$signal" "$captured_pid" 2>/dev/null || true ;; esac
     fi
-  done < "$captured_descendants_read_path" || cleanup_ack_enabled=0
+  done <<EOF
+$captured_descendants_read_data
+EOF
+  [ "$?" -eq 0 ] || cleanup_ack_enabled=0
 }
 signal_tree() {
   signal="$1"
@@ -1636,8 +1663,7 @@ signal_tree() {
   if [ "$group_signal_succeeded" = "1" ]; then return; fi
   signal_descendants_path="$status_dir/signal-descendants"
   if ! descendants "$signal_descendants_path"; then cleanup_ack_enabled=0; return; fi
-  signal_descendants_read_path="$(safe_read_snapshot "$signal_descendants_path" 2>/dev/null || true)"
-  [ -n "$signal_descendants_read_path" ] || { cleanup_ack_enabled=0; return; }
+  signal_descendants_read_data="$(safe_read_snapshot "$signal_descendants_path" 2>/dev/null)" || { cleanup_ack_enabled=0; return; }
   while read -r pid; do
     [ "$pid" = "$$" ] && continue
     process_liveness "$pid"
@@ -1667,22 +1693,25 @@ signal_tree() {
         kill -"$signal" "$pid" 2>/dev/null || true
       fi
     fi
-  done < "$signal_descendants_read_path" || cleanup_ack_enabled=0
+  done <<EOF
+$signal_descendants_read_data
+EOF
+  [ "$?" -eq 0 ] || cleanup_ack_enabled=0
   if [ -e "$descendant_scan_truncated_path" ] || [ -e "$descendant_scan_failed_path" ] || [ -e "$snapshot_failed_path" ]; then cleanup_ack_enabled=0; fi
 }
 captured_identity_for_pid() {
   captured_lookup_pid="$1"
-  [ -f "$captured_descendants_read_path" ] || return 1
-  awk -F'|' -v pid="$captured_lookup_pid" '$1 == pid { print $2; found = 1; exit } END { if (!found) exit 1 }' "$captured_descendants_read_path"
+  [ "$authorized_descendant_count" -gt 0 ] || return 1
+  printf '%s' "$captured_descendants_read_data" | awk -F'|' -v pid="$captured_lookup_pid" '$1 == pid { print $2; found = 1; exit } END { if (!found) exit 1 }'
 }
 captured_group_for_pid() {
   captured_lookup_pid="$1"
-  [ -f "$captured_descendants_read_path" ] || return 1
-  awk -F'|' -v pid="$captured_lookup_pid" '$1 == pid { print $3; found = 1; exit } END { if (!found) exit 1 }' "$captured_descendants_read_path"
+  [ "$authorized_descendant_count" -gt 0 ] || return 1
+  printf '%s' "$captured_descendants_read_data" | awk -F'|' -v pid="$captured_lookup_pid" '$1 == pid { print $3; found = 1; exit } END { if (!found) exit 1 }'
 }
 verify_captured_descendants() {
   if ! validate_captured_ledger; then cleanup_ack_enabled=0; return 1; fi
-  [ -f "$captured_descendants_read_path" ] || { cleanup_ack_enabled=0; return 1; }
+  [ "$authorized_descendant_count" -gt 0 ] || return 0
   while IFS='|' read -r captured_pid captured_identity captured_pgid captured_extra; do
     if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
     [ -n "$captured_pid$captured_identity$captured_pgid$captured_extra" ] || continue
@@ -1782,7 +1811,10 @@ verify_captured_descendants() {
     if ! identity_is_valid "$current_captured_identity" || [ "$current_captured_identity" = "$captured_identity" ]; then cleanup_ack_enabled=0; return 1; fi
     cleanup_ack_enabled=0
     return 1
-  done < "$captured_descendants_read_path" || { cleanup_ack_enabled=0; return 1; }
+  done <<EOF
+$captured_descendants_read_data
+EOF
+  [ "$?" -eq 0 ] || { cleanup_ack_enabled=0; return 1; }
 }
 verify_owned_descendants() {
   verify_owned_path="$status_dir/remaining-owned-descendants"
@@ -1790,8 +1822,7 @@ verify_owned_descendants() {
     cleanup_ack_enabled=0
     return 1
   fi
-  verify_owned_read_path="$(safe_read_snapshot "$verify_owned_path" 2>/dev/null || true)"
-  [ -n "$verify_owned_read_path" ] || { cleanup_ack_enabled=0; return 1; }
+  verify_owned_read_data="$(safe_read_snapshot "$verify_owned_path" 2>/dev/null)" || { cleanup_ack_enabled=0; return 1; }
   while read -r remaining_owned_pid; do
     if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
     case "$remaining_owned_pid" in ''|*[!0-9]*) continue ;; esac
@@ -1828,7 +1859,10 @@ verify_owned_descendants() {
         ;;
     esac
     return 1
-  done < "$verify_owned_read_path" || { cleanup_ack_enabled=0; return 1; }
+  done <<EOF
+$verify_owned_read_data
+EOF
+  [ "$?" -eq 0 ] || { cleanup_ack_enabled=0; return 1; }
 }
 verify_target_group_cleanup() {
   case "$target_pgid" in ''|0|*[!0-9]*) cleanup_ack_enabled=0; return 1 ;; esac
@@ -1846,7 +1880,10 @@ verify_target_group_cleanup() {
       [ "$target_group_member_pid" = "$$" ] && continue
       target_group_remaining=1
       break
-    done < "$captured_group_members_read_path" || { cleanup_ack_enabled=0; return 1; }
+    done <<EOF
+$captured_group_members_read_data
+EOF
+    [ "$?" -eq 0 ] || { cleanup_ack_enabled=0; return 1; }
     [ "$target_group_remaining" = "0" ] && return 0
     sleep 0.05
     target_group_attempt=$((target_group_attempt + 1))
@@ -1863,8 +1900,7 @@ verify_descendant_cleanup() {
     cleanup_ack_enabled=0
     return 1
   fi
-  verify_descendants_read_path="$(safe_read_snapshot "$verify_descendants_path" 2>/dev/null || true)"
-  [ -n "$verify_descendants_read_path" ] || { cleanup_ack_enabled=0; return 1; }
+  verify_descendants_read_data="$(safe_read_snapshot "$verify_descendants_path" 2>/dev/null)" || { cleanup_ack_enabled=0; return 1; }
   remaining_descendants=0
   while read -r remaining_pid; do
     if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
@@ -1892,14 +1928,15 @@ verify_descendant_cleanup() {
       remaining_descendants=1
       kill -KILL "$remaining_pid" 2>/dev/null || true
     fi
-  done < "$verify_descendants_read_path"
+  done <<EOF
+$verify_descendants_read_data
+EOF
   if [ "$remaining_descendants" = "1" ]; then sleep 0.05; fi
   if ! descendants "$verify_descendants_path" 2>/dev/null || [ "$cleanup_ack_enabled" != "1" ]; then
     cleanup_ack_enabled=0
     return 1
   fi
-  verify_descendants_read_path="$(safe_read_snapshot "$verify_descendants_path" 2>/dev/null || true)"
-  [ -n "$verify_descendants_read_path" ] || { cleanup_ack_enabled=0; return 1; }
+  verify_descendants_read_data="$(safe_read_snapshot "$verify_descendants_path" 2>/dev/null)" || { cleanup_ack_enabled=0; return 1; }
   while read -r remaining_pid; do
     if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
     case "$remaining_pid" in ''|*[!0-9]*) continue ;; esac
@@ -1910,7 +1947,9 @@ verify_descendant_cleanup() {
       dead) continue ;;
       *) cleanup_ack_enabled=0; return 1 ;;
     esac
-  done < "$verify_descendants_read_path"
+  done <<EOF
+$verify_descendants_read_data
+EOF
   verify_captured_descendants
 }
 target_group_can_be_signaled_after_anchor_loss() {
@@ -1973,7 +2012,10 @@ target_group_can_be_signaled_after_anchor_loss() {
       dead) ;;
       *) return 1 ;;
     esac
-  done < "$captured_group_members_read_path" || return 1
+  done <<EOF
+$captured_group_members_read_data
+EOF
+  [ "$?" -eq 0 ] || return 1
   [ "$target_group_live_count" -gt 0 ]
 }
 watchdog_pid=""
@@ -2365,6 +2407,24 @@ async function waitForReady(path: string, wrapperExited: Promise<number>): Promi
   return false;
 }
 
+async function waitForTargetReference(
+  statusPath: string,
+  wrapperPid: number,
+  wrapperExited: Promise<number>,
+): Promise<TargetReference | undefined> {
+  const deadline = Date.now() + SUPERVISOR_STATUS_PIPE_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const reference = await readTargetReference(statusPath, wrapperPid);
+    if (reference !== undefined) return reference;
+    const wrapperDone = await Promise.race([
+      wrapperExited.then(() => true, () => true),
+      Bun.sleep(20).then(() => false),
+    ]);
+    if (wrapperDone) return undefined;
+  }
+  return undefined;
+}
+
 async function removeSupervisorDirectory(path: string): Promise<void> {
   try {
     const stats = await lstat(path);
@@ -2484,6 +2544,11 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
         }
       },
     };
+    // The supervisor publishes the target reference before it creates the
+    // target-start marker. Begin reading it immediately after spawning so a
+    // target that exits during the ready handshake cannot erase the anchor
+    // before the parent has authenticated the reference.
+    const targetReferencePromise = waitForTargetReference(statusPath, child.pid, wrapperExited);
     const ready = await waitForReady(readyPath, wrapperExited);
     if (!ready) {
       try { child.kill("SIGTERM"); } catch { /* The wrapper may already be gone. */ }
@@ -2493,9 +2558,21 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
       }
       await wrapperExited;
       await supervised.exited.catch(() => undefined);
+      await targetReferencePromise;
       throw new Error("supervisor_not_ready");
     }
-    rememberedTargetReference = await readTargetReference(statusPath, child.pid);
+    const targetReference = await targetReferencePromise;
+    if (targetReference === undefined) {
+      try { child.kill("SIGTERM"); } catch { /* The wrapper may already be gone. */ }
+      const cleanupReady = await waitForCleanupAcknowledged();
+      if (!cleanupReady) {
+        try { child.kill("SIGKILL"); } catch { /* The wrapper may already be gone. */ }
+      }
+      await wrapperExited.catch(() => undefined);
+      await supervised.exited.catch(() => undefined);
+      throw new Error("supervisor_target_reference_unavailable");
+    }
+    rememberedTargetReference = targetReference;
     return supervised;
   } catch (error) {
     if (statusFdForCleanup !== undefined) await closeFileDescriptor(statusFdForCleanup);

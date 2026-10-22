@@ -1818,29 +1818,44 @@ exec /bin/ps "$@"
   test("fails closed when detached descendant enumeration is truncated", { timeout: 90_000 }, async () => {
     if (process.platform === "win32") return;
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-descendant-cap-"));
-    const pidFile = join(root, "descendants.pid");
-    const readyFile = join(root, "ready");
+    const ps = join(root, "ps");
+    const targetPidFile = join(root, "target.pid");
+    const previousPath = process.env.PATH;
+    const previousTargetPidFile = process.env.AGENT_TOOLKIT_TEST_DESCENDANT_ROOT_PID_FILE;
     let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
-    let descendantPids: number[] = [];
     try {
+      await writeFile(ps, `#!/bin/sh
+if [ "$1" = "-eo" ] && [ "$2" = "pid=,ppid=,pgid=" ]; then
+  /bin/ps "$@"
+  root_pid=""
+  attempt=1
+  while [ "$attempt" -le 50 ] && [ -z "$root_pid" ]; do
+    root_pid=$(cat "$AGENT_TOOLKIT_TEST_DESCENDANT_ROOT_PID_FILE" 2>/dev/null || true)
+    [ -n "$root_pid" ] || { sleep 0.01; attempt=$((attempt + 1)); }
+  done
+  root_pgid=$(/bin/ps -o pgid= -p "$root_pid" | awk 'NR == 1 { gsub(/[[:space:]]/, ""); print; exit }')
+  case "$root_pid:$root_pgid" in
+    ''|*[!0-9:]*|*:0) exit 1 ;;
+  esac
+  i=1
+  while [ "$i" -le 1025 ]; do
+    printf '%s %s %s\\n' "$((900000 + i))" "$root_pid" "$root_pgid"
+    i=$((i + 1))
+  done
+  exit 0
+fi
+exec /bin/ps "$@"
+`);
+      await chmod(ps, 0o755);
+      process.env.PATH = `${root}:${previousPath ?? ""}`;
+      process.env.AGENT_TOOLKIT_TEST_DESCENDANT_ROOT_PID_FILE = targetPidFile;
       supervised = await spawnSupervised([
         "sh",
         "-c",
-        "i=0; while [ \"$i\" -lt 1025 ]; do perl -MPOSIX -e 'POSIX::setsid() < 0 and exit 125; exec @ARGV' -- sleep 30 & printf '%s\\n' \"$!\" >> \"$1\"; i=$((i + 1)); done; printf ready > \"$2\"; while :; do sleep 1; done",
-        "agent-toolkit-supervised-target",
-        pidFile,
-        readyFile,
+        "printf '%s\\n' \"$$\" > \"$1\"; while :; do sleep 1; done",
+        "agent-toolkit-cap-fixture-target",
+        targetPidFile,
       ]);
-      for (let attempt = 0; attempt < 240; attempt += 1) {
-        try {
-          descendantPids = (await readFile(pidFile, "utf8")).split(/\s+/).filter(Boolean).map(Number).filter(Number.isInteger);
-          if (descendantPids.length >= 1025 && (await readFile(readyFile, "utf8")).trim() === "ready") break;
-        } catch {
-          // The target may still be spawning its detached children.
-        }
-        await Bun.sleep(25);
-      }
-      expect(descendantPids.length).toBeGreaterThanOrEqual(1025);
       supervised.child.kill("SIGTERM");
       expect(await supervised.waitForCleanupAcknowledged()).toBe(false);
       await supervised.wrapperExited;
@@ -1850,14 +1865,10 @@ exec /bin/ps "$@"
         await supervised.wrapperExited.catch(() => undefined);
         await supervised.cleanup();
       }
-      try {
-        descendantPids = (await readFile(pidFile, "utf8")).split(/\s+/).filter(Boolean).map(Number).filter(Number.isInteger);
-      } catch {
-        // The target may have exited before writing its full PID list.
-      }
-      for (const pid of descendantPids) {
-        try { process.kill(pid, "SIGKILL"); } catch { /* The detached process may have exited. */ }
-      }
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      if (previousTargetPidFile === undefined) delete process.env.AGENT_TOOLKIT_TEST_DESCENDANT_ROOT_PID_FILE;
+      else process.env.AGENT_TOOLKIT_TEST_DESCENDANT_ROOT_PID_FILE = previousTargetPidFile;
       await rm(root, { recursive: true, force: true });
     }
   });

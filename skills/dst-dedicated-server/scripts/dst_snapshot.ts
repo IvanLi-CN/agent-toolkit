@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { lstat, link, mkdir, mkdtemp, open, opendir, realpath, rename, rm, unlink, type FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { spawnSupervised, type SupervisedChild } from "./process_supervisor.ts";
+import { spawnSupervised, SUPERVISOR_UNKNOWN_TARGET_STATUS, type SupervisedChild } from "./process_supervisor.ts";
 
 interface SnapshotOptions {
   host: string;
@@ -920,6 +920,10 @@ async function remoteCollect(options: SnapshotOptions, script: string): Promise<
     if (!connectivity.cleanupVerified) lines.splice(lines.length - 1, 0, "> Local process cleanup could not be verified; remote collection was not attempted.");
     return { text: lines.join("\n"), failed: false };
   }
+  if (connectivity.exitCode === SUPERVISOR_UNKNOWN_TARGET_STATUS) {
+    lines.push("> Local process supervisor exited before recording the SSH result; remote collection was not attempted.", "");
+    return { text: lines.join("\n"), failed: true };
+  }
   if (connectivity.exitCode !== 0) {
     lines.push("> Remote SSH failed (host down, wrong IP/port, or missing SSH key).");
     const detail = renderReportInline(connectivity.stderr.trim(), [options.host, options.user]);
@@ -952,7 +956,12 @@ async function remoteCollect(options: SnapshotOptions, script: string): Promise<
   if (result.outputTruncated) {
     lines.push(`> Remote collection exceeded the ${MAX_REMOTE_OUTPUT_BYTES}-byte output limit.`);
     if (!result.cleanupVerified) lines.push("> Local process cleanup could not be verified.");
+    if (result.exitCode === SUPERVISOR_UNKNOWN_TARGET_STATUS) lines.push("> Local process supervisor exited before recording the remote collection result; remote collection was not completed.");
     lines.push("");
+    return { text: lines.join("\n"), failed: true };
+  }
+  if (result.exitCode === SUPERVISOR_UNKNOWN_TARGET_STATUS) {
+    lines.push("> Local process supervisor exited before recording the remote collection result; remote collection was not completed.", "");
     return { text: lines.join("\n"), failed: true };
   }
   if (result.exitCode !== 0) {

@@ -1,4 +1,4 @@
-import { lstat, mkdtemp, readFile, rm, rmdir } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, rmdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -100,12 +100,13 @@ ps_identity_for_pid() {
     $5 ~ /^[0-9][0-9][0-9][0-9]$/ { print $1, $2, $3, $4, $5; exit }
   ')"
   ps_identity_pgid="$($ps_identity_runner ps -o pgid= -p "$ps_identity_pid" 2>/dev/null | $ps_identity_runner awk 'NR == 1 { gsub(/[[:space:]]/, ""); if ($0 ~ /^[0-9]+$/) print; exit }')"
+  ps_identity_ppid="$($ps_identity_runner ps -o ppid= -p "$ps_identity_pid" 2>/dev/null | $ps_identity_runner awk 'NR == 1 { gsub(/[[:space:]]/, ""); if ($0 ~ /^[0-9]+$/) print; exit }')"
   ps_identity_command_hash="$($ps_identity_runner ps -o command= -p "$ps_identity_pid" 2>/dev/null | $ps_identity_runner cksum | $ps_identity_runner awk 'NR == 1 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { print $1 ":" $2; exit }')"
   # macOS does not expose /proc start ticks. Bind the second-resolution start
-  # time to the process group and command; descendants may be reparented while
-  # the supervisor is terminating their detached group.
-  if [ -n "$ps_identity_start" ] && [ -n "$ps_identity_pgid" ] && [ -n "$ps_identity_command_hash" ]; then
-    printf 'ps:%s;pgid=%s;cmd=%s\n' "$ps_identity_start" "$ps_identity_pgid" "$ps_identity_command_hash"
+  # time to the original parent, group, and command. Captured descendants may
+  # later be reparented to launchd, which is handled by captured_identity_matches.
+  if [ -n "$ps_identity_start" ] && [ -n "$ps_identity_pgid" ] && [ -n "$ps_identity_ppid" ] && [ -n "$ps_identity_command_hash" ]; then
+    printf 'ps:%s;ppid=%s;pgid=%s;cmd=%s\n' "$ps_identity_start" "$ps_identity_ppid" "$ps_identity_pgid" "$ps_identity_command_hash"
     return 0
   fi
   return 1
@@ -124,8 +125,12 @@ if [ "$parent_identity_mode" != "proc" ]; then
 fi
 target_status_path="$status_dir/target-status"
 target_anchor_path="$status_dir/target"
+target_pgid_path="$status_dir/target-pgid"
+target_identity_path="$status_dir/target-identity"
 target_pgid=""
 target_pid=""
+group_quiescence_required=0
+quiesced_groups_path="$status_dir/quiesced-groups"
 if command -v setsid >/dev/null 2>&1; then
   setsid sh -c '
     anchor_path="$1"
@@ -224,7 +229,19 @@ case "$target_pgid" in
     exit 143
     ;;
 esac
-printf '%s\\n' ready > "$ready_path"
+record_target_reference() {
+  printf '%s\\n' "$target_pgid" > "$target_pgid_path" || return 1
+  case "$target_identity_mode" in
+    proc) printf 'proc:%s\\n' "$target_starttime" > "$target_identity_path" ;;
+    ps) printf '%s\\n' "$target_ps_start" > "$target_identity_path" ;;
+    *) return 1 ;;
+  esac
+}
+if ! record_target_reference; then
+  cleanup_ack_enabled=0
+  cleanup
+  exit 143
+fi
 refresh_target_reference() {
   target_reference_attempt=0
   while [ "$target_reference_attempt" -lt 100 ]; do
@@ -255,6 +272,7 @@ refresh_target_reference() {
       esac
       ;;
   esac
+  record_target_reference || cleanup_ack_enabled=0
 }
 target_identity_matches() {
   if [ "$target_identity_mode" = "proc" ] && [ -r "/proc/$target_pid/stat" ]; then
@@ -416,15 +434,52 @@ identity_is_valid() {
 captured_process_can_be_signaled() {
   case "$1" in
     proc:*) return 0 ;;
-    ps:*';pgid='*';cmd='*)
+    ps:*';ppid='*';pgid='*';cmd='*)
       captured_ps_identity="\${1#ps:}"
+      captured_ps_ppid="\${captured_ps_identity#*;ppid=}"
+      captured_ps_ppid="\${captured_ps_ppid%%;pgid=*}"
       captured_ps_pgid="\${captured_ps_identity#*;pgid=}"
       captured_ps_pgid="\${captured_ps_pgid%%;cmd=*}"
       captured_ps_command_hash="\${captured_ps_identity#*;cmd=}"
+      case "$captured_ps_ppid" in ''|*[!0-9]*) return 1 ;; esac
       case "$captured_ps_pgid" in ''|*[!0-9]*) return 1 ;; esac
       case "$captured_ps_command_hash" in ''|*[!0-9:]*) return 1 ;; esac
       return 0
       ;;
+    *) return 1 ;;
+  esac
+}
+captured_identity_matches() {
+  captured_expected_identity="$1"
+  captured_current_identity="$2"
+  [ "$captured_expected_identity" = "$captured_current_identity" ] && return 0
+  case "$captured_expected_identity" in
+    ps:*';ppid='*';pgid='*';cmd='*) ;;
+    *) return 1 ;;
+  esac
+  case "$captured_current_identity" in
+    ps:*';ppid='*';pgid='*';cmd='*) ;;
+    *) return 1 ;;
+  esac
+  captured_expected_parts="\${captured_expected_identity#ps:}"
+  captured_current_parts="\${captured_current_identity#ps:}"
+  captured_expected_start="\${captured_expected_parts%%;ppid=*}"
+  captured_current_start="\${captured_current_parts%%;ppid=*}"
+  [ "$captured_expected_start" = "$captured_current_start" ] || return 1
+  captured_expected_ppid="\${captured_expected_parts#*;ppid=}"
+  captured_expected_ppid="\${captured_expected_ppid%%;pgid=*}"
+  captured_current_ppid="\${captured_current_parts#*;ppid=}"
+  captured_current_ppid="\${captured_current_ppid%%;pgid=*}"
+  captured_expected_pgid="\${captured_expected_parts#*;pgid=}"
+  captured_expected_pgid="\${captured_expected_pgid%%;cmd=*}"
+  captured_current_pgid="\${captured_current_parts#*;pgid=}"
+  captured_current_pgid="\${captured_current_pgid%%;cmd=*}"
+  captured_expected_command_hash="\${captured_expected_parts#*;cmd=}"
+  captured_current_command_hash="\${captured_current_parts#*;cmd=}"
+  [ "$captured_expected_pgid" = "$captured_current_pgid" ] || return 1
+  [ "$captured_expected_command_hash" = "$captured_current_command_hash" ] || return 1
+  case "$captured_current_ppid" in
+    0|1) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -488,6 +543,7 @@ captured_group_can_be_signaled() {
   captured_group_probe_status=$?
   [ "$captured_group_probe_status" -eq 0 ] || return "$captured_group_probe_status"
   captured_group_live_count=0
+  captured_group_anchor_count=0
   captured_group_missing_member=0
   captured_group_owner_start=""
   captured_group_owner_identity="$(captured_identity_for_pid "$captured_group" 2>/dev/null || true)"
@@ -550,11 +606,21 @@ captured_group_can_be_signaled() {
         *) return 1 ;;
       esac
     fi
-    if [ "$current_group_member_identity" != "$expected_group_member_identity" ]; then
+    if ! captured_identity_matches "$expected_group_member_identity" "$current_group_member_identity"; then
       return 1
+    fi
+    if [ "$group_quiescence_required" = "1" ]; then
+      case "$group_member_state" in
+        T*|t*) ;;
+        *) return 1 ;;
+      esac
+      if awk -F'|' -v group="$captured_group" -v identity="$expected_group_member_identity" '$1 == group && $2 == identity { found = 1; exit } END { exit(found ? 0 : 1) }' "$quiesced_groups_path" 2>/dev/null; then
+        captured_group_anchor_count=$((captured_group_anchor_count + 1))
+      fi
     fi
     captured_group_live_count=$((captured_group_live_count + 1))
   done < "$captured_group_members_path" || return 2
+  if [ "$group_quiescence_required" = "1" ] && [ "$captured_group_anchor_count" -eq 0 ]; then return 1; fi
   if [ "$captured_group_missing_member" = "1" ]; then
     if [ -z "$captured_group_owner_start" ]; then return 1; fi
     return 0
@@ -710,7 +776,7 @@ owned_descendants() {
       current_captured_identity="$(process_identity "$captured_pid" 2>/dev/null || true)"
       current_captured_identity="$(normalize_process_identity "$current_captured_identity" 2>/dev/null || true)"
       current_captured_pgid="$(process_group_id "$captured_pid" 2>/dev/null || true)"
-      if [ "$current_captured_identity" != "$captured_identity" ] || [ "$current_captured_pgid" != "$captured_pgid" ]; then
+      if ! captured_identity_matches "$captured_identity" "$current_captured_identity" || [ "$current_captured_pgid" != "$captured_pgid" ]; then
         cleanup_ack_enabled=0
         return 1
       fi
@@ -787,17 +853,15 @@ record_descendants() {
       esac
     fi
     captured_record="$captured_pid|$captured_identity|$captured_pgid"
-    if awk -F'|' -v pid="$captured_pid" -v record="$captured_record" '
-      $1 == pid { found = 1; if ($0 == record) exact = 1 }
-      END { if (exact) exit 0; if (found) exit 2; exit 1 }
-    ' "$captured_descendants_path" >/dev/null 2>&1; then
-      continue
-    else
-      captured_record_status=$?
-      case "$captured_record_status" in
-        1) ;;
-        *) cleanup_ack_enabled=0; return 1 ;;
-      esac
+    existing_captured_record="$(awk -F'|' -v pid="$captured_pid" '$1 == pid { print; exit }' "$captured_descendants_path" 2>/dev/null || true)"
+    if [ -n "$existing_captured_record" ]; then
+      existing_captured_identity="\${existing_captured_record#*|}"
+      existing_captured_identity="\${existing_captured_identity%%|*}"
+      if captured_identity_matches "$existing_captured_identity" "$captured_identity"; then
+        continue
+      fi
+      cleanup_ack_enabled=0
+      return 1
     fi
     if ! printf '%s\n' "$captured_record" >> "$captured_descendants_path"; then cleanup_ack_enabled=0; return 1; fi
     captured_count=$((captured_count + 1))
@@ -818,6 +882,7 @@ capture_owned_descendants() {
     cleanup_ack_enabled=0
     return 1
   fi
+  if [ "$group_quiescence_required" = "1" ] && ! quiesce_captured_descendants; then return 1; fi
 }
 quiesce_captured_descendants() {
   [ -f "$captured_descendants_path" ] || return 0
@@ -840,13 +905,14 @@ quiesce_captured_descendants() {
     esac
     current_captured_identity="$(process_identity "$captured_pid" 2>/dev/null || true)"
     current_captured_identity="$(normalize_process_identity "$current_captured_identity" 2>/dev/null || true)"
-    if [ "$current_captured_identity" != "$captured_identity" ]; then cleanup_ack_enabled=0; return 1; fi
+    if ! captured_identity_matches "$captured_identity" "$current_captured_identity"; then cleanup_ack_enabled=0; return 1; fi
     current_captured_pgid="$(process_group_id "$captured_pid" 2>/dev/null || true)"
     if [ "$current_captured_pgid" != "$captured_pgid" ]; then cleanup_ack_enabled=0; return 1; fi
     if [ "$current_captured_pgid" = "$wrapper_pgid" ]; then cleanup_ack_enabled=0; return 1; fi
     if [ -n "$target_group_for_quiesce" ] && [ "$current_captured_pgid" = "$target_group_for_quiesce" ]; then continue; fi
     captured_process_can_be_signaled "$captured_identity" || { cleanup_ack_enabled=0; return 1; }
     if ! kill -STOP "-$current_captured_pgid" 2>/dev/null; then cleanup_ack_enabled=0; return 1; fi
+    if ! printf '%s|%s\\n' "$current_captured_pgid" "$captured_identity" >> "$quiesced_groups_path"; then cleanup_ack_enabled=0; return 1; fi
   done < "$captured_descendants_path" || { cleanup_ack_enabled=0; return 1; }
 }
 prepare_kill_ownership() {
@@ -875,6 +941,7 @@ prepare_kill_ownership() {
     fi
   fi
   if ! quiesce_captured_descendants; then return 1; fi
+  group_quiescence_required=1
   ownership_previous_count="$(wc -l < "$captured_descendants_path" 2>/dev/null | tr -d '[:space:]' || true)"
   case "$ownership_previous_count" in ''|*[!0-9]*) cleanup_ack_enabled=0; return 1 ;; esac
   ownership_round=0
@@ -936,7 +1003,7 @@ reconcile_captured_descendants() {
     esac
     current_captured_identity="$(process_identity "$captured_pid" 2>/dev/null || true)"
     current_captured_identity="$(normalize_process_identity "$current_captured_identity" 2>/dev/null || true)"
-    if [ "$current_captured_identity" = "$captured_identity" ]; then
+    if captured_identity_matches "$captured_identity" "$current_captured_identity"; then
       printf '%s|%s|%s\n' "$captured_pid" "$captured_identity" "$captured_pgid" >> "$reconcile_next_path" || { cleanup_ack_enabled=0; return 1; }
       continue
     fi
@@ -985,7 +1052,7 @@ signal_captured_descendants() {
       cleanup_ack_enabled=0
       continue
     fi
-    if [ "$current_captured_identity" != "$captured_identity" ]; then cleanup_ack_enabled=0; continue; fi
+    if ! captured_identity_matches "$captured_identity" "$current_captured_identity"; then cleanup_ack_enabled=0; continue; fi
     current_captured_pgid="$(process_group_id "$captured_pid" 2>/dev/null || true)"
     if [ -z "$current_captured_pgid" ]; then
       cleanup_ack_enabled=0
@@ -1017,6 +1084,8 @@ signal_captured_descendants() {
 signal_tree() {
   signal="$1"
   set_snapshot_deadline
+  group_quiescence_required=0
+  rm -f "$quiesced_groups_path" 2>/dev/null || cleanup_ack_enabled=0
   if [ "$signal" = "KILL" ]; then
     reconcile_captured_descendants || cleanup_ack_enabled=0
   fi
@@ -1164,7 +1233,7 @@ verify_captured_descendants() {
       cleanup_ack_enabled=0
       return 1
     fi
-    if [ "$current_captured_identity" != "$captured_identity" ]; then
+    if ! captured_identity_matches "$captured_identity" "$current_captured_identity"; then
       cleanup_ack_enabled=0
       return 1
     fi
@@ -1216,7 +1285,7 @@ verify_owned_descendants() {
     current_owned_identity="$(process_identity "$remaining_owned_pid" 2>/dev/null || true)"
     current_owned_identity="$(normalize_process_identity "$current_owned_identity" 2>/dev/null || true)"
     current_owned_pgid="$(process_group_id "$remaining_owned_pid" 2>/dev/null || true)"
-    if [ "$current_owned_identity" != "$expected_owned_identity" ] || [ "$current_owned_pgid" != "$expected_owned_pgid" ]; then
+    if ! captured_identity_matches "$expected_owned_identity" "$current_owned_identity" || [ "$current_owned_pgid" != "$expected_owned_pgid" ]; then
       cleanup_ack_enabled=0
       return 1
     fi
@@ -1285,7 +1354,7 @@ verify_descendant_cleanup() {
       current_remaining_identity="$(normalize_process_identity "$current_remaining_identity" 2>/dev/null || true)"
       if ! identity_is_valid "$current_remaining_identity"; then current_remaining_identity=""; fi
       current_remaining_pgid="$(process_group_id "$remaining_pid" 2>/dev/null || true)"
-      if [ -z "$expected_remaining_identity" ] || [ -z "$expected_remaining_pgid" ] || [ "$current_remaining_identity" != "$expected_remaining_identity" ] || [ "$current_remaining_pgid" != "$expected_remaining_pgid" ]; then
+      if [ -z "$expected_remaining_identity" ] || [ -z "$expected_remaining_pgid" ] || ! captured_identity_matches "$expected_remaining_identity" "$current_remaining_identity" || [ "$current_remaining_pgid" != "$expected_remaining_pgid" ]; then
         cleanup_ack_enabled=0
         return 1
       fi
@@ -1334,6 +1403,7 @@ terminate_supervised_tree() {
 }
 hold_pid=""
 trap 'if [ "$termination_started" = "1" ]; then :; else if [ -n "$hold_pid" ]; then kill "$hold_pid" 2>/dev/null || true; fi; terminate_supervised_tree; exit 143; fi' HUP INT TERM
+printf '%s\\n' ready > "$ready_path"
 parent_is_alive() {
   if [ "$parent_identity_mode" = "proc" ] && [ -r "/proc/$parent_pid/stat" ]; then
     parent_identity="$(run_watchdog_probe awk '{ sub(/.*\\) /, ""); print $1 " " $20 }' "/proc/$parent_pid/stat" 2>/dev/null || true)"
@@ -1426,13 +1496,130 @@ async function readStatus(path: string): Promise<number | undefined> {
   return undefined;
 }
 
-async function waitForTarget(path: string, wrapperExited: Promise<number>): Promise<number> {
+function decodeSpawnOutput(output: Uint8Array | string | undefined): string {
+  if (output === undefined) return "";
+  return typeof output === "string" ? output : new TextDecoder().decode(output);
+}
+
+async function readNumericMarker(path: string): Promise<number | undefined> {
+  try {
+    const value = (await readFile(path, "utf8")).trim();
+    if (/^[1-9][0-9]*$/.test(value)) return Number(value);
+  } catch {
+    // The wrapper may have been killed before writing its anchor metadata.
+  }
+  return undefined;
+}
+
+async function processStartTime(pid: number): Promise<string | undefined> {
+  try {
+    const stat = await readFile(`/proc/${pid}/stat`, "utf8");
+    const suffix = stat.slice(stat.lastIndexOf(") ") + 2).trim().split(/\s+/);
+    const start = suffix[19];
+    return start !== undefined && /^[0-9]+$/.test(start) ? start : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function macProcessIdentity(pid: number): string | undefined {
+  const result = Bun.spawnSync([
+    "sh",
+    "-c",
+    `
+pid="$1"
+start="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | awk '
+  $1 ~ /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat)$/ &&
+  $2 ~ /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$/ &&
+  $3 ~ /^[0-9][0-9]*$/ &&
+  $4 ~ /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/ &&
+  $5 ~ /^[0-9][0-9][0-9][0-9]$/ { print $1, $2, $3, $4, $5; exit }
+')"
+ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | awk 'NR == 1 { gsub(/[[:space:]]/, ""); if ($0 ~ /^[0-9]+$/) print; exit }')"
+pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | awk 'NR == 1 { gsub(/[[:space:]]/, ""); if ($0 ~ /^[0-9]+$/) print; exit }')"
+command_hash="$(ps -o command= -p "$pid" 2>/dev/null | cksum | awk 'NR == 1 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { print $1 ":" $2; exit }')"
+if [ -n "$start" ] && [ -n "$ppid" ] && [ -n "$pgid" ] && [ -n "$command_hash" ]; then
+  printf 'ps:%s;ppid=%s;pgid=%s;cmd=%s\\n' "$start" "$ppid" "$pgid" "$command_hash"
+fi
+`,
+    "agent-toolkit-process-identity",
+    String(pid),
+  ]);
+  if (result.exitCode !== 0) return undefined;
+  const identity = decodeSpawnOutput(result.stdout).trim();
+  return identity.startsWith("ps:") ? identity : undefined;
+}
+
+async function currentProcessIdentity(pid: number): Promise<string | undefined> {
+  const start = await processStartTime(pid);
+  if (start !== undefined) return `proc:${start}`;
+  return macProcessIdentity(pid);
+}
+
+function psIdentityFields(identity: string): { start: string; ppid: string; pgid: string; commandHash: string } | undefined {
+  const match = /^ps:(.*);ppid=([0-9]+);pgid=([0-9]+);cmd=([0-9]+:[0-9]+)$/.exec(identity);
+  if (match === null) return undefined;
+  return { start: match[1]!, ppid: match[2]!, pgid: match[3]!, commandHash: match[4]! };
+}
+
+function processIdentityMatches(expected: string, current: string): boolean {
+  if (expected === current) return true;
+  const expectedFields = psIdentityFields(expected);
+  const currentFields = psIdentityFields(current);
+  return expectedFields !== undefined && currentFields !== undefined
+    && expectedFields.start === currentFields.start
+    && expectedFields.pgid === currentFields.pgid
+    && expectedFields.commandHash === currentFields.commandHash
+    && (currentFields.ppid === "0" || currentFields.ppid === "1");
+}
+
+function currentProcessGroup(pid: number): number | undefined {
+  const result = Bun.spawnSync(["ps", "-o", "pgid=", "-p", String(pid)]);
+  if (result.exitCode !== 0) return undefined;
+  const value = decodeSpawnOutput(result.stdout).trim();
+  return /^[1-9][0-9]*$/.test(value) ? Number(value) : undefined;
+}
+
+async function cleanupOrphanedTarget(statusPath: string): Promise<boolean> {
+  if (process.platform === "win32") return false;
+  const directory = dirname(statusPath);
+  const targetPid = await readNumericMarker(join(directory, "target"));
+  const targetPgid = await readNumericMarker(join(directory, "target-pgid"));
+  if (targetPid === undefined || targetPgid === undefined || targetPid === process.pid) return false;
+  const currentPgid = currentProcessGroup(process.pid);
+  if (currentPgid === undefined || currentPgid === targetPgid) return false;
+  const expectedIdentity = (await readFile(join(directory, "target-identity"), "utf8").catch(() => "")).trim();
+  const currentIdentity = await currentProcessIdentity(targetPid);
+  if (expectedIdentity.length === 0 || currentIdentity === undefined || !processIdentityMatches(expectedIdentity, currentIdentity)) return false;
+  if (currentProcessGroup(targetPid) !== targetPgid) return false;
+  try {
+    process.kill(-targetPgid, "SIGKILL");
+  } catch {
+    // The target may have exited between validation and the group signal.
+  }
+  return true;
+}
+
+async function markCleanupFailure(path: string): Promise<void> {
+  await mkdir(path).catch(() => undefined);
+}
+
+async function waitForTarget(path: string, wrapperExited: Promise<number>, cleanupFailurePath?: string): Promise<number> {
   const wrapperResult = wrapperExited.then((code) => ({ code }));
   while (true) {
     const status = await readStatus(path);
     if (status !== undefined) return status;
     const event = await Promise.race([Bun.sleep(20).then(() => undefined), wrapperResult]);
-    if (event !== undefined) return (await readStatus(path)) ?? SUPERVISOR_UNKNOWN_TARGET_STATUS;
+    if (event !== undefined) {
+      const finalStatus = await readStatus(path);
+      if (finalStatus !== undefined) return finalStatus;
+      await Bun.sleep(20);
+      const delayedStatus = await readStatus(path);
+      if (delayedStatus !== undefined) return delayedStatus;
+      await cleanupOrphanedTarget(path);
+      if (cleanupFailurePath !== undefined) await markCleanupFailure(cleanupFailurePath);
+      return SUPERVISOR_UNKNOWN_TARGET_STATUS;
+    }
   }
 }
 
@@ -1570,7 +1757,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
     };
     const supervised: SupervisedChild = {
       child,
-      exited: waitForTarget(statusPath, wrapperExited),
+      exited: waitForTarget(statusPath, wrapperExited, cleanupFailurePath),
       wrapperExited,
       waitForCleanupAcknowledged,
       cleanup: async () => {

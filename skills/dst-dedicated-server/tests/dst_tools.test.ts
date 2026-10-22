@@ -669,6 +669,39 @@ esac
     }
   });
 
+  test("fails a snapshot when the supervisor exits before recording SSH status", { timeout: 30_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-status-missing-"));
+    const previousPath = process.env.PATH;
+    try {
+      const fakeSsh = join(root, "ssh");
+      await writeFile(fakeSsh, `#!/bin/sh
+case "$*" in
+  *"echo ok"*)
+    supervisor_pid="$(ps -o ppid= -p "$PPID" 2>/dev/null | tr -d '[:space:]')"
+    case "$supervisor_pid" in ''|*[!0-9]*) exit 97 ;; esac
+    kill -KILL "$supervisor_pid" 2>/dev/null || true
+    while :; do sleep 1; done
+    ;;
+  *) cat >/dev/null; exit 0 ;;
+esac
+`);
+      await chmod(fakeSsh, 0o755);
+      const output = join(root, "snapshot.md");
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
+        ["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", output],
+        { ...process.env, PATH: `${root}:${previousPath ?? ""}` } as Record<string, string>,
+      );
+      expect(result.status).toBe(1);
+      const report = await readFile(output, "utf8");
+      expect(report).toContain("supervisor exited before recording the SSH result");
+      expect(report).not.toContain("Remote SSH failed");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("redacts local setup paths from modoverrides failures", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-mods-path-redaction-"));
     const privateTmp = join(root, "private-tmp");
@@ -864,7 +897,7 @@ exec /bin/ps "$@"
     }
   });
 
-  test("preserves an SSH connectivity failure when cleanup acknowledgement fails", { timeout: 90_000 }, async () => {
+  test("fails closed when an SSH result cannot be recorded", { timeout: 90_000 }, async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-connectivity-cleanup-"));
     const previousPath = process.env.PATH;
     try {
@@ -889,18 +922,17 @@ exec /bin/ps "$@"
         ["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", output],
         { ...process.env, PATH: `${root}:${previousPath ?? ""}`, AGENT_TOOLKIT_TEST_PS_FAIL: trigger } as Record<string, string>,
       );
-      expect(result.status).toBe(0);
+      expect(result.status).toBe(1);
       const report = await readFile(output, "utf8");
-      expect(report).toContain("Remote SSH failed");
-      expect(report).toContain("fixture SSH connectivity denied");
-      expect(report).toContain("cleanup could not be verified");
+      expect(report).toContain("supervisor exited before recording the SSH result");
+      expect(report).not.toContain("Remote SSH failed");
       expect(report).not.toContain("command could not be started");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  test("preserves a remote command failure when cleanup acknowledgement fails", { timeout: 90_000 }, async () => {
+  test("fails closed when a remote command result cannot be recorded", { timeout: 90_000 }, async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-command-cleanup-"));
     const previousPath = process.env.PATH;
     try {
@@ -927,9 +959,8 @@ exec /bin/ps "$@"
       );
       expect(result.status).toBe(1);
       const report = await readFile(output, "utf8");
-      expect(report).toContain("Remote collection command failed");
-      expect(report).toContain("fixture remote command denied");
-      expect(report).toContain("cleanup could not be verified");
+      expect(report).toContain("supervisor exited before recording the remote collection result");
+      expect(report).not.toContain("Remote collection command failed");
       expect(report).not.toContain("command could not be started");
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -1210,18 +1241,50 @@ exec /bin/ps "$@"
 
   test("fails closed when the supervisor exits before recording target status", { timeout: 30_000 }, async () => {
     if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-unknown-status-"));
+    const marker = join(root, "target-child.pid");
     let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    let targetChildPid: number | undefined;
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
     try {
-      supervised = await spawnSupervised(["sh", "-c", "sleep 30"]);
+      supervised = await spawnSupervised(["sh", "-c", "sleep 30 & printf '%s\\n' \"$!\" > \"$1\"; wait", "agent-toolkit-supervised-target", marker]);
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        try {
+          const value = Number((await readFile(marker, "utf8")).trim());
+          if (Number.isInteger(value) && value > 0) {
+            targetChildPid = value;
+            break;
+          }
+        } catch {
+          // The target may still be writing its child marker.
+        }
+        await Bun.sleep(25);
+      }
+      expect(targetChildPid).toBeDefined();
+      expect(isAlive(targetChildPid!)).toBe(true);
       supervised.child.kill("SIGKILL");
       expect(await supervised.exited).toBe(SUPERVISOR_UNKNOWN_TARGET_STATUS);
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(false);
       await supervised.wrapperExited.catch(() => undefined);
+      for (let attempt = 0; attempt < 40 && isAlive(targetChildPid!); attempt += 1) await Bun.sleep(25);
+      expect(isAlive(targetChildPid!)).toBe(false);
     } finally {
       if (supervised !== undefined) {
         try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
         await supervised.wrapperExited.catch(() => undefined);
         await supervised.cleanup();
       }
+      if (targetChildPid !== undefined && isAlive(targetChildPid)) {
+        try { process.kill(targetChildPid, "SIGKILL"); } catch { /* The target may already be gone. */ }
+      }
+      await rm(root, { recursive: true, force: true });
     }
   });
 

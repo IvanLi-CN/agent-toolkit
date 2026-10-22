@@ -1042,8 +1042,15 @@ signal_tree() {
     current_descendant_identity="$(process_identity "$pid" 2>/dev/null || true)"
     current_descendant_identity="$(normalize_process_identity "$current_descendant_identity" 2>/dev/null || true)"
     if target_identity_matches && [ "$current_descendant_identity" = "$descendant_identity" ]; then
-      case "$descendant_identity" in ps:*) cleanup_ack_enabled=0; continue ;; esac
-      kill -"$signal" "$pid" 2>/dev/null || true
+      current_descendant_pgid="$(process_group_id "$pid" 2>/dev/null || true)"
+      if [ "$current_descendant_pgid" = "$target_pgid" ]; then
+        # A group signal can fail transiently on macOS; the same identity and
+        # captured target PGID make this member-specific fallback safe.
+        if ! kill -"$signal" "$pid" 2>/dev/null; then cleanup_ack_enabled=0; fi
+      else
+        case "$descendant_identity" in ps:*) cleanup_ack_enabled=0; continue ;; esac
+        kill -"$signal" "$pid" 2>/dev/null || true
+      fi
     fi
   done
   if [ -e "$descendant_scan_truncated_path" ] || [ -e "$descendant_scan_failed_path" ] || [ -e "$snapshot_failed_path" ]; then cleanup_ack_enabled=0; fi

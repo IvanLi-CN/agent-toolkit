@@ -955,7 +955,7 @@ exec /bin/ps "$@"
       const fakeSsh = join(root, "ssh");
       await writeFile(fakeSsh, `#!/bin/sh
 case "$*" in
-  *"echo ok"*) exit 0 ;;
+  *"echo ok"*) sleep 0.5; exit 0 ;;
   *)
     cat >/dev/null
     supervisor_pid="$(ps -o ppid= -p "$PPID" 2>/dev/null | tr -d '[:space:]')"

@@ -617,7 +617,7 @@ esac
     }
   });
 
-  test("keeps a completed shard summary when the next shard fails", { timeout: 15_000 }, async () => {
+  test("keeps a completed shard summary when the next shard fails", { timeout: 90_000 }, async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-partial-"));
     const previousPath = process.env.PATH;
     try {

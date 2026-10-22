@@ -998,13 +998,10 @@ async function remoteCollect(options: SnapshotOptions, script: string): Promise<
     return { text: lines.join("\n"), failed: true };
   }
   if (result.exitCode !== 0) {
-    if (!result.cleanupVerified) {
-      lines.push("> Local process supervisor exited before recording the remote collection result, or cleanup could not be verified; remote collection was not completed.", "");
-      return { text: lines.join("\n"), failed: true };
-    }
     lines.push("> Remote collection command failed.");
     const detail = renderReportInline(result.stderr.trim(), [options.host, options.user]);
     if (detail.length > 0) lines.push(`> Reason: ${detail}`);
+    if (!result.cleanupVerified) lines.push("> Local process cleanup could not be verified.");
     lines.push("");
     return { text: lines.join("\n"), failed: true };
   }

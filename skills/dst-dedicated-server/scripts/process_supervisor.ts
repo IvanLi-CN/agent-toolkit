@@ -300,6 +300,7 @@ snapshot_deadline_exceeded() {
   [ "$snapshot_now" -ge "$snapshot_deadline_epoch" ]
 }
 set_snapshot_deadline() {
+  [ "\${snapshot_deadline_epoch:-0}" -gt 0 ] && return 0
   snapshot_now="$(date +%s 2>/dev/null || true)"
   case "$snapshot_now" in
     ''|*[!0-9]*) snapshot_deadline_epoch=1 ;;
@@ -1474,7 +1475,10 @@ async function waitForCleanupAck(path: string, wrapperExited: Promise<number>): 
       wrapperExited.then(() => true, () => true),
       Bun.sleep(20).then(() => false),
     ]);
-    if (wrapperDone) continue;
+    if (wrapperDone) {
+      await Bun.sleep(20);
+      continue;
+    }
   }
   if (await consumeCleanupAck(path)) return true;
   await consumeCleanupFailure(failurePath);

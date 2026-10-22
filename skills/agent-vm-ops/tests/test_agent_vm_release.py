@@ -19,7 +19,7 @@ import agent_vm_release as RELEASE  # noqa: E402
 
 class FakeTransport:
     def __init__(self, *, fail_health_once=False, pending=False, drain_enter=True, unknown_state=False,
-                 malformed_health=False, malformed_reconcile=False):
+                 malformed_health=False, malformed_reconcile=False, malformed_rollback=False):
         self.calls = []
         self.fail_health_once = fail_health_once
         self.pending = pending
@@ -27,6 +27,7 @@ class FakeTransport:
         self.unknown_state = unknown_state
         self.malformed_health = malformed_health
         self.malformed_reconcile = malformed_reconcile
+        self.malformed_rollback = malformed_rollback
         self.health_checks = 0
 
     def wrapper(self, host, wrapper_path, action, transaction_id, release_id, payload=None):
@@ -34,7 +35,14 @@ class FakeTransport:
         if action == "activate":
             return {"ok": True, "result": {"activated": True, "release_id": release_id}}
         if action == "rollback":
-            return {"ok": True, "result": {"rolled_back": True, "release_id": "c" * 40}}
+            if self.malformed_rollback:
+                return {"ok": True, "result": {"rolled_back": True, "release_id": release_id,
+                                                  "previous_release_id": release_id}}
+            return {"ok": True, "result": {"rolled_back": True, "release_id": "c" * 40,
+                                              "previous_release_id": release_id}}
+        if action == "status":
+            return {"ok": True, "result": {"current_release_id": "c" * 40,
+                                              "previous_release_id": release_id}}
         if action == "stage":
             return {"ok": True, "result": {"staged": True}}
         if action == "verify":
@@ -63,7 +71,7 @@ class FakeTransport:
             return {"ok": True, "result": result}
         if action == "admin-reconcile":
             if self.malformed_reconcile:
-                return {"ok": True, "result": {"dry_run": False, "actions": [{"action": "unknown"}]}}
+                return {"ok": True, "result": {"dry_run": True, "actions": [{"action": "inspect"}]}}
             return {"ok": True, "result": {"dry_run": True, "actions": []}}
         return {"ok": True, "result": {"draining": self.drain_enter if action == "drain-enter" else action != "drain-exit"}}
 
@@ -130,6 +138,22 @@ class ReleasePublisherTests(unittest.TestCase):
             )
         self.assertEqual(wrapper_failure.exception.code, "wrapper_path_invalid")
 
+    def test_cli_defaults_to_canonical_wrapper_and_keeps_legacy_option(self):
+        common = [
+            "publish",
+            "--bundle", str(self.bundle),
+            "--control-host", "staging-control",
+            "--client-target", str(self.root / "client" / "agent_vm.py"),
+        ]
+        self.assertEqual(
+            RELEASE.build_parser().parse_args(common).wrapper,
+            RELEASE.CANONICAL_REMOTE_WRAPPER,
+        )
+        self.assertEqual(
+            RELEASE.build_parser().parse_args(common + ["--wrapper", RELEASE.CANONICAL_REMOTE_WRAPPER]).wrapper,
+            RELEASE.CANONICAL_REMOTE_WRAPPER,
+        )
+
     def test_health_rejects_malformed_boolean_values(self):
         transport = FakeTransport(malformed_health=True)
         publisher = self.publisher(transport)
@@ -179,7 +203,15 @@ class ReleasePublisherTests(unittest.TestCase):
         self.assertTrue(result["rolled_back"])
         actions = [item[1] for item in transport.calls]
         self.assertIn("rollback", actions)
+        self.assertIn("status", actions)
         self.assertEqual(actions[-1], "drain-exit")
+
+    def test_post_activation_health_failure_rejects_unverified_rollback(self):
+        transport = FakeTransport(fail_health_once=True, malformed_rollback=True)
+        with self.assertRaises(RELEASE.ReleaseError) as failure:
+            self.publisher(transport).publish(timeout=5, poll=1, transaction_id="tx-bad-rollback")
+        self.assertEqual(failure.exception.code, "rollback_failed")
+        self.assertNotIn("drain-exit", [item[1] for item in transport.calls])
 
     def test_local_client_failure_keeps_remote_release_drained_without_rollback(self):
         transport = FakeTransport()

@@ -615,7 +615,7 @@ def _result(response: Mapping[str, Any]) -> dict[str, Any]:
 class ReleasePublisher:
     bundle: Path
     control_host: str
-    wrapper_path: str
+    wrapper_path: str = CANONICAL_REMOTE_WRAPPER
     remote_control: str = CANONICAL_REMOTE_CONTROL
     client_target: Path | None = None
     session_id: str | None = None
@@ -713,7 +713,16 @@ class ReleasePublisher:
         if not isinstance(value, Mapping) or value.get("dry_run") is not True or not isinstance(actions, list):
             return False
         for item in actions:
-            if not isinstance(item, Mapping) or item.get("action") not in RECONCILE_ACTIONS or "error" in item:
+            if (
+                not isinstance(item, Mapping)
+                or set(item) != {"task_id", "generation", "action"}
+                or not isinstance(item.get("task_id"), str)
+                or not item["task_id"]
+                or isinstance(item.get("generation"), bool)
+                or not isinstance(item.get("generation"), int)
+                or item["generation"] < 0
+                or item.get("action") not in RECONCILE_ACTIONS
+            ):
                 return False
         return True
 
@@ -747,6 +756,36 @@ class ReleasePublisher:
                     "draining": last.get("draining"),
                 })
             self.sleep(min(poll, remaining))
+
+    def _verify_automatic_rollback(
+        self,
+        transaction_id: str,
+        failed_release_id: str,
+        rollback_result: Mapping[str, Any],
+    ) -> None:
+        target_release_id = rollback_result.get("release_id")
+        if (
+            rollback_result.get("rolled_back") is not True
+            or not isinstance(target_release_id, str)
+            or SOURCE_REVISION_RE.fullmatch(target_release_id) is None
+            or target_release_id == failed_release_id
+            or rollback_result.get("previous_release_id") != failed_release_id
+        ):
+            _fail(
+                "rollback_unverified",
+                "automatic rollback did not identify the retained previous release",
+                {"rollback": dict(rollback_result), "failed_release_id": failed_release_id},
+            )
+        status = self._wrapper("status", transaction_id, failed_release_id)
+        if (
+            status.get("current_release_id") != target_release_id
+            or status.get("previous_release_id") != failed_release_id
+        ):
+            _fail(
+                "rollback_unverified",
+                "automatic rollback pointers do not match the retained release record",
+                {"rollback": dict(rollback_result), "status": status, "failed_release_id": failed_release_id},
+            )
 
     def _health(self, manifest: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         doctor = self._control(manifest, "doctor")
@@ -924,6 +963,7 @@ class ReleasePublisher:
         except ReleaseError as health_error:
             try:
                 rollback_result = self._wrapper("rollback", transaction, manifest["release_id"])
+                self._verify_automatic_rollback(transaction, manifest["release_id"], rollback_result)
                 # The wrapper has switched the control files back to the
                 # retained previous release.  Validate that peer through the
                 # explicit protocol-4 legacy contract, not the failed bundle's
@@ -1012,7 +1052,8 @@ def build_parser() -> argparse.ArgumentParser:
     publish = subparsers.add_parser("publish")
     publish.add_argument("--bundle", type=Path, required=True)
     publish.add_argument("--control-host", required=True)
-    publish.add_argument("--wrapper", required=True)
+    publish.add_argument("--wrapper", default=CANONICAL_REMOTE_WRAPPER,
+                         help=f"fixed remote wrapper path (default: {CANONICAL_REMOTE_WRAPPER})")
     publish.add_argument("--client-target", type=Path, required=True)
     publish.add_argument("--session-id")
     publish.add_argument("--transaction-id")
@@ -1021,7 +1062,8 @@ def build_parser() -> argparse.ArgumentParser:
     rollback = subparsers.add_parser("rollback")
     rollback.add_argument("--bundle", type=Path, required=True)
     rollback.add_argument("--control-host", required=True)
-    rollback.add_argument("--wrapper", required=True)
+    rollback.add_argument("--wrapper", default=CANONICAL_REMOTE_WRAPPER,
+                          help=f"fixed remote wrapper path (default: {CANONICAL_REMOTE_WRAPPER})")
     rollback.add_argument("--client-target", type=Path, required=True)
     rollback.add_argument("--session-id")
     rollback.add_argument("--transaction-id", required=True)

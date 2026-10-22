@@ -932,7 +932,9 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
     interrupted = record.get("activated") is False and record.get("activation_phase") in interrupted_phases
     if record.get("release_id") != release_id or not (record.get("activated") is True or interrupted):
         _fail("rollback_unavailable", "rollback transaction does not match the active release")
-    if record.get("rollback_attempts", 0) >= 1:
+    rollback_state = record.get("rollback_state")
+    recovering_in_progress = record.get("activated") is True and rollback_state == "in-progress"
+    if record.get("rollback_attempts", 0) >= 1 and not recovering_in_progress:
         _fail("rollback_already_attempted", "automatic rollback is limited to one attempt")
     previous_id = record.get("previous_release_id")
     if not isinstance(previous_id, str) or RELEASE_ID_RE.fullmatch(previous_id) is None:
@@ -961,8 +963,22 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
     if old_previous_id is not None:
         _verify_retained_release(config, Path(config["release_root"]) / old_previous_id)
     if record.get("activated") is True:
-        if actual_current is None or actual_current.name != release_id:
-            _fail("rollback_stale", "rollback transaction is no longer the active release")
+        actual_current_name = actual_current.name if actual_current is not None else None
+        actual_previous_name = actual_previous.name if actual_previous is not None else None
+        if recovering_in_progress:
+            before_current_switch = {old_current_id, old_previous_id, None}
+            after_current_switch = {old_current_id, old_previous_id, release_id, None}
+            if actual_current_name == release_id and actual_previous_name not in before_current_switch:
+                _fail("rollback_stale", "in-progress rollback release pointers are no longer expected")
+            if actual_current_name == previous_id and actual_previous_name not in after_current_switch:
+                _fail("rollback_stale", "in-progress rollback release pointers are no longer expected")
+            if actual_current_name not in {release_id, previous_id}:
+                _fail("rollback_stale", "in-progress rollback transaction no longer matches the active release")
+        else:
+            if actual_current is None or actual_current.name != release_id:
+                _fail("rollback_stale", "rollback transaction is no longer the active release")
+            if actual_previous is None or actual_previous.name != old_current_id:
+                _fail("rollback_stale", "rollback transaction previous pointer no longer matches the activation record")
     else:
         allowed_current = {release_id, old_current_id}
         allowed_previous = {None, old_current_id, old_previous_id, release_id}

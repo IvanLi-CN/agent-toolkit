@@ -428,6 +428,25 @@ def _recover_local_client_install(client_path: Path, sidecar_path: Path) -> None
         _fail("local_client_recovery_failed", "local client recovery marker targets an unexpected path")
     if staged_dir.parent != client_path.parent or not staged_dir.name.startswith("agent-vm-client-"):
         _fail("local_client_recovery_failed", "local client recovery marker has an unsafe staging path")
+
+    def validate_file_state(value: Any, key: str, *, allow_absent: bool, label: str) -> dict[str, Any]:
+        if not isinstance(value, dict) or not isinstance(value.get("exists"), bool):
+            _fail("local_client_recovery_failed", f"local client recovery marker has invalid {label} state")
+        if not value["exists"]:
+            if not allow_absent or set(value) != {"exists"}:
+                _fail("local_client_recovery_failed", f"local client recovery marker has invalid {label} state")
+            return {"exists": False}
+        if (
+            set(value) != {"exists", "sha256", "mode"}
+            or not isinstance(value.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", value["sha256"]) is None
+            or isinstance(value.get("mode"), bool)
+            or not isinstance(value.get("mode"), int)
+            or value["mode"] not in {0o755, 0o644}
+        ):
+            _fail("local_client_recovery_failed", f"local client recovery marker has invalid {label} state")
+        return dict(value)
+
     phase = record.get("phase")
     if phase == "complete":
         installed = record.get("installed")
@@ -438,18 +457,13 @@ def _recover_local_client_install(client_path: Path, sidecar_path: Path) -> None
             (sidecar_path, "sidecar", 0o644),
         ):
             state = installed.get(key)
-            if (
-                not isinstance(state, dict)
-                or set(state) != {"exists", "sha256", "mode"}
-                or state.get("exists") is not True
-                or not isinstance(state.get("sha256"), str)
-                or not re.fullmatch(r"[0-9a-f]{64}", state["sha256"])
-                or state.get("mode") != mode
-            ):
+            state = validate_file_state(state, key, allow_absent=False, label="installed")
+            if state["mode"] != mode:
                 _fail("local_client_recovery_failed", "completed local client recovery marker has invalid installed state")
             _verify_local_install_file(destination, digest=state["sha256"], mode=mode, label=key)
         for backup in (backup_client, backup_sidecar):
-            _remove_local_path(backup)
+            if backup.exists() or backup.is_symlink():
+                _fail("local_client_recovery_failed", f"completed local client marker has an unexpected backup: {backup.name}")
         _remove_local_staging(staged_dir)
         try:
             record_path.unlink()
@@ -461,33 +475,53 @@ def _recover_local_client_install(client_path: Path, sidecar_path: Path) -> None
     previous = record.get("previous")
     if not isinstance(previous, dict):
         _fail("local_client_recovery_failed", "local client recovery marker has no previous state")
+    target = record.get("target")
+    installed = record.get("installed")
+    if not isinstance(target, dict) or set(target) != {"client", "sidecar"}:
+        _fail("local_client_recovery_failed", "local client recovery marker has no target state")
+    if not isinstance(installed, dict) or set(installed) != {"client", "sidecar"}:
+        _fail("local_client_recovery_failed", "local client recovery marker has no installed state")
     for destination, backup, key in (
         (client_path, backup_client, "client"),
         (sidecar_path, backup_sidecar, "sidecar"),
     ):
         state = previous.get(key)
-        if not isinstance(state, dict) or not isinstance(state.get("exists"), bool):
-            _fail("local_client_recovery_failed", "local client recovery marker has invalid previous state")
+        state = validate_file_state(state, key, allow_absent=True, label="previous")
+        target_state = validate_file_state(target.get(key), key, allow_absent=False, label="target")
+        installed_state = validate_file_state(installed.get(key), key, allow_absent=True, label="installed")
+        if installed_state["exists"] and installed_state != target_state:
+            _fail("local_client_recovery_failed", "local client recovery marker has inconsistent installed state")
+        destination_present = destination.exists() or destination.is_symlink()
+        backup_present = backup.exists() or backup.is_symlink()
         if state["exists"]:
-            expected_digest = state.get("sha256")
-            if not isinstance(expected_digest, str):
-                _fail("local_client_recovery_failed", "local client recovery marker has no previous checksum")
-            expected_mode = state.get("mode", 0o755 if key == "client" else 0o644)
-            if isinstance(expected_mode, bool) or not isinstance(expected_mode, int) or expected_mode not in {0o755, 0o644}:
-                _fail("local_client_recovery_failed", "local client recovery marker has an invalid previous mode")
-            if backup.exists() or backup.is_symlink():
-                _verify_local_install_file(backup, digest=expected_digest, mode=expected_mode, label=f"backup {key}")
-                _remove_local_path(destination)
+            if backup_present:
+                _verify_local_install_file(backup, digest=state["sha256"], mode=state["mode"], label=f"backup {key}")
+                if destination_present:
+                    _verify_local_install_file(
+                        destination,
+                        digest=target_state["sha256"],
+                        mode=target_state["mode"],
+                        label=f"installed {key}",
+                    )
+                    _remove_local_path(destination)
                 try:
                     os.replace(backup, destination)
                     _fsync_directory(destination.parent)
                 except OSError:
                     _fail("local_client_recovery_failed", f"cannot restore previous local client file: {destination.name}")
-                _verify_local_install_file(destination, digest=expected_digest, mode=expected_mode, label=key)
             else:
-                _verify_local_install_file(destination, digest=expected_digest, mode=expected_mode, label=key)
+                _verify_local_install_file(destination, digest=state["sha256"], mode=state["mode"], label=key)
         else:
-            _remove_local_path(destination)
+            if backup_present:
+                _fail("local_client_recovery_failed", f"local client recovery marker has an unexpected backup: {backup.name}")
+            if destination_present:
+                _verify_local_install_file(
+                    destination,
+                    digest=target_state["sha256"],
+                    mode=target_state["mode"],
+                    label=f"installed {key}",
+                )
+                _remove_local_path(destination)
     _remove_local_staging(staged_dir)
     try:
         record_path.unlink()
@@ -585,7 +619,15 @@ class ReleasePublisher:
     def _transport(self) -> ReleaseTransport:
         return self.transport or SSHTransport()
 
-    def _request(self, manifest: Mapping[str, Any], action: str, *, session: str | None = None, write: bool = False) -> dict[str, Any]:
+    def _request(
+        self,
+        manifest: Mapping[str, Any],
+        action: str,
+        *,
+        session: str | None = None,
+        write: bool = False,
+        fields: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         spec = manifest["actions"].get(action)
         if not isinstance(spec, Mapping):
             _fail("unknown_action", f"release manifest does not declare action: {action}")
@@ -605,10 +647,24 @@ class ReleasePublisher:
         if write:
             request["generation"] = 0
             request["operation_id"] = "release-" + uuid.uuid4().hex
+        if fields:
+            request.update(dict(fields))
         return request
 
-    def _control(self, manifest: Mapping[str, Any], action: str, *, session: str | None = None, write: bool = False) -> dict[str, Any]:
-        response = self._transport().control(self.control_host, self.remote_control, self._request(manifest, action, session=session, write=write))
+    def _control(
+        self,
+        manifest: Mapping[str, Any],
+        action: str,
+        *,
+        session: str | None = None,
+        write: bool = False,
+        fields: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        response = self._transport().control(
+            self.control_host,
+            self.remote_control,
+            self._request(manifest, action, session=session, write=write, fields=fields),
+        )
         return _result(response)
 
     def _wrapper(self, action: str, transaction_id: str, release_id: str, payload: bytes | None = None) -> dict[str, Any]:
@@ -663,10 +719,22 @@ class ReleasePublisher:
     def _health(self, manifest: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         doctor = self._control(manifest, "doctor")
         metrics = self._control(manifest, "admin-metrics")
+        reconcile = self._control(manifest, "admin-reconcile", fields={"apply": False})
+        actions = reconcile.get("actions")
+        reconcile_ok = (
+            reconcile.get("dry_run") is True
+            and isinstance(actions, list)
+            and all(isinstance(item, Mapping) and "error" not in item for item in actions)
+        )
         if not self._healthy(metrics, doctor):
             _fail("remote_health_failed", "remote control health or timer checks failed", {
                 "doctor": {"ready": doctor.get("ready"), "issues": doctor.get("issues")},
                 "metrics": {"up": metrics.get("up"), "draining": metrics.get("draining"), "pending_operations": metrics.get("pending_operations"), "task_states": metrics.get("task_states")},
+            })
+        if not reconcile_ok:
+            _fail("remote_reconcile_failed", "remote reconciliation check did not produce a verified dry-run result", {
+                "dry_run": reconcile.get("dry_run"),
+                "actions": actions,
             })
         return doctor, metrics
 
@@ -719,6 +787,10 @@ class ReleasePublisher:
                     previous[key] = {"exists": True, "sha256": sha256_file(destination), "mode": stat.S_IMODE(info.st_mode)}
                 else:
                     previous[key] = {"exists": False}
+            target_states = {
+                "client": {"exists": True, "sha256": sha256_file(staged_client), "mode": 0o755},
+                "sidecar": {"exists": True, "sha256": sha256_file(staged_manifest), "mode": 0o644},
+            }
             record_path = client_path.parent / LOCAL_INSTALL_RECORD_NAME
             record: dict[str, Any] = {
                 "format": 1,
@@ -729,53 +801,35 @@ class ReleasePublisher:
                 "backup_sidecar": str(_local_backup_path(sidecar_path)),
                 "staged_dir": str(staged_dir),
                 "previous": previous,
+                "target": target_states,
+                "installed": {"client": {"exists": False}, "sidecar": {"exists": False}},
             }
             _write_json(record_path, record, 0o600)
             record_written = True
             backups: list[tuple[Path, Path]] = []
             installed_destinations: list[Path] = []
-            installed = [(staged_client, client_path), (staged_manifest, sidecar_path)]
+            installed = [(staged_client, client_path, "client"), (staged_manifest, sidecar_path, "sidecar")]
             install_succeeded = False
             try:
-                for source, destination in installed:
+                for source, destination, key in installed:
                     if destination.exists() or destination.is_symlink():
                         if destination.is_symlink() or not destination.is_file():
                             _fail("local_client_target_invalid", f"local client target is not a regular file: {destination.name}")
                         backup = destination.with_name("." + destination.name + ".previous")
                         if backup.exists() or backup.is_symlink():
-                            backup.unlink()
+                            _fail("local_client_target_invalid", f"local client backup already exists: {backup.name}")
                         os.replace(destination, backup)
                         _fsync_directory(destination.parent)
                         backups.append((backup, destination))
                     os.replace(source, destination)
                     _fsync_directory(destination.parent)
                     installed_destinations.append(destination)
-                record["installed"] = {
-                    "client": {"exists": True, "sha256": sha256_file(client_path), "mode": 0o755},
-                    "sidecar": {"exists": True, "sha256": sha256_file(sidecar_path), "mode": 0o644},
-                }
+                    record["installed"][key] = dict(target_states[key])
+                    _write_json(record_path, record, 0o600)
                 record["phase"] = "complete"
                 _write_json(record_path, record, 0o600)
                 install_succeeded = True
             except (OSError, ReleaseError) as exc:
-                backed_up_destinations = {destination for _, destination in backups}
-                for destination in reversed(installed_destinations):
-                    if destination in backed_up_destinations:
-                        continue
-                    try:
-                        if destination.exists() or destination.is_symlink():
-                            destination.unlink()
-                            _fsync_directory(destination.parent)
-                    except OSError:
-                        pass
-                for backup, destination in reversed(backups):
-                    try:
-                        if destination.exists() or destination.is_symlink():
-                            destination.unlink()
-                        os.replace(backup, destination)
-                        _fsync_directory(destination.parent)
-                    except OSError:
-                        pass
                 if record_written:
                     try:
                         _recover_local_client_install(client_path, sidecar_path)
@@ -882,9 +936,17 @@ class ReleasePublisher:
     def rollback(self, *, transaction_id: str, release_id: str) -> dict[str, Any]:
         temporary, _, manifest = _open_bundle(self.bundle)
         temporary.cleanup()
+        if manifest["release_id"] == release_id:
+            _fail("rollback_release_mismatch", "rollback bundle must identify the previous release, not the active release")
         session = self.session_id or ("release-" + transaction_id)
         self._control(manifest, "drain-enter", session=session, write=True)
         result = self._wrapper("rollback", transaction_id, release_id)
+        if result.get("release_id") != manifest["release_id"]:
+            _fail(
+                "rollback_release_mismatch",
+                "remote rollback target does not match the supplied previous release bundle",
+                {"expected": manifest["release_id"], "actual": result.get("release_id")},
+            )
         self._health(manifest)
         try:
             self._install_local_client(manifest)

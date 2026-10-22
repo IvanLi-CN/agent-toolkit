@@ -45,6 +45,35 @@ LOCAL_STATE_ROOT = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".loc
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.:@/-]{1,160}$")
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
 
+# A present sidecar must describe the complete public control surface.  This
+# is deliberately duplicated here because the client is shipped independently
+# and must not import the operations-side manifest parser.
+CLIENT_ACTION_NAMES = (
+    "acquire",
+    "admin-gc",
+    "admin-metrics",
+    "admin-reconcile",
+    "admin-session-list",
+    "admin-status",
+    "destroy",
+    "doctor",
+    "drain-enter",
+    "drain-exit",
+    "drain-status",
+    "port-add",
+    "port-list",
+    "port-remove",
+    "release",
+    "renew",
+    "resize",
+    "restart",
+    "ssh-info",
+    "status",
+    "timer-age-gc",
+    "timer-expire",
+    "timer-reconcile",
+)
+
 
 class CliError(Exception):
     def __init__(self, code: str, message: str, detail: Any = None, exit_code: int = 2):
@@ -244,6 +273,9 @@ def load_client_release_metadata(path: Path | None = None) -> tuple[dict[str, An
         fail("release_metadata_invalid", "release sidecar is not valid UTF-8 JSON")
     if not isinstance(raw, dict):
         fail("release_metadata_invalid", "release sidecar root must be an object")
+    expected_keys = {"format", "release_id", "source_revision", "protocol", "client_artifact", "client_view"}
+    if set(raw) != expected_keys:
+        fail("release_metadata_invalid", "release sidecar has an unexpected shape")
     if raw.get("format") != MANIFEST_FORMAT:
         fail("release_metadata_invalid", "release sidecar format is unsupported")
     source_revision = raw.get("source_revision")
@@ -254,14 +286,16 @@ def load_client_release_metadata(path: Path | None = None) -> tuple[dict[str, An
         fail("release_metadata_invalid", "release sidecar release_id must equal source_revision")
     if raw.get("protocol") != PROTOCOL_VERSION:
         fail("protocol_unsupported", f"release sidecar protocol must be {PROTOCOL_VERSION}")
-    view = raw.get("client_view", raw)
+    view = raw.get("client_view")
     if not isinstance(view, dict):
         fail("release_metadata_invalid", "client_view must be an object")
-    if view.get("release_id", release_id) != release_id or view.get("source_revision", source_revision) != source_revision or view.get("protocol", PROTOCOL_VERSION) != PROTOCOL_VERSION:
+    if set(view) != {"release_id", "source_revision", "protocol", "actions"}:
+        fail("release_metadata_invalid", "client_view has an unexpected shape")
+    if view.get("release_id") != release_id or view.get("source_revision") != source_revision or view.get("protocol") != PROTOCOL_VERSION:
         fail("release_metadata_invalid", "client_view identity does not match sidecar")
     actions = view.get("actions")
-    if not isinstance(actions, dict) or not actions:
-        fail("release_metadata_invalid", "client_view.actions must be a non-empty object")
+    if not isinstance(actions, dict) or set(actions) != set(CLIENT_ACTION_NAMES):
+        fail("release_metadata_invalid", "client_view.actions must contain the fixed action set")
     normalized: dict[str, Any] = {}
     for action, spec in actions.items():
         if not isinstance(action, str) or re.fullmatch(r"[a-z][a-z0-9-]{0,63}", action) is None:
@@ -282,15 +316,7 @@ def load_client_release_metadata(path: Path | None = None) -> tuple[dict[str, An
             "client_to_control": c2c,
             "control_to_client": c2l,
         }
-    artifacts = raw.get("artifacts")
     client_artifact = raw.get("client_artifact")
-    if isinstance(artifacts, list):
-        matches = [item for item in artifacts if isinstance(item, dict) and item.get("role") == "client"]
-        if len(matches) != 1:
-            fail("release_metadata_invalid", "release sidecar must declare one client artifact")
-        client_artifact = matches[0]
-    elif artifacts is not None:
-        fail("release_metadata_invalid", "release sidecar artifacts must be an array")
     if client_artifact is not None:
         if not isinstance(client_artifact, dict):
             fail("release_metadata_invalid", "client_artifact must be an object")
@@ -371,6 +397,30 @@ def _validate_response_release(value: Any) -> dict[str, Any]:
     return dict(value)
 
 
+def _validate_response_compatibility(value: Any, action: str, accepted: Any) -> dict[str, Any] | None:
+    """Validate the control response's declared schema and semantic window."""
+    accepted_window = _client_window(accepted, "compatibility.accepted_response")
+    if value is None:
+        return _client_warning(
+            "legacy_response_compatibility",
+            "control response omitted schema metadata; accepted as legacy protocol-4 response",
+            action,
+        )
+    if not isinstance(value, dict) or set(value) != {"schema", "semantic_revision"}:
+        fail("invalid_remote_response", "control response compatibility metadata is invalid")
+    schema = value.get("schema")
+    semantic = value.get("semantic_revision")
+    if isinstance(schema, bool) or not isinstance(schema, int) or schema < 1:
+        fail("invalid_remote_response", "control response schema is invalid")
+    if isinstance(semantic, bool) or not isinstance(semantic, int) or semantic < 1:
+        fail("invalid_remote_response", "control response semantic revision is invalid")
+    if not accepted_window["schema_min"] <= schema <= accepted_window["schema_max"]:
+        fail("response_schema_incompatible", "control response schema is outside the accepted window", {"action": action})
+    if not accepted_window["semantic_min"] <= semantic <= accepted_window["semantic_max"]:
+        fail("response_semantic_incompatible", "control response semantic revision is outside the accepted window", {"action": action})
+    return None
+
+
 def _append_warning(warnings: list[dict[str, Any]], item: dict[str, Any]) -> None:
     identity = (item.get("code"), item.get("action"), item.get("message"))
     if not any((existing.get("code"), existing.get("action"), existing.get("message")) == identity for existing in warnings):
@@ -437,6 +487,14 @@ def control_request(action: str, *, session: str | None, generation: int | None 
     if write and response.get("operation_id") != request["operation_id"]:
         fail("protocol_mismatch", "operation identity differs")
     warnings = _validate_response_warnings(response.get("warnings"), action)
+    compatibility = request.get("compatibility")
+    if not isinstance(compatibility, dict):
+        fail("protocol_mismatch", "request compatibility capability is missing")
+    response_warning = _validate_response_compatibility(
+        response.get("response"), action, compatibility.get("accepted_response")
+    )
+    if response_warning is not None:
+        _append_warning(warnings, response_warning)
     if "release" in response:
         response["release"] = _validate_response_release(response["release"])
     for item in local_warnings:

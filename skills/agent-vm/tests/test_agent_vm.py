@@ -166,7 +166,7 @@ class SessionContractTests(unittest.TestCase):
                     "release_id": "a" * 40,
                     "source_revision": "a" * 40,
                     "protocol": 4,
-                    "actions": {"status": action},
+                    "actions": {name: action for name in CLI.CLIENT_ACTION_NAMES},
                 },
             }
             path = root / CLI.CLIENT_SIDECAR_NAME
@@ -187,6 +187,49 @@ class SessionContractTests(unittest.TestCase):
                         CLI.load_client_release_metadata(path)
                     self.assertEqual(failure.exception.code, code)
 
+    def test_present_sidecar_requires_the_complete_client_view(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            client = root / "agent_vm.py"
+            client.write_bytes(b"client\n")
+            client.chmod(0o755)
+            action = {
+                "request": {"schema": 1, "semantic_revision": 1},
+                "response": {"schema": 1, "semantic_revision": 1},
+                "client_to_control": {"schema_min": 1, "schema_max": 1, "semantic_min": 1, "semantic_max": 1},
+                "control_to_client": {"schema_min": 1, "schema_max": 1, "semantic_min": 1, "semantic_max": 1},
+            }
+            sidecar = {
+                "format": 1,
+                "release_id": "a" * 40,
+                "source_revision": "a" * 40,
+                "protocol": 4,
+                "client_artifact": {
+                    "name": "agent_vm.py",
+                    "path": "agent_vm.py",
+                    "role": "client",
+                    "sha256": hashlib.sha256(b"client\n").hexdigest(),
+                    "mode": 0o755,
+                },
+                "client_view": {
+                    "release_id": "a" * 40,
+                    "source_revision": "a" * 40,
+                    "protocol": 4,
+                    "actions": {name: action for name in CLI.CLIENT_ACTION_NAMES},
+                },
+            }
+            path = root / CLI.CLIENT_SIDECAR_NAME
+            for mutation in (
+                lambda value: value.pop("client_view"),
+                lambda value: value["client_view"]["actions"].pop("status"),
+            ):
+                mutated = json.loads(json.dumps(sidecar))
+                mutation(mutated)
+                path.write_text(json.dumps(mutated), encoding="utf-8")
+                with self.assertRaises(CLI.CliError) as failure:
+                    CLI.load_client_release_metadata(path)
+                self.assertEqual(failure.exception.code, "release_metadata_invalid")
+
     def test_malformed_remote_warning_is_rejected(self):
         response = {
             "ok": True,
@@ -201,6 +244,23 @@ class SessionContractTests(unittest.TestCase):
             with self.assertRaises(CLI.CliError) as failure:
                 CLI.control_request("status", session="thread")
         self.assertEqual(failure.exception.code, "invalid_remote_response")
+
+    def test_incompatible_remote_response_is_rejected_before_return(self):
+        response = {
+            "ok": True,
+            "protocol": CLI.PROTOCOL_VERSION,
+            "action": "status",
+            "session_id": "thread",
+            "server_time": "2026-10-22T00:00:00+00:00",
+            "result": {},
+            "response": {"schema": 2, "semantic_revision": 1},
+        }
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(CLI, "DEFAULT_RELEASE_MANIFEST", Path(directory) / "missing.json"), \
+             mock.patch.object(CLI.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps(response).encode(), b"")):
+            with self.assertRaises(CLI.CliError) as failure:
+                CLI.control_request("status", session="thread")
+        self.assertEqual(failure.exception.code, "response_schema_incompatible")
 
     def test_public_parser_has_no_update_command(self):
         with self.assertRaises(SystemExit):

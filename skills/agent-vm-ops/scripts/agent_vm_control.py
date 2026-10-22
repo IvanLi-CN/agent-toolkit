@@ -62,6 +62,8 @@ except ModuleNotFoundError:
 
 
 PROTOCOL_VERSION = 4
+SCHEMA_VERSION = 1
+SEMANTIC_REVISION = 1
 MEMORY_SETTLE_SECONDS = 45
 TRANSITIONAL_ADMISSION_WAIT_SECONDS = 30
 TRANSITIONAL_ADMISSION_POLL_SECONDS = 0.25
@@ -1572,6 +1574,20 @@ class Control:
     ACTIVE_STATES = {"preparing", "active"}
     TRANSITION_STATES = {"preparing", "closing", "deleting"}
 
+    @classmethod
+    def _is_write_action(cls, action: str, request: Mapping[str, Any] | None = None) -> bool:
+        # A dry-run reconciliation is an observation used by release health
+        # checks.  Applying reconciliation remains a journaled write.
+        if (
+            action == "admin-reconcile"
+            and request is not None
+            and request.get("apply", False) is False
+            and "operation_id" not in request
+            and "generation" not in request
+        ):
+            return False
+        return action in cls.WRITE_ACTIONS
+
     def __init__(
         self,
         config: Mapping[str, Any],
@@ -1656,6 +1672,10 @@ class Control:
             verified=self.release_artifacts_verified,
             legacy=self.release_manifest is None,
         )
+
+    @staticmethod
+    def _response_compatibility() -> dict[str, int]:
+        return {"schema": SCHEMA_VERSION, "semantic_revision": SEMANTIC_REVISION}
 
     def _release_activation_fenced(self) -> bool:
         try:
@@ -1771,7 +1791,7 @@ class Control:
                 # durable state. Native cleanup must not race a slow acquire,
                 # restart, resize, or proxy mutation.
                 self._expire_preempt(request)
-            if action in self.WRITE_ACTIONS:
+            if self._is_write_action(action, request):
                 op = require_nonempty_string(request.get("operation_id"), "operation_id", SESSION_ID_RE)
                 with self._object_lock("operation:" + op):
                     return self._dispatch_locked(request, compatibility_warnings)
@@ -2341,7 +2361,8 @@ class Control:
         ):
             raise ControlError("invalid_request", "admin-metrics is sessionless and read-only")
         operation_id = request.get("operation_id")
-        if action in self.WRITE_ACTIONS:
+        is_write = self._is_write_action(action, request)
+        if is_write:
             operation_id = require_nonempty_string(operation_id, "operation_id", SESSION_ID_RE)
             digest = hashlib.sha256(json.dumps(dict(request), sort_keys=True).encode()).hexdigest()
             cached = self.store.operation(operation_id)
@@ -2364,6 +2385,7 @@ class Control:
                     cached_warnings if isinstance(cached_warnings, list) else [],
                     compatibility_warnings,
                 )
+                response.setdefault("response", self._response_compatibility())
                 response["release"] = self._release_metadata()
                 if session_id:
                     task = self.store.get_task(session_id=session_id)
@@ -2381,7 +2403,7 @@ class Control:
             result = self._dispatch_action(action, dict(request), session_id)
         except ControlError as exc:
             try:
-                if operation_id and action in self.WRITE_ACTIONS:
+                if operation_id and is_write:
                     # A committed renew must remain replayable even if rearming its
                     # native timer failed after the atomic deadline/journal commit.
                     saved = self.store.operation(operation_id)
@@ -2391,7 +2413,7 @@ class Control:
                     elif saved.get("outcome") == "pending" and not self._operation_outcome_uncertain(action, exc):
                         self.store.record_operation(operation_id, action, session_id, request.get("generation"),
                                                     {"outcome": "error", "error": exc.as_dict(), "_request_digest": digest})
-                if session_id is not None or action in self.WRITE_ACTIONS:
+                if session_id is not None or is_write:
                     self.store.audit(
                         action,
                         "error",
@@ -2412,11 +2434,12 @@ class Control:
             "operation_id": operation_id,
             "outcome": "success",
             "result": result,
+            "response": self._response_compatibility(),
             "release": self._release_metadata(),
             "warnings": self._merge_warnings(compatibility_warnings),
         }
         try:
-            if operation_id is not None and action in self.WRITE_ACTIONS and action != "renew":
+            if operation_id is not None and is_write and action != "renew":
                 self.store.record_operation(
                     operation_id,
                     action,
@@ -2424,7 +2447,7 @@ class Control:
                     request.get("generation"),
                     {**response, "_request_digest": digest},
                 )
-            if session_id is not None or action in self.WRITE_ACTIONS:
+            if session_id is not None or is_write:
                 self.store.audit(
                     action,
                     "ok",

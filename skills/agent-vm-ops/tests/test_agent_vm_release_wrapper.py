@@ -196,6 +196,46 @@ class WrapperTests(unittest.TestCase):
             WRAPPER.rollback(self.loaded, "tx-second", "d" * 40)
         self.assertEqual(failure.exception.code, "rollback_already_attempted")
 
+    def test_interrupted_rollback_after_pointer_switch_can_be_retried(self):
+        first = self.root / "retry-first.tar"
+        second = self.root / "retry-second.tar"
+        RELEASE.build_release(ROOT, first, "c" * 40)
+        RELEASE.build_release(ROOT, second, "d" * 40)
+        with mock.patch.object(WRAPPER.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")):
+            WRAPPER.stage(self.loaded, "tx-retry-first", "c" * 40, first.read_bytes())
+            WRAPPER.activate(self.loaded, "tx-retry-first", "c" * 40)
+            WRAPPER.stage(self.loaded, "tx-retry-second", "d" * 40, second.read_bytes())
+            WRAPPER.activate(self.loaded, "tx-retry-second", "d" * 40)
+        activation_path = Path(self.loaded["state_root"]) / "tx-retry-second.activation.json"
+        record = json.loads(activation_path.read_text(encoding="utf-8"))
+        record.update({"rollback_attempts": 1, "rollback_state": "in-progress", "rollback_phase": "started"})
+        activation_path.write_text(json.dumps(record), encoding="utf-8")
+        WRAPPER._atomic_symlink(Path(self.loaded["release_root"]) / ("c" * 40), Path(self.loaded["current_link"]))
+        with mock.patch.object(WRAPPER.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")):
+            result = WRAPPER.rollback(self.loaded, "tx-retry-second", "d" * 40)
+        self.assertTrue(result["rolled_back"])
+        self.assertEqual(Path(self.loaded["current_link"]).resolve().name, "c" * 40)
+        self.assertEqual(Path(self.loaded["previous_link"]).resolve().name, "d" * 40)
+        self.assertFalse(Path(self.loaded["fence_path"]).exists())
+        saved = json.loads(activation_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["rollback_state"], "complete")
+
+    def test_rollback_rejects_a_drifted_previous_pointer(self):
+        first = self.root / "pointer-first.tar"
+        second = self.root / "pointer-second.tar"
+        RELEASE.build_release(ROOT, first, "8" * 40)
+        RELEASE.build_release(ROOT, second, "9" * 40)
+        with mock.patch.object(WRAPPER.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")):
+            WRAPPER.stage(self.loaded, "tx-pointer-first", "8" * 40, first.read_bytes())
+            WRAPPER.activate(self.loaded, "tx-pointer-first", "8" * 40)
+            WRAPPER.stage(self.loaded, "tx-pointer-second", "9" * 40, second.read_bytes())
+            WRAPPER.activate(self.loaded, "tx-pointer-second", "9" * 40)
+            WRAPPER._atomic_symlink(Path(self.loaded["release_root"]) / ("9" * 40), Path(self.loaded["previous_link"]))
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER.rollback(self.loaded, "tx-pointer-second", "9" * 40)
+        self.assertEqual(failure.exception.code, "rollback_stale")
+        self.assertEqual(Path(self.loaded["current_link"]).resolve().name, "9" * 40)
+
     def test_stale_rollback_cannot_downgrade_a_newer_release(self):
         first = self.root / "stale-first.tar"
         second = self.root / "stale-second.tar"

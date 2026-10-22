@@ -140,6 +140,12 @@ class ManifestContractTests(unittest.TestCase):
             MANIFEST.check_compatibility(MANIFEST.legacy_manifest(), "status", invalid_peer)
         self.assertEqual(failure.exception.code, "compatibility_invalid")
 
+        missing_release = dict(capability)
+        missing_release.pop("release_id")
+        with self.assertRaises(MANIFEST.ManifestError) as failure:
+            MANIFEST.check_compatibility(MANIFEST.legacy_manifest(), "status", missing_release)
+        self.assertEqual(failure.exception.code, "compatibility_invalid")
+
     def test_missing_runtime_manifest_is_an_explicit_legacy_warning(self):
         manifest, present, verified, warnings = MANIFEST.load_runtime_manifest(self.root / "missing.json")
         self.assertIsNone(manifest)

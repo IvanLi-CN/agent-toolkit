@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -51,6 +52,8 @@ class FakeTransport:
             self.health_checks += 1
             ready = not self.fail_health_once or self.health_checks > 1
             return {"ok": True, "result": {"ready": ready, "issues": [] if ready else ["injected"]}}
+        if action == "admin-reconcile":
+            return {"ok": True, "result": {"dry_run": True, "actions": []}}
         return {"ok": True, "result": {"draining": self.drain_enter if action == "drain-enter" else action != "drain-exit"}}
 
 
@@ -186,6 +189,7 @@ class ReleasePublisherTests(unittest.TestCase):
         os.replace(target, backup_client)
         os.replace(sidecar, backup_sidecar)
         target.write_bytes(b"new-client")
+        target.chmod(0o755)
         staged_dir = target.parent / "agent-vm-client-crash"
         staged_dir.mkdir()
         record = {
@@ -197,8 +201,16 @@ class ReleasePublisherTests(unittest.TestCase):
             "backup_sidecar": str(backup_sidecar),
             "staged_dir": str(staged_dir),
             "previous": {
-                "client": {"exists": True, "sha256": old_client_digest},
-                "sidecar": {"exists": True, "sha256": old_sidecar_digest},
+                "client": {"exists": True, "sha256": old_client_digest, "mode": 0o755},
+                "sidecar": {"exists": True, "sha256": old_sidecar_digest, "mode": 0o644},
+            },
+            "target": {
+                "client": {"exists": True, "sha256": hashlib.sha256(b"new-client").hexdigest(), "mode": 0o755},
+                "sidecar": {"exists": True, "sha256": hashlib.sha256(b"new-sidecar").hexdigest(), "mode": 0o644},
+            },
+            "installed": {
+                "client": {"exists": True, "sha256": hashlib.sha256(b"new-client").hexdigest(), "mode": 0o755},
+                "sidecar": {"exists": False},
             },
         }
         RELEASE._write_json(target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME, record, 0o600)
@@ -207,6 +219,83 @@ class ReleasePublisherTests(unittest.TestCase):
         self.assertEqual(sidecar.read_bytes(), b"old-sidecar")
         self.assertFalse((target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME).exists())
         self.assertFalse(staged_dir.exists())
+
+    def test_preexisting_local_backup_is_rejected_and_preserved(self):
+        target = self.root / "preexisting-backup" / "agent_vm.py"
+        target.parent.mkdir(parents=True)
+        sidecar = target.with_name("client-release.json")
+        target.write_bytes(b"old-client")
+        target.chmod(0o755)
+        backup = RELEASE._local_backup_path(target)
+        backup.write_bytes(b"operator-backup")
+        backup.chmod(0o755)
+        staged_dir = target.parent / "agent-vm-client-preexisting"
+        staged_dir.mkdir()
+        record = {
+            "format": 1,
+            "phase": "installing",
+            "client_path": str(target),
+            "sidecar_path": str(sidecar),
+            "backup_client": str(backup),
+            "backup_sidecar": str(RELEASE._local_backup_path(sidecar)),
+            "staged_dir": str(staged_dir),
+            "previous": {
+                "client": {"exists": True, "sha256": RELEASE.sha256_file(target), "mode": 0o755},
+                "sidecar": {"exists": False},
+            },
+            "target": {
+                "client": {"exists": True, "sha256": "1" * 64, "mode": 0o755},
+                "sidecar": {"exists": True, "sha256": "2" * 64, "mode": 0o644},
+            },
+            "installed": {"client": {"exists": False}, "sidecar": {"exists": False}},
+        }
+        RELEASE._write_json(target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME, record, 0o600)
+        with self.assertRaises(RELEASE.ReleaseError) as failure:
+            RELEASE._recover_local_client_install(target, sidecar)
+        self.assertEqual(failure.exception.code, "local_client_recovery_failed")
+        self.assertEqual(backup.read_bytes(), b"operator-backup")
+        self.assertTrue((target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME).exists())
+
+    def test_external_local_target_replacement_is_preserved_during_recovery(self):
+        target = self.root / "external-replacement" / "agent_vm.py"
+        target.parent.mkdir(parents=True)
+        sidecar = target.with_name("client-release.json")
+        target.write_bytes(b"old-client")
+        target.chmod(0o755)
+        old_digest = RELEASE.sha256_file(target)
+        backup = RELEASE._local_backup_path(target)
+        os.replace(target, backup)
+        target.write_bytes(b"external-replacement")
+        target.chmod(0o755)
+        staged_dir = target.parent / "agent-vm-client-external"
+        staged_dir.mkdir()
+        record = {
+            "format": 1,
+            "phase": "installing",
+            "client_path": str(target),
+            "sidecar_path": str(sidecar),
+            "backup_client": str(backup),
+            "backup_sidecar": str(RELEASE._local_backup_path(sidecar)),
+            "staged_dir": str(staged_dir),
+            "previous": {
+                "client": {"exists": True, "sha256": old_digest, "mode": 0o755},
+                "sidecar": {"exists": False},
+            },
+            "target": {
+                "client": {"exists": True, "sha256": "1" * 64, "mode": 0o755},
+                "sidecar": {"exists": True, "sha256": "2" * 64, "mode": 0o644},
+            },
+            "installed": {
+                "client": {"exists": True, "sha256": "1" * 64, "mode": 0o755},
+                "sidecar": {"exists": False},
+            },
+        }
+        RELEASE._write_json(target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME, record, 0o600)
+        with self.assertRaises(RELEASE.ReleaseError) as failure:
+            RELEASE._recover_local_client_install(target, sidecar)
+        self.assertEqual(failure.exception.code, "local_client_recovery_failed")
+        self.assertEqual(target.read_bytes(), b"external-replacement")
+        self.assertEqual(backup.read_bytes(), b"old-client")
 
     def test_completed_local_client_marker_is_verified_before_cleanup(self):
         target = self.root / "complete" / "agent_vm.py"
@@ -261,6 +350,11 @@ class ReleasePublisherTests(unittest.TestCase):
                 "client": {"exists": True, "sha256": RELEASE.sha256_file(target) if target.exists() else "0" * 64, "mode": 0o755},
                 "sidecar": {"exists": True, "sha256": RELEASE.sha256_file(backup_sidecar), "mode": 0o644},
             },
+            "target": {
+                "client": {"exists": True, "sha256": "1" * 64, "mode": 0o755},
+                "sidecar": {"exists": True, "sha256": "2" * 64, "mode": 0o644},
+            },
+            "installed": {"client": {"exists": False}, "sidecar": {"exists": False}},
         }
         RELEASE._write_json(target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME, record, 0o600)
         with self.assertRaises(RELEASE.ReleaseError) as failure:
@@ -286,6 +380,11 @@ class ReleasePublisherTests(unittest.TestCase):
             "backup_sidecar": str(RELEASE._local_backup_path(sidecar)),
             "staged_dir": str(staged_dir),
             "previous": {"client": {"exists": False}, "sidecar": {"exists": False}},
+            "target": {
+                "client": {"exists": True, "sha256": "1" * 64, "mode": 0o755},
+                "sidecar": {"exists": True, "sha256": "2" * 64, "mode": 0o644},
+            },
+            "installed": {"client": {"exists": False}, "sidecar": {"exists": False}},
         }
         RELEASE._write_json(target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME, record, 0o600)
         with self.assertRaises(RELEASE.ReleaseError) as failure:

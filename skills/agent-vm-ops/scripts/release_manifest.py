@@ -539,7 +539,9 @@ def check_compatibility(
         raise _error("response_schema_incompatible", "control response schema is not accepted by the client", {"action": action})
     if not accepted_response["semantic_min"] <= local_response["semantic_revision"] <= accepted_response["semantic_max"]:
         raise _error("response_semantic_incompatible", "control response semantic revision is not accepted by the client", {"action": action})
-    peer_release = peer_map.get("release_id", LEGACY_RELEASE_ID)
+    if "release_id" not in peer_map:
+        raise _error("compatibility_invalid", "compatibility.release_id is required for a present capability")
+    peer_release = peer_map["release_id"]
     if not isinstance(peer_release, str) or not peer_release:
         raise _error("compatibility_invalid", "compatibility.release_id must be a string")
     if peer_release != LEGACY_RELEASE_ID and RELEASE_ID_RE.fullmatch(peer_release) is None:

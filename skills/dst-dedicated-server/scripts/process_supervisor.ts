@@ -80,8 +80,22 @@ cleanup() {
   if [ "$cleanup_ack_created" = "1" ] || [ "$cleanup_failure_created" = "1" ]; then
     cleanup_marker_path="$cleanup_ack_path"
     [ "$cleanup_failure_created" = "1" ] && cleanup_marker_path="$cleanup_failure_path"
+    if command -v parent_is_alive >/dev/null 2>&1; then
+      cleanup_wait=0
+      while [ -d "$cleanup_marker_path" ] && [ "$cleanup_wait" -lt 1500 ]; do
+        if [ -e "$parent_dead_path" ] || ! parent_is_alive; then
+          ensure_marker "$parent_dead_path" || true
+          break
+        fi
+        sleep 0.05
+        cleanup_wait=$((cleanup_wait + 1))
+      done
+    fi
   fi
-  if [ -e "$parent_dead_path" ]; then rm -rf -- "$status_dir"; fi
+  if [ -e "$parent_dead_path" ]; then
+    rm -rf -- "$status_dir"
+    rmdir "$(dirname -- "$cleanup_ack_path")" 2>/dev/null || true
+  fi
 }
 run_bounded() {
   bounded_seconds="$1"
@@ -146,6 +160,7 @@ if [ "$parent_identity_mode" != "proc" ]; then
   if [ -n "$parent_ps_start" ]; then parent_identity_mode="ps"; fi
 fi
 target_status_path="$status_dir/target-status"
+completion_path="$status_dir/completed"
 target_start_path="$status_dir/target-start"
 target_anchor_path="$status_dir/target"
 target_pgid_path="$status_dir/target-pgid"
@@ -1507,6 +1522,9 @@ fi
 if ! write_marker_exclusive "$status_path" "$target_status"; then
   cleanup_ack_enabled=0
   target_status=125
+elif ! write_marker_exclusive "$completion_path" complete; then
+  cleanup_ack_enabled=0
+  target_status=125
 fi
 exec 0<&- 1>/dev/null 2>/dev/null
 # The target exit code is the wrapper's authenticated result. Run the
@@ -1743,13 +1761,15 @@ async function markCleanupFailure(path: string): Promise<void> {
 
 async function waitForTarget(
   path: string,
+  completionPath: string,
   wrapperExited: Promise<number>,
   cleanupFailurePath?: string,
   rememberedReference?: () => TargetReference | undefined,
 ): Promise<number> {
   const wrapperCode = await wrapperExited;
   const status = await readStatus(path);
-  if (status !== undefined && status === wrapperCode && wrapperCode !== SUPERVISOR_UNKNOWN_TARGET_STATUS) return status;
+  const completed = (await readRegularMarker(completionPath))?.trim() === "complete";
+  if (completed && status !== undefined && status === wrapperCode) return status;
   await cleanupOrphanedTarget(rememberedReference?.());
   if (cleanupFailurePath !== undefined) await markCleanupFailure(cleanupFailurePath);
   return SUPERVISOR_UNKNOWN_TARGET_STATUS;
@@ -1816,7 +1836,7 @@ async function removeCleanupAckRoot(path: string): Promise<void> {
   try { await rmdir(path); } catch { /* The marker consumer may already have removed the private root. */ }
 }
 
-async function waitForCleanupAck(path: string, wrapperExited: Promise<number>): Promise<boolean> {
+async function waitForCleanupAck(path: string): Promise<boolean> {
   // The shell keeps the cleanup work bounded to the shared budget. Allow a
   // short, separate window for its success/failure marker to become visible
   // before the caller force-kills a still-running supervisor.
@@ -1825,19 +1845,7 @@ async function waitForCleanupAck(path: string, wrapperExited: Promise<number>): 
   while (Date.now() < deadline) {
     if (await consumeCleanupAck(path)) return true;
     if (await consumeCleanupFailure(failurePath)) return false;
-    const wrapperDone = await Promise.race([
-      wrapperExited.then(() => true, () => true),
-      Bun.sleep(20).then(() => false),
-    ]);
-    if (wrapperDone) {
-      const settleDeadline = Date.now() + SUPERVISOR_CLEANUP_ACK_SETTLE_MS;
-      while (Date.now() < settleDeadline) {
-        if (await consumeCleanupAck(path)) return true;
-        if (await consumeCleanupFailure(failurePath)) return false;
-        await Bun.sleep(20);
-      }
-      return false;
-    }
+    await Bun.sleep(20);
   }
   if (await consumeCleanupAck(path)) return true;
   await consumeCleanupFailure(failurePath);
@@ -1867,6 +1875,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
     throw error;
   }
   const statusPath = join(directory, "status");
+  const completionPath = join(directory, "completed");
   const readyPath = join(directory, "ready");
   const cleanupAckPath = join(cleanupAckDirectory, "done");
   const cleanupFailurePath = `${cleanupAckPath}.failed`;
@@ -1889,12 +1898,12 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
     let rememberedTargetReference: TargetReference | undefined;
     let cleanupAckPromise: Promise<boolean> | undefined;
     const waitForCleanupAcknowledged = (): Promise<boolean> => {
-      cleanupAckPromise ??= waitForCleanupAck(cleanupAckPath, wrapperExited);
+      cleanupAckPromise ??= waitForCleanupAck(cleanupAckPath);
       return cleanupAckPromise;
     };
     const supervised: SupervisedChild = {
       child,
-      exited: waitForTarget(statusPath, wrapperExited, cleanupFailurePath, () => rememberedTargetReference),
+      exited: waitForTarget(statusPath, completionPath, wrapperExited, cleanupFailurePath, () => rememberedTargetReference),
       wrapperExited,
       waitForCleanupAcknowledged,
       forceCleanup: () => cleanupOrphanedTarget(rememberedTargetReference),
@@ -1906,18 +1915,18 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
       },
     };
     const ready = await waitForReady(readyPath, wrapperExited);
+    rememberedTargetReference = await readTargetReference(statusPath) ?? await discoverTargetReference(targetMarker);
     if (!ready) {
-      await cleanupOrphanedTarget();
+      await cleanupOrphanedTarget(rememberedTargetReference);
       try { child.kill("SIGTERM"); } catch { /* The wrapper may already be gone. */ }
       const cleanupReady = await waitForCleanupAcknowledged();
       if (!cleanupReady) {
         try { child.kill("SIGKILL"); } catch { /* The wrapper may already be gone. */ }
       }
       await wrapperExited;
-      await cleanupOrphanedTarget();
+      await cleanupOrphanedTarget(rememberedTargetReference);
       throw new Error("supervisor_not_ready");
     }
-    rememberedTargetReference = await discoverTargetReference(targetMarker) ?? await readTargetReference(statusPath);
     return supervised;
   } catch (error) {
     await rm(directory, { recursive: true, force: true });

@@ -1359,6 +1359,23 @@ exec /bin/ps "$@"
     }
   });
 
+  test("preserves a valid target exit code that matches the supervisor sentinel", { timeout: 30_000 }, async () => {
+    if (process.platform === "win32") return;
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    try {
+      supervised = await spawnSupervised(["sh", "-c", "exit 125"]);
+      expect(await supervised.exited).toBe(125);
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(true);
+      await supervised.wrapperExited;
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+    }
+  });
+
   test("does not trust mutable target or status markers", { timeout: 90_000 }, async () => {
     if (process.platform === "win32") return;
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-marker-canary-"));

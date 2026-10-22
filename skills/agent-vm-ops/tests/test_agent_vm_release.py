@@ -61,8 +61,12 @@ class ReleasePublisherTests(unittest.TestCase):
         self.bundle = self.root / "bundle.tar"
         RELEASE.build_release(ROOT, self.bundle, "e" * 40)
 
-    def publisher(self, transport, *, client_target=None, clock=None):
+    _DEFAULT_CLIENT_TARGET = object()
+
+    def publisher(self, transport, *, client_target=_DEFAULT_CLIENT_TARGET, clock=None):
         elapsed = [0.0]
+        if client_target is self._DEFAULT_CLIENT_TARGET:
+            client_target = self.root / "client" / "agent_vm.py"
         return RELEASE.ReleasePublisher(
             bundle=self.bundle,
             control_host="staging-control",
@@ -84,6 +88,13 @@ class ReleasePublisherTests(unittest.TestCase):
         self.assertEqual(actions[:3], ["stage", "verify", "drain-enter"])
         self.assertLess(actions.index("drain-enter"), actions.index("activate"))
         self.assertEqual(actions[-1], "drain-exit")
+
+    def test_publish_requires_local_client_target_before_remote_mutation(self):
+        transport = FakeTransport()
+        with self.assertRaises(RELEASE.ReleaseError) as failure:
+            self.publisher(transport, client_target=None).publish(timeout=5, poll=1, transaction_id="tx-no-client")
+        self.assertEqual(failure.exception.code, "local_client_target_missing")
+        self.assertEqual(transport.calls, [])
 
     def test_convergence_timeout_does_not_activate_or_exit_drain(self):
         transport = FakeTransport(pending=True)
@@ -163,6 +174,32 @@ class ReleasePublisherTests(unittest.TestCase):
         self.assertEqual(sidecar.read_bytes(), b"old-sidecar")
         self.assertFalse((target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME).exists())
         self.assertFalse(staged_dir.exists())
+
+    def test_completed_local_client_marker_is_verified_before_cleanup(self):
+        target = self.root / "complete" / "agent_vm.py"
+        target.parent.mkdir(parents=True)
+        sidecar = target.with_name("client-release.json")
+        target.write_bytes(b"installed-client")
+        target.chmod(0o755)
+        sidecar.write_bytes(b"installed-sidecar")
+        sidecar.chmod(0o644)
+        staged_dir = target.parent / "agent-vm-client-complete"
+        staged_dir.mkdir()
+        record = {
+            "format": 1,
+            "phase": "complete",
+            "client_path": str(target),
+            "sidecar_path": str(sidecar),
+            "backup_client": str(RELEASE._local_backup_path(target)),
+            "backup_sidecar": str(RELEASE._local_backup_path(sidecar)),
+            "staged_dir": str(staged_dir),
+        }
+        RELEASE._write_json(target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME, record, 0o600)
+        with self.assertRaises(RELEASE.ReleaseError) as failure:
+            RELEASE._recover_local_client_install(target, sidecar)
+        self.assertEqual(failure.exception.code, "local_client_recovery_failed")
+        self.assertTrue((target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME).exists())
+        self.assertTrue(staged_dir.exists())
 
 
 if __name__ == "__main__":

@@ -72,6 +72,61 @@ class SessionContractTests(unittest.TestCase):
         self.assertTrue(any(item["code"] == "legacy_compatibility" for item in result["warnings"]))
         self.assertTrue(any(item["code"] == "legacy_control_release" for item in result["warnings"]))
 
+    def test_replay_reuses_journaled_capability_after_sidecar_change(self):
+        operation_id = "replay-capability"
+        session = "thread"
+        capability = {
+            "release_id": "a" * 40,
+            "protocol": CLI.PROTOCOL_VERSION,
+            "action": "drain-enter",
+            "request": {"schema": 1, "semantic_revision": 1},
+            "accepted_response": {"schema_min": 1, "schema_max": 1, "semantic_min": 1, "semantic_max": 1},
+        }
+        request = {
+            "protocol": CLI.PROTOCOL_VERSION,
+            "action": "drain-enter",
+            "session_id": session,
+            "operation_id": operation_id,
+            "compatibility": capability,
+        }
+        response = {
+            "ok": True,
+            "protocol": CLI.PROTOCOL_VERSION,
+            "action": "drain-enter",
+            "session_id": session,
+            "operation_id": operation_id,
+            "server_time": "2026-10-22T00:00:00+00:00",
+            "result": {"draining": True},
+            "release": {"release_id": "b" * 40, "source_revision": "b" * 40, "protocol": CLI.PROTOCOL_VERSION},
+        }
+        metadata = {
+            "release_id": "b" * 40,
+            "source_revision": "b" * 40,
+            "protocol": CLI.PROTOCOL_VERSION,
+            "manifest_present": True,
+            "artifacts_verified": True,
+            "actions": {
+                "drain-enter": {
+                    "request": {"schema": 1, "semantic_revision": 1},
+                    "response": {"schema": 1, "semantic_revision": 1},
+                    "client_to_control": {"schema_min": 1, "schema_max": 1, "semantic_min": 1, "semantic_max": 1},
+                    "control_to_client": {"schema_min": 1, "schema_max": 1, "semantic_min": 1, "semantic_max": 1},
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(CLI, "local_session_dir", return_value=Path(directory)), \
+             mock.patch.object(CLI, "load_client_release_metadata", return_value=(metadata, [])), \
+             mock.patch.object(CLI.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps(response).encode(), b"")) as run:
+            operations = Path(directory) / "operations"
+            operations.mkdir()
+            journal = operations / (hashlib.sha256(operation_id.encode()).hexdigest() + ".json")
+            journal.write_text(json.dumps({"request": request, "outcome": "pending"}), encoding="utf-8")
+            result = CLI.control_request("drain-enter", session=session, write=True, operation_id=operation_id)
+        sent = json.loads(run.call_args.kwargs["input"])
+        self.assertEqual(sent["compatibility"]["release_id"], "a" * 40)
+        self.assertEqual(result["operation_id"], operation_id)
+
     def test_present_invalid_sidecar_fails_before_ssh(self):
         with tempfile.TemporaryDirectory() as directory:
             sidecar = Path(directory) / "release.json"

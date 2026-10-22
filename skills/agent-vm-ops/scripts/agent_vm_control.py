@@ -99,6 +99,17 @@ RESOURCE_KEYS = frozenset(("cpu", "memory_mib", "disk_gib"))
 TASK_STATES = frozenset(("absent", "cached", "preparing", "active", "closing", "deleting", "failed"))
 
 
+def runtime_artifact_paths(config: Mapping[str, Any], manifest_path: Path, manifest: Mapping[str, Any]) -> dict[str, Path]:
+    return {
+        item["path"]: (
+            Path(str(config["timer_dir"])) / Path(item["path"]).name
+            if item["role"] == "unit"
+            else manifest_path.parent / Path(*PurePosixPath(item["path"]).parts)
+        )
+        for item in manifest["artifacts"]
+    }
+
+
 def parse_resource_mapping(raw: str | None, label: str, *, allow_empty: bool) -> dict[str, int]:
     if not isinstance(raw, str):
         raise ValueError(label)
@@ -1581,6 +1592,15 @@ class Control:
             ) = load_runtime_manifest(self.release_manifest_path)
         except ManifestError as exc:
             self.release_manifest_error = ControlError(exc.code, exc.message, exc.detail)
+        if self.release_manifest_error is None and self.release_manifest is not None:
+            try:
+                verify_runtime_bundle(
+                    self.release_manifest,
+                    runtime_artifact_paths(self.config, self.release_manifest_path, self.release_manifest),
+                )
+            except ManifestError as exc:
+                self.release_artifacts_verified = False
+                self.release_manifest_error = ControlError(exc.code, exc.message, exc.detail)
         if self.release_manifest_error is not None and store is None:
             # Do not open SQLite/WAL or create the state directory for an
             # invalid installed release.  Tests may inject a store to inspect
@@ -1655,15 +1675,10 @@ class Control:
         manifest = self.release_manifest or legacy_manifest()
         if self.release_manifest is not None:
             try:
-                runtime_paths = {
-                    item["path"]: (
-                        Path(str(self.config["timer_dir"])) / Path(item["path"]).name
-                        if item["role"] == "unit"
-                        else self.release_manifest_path.parent / Path(*PurePosixPath(item["path"]).parts)
-                    )
-                    for item in self.release_manifest["artifacts"]
-                }
-                verify_runtime_bundle(self.release_manifest, runtime_paths)
+                verify_runtime_bundle(
+                    self.release_manifest,
+                    runtime_artifact_paths(self.config, self.release_manifest_path, self.release_manifest),
+                )
             except ManifestError as exc:
                 raise ControlError(exc.code, exc.message, exc.detail) from exc
         try:
@@ -2326,7 +2341,7 @@ class Control:
                     cached_warnings if isinstance(cached_warnings, list) else [],
                     compatibility_warnings,
                 )
-                response.setdefault("release", self._release_metadata())
+                response["release"] = self._release_metadata()
                 if session_id:
                     task = self.store.get_task(session_id=session_id)
                     response["current_state"] = self._state_summary(task) if task else None

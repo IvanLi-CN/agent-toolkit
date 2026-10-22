@@ -399,6 +399,44 @@ class LifecycleTests(Fixture):
         self.error("artifact_checksum_mismatch", checked.dispatch, request)
         self.assertIsNone(store.operation("artifact-mismatch"))
 
+    def test_invalid_runtime_artifact_is_rejected_before_state_store_creation(self):
+        release_root = self.root / "preflight-release"
+        release_root.mkdir()
+        client = release_root / "agent_vm.py"
+        control = release_root / "agent_vm_control.py"
+        client.write_text("client\n")
+        control.write_text("control\n")
+        client.chmod(0o755)
+        control.chmod(0o755)
+        artifacts = [
+            {"name": "agent_vm.py", "path": "agent_vm.py", "role": "client", "sha256": CONTROL.hashlib.sha256(client.read_bytes()).hexdigest(), "mode": 0o755},
+            {"name": "agent_vm_control.py", "path": "agent_vm_control.py", "role": "control", "sha256": CONTROL.hashlib.sha256(control.read_bytes()).hexdigest(), "mode": 0o755},
+        ]
+        manifest_path = release_root / MANIFEST.MANIFEST_NAME
+        manifest_path.write_text(json.dumps(MANIFEST.build_manifest("e" * 40, artifacts)), encoding="utf-8")
+        control.write_text("tampered\n")
+        state_db = self.root / "preflight-state" / "state.sqlite3"
+        config = dict(self.config, state_db=str(state_db), release_manifest_path=str(manifest_path))
+        with self.assertRaises(CONTROL.ControlError) as failure:
+            CONTROL.Control(config, runner=self.runner, systemd=self.systemd, resources=self.resources, clock=lambda: self.now)
+        self.assertEqual(failure.exception.code, "artifact_checksum_mismatch")
+        self.assertFalse(state_db.parent.exists())
+
+    def test_replayed_response_refreshes_release_metadata(self):
+        request = self.request("acquire", operation="release-refresh", public_key=KEY)
+        self.control.dispatch(request)
+        artifacts = [
+            {"name": "agent_vm.py", "path": "agent_vm.py", "role": "client", "sha256": "0" * 64, "mode": 0o755},
+            {"name": "agent_vm_control.py", "path": "agent_vm_control.py", "role": "control", "sha256": "1" * 64, "mode": 0o755},
+        ]
+        self.control.release_manifest = MANIFEST.build_manifest("f" * 40, artifacts)
+        self.control.release_manifest_present = True
+        self.control.release_artifacts_verified = True
+        with mock.patch.object(CONTROL, "verify_runtime_bundle"):
+            replay = self.control.dispatch(request)
+        self.assertEqual(replay["outcome"], "replayed")
+        self.assertEqual(replay["release"]["release_id"], "f" * 40)
+
     def test_readiness_uses_one_budget_and_emits_one_slow_start_diagnostic(self):
         self.acquire()
         elapsed = [0.0]

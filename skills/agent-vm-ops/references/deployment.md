@@ -6,10 +6,10 @@ If the control environment must be rebuilt or recovered, preserve the state and 
 
 | Surface | Deployment input |
 | --- | --- |
-| Control script | `/opt/agent-vm-native/agent_vm_control.py` or an explicitly configured path |
+| Control script | `/opt/agent-vm-native/agent_vm_control.py` |
 | Configuration | root-owned JSON at `/etc/agent-vm-native/config.json` |
 | Durable state | configured local state database and lock directory |
-| Native units | systemd assets copied atomically into the configured unit directory |
+| Native units | systemd assets copied atomically into `/etc/systemd/system` |
 | Local client | installed executable and protected session state under the operator's chosen XDG paths |
 
 The deployment supplies the control alias, Incus project/profile/image, network ACL, control address, guest address pool, host port range, storage path, state database and timer directory through a copied or derived configuration. `config.json.example` is a generic schema/template, not deployment evidence; for the locked deployment policy the installed configuration must set `memory_budget_mib=32768` and `memory_overcommit_ratio=2`. Placeholder values must be replaced before installation; missing or invalid values fail closed.

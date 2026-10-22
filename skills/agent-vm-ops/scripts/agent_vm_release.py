@@ -103,6 +103,19 @@ def _fail(code: str, message: str, detail: Any = None) -> None:
     raise ReleaseError(code, message, detail)
 
 
+def _fsync_directory(path: Path) -> None:
+    """Persist a directory entry after an atomic rename or unlink."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        _fail("bundle_durability_failed", f"cannot persist release directory: {path.name}")
+
+
 def _revision(value: str) -> str:
     if SOURCE_REVISION_RE.fullmatch(value) is None:
         _fail("invalid_source_revision", "source revision must be a 40-character lowercase Git revision")
@@ -132,6 +145,7 @@ def _write_atomic(path: Path, data: bytes, mode: int) -> None:
             os.fchmod(handle.fileno(), mode)
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
     except OSError as exc:
         try:
             temporary.unlink()
@@ -175,6 +189,7 @@ def _create_archive(root: Path, output: Path) -> None:
                     continue
                 archive.add(path, arcname=path.relative_to(root).as_posix(), recursive=False)
         os.replace(temporary, output)
+        _fsync_directory(output.parent)
     except (OSError, tarfile.TarError) as exc:
         try:
             temporary.unlink()
@@ -364,6 +379,17 @@ def _remove_local_staging(path: Path) -> None:
         _fail("local_client_recovery_failed", "cannot remove local client staging directory")
 
 
+def _verify_local_install_file(path: Path, *, digest: str, mode: int, label: str) -> None:
+    try:
+        info = path.lstat()
+    except OSError:
+        _fail("local_client_recovery_failed", f"completed local client file is unavailable: {label}")
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        _fail("local_client_recovery_failed", f"completed local client file is not regular: {label}")
+    if stat.S_IMODE(info.st_mode) != mode or sha256_file(path) != digest:
+        _fail("local_client_recovery_failed", f"completed local client file does not match its recovery marker: {label}")
+
+
 def _recover_local_client_install(client_path: Path, sidecar_path: Path) -> None:
     record_path = client_path.parent / LOCAL_INSTALL_RECORD_NAME
     if not record_path.exists() and not record_path.is_symlink():
@@ -372,6 +398,8 @@ def _recover_local_client_install(client_path: Path, sidecar_path: Path) -> None
         info = record_path.lstat()
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
             _fail("local_client_recovery_failed", "local client recovery marker is not a regular file")
+        if stat.S_IMODE(info.st_mode) != 0o600:
+            _fail("local_client_recovery_failed", "local client recovery marker has an unsafe mode")
         with record_path.open("r", encoding="utf-8") as handle:
             record = json.load(handle)
     except ReleaseError:
@@ -395,6 +423,24 @@ def _recover_local_client_install(client_path: Path, sidecar_path: Path) -> None
         _fail("local_client_recovery_failed", "local client recovery marker has an unsafe staging path")
     phase = record.get("phase")
     if phase == "complete":
+        installed = record.get("installed")
+        if not isinstance(installed, dict) or set(installed) != {"client", "sidecar"}:
+            _fail("local_client_recovery_failed", "completed local client recovery marker has no installed file state")
+        for destination, key, mode in (
+            (client_path, "client", 0o755),
+            (sidecar_path, "sidecar", 0o644),
+        ):
+            state = installed.get(key)
+            if (
+                not isinstance(state, dict)
+                or set(state) != {"exists", "sha256", "mode"}
+                or state.get("exists") is not True
+                or not isinstance(state.get("sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", state["sha256"])
+                or state.get("mode") != mode
+            ):
+                _fail("local_client_recovery_failed", "completed local client recovery marker has invalid installed state")
+            _verify_local_install_file(destination, digest=state["sha256"], mode=mode, label=key)
         for backup in (backup_client, backup_sidecar):
             _remove_local_path(backup)
         _remove_local_staging(staged_dir)
@@ -423,6 +469,7 @@ def _recover_local_client_install(client_path: Path, sidecar_path: Path) -> None
                 _remove_local_path(destination)
                 try:
                     os.replace(backup, destination)
+                    _fsync_directory(destination.parent)
                 except OSError:
                     _fail("local_client_recovery_failed", f"cannot restore previous local client file: {destination.name}")
             elif not destination.is_file() or sha256_file(destination) != expected_digest:
@@ -682,9 +729,15 @@ class ReleasePublisher:
                         if backup.exists() or backup.is_symlink():
                             backup.unlink()
                         os.replace(destination, backup)
+                        _fsync_directory(destination.parent)
                         backups.append((backup, destination))
                     os.replace(source, destination)
+                    _fsync_directory(destination.parent)
                     installed_destinations.append(destination)
+                record["installed"] = {
+                    "client": {"exists": True, "sha256": sha256_file(client_path), "mode": 0o755},
+                    "sidecar": {"exists": True, "sha256": sha256_file(sidecar_path), "mode": 0o644},
+                }
                 record["phase"] = "complete"
                 _write_json(record_path, record, 0o600)
                 install_succeeded = True
@@ -696,6 +749,7 @@ class ReleasePublisher:
                     try:
                         if destination.exists() or destination.is_symlink():
                             destination.unlink()
+                            _fsync_directory(destination.parent)
                     except OSError:
                         pass
                 for backup, destination in reversed(backups):
@@ -703,6 +757,7 @@ class ReleasePublisher:
                         if destination.exists() or destination.is_symlink():
                             destination.unlink()
                         os.replace(backup, destination)
+                        _fsync_directory(destination.parent)
                     except OSError:
                         pass
                 if record_written:
@@ -721,11 +776,13 @@ class ReleasePublisher:
                     for backup, _ in backups:
                         try:
                             backup.unlink()
+                            _fsync_directory(backup.parent)
                         except OSError:
                             pass
                     shutil.rmtree(staged_dir, ignore_errors=True)
                     try:
                         record_path.unlink()
+                        _fsync_directory(record_path.parent)
                     except OSError:
                         pass
             if install_succeeded:
@@ -738,6 +795,8 @@ class ReleasePublisher:
             temporary.cleanup()
 
     def publish(self, *, timeout: float = DEFAULT_TIMEOUT_SECONDS, poll: float = DEFAULT_POLL_SECONDS, transaction_id: str | None = None) -> dict[str, Any]:
+        if self.client_target is None:
+            _fail("local_client_target_missing", "publish requires an explicit local client target")
         if timeout <= 0 or timeout > MAX_TIMEOUT_SECONDS:
             _fail("invalid_timeout", f"timeout must be between 0 and {MAX_TIMEOUT_SECONDS} seconds")
         if poll <= 0 or poll > MAX_POLL_SECONDS:
@@ -829,7 +888,7 @@ def build_parser() -> argparse.ArgumentParser:
     publish.add_argument("--control-host", required=True)
     publish.add_argument("--wrapper", required=True)
     publish.add_argument("--remote-control", default="/opt/agent-vm-native/agent_vm_control.py")
-    publish.add_argument("--client-target", type=Path)
+    publish.add_argument("--client-target", type=Path, required=True)
     publish.add_argument("--session-id")
     publish.add_argument("--transaction-id")
     publish.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)

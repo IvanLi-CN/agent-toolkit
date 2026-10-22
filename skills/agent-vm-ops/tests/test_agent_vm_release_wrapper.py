@@ -42,7 +42,14 @@ class WrapperTests(unittest.TestCase):
         }
         self.config_path = self.root / "wrapper.json"
         self.config_path.write_text(json.dumps(self.config), encoding="utf-8")
-        self.loaded = WRAPPER.load_config(self.config_path)
+        self.loaded = {key: Path(value) for key, value in self.config.items() if key in {
+            "release_root", "staging_root", "current_link", "previous_link", "control_path", "unit_dir", "state_root",
+        }}
+        self.loaded.update({
+            "owner_uid": uid,
+            "require_drained": True,
+            "unit_names": tuple(WRAPPER.FIXED_UNIT_NAMES),
+        })
         self.payload = self.bundle.read_bytes()
         self.drain_patch = mock.patch.object(WRAPPER, "_ensure_drained")
         self.drain_patch.start()
@@ -80,6 +87,12 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(failure.exception.code, "wrapper_config_invalid")
         with self.assertRaises(SystemExit):
             WRAPPER.build_parser().parse_args(["--config", str(invalid_path), "status"])
+        redirected = dict(self.config)
+        redirected_path = self.root / "redirected-wrapper.json"
+        redirected_path.write_text(json.dumps(redirected), encoding="utf-8")
+        with self.assertRaises(WRAPPER.WrapperError) as redirected_failure:
+            WRAPPER.load_config(redirected_path)
+        self.assertEqual(redirected_failure.exception.code, "wrapper_config_invalid")
 
     def test_wrapper_rejects_overlapping_protected_paths(self):
         invalid = dict(self.config)

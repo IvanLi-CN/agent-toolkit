@@ -54,6 +54,8 @@ except ModuleNotFoundError:
 
 
 DEFAULT_CONFIG_PATH = Path("/etc/agent-vm-native/release-wrapper.json")
+CANONICAL_CONTROL_PATH = Path("/opt/agent-vm-native/agent_vm_control.py")
+CANONICAL_UNIT_DIR = Path("/etc/systemd/system")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 RELEASE_ID_RE = re.compile(r"^[0-9a-f]{40}$")
 MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
@@ -154,6 +156,8 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
     if raw.get("require_drained", True) is not True:
         _fail("wrapper_config_invalid", "release activation must require admission drain")
     config["require_drained"] = True
+    if config["control_path"] != CANONICAL_CONTROL_PATH or config["unit_dir"] != CANONICAL_UNIT_DIR:
+        _fail("wrapper_config_invalid", "control_path and unit_dir must use the fixed activation targets")
     unit_names = raw.get("unit_names", list(FIXED_UNIT_NAMES))
     if not isinstance(unit_names, list) or not all(isinstance(item, str) for item in unit_names) or sorted(unit_names) != list(FIXED_UNIT_NAMES):
         _fail("wrapper_config_invalid", "unit_names must equal the fixed systemd unit set")
@@ -274,6 +278,37 @@ def _metadata_path(config: Mapping[str, Any], transaction_id: str) -> Path:
     return _transaction_dir(config, transaction_id) / ".wrapper-state.json"
 
 
+def _fsync_directory(path: Path, code: str = "wrapper_io_error") -> None:
+    """Persist a directory entry after an atomic rename or unlink."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        _fail(code, f"cannot persist release directory: {path.name}")
+
+
+def _fsync_tree(root: Path) -> None:
+    """Persist a newly copied release before publishing its directory entry."""
+    try:
+        files = [path for path in root.rglob("*") if path.is_file() and not path.is_symlink()]
+        directories = [path for path in root.rglob("*") if path.is_dir() and not path.is_symlink()]
+        for path in files:
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        for path in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+            _fsync_directory(path, "activation_failed")
+        _fsync_directory(root, "activation_failed")
+    except OSError:
+        _fail("activation_failed", "cannot persist copied release files")
+
+
 def _write_json(path: Path, value: Mapping[str, Any], mode: int = 0o600) -> None:
     _mkdir_private(path.parent)
     temporary = path.with_name("." + path.name + ".tmp")
@@ -285,6 +320,7 @@ def _write_json(path: Path, value: Mapping[str, Any], mode: int = 0o600) -> None
             os.fchmod(handle.fileno(), mode)
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
     except OSError as exc:
         _fail("wrapper_io_error", f"cannot write wrapper record: {path.name}")
 
@@ -431,6 +467,7 @@ def stage(config: Mapping[str, Any], transaction_id: str, release_id: str, paylo
                 _fail("release_mismatch", "staged manifest does not match requested release")
             _write_json(temporary / ".wrapper-state.json", {"transaction_id": transaction_id, "release_id": release_id, "staged": True})
             os.replace(temporary, destination)
+            _fsync_directory(destination.parent)
         except ManifestError as exc:
             _fail(exc.code, exc.message, exc.detail)
         except OSError as exc:
@@ -487,6 +524,7 @@ def _atomic_symlink(target: Path, link: Path) -> None:
             temporary.unlink()
         os.symlink(target, temporary)
         os.replace(temporary, link)
+        _fsync_directory(link.parent, "activation_failed")
     except OSError as exc:
         _fail("activation_failed", f"cannot atomically update release pointer: {link.name}")
 
@@ -510,6 +548,7 @@ def _copy_atomic(source: Path, target: Path, owner_uid: int, mode: int) -> None:
                 os.fchown(target_handle.fileno(), owner_uid, -1)
             os.fsync(target_handle.fileno())
         os.replace(temporary, target)
+        _fsync_directory(target.parent, "activation_failed")
     except OSError as exc:
         try:
             if temporary.exists():
@@ -552,6 +591,7 @@ def _restore_targets(snapshot: Mapping[Path, tuple[bytes, int, int] | None]) -> 
             try:
                 if target.exists() or target.is_symlink():
                     target.unlink()
+                    _fsync_directory(target.parent, "activation_restore_failed")
             except OSError as exc:
                 _fail("activation_restore_failed", f"cannot remove a partially installed target: {target.name}")
             continue
@@ -567,6 +607,7 @@ def _restore_targets(snapshot: Mapping[Path, tuple[bytes, int, int] | None]) -> 
                     os.fchown(handle.fileno(), owner_uid, -1)
                 os.fsync(handle.fileno())
             os.replace(temporary, target)
+            _fsync_directory(target.parent, "activation_restore_failed")
         except OSError as exc:
             try:
                 if temporary.exists():
@@ -581,6 +622,7 @@ def _restore_pointer(link: Path, target: Path | None) -> None:
         try:
             if link.exists() or link.is_symlink():
                 link.unlink()
+                _fsync_directory(link.parent, "activation_restore_failed")
         except OSError as exc:
             _fail("activation_restore_failed", f"cannot remove release pointer: {link.name}")
     else:
@@ -711,7 +753,9 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
             symlinks=False,
             ignore=shutil.ignore_patterns(".wrapper-state.json", ".verified.json"),
         )
+        _fsync_tree(temporary)
         os.replace(temporary, release_dir)
+        _fsync_directory(release_root, "activation_failed")
     except OSError as exc:
         if temporary.exists():
             shutil.rmtree(temporary, ignore_errors=True)

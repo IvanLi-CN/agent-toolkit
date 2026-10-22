@@ -188,7 +188,12 @@ class NativeTimerTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.runner = mock.Mock(spec=CONTROL.CommandRunner)
-        self.systemd = CONTROL.SystemdManager(self.runner, {"timer_dir": str(self.root)})
+        self.generated_timer_dir = self.root / "generated-timers"
+        self.static_unit_dir = self.root / "static-units"
+        self.generated_timer_dir.mkdir()
+        self.static_unit_dir.mkdir()
+        self.systemd = CONTROL.SystemdManager(self.runner, {"timer_dir": str(self.generated_timer_dir)})
+        self.systemd.static_unit_dir = self.static_unit_dir
         self.task = "avm-0123456789abcdef"
         self.unit = self.systemd.timer_unit(self.task, 1)
         self.failure = CONTROL.ControlError("command_failed", "native unit does not exist")
@@ -204,10 +209,10 @@ class NativeTimerTests(unittest.TestCase):
         self.assertEqual(calls[1], ["systemctl", "show", self.unit, "-p", "LoadState", "-p", "ActiveState",
                                     "-p", "FragmentPath", "-p", "UnitFileState"])
         self.assertEqual(calls[2], ["systemctl", "daemon-reload"])
-        self.assertFalse((self.root / self.unit).exists())
+        self.assertFalse((self.generated_timer_dir / self.unit).exists())
 
     def test_existing_timer_file_is_not_discarded_after_disable_failure(self):
-        path = self.root / self.unit
+        path = self.generated_timer_dir / self.unit
         path.write_text("preserve this timer")
         self.runner.run.side_effect = [self.failure, subprocess.CompletedProcess([], 1, self.absent, b"")]
         with self.assertRaises(CONTROL.ControlError) as error:
@@ -235,7 +240,7 @@ class NativeTimerTests(unittest.TestCase):
 
     def test_expiry_active_requires_the_timer_to_target_its_service(self):
         expires_at = "2026-10-04T12:34:56+00:00"
-        path = self.root / self.unit
+        path = self.generated_timer_dir / self.unit
         content = (
             "[Timer]\n"
             "OnCalendar=2026-10-04 12:34:56 UTC\n"
@@ -254,7 +259,7 @@ class NativeTimerTests(unittest.TestCase):
 
     def test_service_asset_requires_loaded_fragment_and_exec_contract(self):
         unit = "agent-vm-native-reconcile.service"
-        path = self.root / unit
+        path = self.static_unit_dir / unit
         path.write_text(
             "[Service]\n"
             "ExecStart=/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py --timer-reconcile\n"
@@ -274,7 +279,7 @@ class NativeTimerTests(unittest.TestCase):
 
     def test_service_asset_validates_template_with_systemd_cat(self):
         unit = "agent-vm-native-expire@.service"
-        path = self.root / unit
+        path = self.static_unit_dir / unit
         required = "ExecStart=/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py --timer-expire %i"
         path.write_text(f"[Service]\n{required}\n")
         self.runner.run.return_value = subprocess.CompletedProcess(
@@ -335,6 +340,26 @@ class Fixture(unittest.TestCase):
                       mock.patch.object(CONTROL.os, "cpu_count", return_value=16)):
             patch.start(); self.addCleanup(patch.stop)
         self.counter = 0
+
+    def runtime_manifest(self, root: Path, revision: str, *, client: bytes = b"client\n", control: bytes = b"control\n"):
+        artifacts = []
+        for name, path, role, mode in sorted(MANIFEST.FIXED_ARTIFACTS):
+            content = client if role == "client" else control if role == "control" else f"{role}:{path}\n".encode()
+            target = root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+            target.chmod(mode)
+            artifacts.append({
+                "name": name,
+                "path": path,
+                "role": role,
+                "sha256": CONTROL.hashlib.sha256(content).hexdigest(),
+                "mode": mode,
+            })
+        manifest = MANIFEST.build_manifest(revision, artifacts)
+        manifest_path = root / MANIFEST.MANIFEST_NAME
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        return manifest, manifest_path
 
     def request(self, action, session="thread-a", operation=None, **fields):
         self.counter += 1
@@ -400,24 +425,14 @@ class LifecycleTests(Fixture):
     def test_changed_verified_artifact_is_rejected_before_write(self):
         release_root = self.root / "verified-release"
         release_root.mkdir()
-        client = release_root / "agent_vm.py"
+        _, manifest_path = self.runtime_manifest(release_root, "f" * 40)
         control = release_root / "agent_vm_control.py"
-        client.write_text("client\n")
-        control.write_text("control\n")
-        client.chmod(0o755)
-        control.chmod(0o755)
-        artifacts = [
-            {"name": "agent_vm.py", "path": "agent_vm.py", "role": "client", "sha256": CONTROL.hashlib.sha256(client.read_bytes()).hexdigest(), "mode": 0o755},
-            {"name": "agent_vm_control.py", "path": "agent_vm_control.py", "role": "control", "sha256": CONTROL.hashlib.sha256(control.read_bytes()).hexdigest(), "mode": 0o755},
-        ]
-        manifest = MANIFEST.build_manifest("f" * 40, artifacts)
-        manifest_path = release_root / MANIFEST.MANIFEST_NAME
-        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         control.write_text("changed\n")
         config = dict(self.config, state_db=str(self.root / "artifact-state.sqlite3"), release_manifest_path=str(manifest_path))
         store = CONTROL.StateStore(Path(config["state_db"]))
         self.addCleanup(store.close)
-        checked = CONTROL.Control(config, runner=self.runner, store=store, systemd=self.systemd, resources=self.resources, clock=lambda: self.now)
+        with mock.patch.object(CONTROL, "DEFAULT_TIMER_DIR", release_root / "systemd"):
+            checked = CONTROL.Control(config, runner=self.runner, store=store, systemd=self.systemd, resources=self.resources, clock=lambda: self.now)
         request = {"protocol": CONTROL.PROTOCOL_VERSION, "action": "acquire", "session_id": "thread-a", "generation": 0, "operation_id": "artifact-mismatch", "public_key": KEY}
         self.error("artifact_checksum_mismatch", checked.dispatch, request)
         self.assertIsNone(store.operation("artifact-mismatch"))
@@ -425,34 +440,21 @@ class LifecycleTests(Fixture):
     def test_invalid_runtime_artifact_is_rejected_before_state_store_creation(self):
         release_root = self.root / "preflight-release"
         release_root.mkdir()
-        client = release_root / "agent_vm.py"
+        _, manifest_path = self.runtime_manifest(release_root, "e" * 40)
         control = release_root / "agent_vm_control.py"
-        client.write_text("client\n")
-        control.write_text("control\n")
-        client.chmod(0o755)
-        control.chmod(0o755)
-        artifacts = [
-            {"name": "agent_vm.py", "path": "agent_vm.py", "role": "client", "sha256": CONTROL.hashlib.sha256(client.read_bytes()).hexdigest(), "mode": 0o755},
-            {"name": "agent_vm_control.py", "path": "agent_vm_control.py", "role": "control", "sha256": CONTROL.hashlib.sha256(control.read_bytes()).hexdigest(), "mode": 0o755},
-        ]
-        manifest_path = release_root / MANIFEST.MANIFEST_NAME
-        manifest_path.write_text(json.dumps(MANIFEST.build_manifest("e" * 40, artifacts)), encoding="utf-8")
         control.write_text("tampered\n")
         state_db = self.root / "preflight-state" / "state.sqlite3"
         config = dict(self.config, state_db=str(state_db), release_manifest_path=str(manifest_path))
-        with self.assertRaises(CONTROL.ControlError) as failure:
-            CONTROL.Control(config, runner=self.runner, systemd=self.systemd, resources=self.resources, clock=lambda: self.now)
+        with mock.patch.object(CONTROL, "DEFAULT_TIMER_DIR", release_root / "systemd"):
+            with self.assertRaises(CONTROL.ControlError) as failure:
+                CONTROL.Control(config, runner=self.runner, systemd=self.systemd, resources=self.resources, clock=lambda: self.now)
         self.assertEqual(failure.exception.code, "artifact_checksum_mismatch")
         self.assertFalse(state_db.parent.exists())
 
     def test_replayed_response_refreshes_release_metadata(self):
         request = self.request("acquire", operation="release-refresh", public_key=KEY)
         self.control.dispatch(request)
-        artifacts = [
-            {"name": "agent_vm.py", "path": "agent_vm.py", "role": "client", "sha256": "0" * 64, "mode": 0o755},
-            {"name": "agent_vm_control.py", "path": "agent_vm_control.py", "role": "control", "sha256": "1" * 64, "mode": 0o755},
-        ]
-        self.control.release_manifest = MANIFEST.build_manifest("f" * 40, artifacts)
+        self.control.release_manifest = self.runtime_manifest(self.root / "replay-release", "f" * 40)[0]
         self.control.release_manifest_present = True
         self.control.release_artifacts_verified = True
         with mock.patch.object(CONTROL, "verify_runtime_bundle"):

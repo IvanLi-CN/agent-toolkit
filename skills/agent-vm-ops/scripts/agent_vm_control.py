@@ -1326,6 +1326,7 @@ class SystemdManager:
         self.config = config
         self.enabled = enabled
         self.timer_dir = Path(str(config["timer_dir"]))
+        self.static_unit_dir = DEFAULT_TIMER_DIR
 
     @staticmethod
     def timer_unit(task_id: str, generation: int) -> str:
@@ -1411,7 +1412,7 @@ class SystemdManager:
     def service_asset_active(self, unit: str, required_lines: Sequence[str]) -> bool:
         if not self.enabled:
             return True
-        path = self.timer_dir / unit
+        path = self.static_unit_dir / unit
         if path.is_symlink() or not path.is_file():
             return False
         try:
@@ -1663,7 +1664,10 @@ class Control:
             return False
         except OSError as exc:
             raise ControlError("release_fence_unverified", "release activation fence cannot be inspected") from exc
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or (
+            self.release_fence_path == DEFAULT_RELEASE_FENCE_PATH
+            and (info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o600)
+        ):
             raise ControlError("release_fence_unverified", "release activation fence is not a regular file")
         return True
 

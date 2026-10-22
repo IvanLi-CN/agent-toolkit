@@ -72,6 +72,7 @@ DEFAULT_TIMEOUT_SECONDS = 300
 DEFAULT_POLL_SECONDS = 1.0
 MAX_TIMEOUT_SECONDS = 300
 MAX_POLL_SECONDS = 1.0
+CANONICAL_REMOTE_CONTROL = "/opt/agent-vm-native/agent_vm_control.py"
 CONTROL_TRANSITION_STATES = {"preparing", "closing", "deleting", "failed"}
 KNOWN_TASK_STATES = {"absent", "cached", "preparing", "active", "closing", "deleting", "failed"}
 SOURCE_ARTIFACTS = (
@@ -570,12 +571,16 @@ class ReleasePublisher:
     bundle: Path
     control_host: str
     wrapper_path: str
-    remote_control: str = "/opt/agent-vm-native/agent_vm_control.py"
+    remote_control: str = CANONICAL_REMOTE_CONTROL
     client_target: Path | None = None
     session_id: str | None = None
     transport: ReleaseTransport | None = None
     sleep: Callable[[float], None] = time.sleep
     monotonic: Callable[[], float] = time.monotonic
+
+    def __post_init__(self) -> None:
+        if self.remote_control != CANONICAL_REMOTE_CONTROL:
+            _fail("remote_control_invalid", "release publisher uses the fixed control target")
 
     def _transport(self) -> ReleaseTransport:
         return self.transport or SSHTransport()
@@ -881,8 +886,18 @@ class ReleasePublisher:
         self._control(manifest, "drain-enter", session=session, write=True)
         result = self._wrapper("rollback", transaction_id, release_id)
         self._health(manifest)
+        try:
+            self._install_local_client(manifest)
+        except ReleaseError as local_error:
+            return {
+                "rolled_back": True,
+                "remote_healthy": True,
+                "draining": True,
+                "warnings": [{"code": "local_client_update_failed", "message": local_error.message, "detail": local_error.as_dict()}],
+                **result,
+            }
         self._control(manifest, "drain-exit", session=session, write=True)
-        return {"rolled_back": True, "draining": False, **result}
+        return {"rolled_back": True, "local_client_updated": True, "draining": False, **result}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -898,7 +913,6 @@ def build_parser() -> argparse.ArgumentParser:
     publish.add_argument("--bundle", type=Path, required=True)
     publish.add_argument("--control-host", required=True)
     publish.add_argument("--wrapper", required=True)
-    publish.add_argument("--remote-control", default="/opt/agent-vm-native/agent_vm_control.py")
     publish.add_argument("--client-target", type=Path, required=True)
     publish.add_argument("--session-id")
     publish.add_argument("--transaction-id")
@@ -908,7 +922,7 @@ def build_parser() -> argparse.ArgumentParser:
     rollback.add_argument("--bundle", type=Path, required=True)
     rollback.add_argument("--control-host", required=True)
     rollback.add_argument("--wrapper", required=True)
-    rollback.add_argument("--remote-control", default="/opt/agent-vm-native/agent_vm_control.py")
+    rollback.add_argument("--client-target", type=Path, required=True)
     rollback.add_argument("--session-id")
     rollback.add_argument("--transaction-id", required=True)
     rollback.add_argument("--release-id", required=True)
@@ -927,8 +941,7 @@ def main(argv: list[str] | None = None) -> int:
                 bundle=args.bundle,
                 control_host=args.control_host,
                 wrapper_path=args.wrapper,
-                remote_control=args.remote_control,
-                client_target=getattr(args, "client_target", None),
+                client_target=args.client_target,
                 session_id=args.session_id,
             )
             if args.action == "publish":

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -96,6 +97,17 @@ class ReleasePublisherTests(unittest.TestCase):
         self.assertEqual(failure.exception.code, "local_client_target_missing")
         self.assertEqual(transport.calls, [])
 
+    def test_remote_control_target_is_fixed(self):
+        with self.assertRaises(RELEASE.ReleaseError) as failure:
+            RELEASE.ReleasePublisher(
+                bundle=self.bundle,
+                control_host="staging-control",
+                wrapper_path="/usr/local/sbin/agent-vm-release-wrapper",
+                remote_control="/tmp/other-control.py",
+                client_target=self.root / "client" / "agent_vm.py",
+            )
+        self.assertEqual(failure.exception.code, "remote_control_invalid")
+
     def test_convergence_timeout_does_not_activate_or_exit_drain(self):
         transport = FakeTransport(pending=True)
         publisher = self.publisher(transport)
@@ -139,6 +151,25 @@ class ReleasePublisherTests(unittest.TestCase):
         actions = [item[1] for item in transport.calls]
         self.assertNotIn("rollback", actions)
         self.assertNotIn("drain-exit", actions)
+
+    def test_manual_rollback_installs_the_supplied_previous_client_before_drain_exit(self):
+        previous_bundle = self.root / "previous.tar"
+        RELEASE.build_release(ROOT, previous_bundle, "c" * 40)
+        target = self.root / "client" / "agent_vm.py"
+        self.publisher(FakeTransport(), client_target=target).publish(timeout=5, poll=1, transaction_id="tx-current")
+        transport = FakeTransport()
+        result = RELEASE.ReleasePublisher(
+            bundle=previous_bundle,
+            control_host="staging-control",
+            wrapper_path="/usr/local/sbin/agent-vm-release-wrapper",
+            client_target=target,
+            transport=transport,
+        ).rollback(transaction_id="tx-current", release_id="e" * 40)
+        self.assertTrue(result["rolled_back"])
+        self.assertTrue(result["local_client_updated"])
+        sidecar = json.loads((target.parent / "client-release.json").read_text(encoding="utf-8"))
+        self.assertEqual(sidecar["release_id"], "c" * 40)
+        self.assertEqual([item[1] for item in transport.calls][-1], "drain-exit")
 
     def test_local_client_recovery_marker_restores_the_previous_pair(self):
         target = self.root / "recover" / "agent_vm.py"

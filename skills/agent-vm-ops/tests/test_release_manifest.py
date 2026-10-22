@@ -25,16 +25,17 @@ class ManifestContractTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.files = {"agent_vm.py": (b"client\n", 0o755), "agent_vm_control.py": (b"control\n", 0o755)}
         artifacts = []
-        for path, (content, mode) in self.files.items():
+        for name, path, role, mode in sorted(MANIFEST.FIXED_ARTIFACTS):
+            content = f"{role}:{path}\n".encode()
             target = self.root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(content)
             target.chmod(mode)
             artifacts.append({
-                "name": path,
+                "name": name,
                 "path": path,
-                "role": "client" if path == "agent_vm.py" else "control",
+                "role": role,
                 "sha256": hashlib.sha256(content).hexdigest(),
                 "mode": mode,
             })
@@ -52,7 +53,7 @@ class ManifestContractTests(unittest.TestCase):
     def test_paths_modes_checksums_and_self_reference_fail_closed(self):
         for mutation, code in (
             (lambda value: value["artifacts"][0].update(path="../escape"), "manifest_path_invalid"),
-            (lambda value: value["artifacts"][0].update(mode=0o644), "artifact_mode_mismatch"),
+            (lambda value: value["artifacts"][0].update(mode=0o644), "manifest_artifact_set_invalid"),
             (lambda value: value["artifacts"][0].update(sha256="0" * 64), "artifact_checksum_mismatch"),
             (lambda value: value["artifacts"][0].update(path=MANIFEST.MANIFEST_NAME), "manifest_self_reference"),
         ):
@@ -79,7 +80,20 @@ class ManifestContractTests(unittest.TestCase):
         (self.root / "nested").symlink_to(outside, target_is_directory=True)
         with self.assertRaises(MANIFEST.ManifestError) as failure:
             MANIFEST.verify_bundle(self.root, value)
-        self.assertEqual(failure.exception.code, "artifact_unverified")
+        self.assertEqual(failure.exception.code, "manifest_artifact_set_invalid")
+
+    def test_release_shape_requires_fixed_artifacts_and_client_view(self):
+        incomplete = copy.deepcopy(self.manifest)
+        incomplete["artifacts"] = incomplete["artifacts"][:-1]
+        with self.assertRaises(MANIFEST.ManifestError) as failure:
+            MANIFEST.validate_manifest(incomplete)
+        self.assertEqual(failure.exception.code, "manifest_artifact_set_invalid")
+
+        missing_view = copy.deepcopy(self.manifest)
+        del missing_view["client_view"]
+        with self.assertRaises(MANIFEST.ManifestError) as failure:
+            MANIFEST.validate_manifest(missing_view)
+        self.assertEqual(failure.exception.code, "manifest_invalid")
 
     def test_revision_protocol_and_window_are_explicit(self):
         for field, value, code in (

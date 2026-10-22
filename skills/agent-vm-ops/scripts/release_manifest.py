@@ -75,6 +75,16 @@ UNIT_CONTENT_SHA256 = {
     "agent-vm-native-reconcile.service": "5951d2304d16c46da75895d266727a715169f66190d379eadcc42b11dc9512ef",
 }
 
+FIXED_ARTIFACTS = frozenset({
+    ("agent_vm.py", "agent_vm.py", "client", 0o755),
+    ("agent_vm_control.py", "agent_vm_control.py", "control", 0o755),
+    ("release_manifest.py", "release_manifest.py", "support", 0o644),
+    ("unit:agent-vm-native-age-gc.service", "systemd/agent-vm-native-age-gc.service", "unit", 0o644),
+    ("unit:agent-vm-native-age-gc.timer", "systemd/agent-vm-native-age-gc.timer", "unit", 0o644),
+    ("unit:agent-vm-native-expire@.service", "systemd/agent-vm-native-expire@.service", "unit", 0o644),
+    ("unit:agent-vm-native-reconcile.service", "systemd/agent-vm-native-reconcile.service", "unit", 0o644),
+})
+
 
 class ManifestError(Exception):
     """A fail-closed manifest or artifact validation error."""
@@ -190,16 +200,24 @@ def default_operations() -> dict[str, dict[str, Any]]:
 
 def legacy_manifest() -> dict[str, Any]:
     """Return the explicit protocol-4 fallback used by pre-manifest installs."""
+    artifacts = [
+        {"name": name, "path": path, "role": role, "sha256": "0" * 64, "mode": mode}
+        for name, path, role, mode in sorted(FIXED_ARTIFACTS)
+    ]
+    actions = default_operations()
     return {
         "format": MANIFEST_FORMAT,
         "release_id": "0" * 40,
         "source_revision": "0" * 40,
         "protocol": PROTOCOL_VERSION,
-        "artifacts": [
-            {"name": "legacy-client", "path": "legacy-client.py", "role": "client", "sha256": "0" * 64, "mode": 0o755},
-            {"name": "legacy-control", "path": "legacy-control.py", "role": "control", "sha256": "0" * 64, "mode": 0o755},
-        ],
-        "actions": default_operations(),
+        "artifacts": artifacts,
+        "actions": actions,
+        "client_view": {
+            "release_id": "0" * 40,
+            "source_revision": "0" * 40,
+            "protocol": PROTOCOL_VERSION,
+            "actions": actions,
+        },
     }
 
 
@@ -230,10 +248,10 @@ def build_manifest(
 def validate_manifest(value: Any) -> dict[str, Any]:
     """Validate the complete manifest and return a JSON-safe copy."""
     root = _require_mapping(value, "manifest")
-    required = {"format", "release_id", "source_revision", "protocol", "artifacts", "actions"}
+    required = {"format", "release_id", "source_revision", "protocol", "artifacts", "actions", "client_view"}
     if not required.issubset(root):
         raise _error("manifest_invalid", "manifest is missing required fields", {"missing": sorted(required - set(root))})
-    allowed = required | {"client_view"}
+    allowed = required
     if set(root) - allowed:
         raise _error("manifest_invalid", "manifest contains unknown fields", {"fields": sorted(set(root) - allowed)})
     if _require_int(root["format"], "format", 1) != MANIFEST_FORMAT:
@@ -267,10 +285,13 @@ def validate_manifest(value: Any) -> dict[str, Any]:
         names.add(name)
         paths.add(path)
         artifacts.append({"name": name, "path": path, "role": role, "sha256": digest, "mode": mode})
-    if not any(item["role"] == "client" for item in artifacts):
-        raise _error("manifest_invalid", "manifest must include a client artifact")
-    if not any(item["role"] == "control" for item in artifacts):
-        raise _error("manifest_invalid", "manifest must include a control artifact")
+    actual_artifacts = {(item["name"], item["path"], item["role"], item["mode"]) for item in artifacts}
+    if actual_artifacts != FIXED_ARTIFACTS:
+        raise _error(
+            "manifest_artifact_set_invalid",
+            "manifest artifact set differs from the fixed release allowlist",
+            {"expected": sorted(FIXED_ARTIFACTS), "actual": sorted(actual_artifacts)},
+        )
 
     raw_actions = _require_mapping(root["actions"], "actions")
     if not raw_actions:
@@ -307,29 +328,21 @@ def validate_manifest(value: Any) -> dict[str, Any]:
         "artifacts": artifacts,
         "actions": actions,
     }
-    if "client_view" in root:
-        client_view = _require_mapping(root["client_view"], "client_view")
-        expected_view = {"release_id", "source_revision", "protocol", "actions"}
-        if set(client_view) != expected_view:
-            raise _error("manifest_invalid", "client_view has an unexpected shape")
-        if client_view["release_id"] != release_id or client_view["source_revision"] != source_revision or client_view["protocol"] != PROTOCOL_VERSION:
-            raise _error("manifest_invalid", "client_view identity does not match manifest")
-        view_actions = _require_mapping(client_view["actions"], "client_view.actions")
-        if dict(view_actions) != actions:
-            raise _error("manifest_invalid", "client_view actions do not match manifest actions")
-        result["client_view"] = {
-            "release_id": release_id,
-            "source_revision": source_revision,
-            "protocol": PROTOCOL_VERSION,
-            "actions": actions,
-        }
-    else:
-        result["client_view"] = {
-            "release_id": release_id,
-            "source_revision": source_revision,
-            "protocol": PROTOCOL_VERSION,
-            "actions": actions,
-        }
+    client_view = _require_mapping(root["client_view"], "client_view")
+    expected_view = {"release_id", "source_revision", "protocol", "actions"}
+    if set(client_view) != expected_view:
+        raise _error("manifest_invalid", "client_view has an unexpected shape")
+    if client_view["release_id"] != release_id or client_view["source_revision"] != source_revision or client_view["protocol"] != PROTOCOL_VERSION:
+        raise _error("manifest_invalid", "client_view identity does not match manifest")
+    view_actions = _require_mapping(client_view["actions"], "client_view.actions")
+    if dict(view_actions) != actions:
+        raise _error("manifest_invalid", "client_view actions do not match manifest actions")
+    result["client_view"] = {
+        "release_id": release_id,
+        "source_revision": source_revision,
+        "protocol": PROTOCOL_VERSION,
+        "actions": actions,
+    }
     return result
 
 

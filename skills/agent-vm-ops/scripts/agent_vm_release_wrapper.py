@@ -116,6 +116,25 @@ def _absolute_path(value: Any, label: str) -> Path:
     return path
 
 
+def _require_root_owned_path(path: Path, label: str, *, regular: bool = False) -> None:
+    """Reject symlinked or writable-by-others configuration boundaries."""
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            break
+        except OSError:
+            _fail("wrapper_config_invalid", f"cannot inspect {label}")
+        if stat.S_ISLNK(info.st_mode):
+            _fail("wrapper_config_invalid", f"{label} contains a symlink")
+        if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022:
+            _fail("wrapper_config_invalid", f"{label} is not root-owned and private")
+        if current == path and regular and not stat.S_ISREG(info.st_mode):
+            _fail("wrapper_config_invalid", f"{label} is not a regular file")
+
+
 def _paths_overlap(left: Path, right: Path) -> bool:
     # Compare configured path entries without following a current/previous
     # symlink into release_root.  Pointer targets are verified separately.
@@ -136,6 +155,7 @@ def _read_json(path: Path, code: str) -> dict[str, Any]:
 
 
 def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
+    _require_root_owned_path(path, "wrapper config", regular=True)
     raw = _read_json(path, "wrapper_config_invalid")
     required = {
         "release_root",
@@ -153,6 +173,8 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
     owner_uid = raw.get("owner_uid", 0)
     if isinstance(owner_uid, bool) or not isinstance(owner_uid, int) or owner_uid < 0:
         _fail("wrapper_config_invalid", "owner_uid must be a non-negative integer")
+    if owner_uid != 0:
+        _fail("wrapper_config_invalid", "owner_uid must be root")
     config["owner_uid"] = owner_uid
     if raw.get("require_drained", True) is not True:
         _fail("wrapper_config_invalid", "release activation must require admission drain")
@@ -181,6 +203,8 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
         for right in protected[index + 1:]:
             if _paths_overlap(left, right):
                 _fail("wrapper_config_invalid", "wrapper paths must not overlap", {"left": str(left), "right": str(right)})
+    for key, configured_path in ((key, config[key]) for key in config if isinstance(config[key], Path)):
+        _require_root_owned_path(configured_path, key)
     return config
 
 
@@ -319,6 +343,8 @@ def _activation_fence(config: Mapping[str, Any], transaction_id: str, release_id
     """Keep control-plane drain exit fenced for the whole activation window."""
     path = Path(config.get("fence_path", RELEASE_FENCE_PATH))
     _mkdir_private(path.parent, 0o755)
+    if path == RELEASE_FENCE_PATH:
+        _require_root_owned_path(path.parent, "release activation fence directory")
     try:
         info = path.lstat()
     except FileNotFoundError:
@@ -326,7 +352,7 @@ def _activation_fence(config: Mapping[str, Any], transaction_id: str, release_id
     except OSError:
         _fail("release_fence_unverified", "release activation fence cannot be inspected")
     if info is not None:
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+        if (path == RELEASE_FENCE_PATH and info.st_uid != 0) or stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
             _fail("release_fence_unverified", "release activation fence is not a private regular file")
         existing = _read_json(path, "release_fence_unverified")
         if (

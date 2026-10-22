@@ -1294,6 +1294,7 @@ exec /bin/ps "$@"
 
   test("starts the cleanup acknowledgement deadline when stopping", { timeout: 90_000 }, async () => {
     if (process.platform === "win32") return;
+    const before = new Set((await readdir(tmpdir())).filter((entry) => entry.startsWith(".agent-toolkit-dst-supervisor-") && !entry.includes("ack-")));
     let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
     try {
       supervised = await spawnSupervised(["sh", "-c", "sleep 30"]);
@@ -1301,6 +1302,8 @@ exec /bin/ps "$@"
       supervised.child.kill("SIGTERM");
       expect(await supervised.waitForCleanupAcknowledged()).toBe(true);
       await supervised.wrapperExited;
+      await Bun.sleep(50);
+      expect((await readdir(tmpdir())).filter((entry) => entry.startsWith(".agent-toolkit-dst-supervisor-") && !entry.includes("ack-") && !before.has(entry))).toEqual([]);
     } finally {
       if (supervised !== undefined) {
         try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
@@ -1393,7 +1396,7 @@ exec /bin/ps "$@"
       expect(resolvedEntry).toBeString();
       await writeFile(join(tmpdir(), resolvedEntry!, "target-status"), "0\n", "utf8");
       const forgedTargetPid = (await readFile(join(tmpdir(), resolvedEntry!, "target"), "utf8")).trim();
-      await writeFile(join(tmpdir(), resolvedEntry!, "target-status-writer"), `${forgedTargetPid}|forged\n`, "utf8");
+      await writeFile(join(tmpdir(), resolvedEntry!, "target-status-writer"), `${forgedTargetPid}\n`, "utf8");
       const early = await Promise.race([supervised.exited, Bun.sleep(250).then(() => "pending" as const)]);
       expect(early).toBe("pending");
       supervised.child.kill("SIGTERM");

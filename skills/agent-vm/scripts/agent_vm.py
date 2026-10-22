@@ -33,6 +33,13 @@ CONTROL_HOST_ENV = "AGENT_VM_CONTROL_HOST"
 REMOTE_CONTROL_ENV = "AGENT_VM_REMOTE_CONTROL"
 DEFAULT_CONTROL_HOST = "agent-vm-host"
 DEFAULT_REMOTE_CONTROL = "/opt/agent-vm-native/agent_vm_control.py"
+RELEASE_MANIFEST_ENV = "AGENT_VM_RELEASE_MANIFEST"
+CLIENT_SIDECAR_NAME = "client-release.json"
+DEFAULT_RELEASE_MANIFEST = Path(__file__).resolve().with_name(CLIENT_SIDECAR_NAME)
+LEGACY_RELEASE_ID = "legacy-protocol-4"
+MANIFEST_FORMAT = 1
+SCHEMA_VERSION = 1
+SEMANTIC_REVISION = 1
 LOCAL_CONFIG_ROOT = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "agent-vm"
 LOCAL_STATE_ROOT = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "agent-vm"
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.:@/-]{1,160}$")
@@ -122,6 +129,254 @@ def control_timeout(action: str, fields: dict[str, Any] | None = None) -> int:
     return DEFAULT_CONTROL_TIMEOUT_SECONDS
 
 
+def _client_warning(code: str, message: str, action: str | None = None, detail: Any = None) -> dict[str, Any]:
+    value: dict[str, Any] = {"code": code, "message": message}
+    if action is not None:
+        value["action"] = action
+    if detail is not None:
+        value["detail"] = detail
+    return value
+
+
+def _manifest_sidecar_path(path: Path | None = None) -> Path:
+    candidate = path
+    if candidate is None:
+        configured = os.environ.get(RELEASE_MANIFEST_ENV)
+        candidate = Path(configured) if configured else DEFAULT_RELEASE_MANIFEST
+    if not candidate.is_absolute() or any(part in {"..", "."} for part in candidate.parts) or "\x00" in str(candidate):
+        fail("release_metadata_invalid", "release sidecar path must be absolute and canonical")
+    return candidate
+
+
+def _safe_sidecar_path(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value or "\\" in value or "\x00" in value:
+        fail("release_metadata_invalid", f"{label} is not a safe relative path")
+    path = Path(value)
+    if path.is_absolute() or ".." in path.parts or "." in path.parts:
+        fail("release_metadata_invalid", f"{label} is not a safe relative path")
+    return path.as_posix()
+
+
+def _client_schema(value: Any, label: str) -> dict[str, int]:
+    if not isinstance(value, dict) or set(value) != {"schema", "semantic_revision"}:
+        fail("release_metadata_invalid", f"{label} must declare schema and semantic revision")
+    schema = value.get("schema")
+    semantic = value.get("semantic_revision")
+    if isinstance(schema, bool) or not isinstance(schema, int) or schema < 1:
+        fail("release_metadata_invalid", f"{label}.schema is invalid")
+    if isinstance(semantic, bool) or not isinstance(semantic, int) or semantic < 1:
+        fail("release_metadata_invalid", f"{label}.semantic_revision is invalid")
+    return {"schema": schema, "semantic_revision": semantic}
+
+
+def _client_window(value: Any, label: str) -> dict[str, int]:
+    expected = {"schema_min", "schema_max", "semantic_min", "semantic_max"}
+    if not isinstance(value, dict) or set(value) != expected:
+        fail("release_metadata_invalid", f"{label} must declare schema and semantic min/max")
+    result: dict[str, int] = {}
+    for key in expected:
+        item = value[key]
+        if isinstance(item, bool) or not isinstance(item, int) or item < 1:
+            fail("release_metadata_invalid", f"{label}.{key} is invalid")
+        result[key] = item
+    if result["schema_min"] > result["schema_max"] or result["semantic_min"] > result["semantic_max"]:
+        fail("release_metadata_invalid", f"{label} is inverted")
+    return result
+
+
+def _validate_client_artifact(sidecar: Path, artifact: dict[str, Any]) -> None:
+    import stat
+
+    required = {"name", "path", "role", "sha256", "mode"}
+    if set(artifact) != required or artifact.get("role") != "client":
+        fail("release_metadata_invalid", "client artifact declaration is incomplete")
+    relative = _safe_sidecar_path(artifact["path"], "client artifact path")
+    if artifact.get("name") != "agent_vm.py" or relative != "agent_vm.py":
+        fail("release_metadata_invalid", "client artifact must identify agent_vm.py")
+    digest = artifact["sha256"]
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        fail("release_metadata_invalid", "client artifact checksum is invalid")
+    mode = artifact["mode"]
+    if isinstance(mode, bool) or not isinstance(mode, int) or mode < 0 or mode > 0o777:
+        fail("release_metadata_invalid", "client artifact mode is invalid")
+    if mode != 0o755:
+        fail("release_metadata_invalid", "client artifact mode must be 0755")
+    path = sidecar.parent / relative
+    try:
+        info = path.lstat()
+    except (FileNotFoundError, OSError) as exc:
+        fail("artifact_unverified", "declared client artifact is missing")
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        fail("artifact_unverified", "declared client artifact is not a regular file")
+    if stat.S_IMODE(info.st_mode) != mode:
+        fail("artifact_mode_mismatch", "declared client artifact mode differs")
+    try:
+        digest_actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        fail("artifact_unverified", "declared client artifact cannot be read")
+    if digest_actual != digest:
+        fail("artifact_checksum_mismatch", "declared client artifact checksum differs")
+
+
+def load_client_release_metadata(path: Path | None = None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Read only the local client view and verify a present sidecar fail-closed."""
+    sidecar = _manifest_sidecar_path(path)
+    try:
+        sidecar_info = sidecar.lstat()
+    except FileNotFoundError:
+        return {
+            "release_id": LEGACY_RELEASE_ID,
+            "source_revision": None,
+            "protocol": PROTOCOL_VERSION,
+            "manifest_present": False,
+            "artifacts_verified": True,
+            "actions": {},
+        }, [_client_warning("legacy_compatibility", "release sidecar is absent; using legacy protocol-4 compatibility")]
+    except OSError as exc:
+        fail("release_metadata_invalid", "release sidecar cannot be inspected")
+    import stat
+    if stat.S_ISLNK(sidecar_info.st_mode) or not stat.S_ISREG(sidecar_info.st_mode):
+        fail("release_metadata_invalid", "release sidecar is not a regular file")
+    try:
+        with sidecar.open("r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        fail("release_metadata_invalid", "release sidecar is not valid UTF-8 JSON")
+    if not isinstance(raw, dict):
+        fail("release_metadata_invalid", "release sidecar root must be an object")
+    if raw.get("format") != MANIFEST_FORMAT:
+        fail("release_metadata_invalid", "release sidecar format is unsupported")
+    source_revision = raw.get("source_revision")
+    release_id = raw.get("release_id")
+    if not isinstance(source_revision, str) or re.fullmatch(r"[0-9a-f]{40}", source_revision) is None:
+        fail("release_metadata_invalid", "release sidecar source_revision is invalid")
+    if release_id != source_revision:
+        fail("release_metadata_invalid", "release sidecar release_id must equal source_revision")
+    if raw.get("protocol") != PROTOCOL_VERSION:
+        fail("protocol_unsupported", f"release sidecar protocol must be {PROTOCOL_VERSION}")
+    view = raw.get("client_view", raw)
+    if not isinstance(view, dict):
+        fail("release_metadata_invalid", "client_view must be an object")
+    if view.get("release_id", release_id) != release_id or view.get("source_revision", source_revision) != source_revision or view.get("protocol", PROTOCOL_VERSION) != PROTOCOL_VERSION:
+        fail("release_metadata_invalid", "client_view identity does not match sidecar")
+    actions = view.get("actions")
+    if not isinstance(actions, dict) or not actions:
+        fail("release_metadata_invalid", "client_view.actions must be a non-empty object")
+    normalized: dict[str, Any] = {}
+    for action, spec in actions.items():
+        if not isinstance(action, str) or re.fullmatch(r"[a-z][a-z0-9-]{0,63}", action) is None:
+            fail("release_metadata_invalid", "client_view contains an invalid action")
+        if not isinstance(spec, dict) or set(spec) != {"request", "response", "client_to_control", "control_to_client"}:
+            fail("release_metadata_invalid", f"client_view action {action} has an invalid shape")
+        request = _client_schema(spec["request"], f"client_view.{action}.request")
+        response = _client_schema(spec["response"], f"client_view.{action}.response")
+        c2c = _client_window(spec["client_to_control"], f"client_view.{action}.client_to_control")
+        c2l = _client_window(spec["control_to_client"], f"client_view.{action}.control_to_client")
+        if not c2c["schema_min"] <= request["schema"] <= c2c["schema_max"] or not c2c["semantic_min"] <= request["semantic_revision"] <= c2c["semantic_max"]:
+            fail("release_metadata_invalid", f"client_view action {action} request is outside its window")
+        if not c2l["schema_min"] <= response["schema"] <= c2l["schema_max"] or not c2l["semantic_min"] <= response["semantic_revision"] <= c2l["semantic_max"]:
+            fail("release_metadata_invalid", f"client_view action {action} response is outside its window")
+        normalized[action] = {
+            "request": request,
+            "response": response,
+            "client_to_control": c2c,
+            "control_to_client": c2l,
+        }
+    artifacts = raw.get("artifacts")
+    client_artifact = raw.get("client_artifact")
+    if isinstance(artifacts, list):
+        matches = [item for item in artifacts if isinstance(item, dict) and item.get("role") == "client"]
+        if len(matches) != 1:
+            fail("release_metadata_invalid", "release sidecar must declare one client artifact")
+        client_artifact = matches[0]
+    elif artifacts is not None:
+        fail("release_metadata_invalid", "release sidecar artifacts must be an array")
+    if client_artifact is not None:
+        if not isinstance(client_artifact, dict):
+            fail("release_metadata_invalid", "client_artifact must be an object")
+        _validate_client_artifact(sidecar, client_artifact)
+    else:
+        fail("release_metadata_invalid", "release sidecar must declare one client artifact")
+    return {
+        "release_id": release_id,
+        "source_revision": source_revision,
+        "protocol": PROTOCOL_VERSION,
+        "manifest_present": True,
+        "artifacts_verified": client_artifact is not None,
+        "actions": normalized,
+    }, []
+
+
+def client_capability(action: str, metadata: dict[str, Any]) -> dict[str, Any]:
+    spec = metadata.get("actions", {}).get(action)
+    if spec is None:
+        if metadata.get("manifest_present"):
+            fail("unknown_action", f"action is not declared in the local release sidecar: {action}")
+        return {
+            "release_id": LEGACY_RELEASE_ID,
+            "protocol": PROTOCOL_VERSION,
+            "action": action,
+            "request": {"schema": SCHEMA_VERSION, "semantic_revision": SEMANTIC_REVISION},
+            "accepted_response": {
+                "schema_min": SCHEMA_VERSION,
+                "schema_max": SCHEMA_VERSION,
+                "semantic_min": SEMANTIC_REVISION,
+                "semantic_max": SEMANTIC_REVISION,
+            },
+            "legacy": True,
+        }
+    return {
+        "release_id": metadata["release_id"],
+        "protocol": metadata["protocol"],
+        "action": action,
+        "request": dict(spec["request"]),
+        "accepted_response": dict(spec["control_to_client"]),
+        "legacy": False,
+    }
+
+
+def _validate_response_warnings(value: Any, action: str) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        fail("invalid_remote_response", "control warnings must be an array")
+    warnings: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict) or not isinstance(item.get("code"), str) or not item.get("code") or not isinstance(item.get("message"), str) or not item.get("message"):
+            fail("invalid_remote_response", "control warning entries must have code and message")
+        if "action" in item and item["action"] != action:
+            fail("invalid_remote_response", "control warning action does not match request")
+        warnings.append(dict(item))
+    return warnings
+
+
+def _validate_response_release(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        fail("invalid_remote_response", "control release metadata must be an object")
+    release_id = value.get("release_id")
+    if not isinstance(release_id, str) or (release_id != LEGACY_RELEASE_ID and re.fullmatch(r"[0-9a-f]{40}", release_id) is None):
+        fail("invalid_remote_response", "control release metadata has an invalid release_id")
+    source_revision = value.get("source_revision")
+    if release_id == LEGACY_RELEASE_ID:
+        if source_revision is not None:
+            fail("invalid_remote_response", "legacy control release must not declare source_revision")
+    elif source_revision != release_id:
+        fail("invalid_remote_response", "control release source_revision does not match release_id")
+    protocol = value.get("protocol")
+    if protocol != PROTOCOL_VERSION:
+        fail("protocol_mismatch", "control release metadata protocol differs")
+    for field in ("manifest_present", "artifacts_verified"):
+        if field in value and not isinstance(value[field], bool):
+            fail("invalid_remote_response", f"control release metadata {field} must be boolean")
+    return dict(value)
+
+
+def _append_warning(warnings: list[dict[str, Any]], item: dict[str, Any]) -> None:
+    identity = (item.get("code"), item.get("action"), item.get("message"))
+    if not any((existing.get("code"), existing.get("action"), existing.get("message")) == identity for existing in warnings):
+        warnings.append(item)
+
+
 def control_request(action: str, *, session: str | None, generation: int | None = None,
                     write: bool = False, operation_id: str | None = None,
                     fields: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -131,6 +386,8 @@ def control_request(action: str, *, session: str | None, generation: int | None 
     if generation is not None: request["generation"] = generation
     if write: request["operation_id"] = operation_id or str(uuid.uuid4())
     if fields: request.update(fields)
+    metadata, local_warnings = load_client_release_metadata()
+    request["compatibility"] = client_capability(action, metadata)
     if write:
         directory = local_session_dir(session) / "operations"
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -170,6 +427,16 @@ def control_request(action: str, *, session: str | None, generation: int | None 
         fail("invalid_remote_response", "invalid control response envelope")
     if write and response.get("operation_id") != request["operation_id"]:
         fail("protocol_mismatch", "operation identity differs")
+    warnings = _validate_response_warnings(response.get("warnings"), action)
+    if "release" in response:
+        response["release"] = _validate_response_release(response["release"])
+    for item in local_warnings:
+        enriched = dict(item)
+        enriched["action"] = action
+        _append_warning(warnings, enriched)
+    if "release" not in response:
+        _append_warning(warnings, _client_warning("legacy_control_release", "control response did not identify a release", action))
+    response["warnings"] = warnings
     return response
 
 
@@ -610,7 +877,8 @@ def command_admin(args: argparse.Namespace) -> int:
 
 def dispatch(args: argparse.Namespace) -> int:
     if args.command == "version":
-        json_output({"version": VERSION, "protocol": PROTOCOL_VERSION})
+        metadata, warnings = load_client_release_metadata()
+        json_output({"version": VERSION, "protocol": PROTOCOL_VERSION, "release": metadata, "warnings": warnings})
         return 0
     if args.command == "help":
         build_parser().print_help()

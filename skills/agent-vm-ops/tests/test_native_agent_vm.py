@@ -31,6 +31,7 @@ def load(name, relative):
 
 CONTROL = load("native_control", "skills/agent-vm-ops/scripts/agent_vm_control.py")
 CLI = load("native_cli", "skills/agent-vm/scripts/agent_vm.py")
+import release_manifest as MANIFEST  # noqa: E402
 
 
 class ConfigurationTests(unittest.TestCase):
@@ -350,6 +351,54 @@ class Fixture(unittest.TestCase):
 
 
 class LifecycleTests(Fixture):
+    def test_legacy_compatibility_warning_is_persisted_and_replayed(self):
+        request = self.request("acquire", operation="legacy-warning", public_key=KEY)
+        response = self.control.dispatch(request)
+        codes = {item["code"] for item in response["warnings"]}
+        self.assertIn("legacy_compatibility", codes)
+        replay = self.control.dispatch(request)
+        self.assertEqual(replay["outcome"], "replayed")
+        self.assertEqual({item["code"] for item in replay["warnings"]}, codes)
+
+    def test_incompatible_request_is_rejected_before_journal_or_native_effect(self):
+        request = self.request("acquire", operation="incompatible-request", public_key=KEY)
+        request["compatibility"] = {
+            "release_id": "f" * 40,
+            "protocol": CONTROL.PROTOCOL_VERSION,
+            "action": "acquire",
+            "request": {"schema": 99, "semantic_revision": 1},
+            "accepted_response": {"schema_min": 1, "schema_max": 1, "semantic_min": 1, "semantic_max": 1},
+        }
+        self.error("request_schema_incompatible", self.control.dispatch, request)
+        self.assertIsNone(self.store.operation("incompatible-request"))
+        self.assertEqual(self.store.list_tasks(), [])
+        self.assertEqual(self.runner.instances, {})
+
+    def test_changed_verified_artifact_is_rejected_before_write(self):
+        release_root = self.root / "verified-release"
+        release_root.mkdir()
+        client = release_root / "agent_vm.py"
+        control = release_root / "agent_vm_control.py"
+        client.write_text("client\n")
+        control.write_text("control\n")
+        client.chmod(0o755)
+        control.chmod(0o755)
+        artifacts = [
+            {"name": "agent_vm.py", "path": "agent_vm.py", "role": "client", "sha256": CONTROL.hashlib.sha256(client.read_bytes()).hexdigest(), "mode": 0o755},
+            {"name": "agent_vm_control.py", "path": "agent_vm_control.py", "role": "control", "sha256": CONTROL.hashlib.sha256(control.read_bytes()).hexdigest(), "mode": 0o755},
+        ]
+        manifest = MANIFEST.build_manifest("f" * 40, artifacts)
+        manifest_path = release_root / MANIFEST.MANIFEST_NAME
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        control.write_text("changed\n")
+        config = dict(self.config, state_db=str(self.root / "artifact-state.sqlite3"), release_manifest_path=str(manifest_path))
+        store = CONTROL.StateStore(Path(config["state_db"]))
+        self.addCleanup(store.close)
+        checked = CONTROL.Control(config, runner=self.runner, store=store, systemd=self.systemd, resources=self.resources, clock=lambda: self.now)
+        request = {"protocol": CONTROL.PROTOCOL_VERSION, "action": "acquire", "session_id": "thread-a", "generation": 0, "operation_id": "artifact-mismatch", "public_key": KEY}
+        self.error("artifact_checksum_mismatch", checked.dispatch, request)
+        self.assertIsNone(store.operation("artifact-mismatch"))
+
     def test_readiness_uses_one_budget_and_emits_one_slow_start_diagnostic(self):
         self.acquire()
         elapsed = [0.0]

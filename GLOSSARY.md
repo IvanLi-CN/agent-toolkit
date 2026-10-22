@@ -28,3 +28,41 @@ The bounded period during which an Agent VM session may access its VM.
 
 **Stopped cache**:
 A stopped managed VM whose retained disk may be reused or reclaimed under the deployment's policy. It carries no guarantee of recovery after lease expiry.
+
+## Agent VM control plane
+
+**Control environment**:
+The operator-owned environment that holds authoritative Agent VM lifecycle state and is permitted to coordinate Incus resources, leases, mappings, and maintenance actions.
+_Avoid_: Agent VM guest, PVE host, underlying host
+
+**One-shot control process**:
+A control-plane execution that handles one request against the authoritative state and native resources, then exits; it is an invocation boundary rather than a resident broker.
+_Avoid_: Control daemon, HTTP broker
+
+**Deployment operator**:
+The operator-owned authority responsible for publishing and recovering control-plane releases, protected configuration, and maintenance assets.
+_Avoid_: Skill consumer, Agent VM guest
+
+**Control-plane update**:
+A coordinated change to the control components that implement the Agent VM lifecycle contract, including the client-facing compatibility surface and the control environment's executable behavior.
+_Avoid_: VM image update, guest update
+
+**Control-plane release**:
+An approved set of control components intended to operate as one compatibility unit across the local client and the control environment.
+_Avoid_: Guest image, runtime cache
+
+**Admission drain**:
+A maintenance state in which new lease acquisition and restart admission are blocked while observation, retrieval, release, and required cleanup remain available.
+_Avoid_: VM shutdown, lease revocation
+
+**Release manifest**:
+The authoritative description of a control-plane release's identity, artifacts, integrity evidence, and declared compatibility.
+_Avoid_: Deployment configuration, state database
+
+**Compatible operation**:
+An Agent VM operation whose request, response, and semantics are explicitly supported by both participating control-plane releases.
+_Avoid_: Any operation that happens to parse
+
+**Compatibility warning**:
+A non-fatal diagnostic that records a release or capability difference while the requested operation remains explicitly compatible.
+_Avoid_: Compatibility error, protocol downgrade

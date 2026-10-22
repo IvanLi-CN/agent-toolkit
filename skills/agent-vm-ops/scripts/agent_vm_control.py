@@ -36,6 +36,31 @@ import uuid
 from urllib.parse import quote, urlencode
 
 
+try:
+    from release_manifest import (
+        ACTION_NAMES,
+        LEGACY_RELEASE_ID,
+        ManifestError,
+        check_compatibility,
+        legacy_manifest,
+        load_runtime_manifest,
+        manifest_metadata,
+        verify_runtime_bundle,
+    )
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from release_manifest import (
+        ACTION_NAMES,
+        LEGACY_RELEASE_ID,
+        ManifestError,
+        check_compatibility,
+        legacy_manifest,
+        load_runtime_manifest,
+        manifest_metadata,
+        verify_runtime_bundle,
+    )
+
+
 PROTOCOL_VERSION = 4
 MEMORY_SETTLE_SECONDS = 45
 TRANSITIONAL_ADMISSION_WAIT_SECONDS = 30
@@ -47,6 +72,7 @@ DIAGNOSTIC_LOG_LIMIT = 8192
 DIAGNOSTIC_LOG_TRUNCATION_MARKER = "\n[TRUNCATED BY DIAGNOSTIC LIMIT]"
 DEFAULT_CONFIG_PATH = Path("/etc/agent-vm-native/config.json")
 DEFAULT_TIMER_DIR = Path("/etc/systemd/system")
+DEFAULT_RELEASE_MANIFEST_PATH = Path(__file__).resolve().with_name("release-manifest.json")
 REQUIRED_ENVIRONMENT_FIELDS = (
     "project",
     "profile",
@@ -1539,6 +1565,27 @@ class Control:
     ):
         self.config = dict(config)
         self.runner = runner or CommandRunner()
+        configured_manifest = self.config.get("release_manifest_path")
+        self.release_manifest_path = Path(str(configured_manifest)) if configured_manifest else DEFAULT_RELEASE_MANIFEST_PATH
+        self.release_manifest: dict[str, Any] | None = None
+        self.release_manifest_present = False
+        self.release_artifacts_verified = True
+        self.release_manifest_error: ControlError | None = None
+        self.release_warnings: list[dict[str, Any]] = []
+        try:
+            (
+                self.release_manifest,
+                self.release_manifest_present,
+                self.release_artifacts_verified,
+                self.release_warnings,
+            ) = load_runtime_manifest(self.release_manifest_path)
+        except ManifestError as exc:
+            self.release_manifest_error = ControlError(exc.code, exc.message, exc.detail)
+        if self.release_manifest_error is not None and store is None:
+            # Do not open SQLite/WAL or create the state directory for an
+            # invalid installed release.  Tests may inject a store to inspect
+            # the preflight error without changing this production boundary.
+            raise self.release_manifest_error
         self.store = store or StateStore(Path(str(self.config["state_db"])))
         self.incus = IncusClient(self.runner, self.config)
         self.systemd = systemd or SystemdManager(self.runner, self.config)
@@ -1572,6 +1619,64 @@ class Control:
 
     def now(self) -> dt.datetime:
         return self.clock().astimezone(dt.timezone.utc)
+
+    def _release_metadata(self) -> dict[str, Any]:
+        return manifest_metadata(
+            self.release_manifest,
+            present=self.release_manifest_present,
+            verified=self.release_artifacts_verified,
+            legacy=self.release_manifest is None,
+        )
+
+    @staticmethod
+    def _merge_warnings(*groups: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        seen: set[tuple[Any, Any, Any]] = set()
+        for group in groups:
+            for item in group:
+                value = dict(item)
+                identity = (value.get("code"), value.get("action"), value.get("message"))
+                if identity not in seen:
+                    seen.add(identity)
+                    result.append(value)
+        return result
+
+    def _preflight_release(self, request: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Check release identity and compatibility before locks/journals/effects."""
+        if self.release_manifest_error is not None:
+            raise self.release_manifest_error
+        if request.get("protocol") != PROTOCOL_VERSION:
+            raise ControlError("protocol_mismatch", f"protocol must be {PROTOCOL_VERSION}")
+        action = request.get("action")
+        if not isinstance(action, str) or not action:
+            raise ControlError("invalid_request", "action must be a non-empty string")
+        if action not in ACTION_NAMES:
+            raise ControlError("unknown_action", f"unknown action: {action}")
+        manifest = self.release_manifest or legacy_manifest()
+        if self.release_manifest is not None:
+            try:
+                runtime_paths = {
+                    item["path"]: (
+                        Path(str(self.config["timer_dir"])) / Path(item["path"]).name
+                        if item["role"] == "unit"
+                        else self.release_manifest_path.parent / Path(item["path"]).name
+                    )
+                    for item in self.release_manifest["artifacts"]
+                }
+                verify_runtime_bundle(self.release_manifest, runtime_paths)
+            except ManifestError as exc:
+                raise ControlError(exc.code, exc.message, exc.detail) from exc
+        try:
+            warnings = check_compatibility(manifest, action, request.get("compatibility"))
+        except ManifestError as exc:
+            raise ControlError(exc.code, exc.message, exc.detail) from exc
+        if self.release_manifest is None:
+            warnings.append({
+                "code": "legacy_control_release",
+                "action": action,
+                "message": "control release manifest is absent; using legacy protocol-4 compatibility",
+            })
+        return self._merge_warnings(self.release_warnings, warnings)
 
     @contextmanager
     def _object_lock(self, identity: str, *, blocking: bool = True):
@@ -1612,6 +1717,7 @@ class Control:
         if not isinstance(request, Mapping):
             raise ControlError("invalid_request", "request must be an object")
         action = request.get("action")
+        compatibility_warnings = self._preflight_release(request)
         # Resolve timer ownership from the durable record, never from a guessed
         # resource name. The same object lock serializes native operations.
         session = request.get("session_id")
@@ -1630,8 +1736,8 @@ class Control:
             if action in self.WRITE_ACTIONS:
                 op = require_nonempty_string(request.get("operation_id"), "operation_id", SESSION_ID_RE)
                 with self._object_lock("operation:" + op):
-                    return self._dispatch_locked(request)
-            return self._dispatch_locked(request)
+                    return self._dispatch_locked(request, compatibility_warnings)
+            return self._dispatch_locked(request, compatibility_warnings)
 
     def _annotate_state_error(
         self,
@@ -2176,7 +2282,11 @@ class Control:
                         raise ControlError("operation_unverified", "reconciled native instance still exists",
                                            {"operation_id": operation_id})
 
-    def _dispatch_locked(self, request: Mapping[str, Any]) -> dict[str, Any]:
+    def _dispatch_locked(
+        self,
+        request: Mapping[str, Any],
+        compatibility_warnings: Iterable[Mapping[str, Any]] = (),
+    ) -> dict[str, Any]:
         if not isinstance(request, Mapping):
             raise ControlError("invalid_request", "request must be an object")
         if request.get("protocol") != PROTOCOL_VERSION:
@@ -2211,6 +2321,12 @@ class Control:
                 response.pop("_request_digest", None)
                 response["server_time"] = iso_time(self.now())
                 response["outcome"] = "replayed"
+                cached_warnings = response.get("warnings", [])
+                response["warnings"] = self._merge_warnings(
+                    cached_warnings if isinstance(cached_warnings, list) else [],
+                    compatibility_warnings,
+                )
+                response.setdefault("release", self._release_metadata())
                 if session_id:
                     task = self.store.get_task(session_id=session_id)
                     response["current_state"] = self._state_summary(task) if task else None
@@ -2258,6 +2374,8 @@ class Control:
             "operation_id": operation_id,
             "outcome": "success",
             "result": result,
+            "release": self._release_metadata(),
+            "warnings": self._merge_warnings(compatibility_warnings),
         }
         try:
             if operation_id is not None and action in self.WRITE_ACTIONS and action != "renew":
@@ -3922,6 +4040,8 @@ class Control:
         return {"ready": not issues, "issues": issues, "incus_version": version, "capacity": capacity,
                 "resources": resources, "instances": instance_policy, "default_admission": admission,
                 "admission_ready": not issues and admission["ready"],
+                "release": self._release_metadata(),
+                "release_warnings": self._merge_warnings(self.release_warnings),
                 "config": {key: self.config[key] for key in ("project", "profile", "image_fingerprint", "network", "pool", "host_address")}}
 
 
@@ -4642,6 +4762,8 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
                 "warnings": warnings,
                 "warning_counts": audit["warnings"],
                 "doctor": {"ready": doctor.get("ready"), "issues": doctor.get("issues", [])},
+                "release": self._release_metadata(),
+                "release_warnings": self._merge_warnings(self.release_warnings),
             }
 
 

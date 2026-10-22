@@ -17,7 +17,7 @@ import hashlib
 import json
 import os
 import ipaddress
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import selectors
 import shlex
@@ -1659,7 +1659,7 @@ class Control:
                     item["path"]: (
                         Path(str(self.config["timer_dir"])) / Path(item["path"]).name
                         if item["role"] == "unit"
-                        else self.release_manifest_path.parent / Path(item["path"]).name
+                        else self.release_manifest_path.parent / Path(*PurePosixPath(item["path"]).parts)
                     )
                     for item in self.release_manifest["artifacts"]
                 }

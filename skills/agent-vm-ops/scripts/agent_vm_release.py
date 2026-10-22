@@ -33,6 +33,7 @@ try:
         CLIENT_SIDECAR_NAME,
         PROTOCOL_VERSION,
         UNIT_EXEC_START,
+        UNIT_CONTENT_SHA256,
         ManifestError,
         build_manifest,
         default_operations,
@@ -48,6 +49,7 @@ except ModuleNotFoundError:
         CLIENT_SIDECAR_NAME,
         PROTOCOL_VERSION,
         UNIT_EXEC_START,
+        UNIT_CONTENT_SHA256,
         ManifestError,
         build_manifest,
         default_operations,
@@ -59,10 +61,10 @@ except ModuleNotFoundError:
 
 
 try:
-    from agent_vm_release_wrapper import safe_extract_archive
+    from agent_vm_release_wrapper import WrapperError, safe_extract_archive
 except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from agent_vm_release_wrapper import safe_extract_archive
+    from agent_vm_release_wrapper import WrapperError, safe_extract_archive
 
 
 SOURCE_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -223,6 +225,9 @@ def _verify_unit_contents(root: Path, manifest: Mapping[str, Any]) -> None:
             content = (root / Path(*PurePosixPath(artifact["path"]).parts)).read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             _fail("unit_unverified", f"unit cannot be read: {name}")
+        path = root / Path(*PurePosixPath(artifact["path"]).parts)
+        if sha256_file(path) != UNIT_CONTENT_SHA256[name]:
+            _fail("unit_unverified", f"unit bytes differ from the fixed policy: {name}")
         required = UNIT_EXEC_START.get(name, "Unit=agent-vm-native-age-gc.service")
         if required not in content or (name != "agent-vm-native-age-gc.timer" and "ExecStart=" not in content):
             _fail("unit_unverified", f"unit does not contain its fixed ExecStart: {name}")
@@ -289,6 +294,9 @@ def _open_bundle(bundle: Path) -> tuple[tempfile.TemporaryDirectory[str], Path, 
     except ManifestError as exc:
         temporary.cleanup()
         _fail(exc.code, exc.message, exc.detail)
+    except WrapperError as exc:
+        temporary.cleanup()
+        _fail(exc.code, exc.message, exc.detail)
     except ReleaseError:
         temporary.cleanup()
         raise
@@ -317,6 +325,115 @@ def _archive_bytes(bundle: Path) -> bytes:
         output = Path(temporary) / "release.tar"
         _create_archive(bundle, output)
         return output.read_bytes()
+
+
+LOCAL_INSTALL_RECORD_NAME = ".agent-vm-client-install.json"
+
+
+def _local_backup_path(path: Path) -> Path:
+    return path.with_name("." + path.name + ".previous")
+
+
+def _remove_local_path(path: Path) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    try:
+        info = path.lstat()
+    except OSError:
+        _fail("local_client_recovery_failed", f"cannot inspect local client path: {path.name}")
+    if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+        _fail("local_client_recovery_failed", f"local client path is a directory: {path.name}")
+    try:
+        path.unlink()
+    except OSError:
+        _fail("local_client_recovery_failed", f"cannot remove local client path: {path.name}")
+
+
+def _remove_local_staging(path: Path) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    try:
+        info = path.lstat()
+    except OSError:
+        _fail("local_client_recovery_failed", "cannot inspect local client staging directory")
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        _fail("local_client_recovery_failed", "local client staging path is not a directory")
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        _fail("local_client_recovery_failed", "cannot remove local client staging directory")
+
+
+def _recover_local_client_install(client_path: Path, sidecar_path: Path) -> None:
+    record_path = client_path.parent / LOCAL_INSTALL_RECORD_NAME
+    if not record_path.exists() and not record_path.is_symlink():
+        return
+    try:
+        info = record_path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            _fail("local_client_recovery_failed", "local client recovery marker is not a regular file")
+        with record_path.open("r", encoding="utf-8") as handle:
+            record = json.load(handle)
+    except ReleaseError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        _fail("local_client_recovery_failed", "local client recovery marker is unreadable")
+    if not isinstance(record, dict) or record.get("format") != 1:
+        _fail("local_client_recovery_failed", "local client recovery marker is invalid")
+    backup_client = _local_backup_path(client_path)
+    backup_sidecar = _local_backup_path(sidecar_path)
+    staged_dir = Path(str(record.get("staged_dir", "")))
+    expected_paths = {
+        "client_path": str(client_path),
+        "sidecar_path": str(sidecar_path),
+        "backup_client": str(backup_client),
+        "backup_sidecar": str(backup_sidecar),
+    }
+    if any(record.get(key) != value for key, value in expected_paths.items()):
+        _fail("local_client_recovery_failed", "local client recovery marker targets an unexpected path")
+    if staged_dir.parent != client_path.parent or not staged_dir.name.startswith("agent-vm-client-"):
+        _fail("local_client_recovery_failed", "local client recovery marker has an unsafe staging path")
+    phase = record.get("phase")
+    if phase == "complete":
+        for backup in (backup_client, backup_sidecar):
+            _remove_local_path(backup)
+        _remove_local_staging(staged_dir)
+        try:
+            record_path.unlink()
+        except OSError:
+            _fail("local_client_recovery_failed", "cannot remove completed local client recovery marker")
+        return
+    if phase != "installing":
+        _fail("local_client_recovery_failed", "local client recovery marker has an unknown phase")
+    previous = record.get("previous")
+    if not isinstance(previous, dict):
+        _fail("local_client_recovery_failed", "local client recovery marker has no previous state")
+    for destination, backup, key in (
+        (client_path, backup_client, "client"),
+        (sidecar_path, backup_sidecar, "sidecar"),
+    ):
+        state = previous.get(key)
+        if not isinstance(state, dict) or not isinstance(state.get("exists"), bool):
+            _fail("local_client_recovery_failed", "local client recovery marker has invalid previous state")
+        if state["exists"]:
+            expected_digest = state.get("sha256")
+            if not isinstance(expected_digest, str):
+                _fail("local_client_recovery_failed", "local client recovery marker has no previous checksum")
+            if backup.exists() or backup.is_symlink():
+                _remove_local_path(destination)
+                try:
+                    os.replace(backup, destination)
+                except OSError:
+                    _fail("local_client_recovery_failed", f"cannot restore previous local client file: {destination.name}")
+            elif not destination.is_file() or sha256_file(destination) != expected_digest:
+                _fail("local_client_recovery_failed", f"previous local client file is unavailable: {destination.name}")
+        else:
+            _remove_local_path(destination)
+    _remove_local_staging(staged_dir)
+    try:
+        record_path.unlink()
+    except OSError:
+        _fail("local_client_recovery_failed", "cannot remove local client recovery marker")
 
 
 class ReleaseTransport(Protocol):
@@ -504,6 +621,7 @@ class ReleasePublisher:
                 client_path = target / "agent_vm.py"
             sidecar_path = client_path.with_name(CLIENT_SIDECAR_NAME)
             client_path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+            _recover_local_client_install(client_path, sidecar_path)
             source_client = root / "agent_vm.py"
             source_manifest = root / CLIENT_SIDECAR_NAME
             staged_dir: Path | None = Path(tempfile.mkdtemp(prefix="agent-vm-client-", dir=str(client_path.parent)))
@@ -526,9 +644,35 @@ class ReleasePublisher:
                 _fail("local_client_selfcheck_failed", "new local client could not be self-checked")
             if check.returncode != 0:
                 _fail("local_client_selfcheck_failed", "new local client self-check failed", check.stderr.decode("utf-8", "replace")[-2000:])
+            previous: dict[str, dict[str, Any]] = {}
+            for destination, key in ((client_path, "client"), (sidecar_path, "sidecar")):
+                if destination.exists() or destination.is_symlink():
+                    try:
+                        info = destination.lstat()
+                    except OSError:
+                        _fail("local_client_target_invalid", f"cannot inspect local client target: {destination.name}")
+                    if stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                        _fail("local_client_target_invalid", f"local client target is not a regular file: {destination.name}")
+                    previous[key] = {"exists": True, "sha256": sha256_file(destination)}
+                else:
+                    previous[key] = {"exists": False}
+            record_path = client_path.parent / LOCAL_INSTALL_RECORD_NAME
+            record: dict[str, Any] = {
+                "format": 1,
+                "phase": "installing",
+                "client_path": str(client_path),
+                "sidecar_path": str(sidecar_path),
+                "backup_client": str(_local_backup_path(client_path)),
+                "backup_sidecar": str(_local_backup_path(sidecar_path)),
+                "staged_dir": str(staged_dir),
+                "previous": previous,
+            }
+            _write_json(record_path, record, 0o600)
+            record_written = True
             backups: list[tuple[Path, Path]] = []
             installed_destinations: list[Path] = []
             installed = [(staged_client, client_path), (staged_manifest, sidecar_path)]
+            install_succeeded = False
             try:
                 for source, destination in installed:
                     if destination.exists() or destination.is_symlink():
@@ -541,6 +685,9 @@ class ReleasePublisher:
                         backups.append((backup, destination))
                     os.replace(source, destination)
                     installed_destinations.append(destination)
+                record["phase"] = "complete"
+                _write_json(record_path, record, 0o600)
+                install_succeeded = True
             except (OSError, ReleaseError) as exc:
                 backed_up_destinations = {destination for _, destination in backups}
                 for destination in reversed(installed_destinations):
@@ -558,17 +705,31 @@ class ReleasePublisher:
                         os.replace(backup, destination)
                     except OSError:
                         pass
+                if record_written:
+                    try:
+                        _recover_local_client_install(client_path, sidecar_path)
+                    except ReleaseError as recovery_error:
+                        _fail("local_client_recovery_failed", "local client installation could not be safely recovered", {
+                            "install_error": str(exc),
+                            "recovery_error": recovery_error.as_dict(),
+                        })
                 if isinstance(exc, OSError):
                     _fail("local_client_install_failed", "local client files could not be installed")
                 raise
             finally:
-                for backup, _ in backups:
+                if install_succeeded:
+                    for backup, _ in backups:
+                        try:
+                            backup.unlink()
+                        except OSError:
+                            pass
+                    shutil.rmtree(staged_dir, ignore_errors=True)
                     try:
-                        backup.unlink()
+                        record_path.unlink()
                     except OSError:
                         pass
-            shutil.rmtree(staged_dir, ignore_errors=True)
-            staged_dir = None
+            if install_succeeded:
+                staged_dir = None
         except OSError as exc:
             _fail("local_client_install_failed", "local client files could not be installed")
         finally:

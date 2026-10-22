@@ -129,6 +129,41 @@ class ReleasePublisherTests(unittest.TestCase):
         self.assertNotIn("rollback", actions)
         self.assertNotIn("drain-exit", actions)
 
+    def test_local_client_recovery_marker_restores_the_previous_pair(self):
+        target = self.root / "recover" / "agent_vm.py"
+        target.parent.mkdir(parents=True)
+        sidecar = target.with_name("client-release.json")
+        backup_client = RELEASE._local_backup_path(target)
+        backup_sidecar = RELEASE._local_backup_path(sidecar)
+        target.write_bytes(b"old-client")
+        sidecar.write_bytes(b"old-sidecar")
+        old_client_digest = RELEASE.sha256_file(target)
+        old_sidecar_digest = RELEASE.sha256_file(sidecar)
+        os.replace(target, backup_client)
+        os.replace(sidecar, backup_sidecar)
+        target.write_bytes(b"new-client")
+        staged_dir = target.parent / "agent-vm-client-crash"
+        staged_dir.mkdir()
+        record = {
+            "format": 1,
+            "phase": "installing",
+            "client_path": str(target),
+            "sidecar_path": str(sidecar),
+            "backup_client": str(backup_client),
+            "backup_sidecar": str(backup_sidecar),
+            "staged_dir": str(staged_dir),
+            "previous": {
+                "client": {"exists": True, "sha256": old_client_digest},
+                "sidecar": {"exists": True, "sha256": old_sidecar_digest},
+            },
+        }
+        RELEASE._write_json(target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME, record, 0o600)
+        RELEASE._recover_local_client_install(target, sidecar)
+        self.assertEqual(target.read_bytes(), b"old-client")
+        self.assertEqual(sidecar.read_bytes(), b"old-sidecar")
+        self.assertFalse((target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME).exists())
+        self.assertFalse(staged_dir.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

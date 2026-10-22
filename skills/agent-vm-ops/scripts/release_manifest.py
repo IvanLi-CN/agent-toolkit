@@ -64,6 +64,17 @@ UNIT_EXEC_START = {
         "ExecStart=/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py --timer-reconcile",
 }
 
+# Unit files are deployment policy, not caller-provided configuration.  The
+# wrapper and publisher both require these exact bytes in addition to the
+# manifest checksum so a modified manifest cannot authorize new scheduling or
+# control commands.
+UNIT_CONTENT_SHA256 = {
+    "agent-vm-native-age-gc.service": "fc666a1e2d408b68718b50e203f61d71c6d1f950d0acd0e0135a4f9f0afad3ec",
+    "agent-vm-native-age-gc.timer": "4eb1c7b012fc3251ef4427c56b8c1b0236deff28762cc4293278f56d02c4cb4b",
+    "agent-vm-native-expire@.service": "b8d3c6428b4c1ba9b5e2bea788fa8734b4967f530293f98cd9c7ad415a0c1a1c",
+    "agent-vm-native-reconcile.service": "5951d2304d16c46da75895d266727a715169f66190d379eadcc42b11dc9512ef",
+}
+
 
 class ManifestError(Exception):
     """A fail-closed manifest or artifact validation error."""

@@ -31,6 +31,7 @@ from typing import Any, Mapping
 try:
     from release_manifest import (
         MANIFEST_NAME,
+        UNIT_CONTENT_SHA256,
         UNIT_EXEC_START,
         ManifestError,
         load_manifest,
@@ -42,6 +43,7 @@ except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from release_manifest import (
         MANIFEST_NAME,
+        UNIT_CONTENT_SHA256,
         UNIT_EXEC_START,
         ManifestError,
         load_manifest,
@@ -111,6 +113,12 @@ def _absolute_path(value: Any, label: str) -> Path:
     return path
 
 
+def _paths_overlap(left: Path, right: Path) -> bool:
+    left_resolved = left.resolve(strict=False)
+    right_resolved = right.resolve(strict=False)
+    return left_resolved == right_resolved or left_resolved in right_resolved.parents or right_resolved in left_resolved.parents
+
+
 def _read_json(path: Path, code: str) -> dict[str, Any]:
     try:
         with path.open("r", encoding="utf-8") as handle:
@@ -153,6 +161,15 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
             _fail("wrapper_config_invalid", f"{path_key} cannot target durable control state")
     if config["current_link"].parent != config["release_root"].parent or config["previous_link"].parent != config["release_root"].parent:
         _fail("wrapper_config_invalid", "current and previous links must be release-root siblings")
+    if _paths_overlap(config["current_link"], config["previous_link"]):
+        _fail("wrapper_config_invalid", "current and previous links must be distinct")
+    protected = tuple(config[key] for key in (
+        "release_root", "staging_root", "state_root", "current_link", "previous_link", "control_path", "unit_dir",
+    ))
+    for index, left in enumerate(protected):
+        for right in protected[index + 1:]:
+            if _paths_overlap(left, right):
+                _fail("wrapper_config_invalid", "wrapper paths must not overlap", {"left": str(left), "right": str(right)})
     return config
 
 
@@ -301,7 +318,17 @@ def _verify_unit_contents(root: Path, manifest: Mapping[str, Any]) -> None:
         name = Path(item["path"]).name
         if name not in UNIT_EXEC_START and name != "agent-vm-native-age-gc.timer":
             _fail("unit_unverified", f"unit is not in the fixed allowlist: {name}")
-        content = (root / Path(*PurePosixPath(item["path"]).parts)).read_text(encoding="utf-8")
+        path = root / Path(*PurePosixPath(item["path"]).parts)
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            _fail("unit_unverified", f"unit cannot be read: {name}")
+        try:
+            digest = sha256_file(path)
+        except ManifestError:
+            _fail("unit_unverified", f"unit cannot be hashed: {name}")
+        if digest != UNIT_CONTENT_SHA256[name]:
+            _fail("unit_unverified", f"unit bytes differ from the fixed policy: {name}")
         required = UNIT_EXEC_START.get(name, "Unit=agent-vm-native-age-gc.service")
         if required not in content or (name != "agent-vm-native-age-gc.timer" and "ExecStart=" not in content):
             _fail("unit_unverified", f"unit does not contain its fixed ExecStart: {name}")
@@ -429,6 +456,26 @@ def _current_target(link: Path, release_root: Path | None = None) -> Path | None
         if RELEASE_ID_RE.fullmatch(target.name) is None:
             _fail("activation_unverified", f"release pointer target has an invalid release id: {link.name}")
     return target
+
+
+def _verify_retained_release(config: Mapping[str, Any], target: Path) -> dict[str, Any]:
+    """Re-verify a release before using it as an activation or rollback target."""
+    try:
+        manifest = load_manifest(target / MANIFEST_NAME)
+        verify_bundle(target, manifest)
+        verify_client_sidecar(target, manifest)
+    except ManifestError as exc:
+        _fail("activation_unverified", "retained release cannot be verified", exc.as_dict())
+    _reject_transaction_extras(target, manifest)
+    _verify_fixed_artifacts(config, manifest)
+    _verify_python_syntax(target, manifest)
+    _verify_unit_contents(target, manifest)
+    owner_uid = int(config["owner_uid"])
+    _require_owned_regular(target / MANIFEST_NAME, owner_uid, 0o644)
+    _require_owned_regular(target / "client-release.json", owner_uid, 0o644)
+    for item in manifest["artifacts"]:
+        _require_owned_regular(target / Path(*PurePosixPath(item["path"]).parts), owner_uid, item["mode"])
+    return manifest
 
 
 def _atomic_symlink(target: Path, link: Path) -> None:
@@ -638,6 +685,16 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         _fail("transaction_exists", "activation record already exists for this transaction")
     staged = _transaction_dir(config, transaction_id)
     release_root = Path(config["release_root"])
+    current_link = Path(config["current_link"])
+    previous_link = Path(config["previous_link"])
+    old_current = _current_target(current_link, release_root)
+    old_previous = _current_target(previous_link, release_root)
+    if old_current is not None and old_current == old_previous:
+        _fail("activation_unverified", "current and previous pointers must not target the same release")
+    if old_current is not None:
+        _verify_retained_release(config, old_current)
+    if old_previous is not None:
+        _verify_retained_release(config, old_previous)
     _mkdir_private(release_root, 0o755)
     release_dir = release_root / release_id
     if release_dir.exists():
@@ -657,10 +714,6 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         if temporary.exists():
             shutil.rmtree(temporary, ignore_errors=True)
         _fail("activation_failed", "cannot commit verified release directory")
-    current_link = Path(config["current_link"])
-    previous_link = Path(config["previous_link"])
-    old_current = _current_target(current_link, release_root)
-    old_previous = _current_target(previous_link, release_root)
     previous_id = old_current.name if old_current else None
     target_snapshot = _snapshot_targets(config)
     record = {
@@ -669,17 +722,32 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         "previous_release_id": previous_id,
         "manifest_sha256": verified["manifest_sha256"],
         "activated": False,
+        "activation_phase": "prepared",
         "rollback_attempts": 0,
     }
     _write_json(activation_path, record)
     try:
         manifest = load_manifest(release_dir / MANIFEST_NAME)
         _install_release_files(config, release_dir, manifest)
+        record["activation_phase"] = "files-installed"
+        _write_json(activation_path, record)
         if old_current is not None:
             _atomic_symlink(old_current, previous_link)
+        record["activation_phase"] = "previous-pointer-updated"
+        _write_json(activation_path, record)
         _atomic_symlink(release_dir, current_link)
+        record["activation_phase"] = "current-pointer-updated"
+        _write_json(activation_path, record)
         _daemon_reload()
-    except WrapperError as failure:
+        record["activation_phase"] = "daemon-reloaded"
+        _write_json(activation_path, record)
+        record["activated"] = True
+        record["activation_phase"] = "active"
+        _write_json(activation_path, record)
+    except (WrapperError, ManifestError) as raw_failure:
+        failure = raw_failure if isinstance(raw_failure, WrapperError) else WrapperError(
+            raw_failure.code, raw_failure.message, raw_failure.detail,
+        )
         try:
             _restore_activation_state(
                 config,
@@ -696,36 +764,15 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
                 {"activation_error": failure.as_dict(), "restore_error": restore_error.as_dict()},
             )
         try:
-            _write_json(activation_path, {**record, "activation_error": failure.as_dict()})
+            _write_json(activation_path, {
+                **record,
+                "activated": False,
+                "activation_phase": "failed",
+                "activation_error": failure.as_dict(),
+            })
         except WrapperError:
             pass
         raise failure
-    record["activated"] = True
-    try:
-        _write_json(activation_path, record)
-    except WrapperError as record_error:
-        try:
-            _restore_activation_state(
-                config,
-                current_link,
-                previous_link,
-                old_current,
-                old_previous,
-                target_snapshot,
-            )
-        except WrapperError as restore_error:
-            raise WrapperError(
-                "activation_restore_failed",
-                "activation record could not be persisted and the previous release could not be fully restored",
-                {"record_error": record_error.as_dict(), "restore_error": restore_error.as_dict()},
-            ) from restore_error
-        record["activated"] = False
-        record["activation_error"] = record_error.as_dict()
-        try:
-            _write_json(activation_path, record)
-        except WrapperError:
-            pass
-        raise record_error
     return record
 
 
@@ -745,7 +792,15 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
     if stat.S_ISLNK(activation_info.st_mode) or not stat.S_ISREG(activation_info.st_mode):
         _fail("rollback_unavailable", "there is no activation record for this transaction")
     record = _read_json(activation_path, "rollback_unavailable")
-    if record.get("release_id") != release_id or not record.get("activated"):
+    interrupted_phases = {
+        "prepared",
+        "files-installed",
+        "previous-pointer-updated",
+        "current-pointer-updated",
+        "daemon-reloaded",
+    }
+    interrupted = record.get("activated") is False and record.get("activation_phase") in interrupted_phases
+    if record.get("release_id") != release_id or not (record.get("activated") is True or interrupted):
         _fail("rollback_unavailable", "rollback transaction does not match the active release")
     if record.get("rollback_attempts", 0) >= 1:
         _fail("rollback_already_attempted", "automatic rollback is limited to one attempt")
@@ -753,20 +808,24 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
     if not isinstance(previous_id, str) or RELEASE_ID_RE.fullmatch(previous_id) is None:
         _fail("rollback_unavailable", "no previous verified release is retained")
     previous_dir = Path(config["release_root"]) / previous_id
-    try:
-        previous_manifest = load_manifest(previous_dir / MANIFEST_NAME)
-        verify_bundle(previous_dir, previous_manifest)
-        verify_client_sidecar(previous_dir, previous_manifest)
-    except (ManifestError, OSError) as exc:
-        _fail("rollback_unverified", "previous release cannot be verified")
+    previous_manifest = _verify_retained_release(config, previous_dir)
     _ensure_drained(config)
     current_link = Path(config["current_link"])
     previous_link = Path(config["previous_link"])
     old_current = _current_target(current_link, Path(config["release_root"]))
     old_previous = _current_target(previous_link, Path(config["release_root"]))
+    if old_current is not None and old_current == old_previous:
+        _fail("activation_unverified", "current and previous pointers must not target the same release")
+    if old_current is not None:
+        _verify_retained_release(config, old_current)
+    if old_previous is not None:
+        _verify_retained_release(config, old_previous)
     target_snapshot = _snapshot_targets(config)
     record["rollback_attempts"] = 1
     record["rollback_started"] = True
+    record["rollback_phase"] = "started"
+    record["rollback_state"] = "in-progress"
+    record["draining"] = True
     _write_json(activation_path, record)
     try:
         _install_release_files(config, previous_dir, previous_manifest)
@@ -790,13 +849,19 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
                 "rollback failed and the previous release could not be fully restored",
                 {"rollback_error": failure.as_dict(), "restore_error": restore_error.as_dict()},
             )
-        record["rollback_error"] = "activation_failed"
+        record["rollback_phase"] = "failed"
+        record["rollback_state"] = "failed"
+        record["rollback_error"] = failure.as_dict()
+        record["draining"] = True
         try:
             _write_json(activation_path, record)
         except WrapperError:
             pass
         raise failure
     record["rolled_back_to"] = previous_id
+    record["rollback_phase"] = "complete"
+    record["rollback_state"] = "complete"
+    record["draining"] = True
     try:
         _write_json(activation_path, record)
     except WrapperError as record_error:

@@ -81,6 +81,40 @@ class WrapperTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             WRAPPER.build_parser().parse_args(["--config", str(invalid_path), "status"])
 
+    def test_wrapper_rejects_overlapping_protected_paths(self):
+        invalid = dict(self.config)
+        invalid["staging_root"] = invalid["release_root"]
+        invalid_path = self.root / "overlap-wrapper.json"
+        invalid_path.write_text(json.dumps(invalid), encoding="utf-8")
+        with self.assertRaises(WRAPPER.WrapperError) as failure:
+            WRAPPER.load_config(invalid_path)
+        self.assertEqual(failure.exception.code, "wrapper_config_invalid")
+
+    def _tampered_unit_payload(self):
+        extracted = self.root / "tampered"
+        WRAPPER.safe_extract_archive(self.payload, extracted)
+        unit = extracted / "systemd" / "agent-vm-native-reconcile.service"
+        unit.write_text(unit.read_text(encoding="utf-8") + "\nExecStartPre=/bin/echo injected\n", encoding="utf-8")
+        manifest_path = extracted / "release-manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for item in manifest["artifacts"]:
+            if item["path"] == "systemd/agent-vm-native-reconcile.service":
+                item["sha256"] = RELEASE.sha256_file(unit)
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w") as archive:
+            for path in sorted(extracted.rglob("*")):
+                if path.is_file():
+                    archive.add(path, arcname=path.relative_to(extracted).as_posix(), recursive=False)
+        return output.getvalue()
+
+    def test_unit_policy_bytes_are_pinned_even_when_manifest_checksum_matches(self):
+        payload = self._tampered_unit_payload()
+        WRAPPER.stage(self.loaded, "tx-tampered-unit", "b" * 40, payload)
+        with self.assertRaises(WRAPPER.WrapperError) as failure:
+            WRAPPER.verify_transaction(self.loaded, "tx-tampered-unit", "b" * 40)
+        self.assertEqual(failure.exception.code, "unit_unverified")
+
     def test_stage_verify_and_activate_only_install_fixed_targets(self):
         staged = WRAPPER.stage(self.loaded, "tx-one", "b" * 40, self.payload)
         self.assertTrue(staged["staged"])
@@ -114,6 +148,22 @@ class WrapperTests(unittest.TestCase):
         self.assertFalse(Path(self.loaded["control_path"]).with_name("agent_vm.py").exists())
         self.assertFalse(Path(self.loaded["control_path"]).with_name("client-release.json").exists())
 
+    def test_activation_rejects_a_modified_retained_release(self):
+        first = self.root / "retained-first.tar"
+        second = self.root / "retained-second.tar"
+        RELEASE.build_release(ROOT, first, "e" * 40)
+        RELEASE.build_release(ROOT, second, "f" * 40)
+        with mock.patch.object(WRAPPER.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")):
+            WRAPPER.stage(self.loaded, "tx-retained-first", "e" * 40, first.read_bytes())
+            WRAPPER.activate(self.loaded, "tx-retained-first", "e" * 40)
+            retained_unit = Path(self.loaded["release_root"]) / ("e" * 40) / "systemd" / "agent-vm-native-reconcile.service"
+            retained_unit.write_text(retained_unit.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+            WRAPPER.stage(self.loaded, "tx-retained-second", "f" * 40, second.read_bytes())
+            WRAPPER.verify_transaction(self.loaded, "tx-retained-second", "f" * 40)
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER.activate(self.loaded, "tx-retained-second", "f" * 40)
+        self.assertEqual(failure.exception.code, "activation_unverified")
+
     def test_rollback_is_bounded_and_keeps_previous_release(self):
         first = self.root / "first.tar"
         second = self.root / "second.tar"
@@ -131,6 +181,44 @@ class WrapperTests(unittest.TestCase):
         with self.assertRaises(WRAPPER.WrapperError) as failure:
             WRAPPER.rollback(self.loaded, "tx-second", "d" * 40)
         self.assertEqual(failure.exception.code, "rollback_already_attempted")
+
+    def test_interrupted_activation_record_can_be_rolled_back_once(self):
+        first = self.root / "interrupted-first.tar"
+        second = self.root / "interrupted-second.tar"
+        RELEASE.build_release(ROOT, first, "1" * 40)
+        RELEASE.build_release(ROOT, second, "2" * 40)
+        with mock.patch.object(WRAPPER.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")):
+            WRAPPER.stage(self.loaded, "tx-interrupted-first", "1" * 40, first.read_bytes())
+            WRAPPER.activate(self.loaded, "tx-interrupted-first", "1" * 40)
+            WRAPPER.stage(self.loaded, "tx-interrupted-second", "2" * 40, second.read_bytes())
+            WRAPPER.activate(self.loaded, "tx-interrupted-second", "2" * 40)
+        activation_path = Path(self.loaded["state_root"]) / "tx-interrupted-second.activation.json"
+        record = json.loads(activation_path.read_text(encoding="utf-8"))
+        record["activated"] = False
+        record["activation_phase"] = "current-pointer-updated"
+        activation_path.write_text(json.dumps(record), encoding="utf-8")
+        with mock.patch.object(WRAPPER.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")):
+            result = WRAPPER.rollback(self.loaded, "tx-interrupted-second", "2" * 40)
+        self.assertTrue(result["rolled_back"])
+        self.assertEqual(Path(self.loaded["current_link"]).resolve().name, "1" * 40)
+
+    def test_rollback_failure_keeps_structured_error_and_drain_state(self):
+        first = self.root / "failure-first.tar"
+        second = self.root / "failure-second.tar"
+        RELEASE.build_release(ROOT, first, "3" * 40)
+        RELEASE.build_release(ROOT, second, "4" * 40)
+        with mock.patch.object(WRAPPER.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")):
+            WRAPPER.stage(self.loaded, "tx-failure-first", "3" * 40, first.read_bytes())
+            WRAPPER.activate(self.loaded, "tx-failure-first", "3" * 40)
+            WRAPPER.stage(self.loaded, "tx-failure-second", "4" * 40, second.read_bytes())
+            WRAPPER.activate(self.loaded, "tx-failure-second", "4" * 40)
+            with mock.patch.object(WRAPPER, "_install_release_files", side_effect=WRAPPER.WrapperError("injected", "rollback failure")):
+                with self.assertRaises(WRAPPER.WrapperError):
+                    WRAPPER.rollback(self.loaded, "tx-failure-second", "4" * 40)
+        record = json.loads((Path(self.loaded["state_root"]) / "tx-failure-second.activation.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["rollback_state"], "failed")
+        self.assertTrue(record["draining"])
+        self.assertEqual(record["rollback_error"]["code"], "injected")
 
 
 if __name__ == "__main__":

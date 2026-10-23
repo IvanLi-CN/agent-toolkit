@@ -3,7 +3,7 @@ import { mkdtemp, readFile, readlink, rm, symlink, truncate, utimes, writeFile }
 import { homedir, tmpdir } from "node:os";
 import { inflateSync } from "node:zlib";
 import { basename, join } from "node:path";
-import { convertFramebuffer, encodePng, expandUser, main, parseArgs, MAX_FRAMEBUFFER_INPUT_BYTES, MAX_FRAMEBUFFER_PIXELS, MAX_FRAMEBUFFER_ROWS, type ConvertOptions } from "../scripts/fb_to_png.ts";
+import { convertFramebuffer, createFramebufferOwnerMarker, encodePng, expandUser, main, parseArgs, MAX_FRAMEBUFFER_INPUT_BYTES, MAX_FRAMEBUFFER_PIXELS, MAX_FRAMEBUFFER_ROWS, type ConvertOptions } from "../scripts/fb_to_png.ts";
 
 async function captureStdout<T>(callback: () => Promise<T>): Promise<{ value: T; stdout: string[] }> {
   const originalLog = console.log;
@@ -245,7 +245,7 @@ describe("framebuffer to PNG helper", () => {
     const outputName = "preview.png";
     const staleTime = new Date(Date.now() - 60 * 60 * 1000);
     try {
-      await writeFile(join(temporaryDirectory, ".owner"), `agent-toolkit-fb-to-png-v1\n${basename(temporaryDirectory)}\n${outputName}\n`, { mode: 0o600 });
+      await writeFile(join(temporaryDirectory, ".owner"), await createFramebufferOwnerMarker(basename(temporaryDirectory), outputName, 999_999_999), { mode: 0o600 });
       await writeFile(join(temporaryDirectory, outputName), "temporary");
       await writeFile(join(temporaryDirectory, "unrelated.txt"), "preserve");
       await utimes(temporaryDirectory, staleTime, staleTime);

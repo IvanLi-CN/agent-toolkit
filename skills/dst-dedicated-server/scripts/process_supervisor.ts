@@ -42,6 +42,7 @@ target_marker="\${AGENT_TOOLKIT_TARGET_MARKER:-unbound}"
 supervisor_pid="$$"
 ready_path="$status_dir/ready"
 cleanup_started_path="$status_dir/cleanup-started"
+cleanup_complete_path="$status_dir/cleanup-complete"
 cleanup_ack_enabled=1
 captured_descendants_read_data=""
 captured_group_members_read_data=""
@@ -329,7 +330,7 @@ cleanup() {
   fi
   if [ "$cleanup_ack_sent" = "1" ]; then return; fi
   cleanup_ack_sent=1
-  if [ "$cleanup_ack_enabled" = "1" ] && [ "$cleanup_ack_result" = "1" ] && [ ! -e "$parent_dead_path" ]; then
+  if [ "$cleanup_ack_enabled" = "1" ] && [ "$cleanup_ack_result" = "1" ] && [ ! -e "$parent_dead_path" ] && write_marker_exclusive "$cleanup_complete_path" complete; then
     printf '1\n' >&4 2>/dev/null || true
   else
     printf '0\n' >&4 2>/dev/null || true
@@ -2580,7 +2581,10 @@ async function settleSupervisorDirectory(path: string, acknowledgement: number |
   // The detached cleaner owns the directory until it writes the ACK. Removing
   // it merely because the wrapper exited can interrupt a still-running
   // descendant verification pass.
-  if (acknowledgement !== undefined) await removeSupervisorDirectory(path);
+  if (acknowledgement !== 1) return;
+  if ((await readRegularMarker(join(path, "cleanup-complete")))?.trim() === "complete") {
+    await removeSupervisorDirectory(path);
+  }
 }
 
 async function waitForCleanupAck(fd: number, cleanupStartedPath: string, wrapperExited: Promise<number>, statusDirectory: string): Promise<boolean> {
@@ -2634,6 +2638,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
   const readyPath = join(directory, "ready");
   const targetAuthorizedPath = join(directory, "target-authorized");
   const cleanupStartedPath = join(directory, "cleanup-started");
+  const cleanupCompletePath = join(directory, "cleanup-complete");
   let statusFdForCleanup: number | undefined;
   let cleanupFdForParent: number | undefined;
   try {
@@ -2682,7 +2687,9 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
       },
       cleanup: async () => {
         await cleanupOrphanedTarget(rememberedTargetReference);
-        await rm(directory, { recursive: true, force: true });
+        if ((await readRegularMarker(cleanupCompletePath))?.trim() === "complete") {
+          await rm(directory, { recursive: true, force: true });
+        }
         if (cleanupFdForParent !== undefined) {
           await closeFileDescriptor(cleanupFdForParent);
           cleanupFdForParent = undefined;
@@ -2732,7 +2739,9 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
   } catch (error) {
     if (statusFdForCleanup !== undefined) await closeFileDescriptor(statusFdForCleanup);
     if (cleanupFdForParent !== undefined) await closeFileDescriptor(cleanupFdForParent);
-    await rm(directory, { recursive: true, force: true });
+    if (statusFdForCleanup === undefined || (await readRegularMarker(cleanupCompletePath))?.trim() === "complete") {
+      await rm(directory, { recursive: true, force: true });
+    }
     throw error;
   }
 }

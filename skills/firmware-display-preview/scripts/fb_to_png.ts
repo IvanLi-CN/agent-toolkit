@@ -1,7 +1,8 @@
 #!/usr/bin/env bun
 
 import { constants } from "node:fs";
-import { lstat, mkdtemp, open, opendir, rename, rm, rmdir, unlink, type FileHandle } from "node:fs/promises";
+import { createHmac, randomBytes, randomUUID } from "node:crypto";
+import { lstat, link, mkdir, mkdtemp, open, opendir, rename, rm, rmdir, unlink, type FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { deflateSync } from "node:zlib";
 import { basename, dirname, join, resolve } from "node:path";
@@ -13,11 +14,136 @@ export const MAX_FRAMEBUFFER_PIXELS = 16_777_216;
 export const MAX_FRAMEBUFFER_INPUT_BYTES = 128 * 1024 * 1024;
 export const MAX_FRAMEBUFFER_ROWS = 1_048_576;
 const TEMP_DIRECTORY_PREFIX = ".fb-to-png-tmp-";
-const TEMP_OWNER_MARKER_VERSION = "agent-toolkit-fb-to-png-v1";
+const TEMP_OWNER_MARKER_VERSION = "agent-toolkit-fb-to-png-v2";
+const TEMP_OWNER_RECORD_PATTERN = /^([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.([0-9a-f]{64})$/i;
+const TEMP_OWNER_PID_PATTERN = /^[1-9][0-9]*$/;
+const OWNER_KEY_FILE_ENV = "FB_TO_PNG_OWNER_KEY_FILE";
+const OWNER_KEY_BYTES = 32;
 const MAX_TEMP_DIRECTORY_SCAN_ENTRIES = 128;
 const TEMP_DIRECTORY_STALE_MS = 15 * 60 * 1000;
+let ownerKeyPromise: Promise<Uint8Array> | undefined;
 
-async function ownedTemporaryOutput(path: string, directoryName: string): Promise<string | undefined> {
+function noFollowFlag(): number {
+  if (typeof constants.O_NOFOLLOW !== "number") throw new Error("nofollow_unsupported_platform");
+  return constants.O_NOFOLLOW;
+}
+
+function ownerKeyPath(): string {
+  const configured = process.env[OWNER_KEY_FILE_ENV];
+  return resolve(expandUser(configured ?? join("~", ".cache", "agent-toolkit", "fb-to-png-owner.key")));
+}
+
+async function readOwnerKeyFile(path: string): Promise<Uint8Array> {
+  const metadata = await lstat(path);
+  if (!metadata.isFile() || metadata.isSymbolicLink() || (metadata.mode & 0o077) !== 0) throw new Error("framebuffer owner key must be a private regular file");
+  if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) throw new Error("framebuffer owner key is not owned by the current user");
+  const handle = await open(path, constants.O_RDONLY | noFollowFlag() | (constants.O_NONBLOCK ?? 0));
+  try {
+    const openedMetadata = await handle.stat();
+    if (!openedMetadata.isFile() || openedMetadata.size !== OWNER_KEY_BYTES) throw new Error("framebuffer owner key has an invalid length");
+    const key = new Uint8Array(OWNER_KEY_BYTES);
+    let offset = 0;
+    while (offset < key.byteLength) {
+      const result = await handle.read(key, offset, key.byteLength - offset, null);
+      if (result.bytesRead === 0) break;
+      offset += result.bytesRead;
+    }
+    const finalMetadata = await handle.stat();
+    if (offset !== key.byteLength || finalMetadata.size !== openedMetadata.size) throw new Error("framebuffer owner key changed while reading");
+    return key;
+  } finally {
+    await handle.close();
+  }
+}
+
+async function syncDirectory(path: string): Promise<void> {
+  const handle = await open(path, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readOwnerKey(): Promise<Uint8Array> {
+  if (ownerKeyPromise !== undefined) return ownerKeyPromise;
+  const promise = (async () => {
+    const path = ownerKeyPath();
+    const parent = dirname(path);
+    await mkdir(parent, { recursive: true, mode: 0o700 });
+    const parentMetadata = await lstat(parent);
+    if (!parentMetadata.isDirectory() || parentMetadata.isSymbolicLink() || (parentMetadata.mode & 0o077) !== 0) throw new Error("framebuffer owner key parent must be a private directory");
+    if (typeof process.getuid === "function" && parentMetadata.uid !== process.getuid()) throw new Error("framebuffer owner key parent is not owned by the current user");
+    try {
+      return await readOwnerKeyFile(path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    const key = randomBytes(OWNER_KEY_BYTES);
+    const temporary = join(parent, `.owner-key-tmp-${randomUUID()}`);
+    try {
+      const handle = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollowFlag(), 0o600);
+      try {
+        await handle.writeFile(key);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      try {
+        await link(temporary, path);
+        await syncDirectory(parent);
+        return key;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        return await readOwnerKeyFile(path);
+      }
+    } finally {
+      await unlink(temporary).catch(() => undefined);
+    }
+  })();
+  ownerKeyPromise = promise;
+  try {
+    return await promise;
+  } catch (error) {
+    ownerKeyPromise = undefined;
+    throw error;
+  }
+}
+
+export async function createFramebufferOwnerMarker(directoryName: string, outputName: string, ownerPid = process.pid): Promise<string> {
+  if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0) throw new Error("framebuffer owner pid is invalid");
+  const nonce = randomUUID();
+  const key = await readOwnerKey();
+  const proof = createHmac("sha256", key).update(`${directoryName}\n${outputName}\n${ownerPid}\n${nonce}`).digest("hex");
+  return `${TEMP_OWNER_MARKER_VERSION}\n${nonce}.${proof}\n${directoryName}\n${outputName}\n${ownerPid}\n`;
+}
+
+async function ownerPidFromMarker(value: string, directoryName: string, outputName: string): Promise<number | undefined> {
+  const lines = value.split("\n");
+  if (lines.length !== 6 || lines[0] !== TEMP_OWNER_MARKER_VERSION || lines[2] !== directoryName || lines[3] !== outputName) return undefined;
+  const ownerPid = lines[4] ?? "";
+  if (!TEMP_OWNER_PID_PATTERN.test(ownerPid)) return undefined;
+  const match = TEMP_OWNER_RECORD_PATTERN.exec(lines[1] ?? "");
+  if (match === null) return undefined;
+  try {
+    const key = await readOwnerKey();
+    const expected = createHmac("sha256", key).update(`${directoryName}\n${outputName}\n${ownerPid}\n${match[1]}`).digest("hex");
+    return expected === match[2]!.toLowerCase() ? Number(ownerPid) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function ownerProcessMayBeAlive(ownerPid: number): boolean {
+  try {
+    process.kill(ownerPid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+async function ownedTemporaryOutput(path: string, directoryName: string): Promise<{ outputName: string; ownerPid: number } | undefined> {
   let metadata;
   try {
     metadata = await lstat(path);
@@ -42,11 +168,14 @@ async function ownedTemporaryOutput(path: string, directoryName: string): Promis
     }
     const finalMetadata = await handle.stat();
     if (offset !== openedMetadata.size || finalMetadata.dev !== openedMetadata.dev || finalMetadata.ino !== openedMetadata.ino || finalMetadata.size !== openedMetadata.size) return undefined;
-    const lines = new TextDecoder().decode(buffer.subarray(0, offset)).split("\n");
-    if (lines.length !== 4 || lines[0] !== TEMP_OWNER_MARKER_VERSION || lines[1] !== directoryName) return undefined;
-    const outputName = lines[2] ?? "";
+    const marker = new TextDecoder().decode(buffer.subarray(0, offset));
+    const lines = marker.split("\n");
+    const outputName = lines[3] ?? "";
+    const ownerPid = await ownerPidFromMarker(marker, directoryName, outputName);
+    if (ownerPid === undefined) return undefined;
+    if (lines[2] !== directoryName) return undefined;
     if (outputName.length === 0 || basename(outputName) !== outputName || outputName === "." || outputName === "..") return undefined;
-    return outputName;
+    return { outputName, ownerPid };
   } catch {
     return undefined;
   } finally {
@@ -170,7 +299,7 @@ function inputBounds(format: FramebufferFormat, options: ConvertOptions): { mini
 async function readFramebufferInput(path: string, bounds: { minimum: number; maximum: number }): Promise<Uint8Array> {
   const initialMetadata = await lstat(path);
   if (!initialMetadata.isFile() || initialMetadata.isSymbolicLink()) throw new Error("framebuffer input must be a regular file");
-  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+  const handle = await open(path, constants.O_RDONLY | noFollowFlag() | (constants.O_NONBLOCK ?? 0));
   try {
     const metadata = await handle.stat();
     if (!metadata.isFile()) throw new Error("framebuffer input must be a regular file");
@@ -381,6 +510,7 @@ export function parseArgs(args: string[]): CliOptions | "help" {
   if (format === undefined || width === undefined || height === undefined || input === undefined || output === undefined) {
     throw new CliError("--format, --width, --height, --in, and --out are required");
   }
+  if (basename(output) === ".owner") throw new CliError("--out cannot use .owner as the output filename");
   return { format, width, height, input, output, strideBytes, endian, bitOrder, ssd1306BitOrder, invert };
 }
 
@@ -403,8 +533,9 @@ async function cleanupStaleTemporaryDirectories(parent: string): Promise<void> {
         const metadata = await lstat(temporaryDirectory);
         if (!metadata.isDirectory() || metadata.isSymbolicLink() || (metadata.mode & 0o777) !== 0o700 || Date.now() - metadata.mtimeMs < TEMP_DIRECTORY_STALE_MS) continue;
         if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) continue;
-        const outputName = await ownedTemporaryOutput(join(temporaryDirectory, ".owner"), basename(temporaryDirectory));
-        if (outputName === undefined) continue;
+        const ownedOutput = await ownedTemporaryOutput(join(temporaryDirectory, ".owner"), basename(temporaryDirectory));
+        if (ownedOutput === undefined || ownerProcessMayBeAlive(ownedOutput.ownerPid)) continue;
+        const outputName = ownedOutput.outputName;
         const entries: string[] = [];
         const contents = await opendir(temporaryDirectory);
         try {
@@ -430,6 +561,7 @@ async function cleanupStaleTemporaryDirectories(parent: string): Promise<void> {
 }
 
 async function writePngAtomically(outputPath: string, data: Uint8Array): Promise<void> {
+  if (basename(outputPath) === ".owner") throw new Error("--out cannot use .owner as the output filename");
   const parent = dirname(outputPath);
   await cleanupStaleTemporaryDirectories(parent);
   const temporaryDirectory = await mkdtemp(join(parent, TEMP_DIRECTORY_PREFIX));
@@ -437,12 +569,12 @@ async function writePngAtomically(outputPath: string, data: Uint8Array): Promise
   try {
     const owner = await open(join(temporaryDirectory, ".owner"), "wx", 0o600);
     try {
-      await owner.writeFile(`${TEMP_OWNER_MARKER_VERSION}\n${basename(temporaryDirectory)}\n${basename(outputPath)}\n`);
+      await owner.writeFile(await createFramebufferOwnerMarker(basename(temporaryDirectory), basename(outputPath)));
       await owner.sync();
     } finally {
       await owner.close();
     }
-    const handle = await open(temporaryPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
+    const handle = await open(temporaryPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollowFlag(), 0o600);
     try {
       await handle.writeFile(data);
       await handle.sync();

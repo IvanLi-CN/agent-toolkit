@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { constants, type Dirent } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { lstat, link, mkdir, mkdtemp, open, opendir, realpath, rename, rm, unlink, type FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -57,10 +57,131 @@ const SUPERVISOR_STOP_GRACE_MS = 250;
 const SUPERVISOR_FORCE_KILL_MS = 6_000;
 const SNAPSHOT_TEMP_PREFIX = ".dst-snapshot-tmp-";
 const SNAPSHOT_TEMP_ROOT_NAME = ".agent-toolkit-dst-snapshot-tmp";
-const SNAPSHOT_OWNER_MARKER = "agent-toolkit-dst-snapshot-v1\n";
+const SNAPSHOT_OWNER_MARKER_VERSION = "agent-toolkit-dst-snapshot-v2";
+const SNAPSHOT_OWNER_RECORD_PATTERN = /^([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.([0-9a-f]{64})$/i;
+const SNAPSHOT_OWNER_PID_PATTERN = /^[1-9][0-9]*$/;
+const SNAPSHOT_OWNER_KEY_FILE_ENV = "DST_SNAPSHOT_OWNER_KEY_FILE";
+const SNAPSHOT_OWNER_KEY_BYTES = 32;
 const SNAPSHOT_TEMP_STALE_MS = 15 * 60 * 1000;
 const MAX_SNAPSHOT_TEMP_SCAN_ENTRIES = 128;
 const SNAPSHOT_OWNER_WAIT_ATTEMPTS = 400;
+let snapshotOwnerKeyPromise: Promise<Uint8Array> | undefined;
+
+function noFollowFlag(): number {
+  if (typeof constants.O_NOFOLLOW !== "number") throw new Error("nofollow_unsupported_platform");
+  return constants.O_NOFOLLOW;
+}
+
+function snapshotOwnerKeyPath(): string {
+  const configured = process.env[SNAPSHOT_OWNER_KEY_FILE_ENV];
+  return resolve(expandUser(configured ?? join("~", ".cache", "agent-toolkit", "dst-snapshot-owner.key")));
+}
+
+async function readSnapshotOwnerKeyFile(path: string): Promise<Uint8Array> {
+  const metadata = await lstat(path);
+  if (!metadata.isFile() || metadata.isSymbolicLink() || (metadata.mode & 0o077) !== 0) throw new Error("snapshot owner key must be a private regular file");
+  if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) throw new Error("snapshot owner key is not owned by the current user");
+  const handle = await open(path, constants.O_RDONLY | noFollowFlag() | (constants.O_NONBLOCK ?? 0));
+  try {
+    const openedMetadata = await handle.stat();
+    if (!openedMetadata.isFile() || openedMetadata.size !== SNAPSHOT_OWNER_KEY_BYTES) throw new Error("snapshot owner key has an invalid length");
+    const key = new Uint8Array(SNAPSHOT_OWNER_KEY_BYTES);
+    let offset = 0;
+    while (offset < key.byteLength) {
+      const result = await handle.read(key, offset, key.byteLength - offset, null);
+      if (result.bytesRead === 0) break;
+      offset += result.bytesRead;
+    }
+    const finalMetadata = await handle.stat();
+    if (offset !== key.byteLength || finalMetadata.size !== openedMetadata.size) throw new Error("snapshot owner key changed while reading");
+    return key;
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readSnapshotOwnerKey(): Promise<Uint8Array> {
+  if (snapshotOwnerKeyPromise !== undefined) return snapshotOwnerKeyPromise;
+  const promise = (async () => {
+    const path = snapshotOwnerKeyPath();
+    const parent = dirname(path);
+    await mkdir(parent, { recursive: true, mode: 0o700 });
+    const parentMetadata = await lstat(parent);
+    if (!parentMetadata.isDirectory() || parentMetadata.isSymbolicLink() || (parentMetadata.mode & 0o077) !== 0) throw new Error("snapshot owner key parent must be a private directory");
+    if (typeof process.getuid === "function" && parentMetadata.uid !== process.getuid()) throw new Error("snapshot owner key parent is not owned by the current user");
+    try {
+      return await readSnapshotOwnerKeyFile(path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    const key = randomBytes(SNAPSHOT_OWNER_KEY_BYTES);
+    const temporary = join(parent, `.owner-key-tmp-${randomUUID()}`);
+    try {
+      const handle = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollowFlag(), 0o600);
+      try {
+        await handle.writeFile(key);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      try {
+        await link(temporary, path);
+        await syncDirectory(parent);
+        return key;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        return await readSnapshotOwnerKeyFile(path);
+      }
+    } finally {
+      await unlink(temporary).catch(() => undefined);
+    }
+  })();
+  snapshotOwnerKeyPromise = promise;
+  try {
+    return await promise;
+  } catch (error) {
+    snapshotOwnerKeyPromise = undefined;
+    throw error;
+  }
+}
+
+export async function createSnapshotOwnerMarker(scope: string, ownerPid = process.pid): Promise<string> {
+  if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0) throw new Error("snapshot owner pid is invalid");
+  const nonce = randomUUID();
+  const key = await readSnapshotOwnerKey();
+  const proof = createHmac("sha256", key).update(`${scope}\n${ownerPid}\n${nonce}`).digest("hex");
+  const scopeDigest = createHash("sha256").update(scope).digest("hex");
+  return `${SNAPSHOT_OWNER_MARKER_VERSION}\n${nonce}.${proof}\n${scopeDigest}\n${ownerPid}\n`;
+}
+
+async function snapshotOwnerPid(value: string, expectedScope: string): Promise<number | undefined> {
+  const lines = value.split("\n");
+  if (lines.length !== 5 || lines[0] !== SNAPSHOT_OWNER_MARKER_VERSION || lines[2] !== createHash("sha256").update(expectedScope).digest("hex")) return undefined;
+  const ownerPid = lines[3] ?? "";
+  if (!SNAPSHOT_OWNER_PID_PATTERN.test(ownerPid)) return undefined;
+  const match = SNAPSHOT_OWNER_RECORD_PATTERN.exec(lines[1] ?? "");
+  if (match === null) return undefined;
+  try {
+    const key = await readSnapshotOwnerKey();
+    const expected = createHmac("sha256", key).update(`${expectedScope}\n${ownerPid}\n${match[1]}`).digest("hex");
+    return expected === match[2]!.toLowerCase() ? Number(ownerPid) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function hasValidSnapshotOwnerMarker(value: string, expectedScope: string): Promise<boolean> {
+  return (await snapshotOwnerPid(value, expectedScope)) !== undefined;
+}
+
+function ownerProcessMayBeAlive(ownerPid: number): boolean {
+  try {
+    process.kill(ownerPid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
 
 async function readBounded(
   stream: ReadableStream<Uint8Array>,
@@ -291,6 +412,7 @@ const SENSITIVE_FILENAME = new RegExp("(?<![A-Za-z0-9])(?:[A-Za-z0-9_.-]*(?:" + 
 const RAW_JWT = /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?![A-Za-z0-9_-])/g;
 const ANSI_ESCAPE = /\u001B(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001B\\))/g;
 const CONTROL_CHARACTERS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g;
+const UNICODE_FORMAT_CHARACTERS = /\p{Cf}/gu;
 const SENSITIVE_MULTILINE_ASSIGNMENT = new RegExp(`(${SENSITIVE_KEY_TOKEN}\\s*[:=])\\s*\\r?\\n(?:[ \\t]+[^\\r\\n]*(?:\\r?\\n|$))+`, "gi");
 const SENSITIVE_COLLECTION_ASSIGNMENT = new RegExp(`(${SENSITIVE_KEY}\\s*[:=]\\s*)([\\[{])`, "gi");
 
@@ -409,6 +531,7 @@ export function redactSensitiveText(text: string): string {
   const normalized = text
     .replace(ANSI_ESCAPE, " ")
     .replace(CONTROL_CHARACTERS, " ")
+    .replace(UNICODE_FORMAT_CHARACTERS, " ")
     .replace(/([A-Za-z0-9])\s+([_.-])(?=[A-Za-z0-9])/g, "$1$2")
     .replace(/([_.-])\s+([A-Za-z0-9])/g, "$1$2");
   const redacted = redactSensitiveCollections(redactSensitiveBlocks(redactSensitiveContinuations(normalized)))
@@ -494,7 +617,8 @@ async function containedPath(root: string, candidate: string): Promise<string | 
 export async function safeTail(file: string, lines: number, allowedRoot?: string): Promise<string> {
   if (lines <= 0) return "";
   try {
-    const noFollow = constants.O_NOFOLLOW ?? 0;
+    const noFollow = constants.O_NOFOLLOW;
+    if (typeof noFollow !== "number") return "";
     const nonBlocking = constants.O_NONBLOCK ?? 0;
     let safeFile = file;
     let rootIdentity: { dev: number; ino: number } | undefined;
@@ -646,6 +770,7 @@ async function ensureSnapshotTemporaryRoot(parent: string): Promise<string> {
   if (!metadata.isDirectory() || metadata.isSymbolicLink() || (metadata.mode & 0o077) !== 0) throw new Error("snapshot temporary root must be a private directory");
   if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) throw new Error("snapshot temporary root is not owned by the current user");
   const marker = join(root, ".owner");
+  const rootScope = `root:${root}`;
   const readMarker = async (path = marker): Promise<boolean | undefined> => {
     let markerMetadata;
     try {
@@ -661,25 +786,21 @@ async function ensureSnapshotTemporaryRoot(parent: string): Promise<string> {
       return false;
     }
     const noFollow = constants.O_NOFOLLOW;
-    if (noFollow === undefined) return false;
+    if (typeof noFollow !== "number") return false;
     let handle: FileHandle | undefined;
     try {
       handle = await open(path, constants.O_RDONLY | noFollow | (constants.O_NONBLOCK ?? 0));
       const openedMetadata = await handle.stat();
       if (!openedMetadata.isFile()) return false;
-      const expected = new TextEncoder().encode(SNAPSHOT_OWNER_MARKER);
-      const buffer = new Uint8Array(expected.byteLength + 1);
+      const buffer = new Uint8Array(8192);
       let offset = 0;
       while (offset < buffer.byteLength) {
         const result = await handle.read(buffer, offset, buffer.byteLength - offset, null);
         if (result.bytesRead === 0) break;
         offset += result.bytesRead;
       }
-      if (offset !== expected.byteLength) return false;
-      for (let index = 0; index < expected.byteLength; index += 1) {
-        if (buffer[index] !== expected[index]) return false;
-      }
-      return true;
+      if (offset === buffer.byteLength) return false;
+      return await hasValidSnapshotOwnerMarker(new TextDecoder().decode(buffer.subarray(0, offset)), rootScope);
     } catch {
       return false;
     } finally {
@@ -691,7 +812,7 @@ async function ensureSnapshotTemporaryRoot(parent: string): Promise<string> {
     try {
       const handle = await open(temporaryMarker, "wx", 0o600);
       try {
-        await handle.writeFile(SNAPSHOT_OWNER_MARKER);
+        await handle.writeFile(await createSnapshotOwnerMarker(rootScope));
         await handle.sync();
       } finally {
         await handle.close();
@@ -748,9 +869,9 @@ async function ensureSnapshotTemporaryRoot(parent: string): Promise<string> {
   if (entries.length !== 0) throw new Error("snapshot temporary root owner marker is invalid");
   const temporaryMarker = join(root, `.owner-tmp-${randomUUID()}`);
   try {
-    const handle = await open(temporaryMarker, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
+    const handle = await open(temporaryMarker, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollowFlag(), 0o600);
     try {
-      await handle.writeFile(SNAPSHOT_OWNER_MARKER);
+      await handle.writeFile(await createSnapshotOwnerMarker(rootScope));
       await handle.sync();
     } finally {
       await handle.close();
@@ -784,7 +905,7 @@ async function cleanupSnapshotTemporaryDirectories(root: string): Promise<void> 
       try {
         const metadata = await lstat(path);
         if (!metadata.isDirectory() || metadata.isSymbolicLink() || Date.now() - metadata.mtimeMs < SNAPSHOT_TEMP_STALE_MS) continue;
-        if (await readMarkerForCleanup(join(path, ".owner")) !== true) continue;
+        if (await readMarkerForCleanup(join(path, ".owner"), `temp:${path}`) !== true) continue;
         await rm(path, { recursive: true, force: true, maxRetries: 0 });
       } catch {
         // Preserve a concurrently changing directory for a later invocation.
@@ -795,7 +916,7 @@ async function cleanupSnapshotTemporaryDirectories(root: string): Promise<void> 
   }
 }
 
-async function readMarkerForCleanup(path: string): Promise<boolean | undefined> {
+async function readMarkerForCleanup(path: string, expectedScope: string): Promise<boolean | undefined> {
   let metadata;
   try {
     metadata = await lstat(path);
@@ -806,22 +927,22 @@ async function readMarkerForCleanup(path: string): Promise<boolean | undefined> 
   if (!metadata.isFile() || metadata.isSymbolicLink()) return false;
   if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) return false;
   const noFollow = constants.O_NOFOLLOW;
-  if (noFollow === undefined) return false;
+  if (typeof noFollow !== "number") return false;
   let handle: FileHandle | undefined;
   try {
     handle = await open(path, constants.O_RDONLY | noFollow | (constants.O_NONBLOCK ?? 0));
     const openedMetadata = await handle.stat();
     if (!openedMetadata.isFile()) return false;
-    const expected = new TextEncoder().encode(SNAPSHOT_OWNER_MARKER);
-    const buffer = new Uint8Array(expected.byteLength + 1);
+    const buffer = new Uint8Array(8192);
     let offset = 0;
     while (offset < buffer.byteLength) {
       const result = await handle.read(buffer, offset, buffer.byteLength - offset, null);
       if (result.bytesRead === 0) break;
       offset += result.bytesRead;
     }
-    if (offset !== expected.byteLength) return false;
-    return expected.every((value, index) => buffer[index] === value);
+    if (offset === buffer.byteLength) return false;
+    const ownerPid = await snapshotOwnerPid(new TextDecoder().decode(buffer.subarray(0, offset)), expectedScope);
+    return ownerPid === undefined ? false : !ownerProcessMayBeAlive(ownerPid);
   } catch {
     return false;
   } finally {
@@ -1108,6 +1229,7 @@ export function parseArgs(args: string[], env: Record<string, string | undefined
     validateSshToken(host, "host");
     validateSshToken(user, "user");
   }
+  if (out !== undefined && basename(expandUser(out)) === ".owner") throw new CliError("--out cannot use .owner as the output filename");
   return { host, user, out, localDir, noLocal, noRemote };
 }
 
@@ -1161,12 +1283,12 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     try {
       const owner = await open(join(tempDir, ".owner"), "wx", 0o600);
       try {
-        await owner.writeFile(SNAPSHOT_OWNER_MARKER);
+          await owner.writeFile(await createSnapshotOwnerMarker(`temp:${tempDir}`));
         await owner.sync();
       } finally {
         await owner.close();
       }
-      const handle = await open(tempPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
+      const handle = await open(tempPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollowFlag(), 0o600);
       try {
         await handle.writeFile(report.join("\n"), "utf8");
         await handle.sync();

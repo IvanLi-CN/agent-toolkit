@@ -526,7 +526,7 @@ async function writeSyncedFile(path: string, data: Uint8Array): Promise<void> {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
-  const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
+  const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | noFollowFlag() | (constants.O_NONBLOCK ?? 0);
   const handle = await open(path, flags, 0o600);
   try {
     const metadata = await handle.stat();
@@ -570,6 +570,11 @@ const OWNER_KEY_FILE_ENV = "BUZZER_PREVIEW_OWNER_KEY_FILE";
 const OWNER_KEY_BYTES = 32;
 let ownerKeyPromise: Promise<Uint8Array> | undefined;
 
+function noFollowFlag(): number {
+  if (typeof constants.O_NOFOLLOW !== "number") throw new Error("nofollow_unsupported_platform");
+  return constants.O_NOFOLLOW;
+}
+
 function ownerKeyPath(): string {
   const configured = process.env[OWNER_KEY_FILE_ENV];
   return resolve(expandUser(configured ?? join("~", ".cache", "agent-toolkit", "buzzer-preview-owner.key")));
@@ -596,7 +601,7 @@ async function readOwnerKey(): Promise<Uint8Array> {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       const key = randomBytes(OWNER_KEY_BYTES);
       const temporaryPath = join(dirname(path), `.owner-key-tmp-${randomUUID()}`);
-      const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0);
+      const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollowFlag();
       try {
         const handle = await open(temporaryPath, flags, 0o600);
         try {
@@ -718,7 +723,7 @@ async function readRegularFile(path: string, maxBytes = MAX_TRANSACTION_METADATA
 async function readBoundedRegularFile(path: string, maxBytes: number, label: string): Promise<Uint8Array> {
   const initialMetadata = await lstat(path);
   if (!initialMetadata.isFile() || initialMetadata.isSymbolicLink()) throw new Error(`${label} is not a regular file: ${path}`);
-  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+  const handle = await open(path, constants.O_RDONLY | noFollowFlag() | (constants.O_NONBLOCK ?? 0));
   try {
     const metadata = await handle.stat();
     if (!metadata.isFile()) throw new Error(`${label} is not a regular file: ${path}`);

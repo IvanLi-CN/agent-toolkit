@@ -12,7 +12,7 @@ import {
   renderSummary,
   type ShardSummary,
 } from "../scripts/dst_mods_from_modoverrides.ts";
-import { main as snapshotMain, MAX_LOCAL_DIRECTORY_ENTRIES, MAX_LOCAL_LOG_LISTING_ENTRIES, MAX_REMOTE_OUTPUT_BYTES, redactOperationalText, redactSensitiveText, safeTail } from "../scripts/dst_snapshot.ts";
+import { createSnapshotOwnerMarker, main as snapshotMain, MAX_LOCAL_DIRECTORY_ENTRIES, MAX_LOCAL_LOG_LISTING_ENTRIES, MAX_REMOTE_OUTPUT_BYTES, redactOperationalText, redactSensitiveText, safeTail } from "../scripts/dst_snapshot.ts";
 import { spawnSupervised, SUPERVISOR_UNKNOWN_TARGET_STATUS } from "../scripts/process_supervisor.ts";
 
 async function runTool(script: string, args: string[], env: Record<string, string>): Promise<{ status: number; stdout: string; stderr: string }> {
@@ -59,6 +59,8 @@ describe.serial("DST local Bun tooling", () => {
     expect(redactSensitiveText("token\u001b[31mANSI_SECRET")).not.toContain("ANSI_SECRET");
     expect(redactSensitiveText("api_key\u001b[31m=fixture-secret")).not.toContain("fixture-secret");
     expect(redactSensitiveText("api_key=\u001b[31mfixture-secret")).not.toContain("fixture-secret");
+    expect(redactSensitiveText("token\u200B=UNICODE_SECRET")).not.toContain("UNICODE_SECRET");
+    expect(redactSensitiveText("token=\u0000NUL_SECRET")).not.toContain("NUL_SECRET");
     expect(redactSensitiveText("api_key=\n  fixture-secret\nvisible=ok")).not.toContain("fixture-secret");
     expect(redactSensitiveText('{"api_keys": [\n  "json-secret"\n], "nested": {"token": "nested-secret"}}')).not.toMatch(/json-secret|nested-secret/);
     expect(redactSensitiveText('api_key="prefix\\"LEAK"')).toBe("api_key=[REDACTED]");
@@ -1088,20 +1090,26 @@ exec /bin/ps "$@"
     try {
       const tempRoot = join(root, ".agent-toolkit-dst-snapshot-tmp");
       await mkdir(tempRoot, { mode: 0o700 });
-      await writeFile(join(tempRoot, ".owner"), "agent-toolkit-dst-snapshot-v1\n");
+      await writeFile(join(tempRoot, ".owner"), await createSnapshotOwnerMarker(`root:${tempRoot}`));
       const stale = join(tempRoot, ".dst-snapshot-tmp-stale");
       await mkdir(stale);
-      await writeFile(join(stale, ".owner"), "agent-toolkit-dst-snapshot-v1\n");
+      await writeFile(join(stale, ".owner"), await createSnapshotOwnerMarker(`temp:${stale}`, 999_999_999));
       const old = new Date(Date.now() - 20 * 60 * 1000);
       await utimes(stale, old, old);
       const ownerless = join(tempRoot, ".dst-snapshot-tmp-ownerless");
       await mkdir(ownerless);
       await writeFile(join(ownerless, "partial.md"), "interrupted");
       await utimes(ownerless, old, old);
+      const active = join(tempRoot, ".dst-snapshot-tmp-active");
+      await mkdir(active);
+      await writeFile(join(active, ".owner"), await createSnapshotOwnerMarker(`temp:${active}`));
+      await writeFile(join(active, "partial.md"), "in progress");
+      await utimes(active, old, old);
       const output = join(root, "snapshot.md");
       expect(await snapshotMain(["--no-local", "--no-remote", "--out", output])).toBe(0);
       expect(await readdir(tempRoot)).not.toContain(".dst-snapshot-tmp-stale");
       expect(await readdir(tempRoot)).toContain(".dst-snapshot-tmp-ownerless");
+      expect(await readdir(tempRoot)).toContain(".dst-snapshot-tmp-active");
       expect(await readFile(join(ownerless, "partial.md"), "utf8")).toBe("interrupted");
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -1115,7 +1123,7 @@ exec /bin/ps "$@"
       await mkdir(tempRoot, { mode: 0o700 });
       const output = join(root, "snapshot.md");
       expect(await snapshotMain(["--no-local", "--no-remote", "--out", output])).toBe(0);
-      expect(await readFile(join(tempRoot, ".owner"), "utf8")).toBe("agent-toolkit-dst-snapshot-v1\n");
+      expect((await readFile(join(tempRoot, ".owner"), "utf8")).split("\n")).toHaveLength(5);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -1636,7 +1644,7 @@ exec /bin/ps "$@"
       supervised = await spawnSupervised([
         "sh",
         "-c",
-        "sleep 30 & child=$!; printf '%s\\n' \"$child\" > \"$1\"; sleep 1; kill -KILL \"$PPID\"; wait",
+        "sleep 30 & child=$!; printf '%s\\n' \"$child\" > \"$1\"; sleep 2; kill -KILL \"$PPID\"; wait",
         "agent-toolkit-supervised-target",
         marker,
       ]);

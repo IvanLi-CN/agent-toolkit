@@ -54,6 +54,7 @@ esac
 ready_path="$status_dir/ready"
 cleanup_started_path="$status_dir/cleanup-started"
 cleanup_complete_path="$status_dir/cleanup-complete"
+stop_target_path="$status_dir/stop-target"
 cleanup_owner_path="$status_dir/cleanup-owner"
 cleanup_ack_enabled=1
 captured_descendants_read_data=""
@@ -363,6 +364,9 @@ acquire_cleanup_owner() {
   return 2
 }
 cleanup() {
+  # The target launcher watches this private marker and can terminate its own
+  # process group even when the supervisor's process probe is unavailable.
+  ensure_marker "$stop_target_path" || cleanup_ack_enabled=0
   if [ -e "$descendant_scan_truncated_path" ] || [ -e "$descendant_scan_failed_path" ] || [ -e "$snapshot_failed_path" ]; then cleanup_ack_enabled=0; fi
   if [ -e "$parent_dead_path" ]; then
     rm -rf -- "$status_dir"
@@ -490,7 +494,8 @@ if command -v setsid >/dev/null 2>&1 && [ "\${AGENT_TOOLKIT_SUPERVISOR_DISABLE_S
     writer_path="$5"
     done_path="$6"
     supervisor_no_follow="$7"
-    shift 7
+    stop_path="$8"
+    shift 8
     publication_path="$(dirname -- "$result_path")/status"
     write_target_marker() {
       marker_path="$1"
@@ -504,8 +509,12 @@ if command -v setsid >/dev/null 2>&1 && [ "\${AGENT_TOOLKIT_SUPERVISOR_DISABLE_S
     while [ ! -e "$authorized_path" ]; do sleep 0.01; done
     "$@" 3>&- 4>&- &
     target_pid=$!
+    (trap ':' HUP INT TERM; while [ ! -e "$stop_path" ]; do sleep 0.02; done; kill -TERM "-$$" 2>/dev/null || true; sleep 0.25; kill -KILL "-$$" 2>/dev/null || true) &
+    stop_watcher_pid=$!
     wait "$target_pid"
     target_status=$?
+    kill -KILL "$stop_watcher_pid" 2>/dev/null || true
+    wait "$stop_watcher_pid" 2>/dev/null || true
     if ! write_target_marker "$writer_path" "$$"; then exit 125; fi
     if ! write_target_marker "$result_path" "$target_status"; then exit 125; fi
     if ! write_target_marker "$publication_path" "$target_status"; then exit 125; fi
@@ -513,7 +522,7 @@ if command -v setsid >/dev/null 2>&1 && [ "\${AGENT_TOOLKIT_SUPERVISOR_DISABLE_S
     if ! write_target_marker "$done_path" complete; then exit 125; fi
     exec 3>&-
     while :; do sleep 1; done
-  ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$target_start_path" "$target_authorized_path" "$target_status_writer_path" "$completion_path" "$supervisor_no_follow" "$@" &
+  ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$target_start_path" "$target_authorized_path" "$target_status_writer_path" "$completion_path" "$supervisor_no_follow" "$stop_target_path" "$@" &
 else
   # The external setsid utility may be absent or deliberately disabled in
   # tests, but Perl is already a supervisor prerequisite. Use POSIX::setsid
@@ -527,7 +536,8 @@ else
     writer_path="$5"
     done_path="$6"
     supervisor_no_follow="$7"
-    shift 7
+    stop_path="$8"
+    shift 8
     publication_path="$(dirname -- "$result_path")/status"
     write_target_marker() {
       marker_path="$1"
@@ -541,8 +551,12 @@ else
     while [ ! -e "$authorized_path" ]; do sleep 0.01; done
     "$@" 3>&- 4>&- &
     target_pid=$!
+    (trap ':' HUP INT TERM; while [ ! -e "$stop_path" ]; do sleep 0.02; done; kill -TERM "-$$" 2>/dev/null || true; sleep 0.25; kill -KILL "-$$" 2>/dev/null || true) &
+    stop_watcher_pid=$!
     wait "$target_pid"
     target_status=$?
+    kill -KILL "$stop_watcher_pid" 2>/dev/null || true
+    wait "$stop_watcher_pid" 2>/dev/null || true
     if ! write_target_marker "$writer_path" "$$"; then exit 125; fi
     if ! write_target_marker "$result_path" "$target_status"; then exit 125; fi
     if ! write_target_marker "$publication_path" "$target_status"; then exit 125; fi
@@ -550,7 +564,7 @@ else
     if ! write_target_marker "$done_path" complete; then exit 125; fi
     exec 3>&-
     while :; do sleep 1; done
-  ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$target_start_path" "$target_authorized_path" "$target_status_writer_path" "$completion_path" "$supervisor_no_follow" "$@" &
+  ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$target_start_path" "$target_authorized_path" "$target_status_writer_path" "$completion_path" "$supervisor_no_follow" "$stop_target_path" "$@" &
 fi
 target_launcher_pid=$!
 # The shell owns this PID; the target can discover and mutate marker files but
@@ -2613,6 +2627,30 @@ async function processGroupHasLiveProcess(pgid: number): Promise<boolean | undef
   return false;
 }
 
+async function readCurrentProcessGroupMembers(pgid: number): Promise<TargetGroupMember[] | undefined> {
+  const result = POSIX_PS === undefined ? undefined : await boundedCommandOutput([POSIX_PS, "-axo", "pid=,pgid=,state="]);
+  if (result === undefined || result.exitCode !== 0) return undefined;
+  const members: TargetGroupMember[] = [];
+  for (const line of result.stdout.split("\n")) {
+    if (line.trim().length === 0) continue;
+    const match = /^\s*([0-9]+)\s+([0-9]+)\s+(\S+)/.exec(line);
+    if (match === null) return undefined;
+    const pid = Number(match[1]);
+    const observedPgid = Number(match[2]);
+    if (!Number.isInteger(pid) || !Number.isInteger(observedPgid)) return undefined;
+    if (observedPgid !== pgid || pid === process.pid || match[3]!.startsWith("Z")) continue;
+    const identity = await currentProcessIdentity(pid);
+    if (identity === undefined) {
+      if (processIsAlive(pid)) return undefined;
+      continue;
+    }
+    const currentPgid = await currentProcessGroup(pid);
+    if (currentPgid !== pgid) return undefined;
+    members.push({ pid, pgid, identity });
+  }
+  return members;
+}
+
 async function captureTargetGroupMembers(reference: TargetReference, wrapperExited: Promise<number>): Promise<TargetGroupMember[] | undefined> {
   const deadline = Date.now() + SUPERVISOR_GROUP_MEMBER_CAPTURE_TIMEOUT_MS;
   while (Date.now() < deadline) {
@@ -2664,52 +2702,44 @@ async function cleanupAuthorizedTargetGroup(
   reference: TargetReference,
   rememberedMembers?: readonly TargetGroupMember[],
 ): Promise<boolean> {
-  const members = rememberedMembers === undefined
-    ? undefined
-    : rememberedMembers.filter((member) => member.pgid === reference.pgid);
-  const ledger = members === undefined ? await readRegularMarker(join(statusDirectory, "descendants"), MAX_SUPERVISOR_DESCENDANT_BYTES) : undefined;
-  if (members === undefined && ledger === undefined) return false;
-  const currentPgid = await currentProcessGroup(process.pid);
-  if (currentPgid === undefined || currentPgid === reference.pgid) return false;
-  let authorizedLiveMember = false;
-  if (members !== undefined) {
-    for (const member of members) {
-      if (member.pid === reference.pid || member.pid === process.pid || !processIsAlive(member.pid) || await processIsZombie(member.pid)) {
-        continue;
-      }
-      const identity = await currentProcessIdentity(member.pid);
-      const pgid = await currentProcessGroup(member.pid);
-      if (identity === undefined || !processIdentityMatches(member.identity, identity)) {
-        return false;
-      }
-      if (pgid === undefined) continue;
-      if (pgid !== reference.pgid) return false;
-      authorizedLiveMember = true;
-    }
-  } else {
-    for (const line of ledger!.split(/\r?\n/)) {
+  const authorized = new Map<number, TargetGroupMember>();
+  for (const member of rememberedMembers ?? []) {
+    if (member.pgid !== reference.pgid) continue;
+    const previous = authorized.get(member.pid);
+    if (previous !== undefined && (previous.identity !== member.identity || previous.pgid !== member.pgid)) return false;
+    authorized.set(member.pid, member);
+  }
+  const ledger = await readRegularMarker(join(statusDirectory, "descendants"), MAX_SUPERVISOR_DESCENDANT_BYTES);
+  if (ledger !== undefined) {
+    for (const line of ledger.split(/\r?\n/)) {
       if (line.trim().length === 0) continue;
       const fields = line.split("|");
       if (fields.length !== 3 || !/^[1-9][0-9]*$/.test(fields[0]!) || fields[1]!.length === 0 || !/^[1-9][0-9]*$/.test(fields[2]!)) return false;
-      if (fields[2] !== String(reference.pgid)) continue;
       const pid = Number(fields[0]);
-      if (pid === process.pid) return false;
-      if (!processIsAlive(pid) || await processIsZombie(pid)) continue;
-      const identity = await currentProcessIdentity(pid);
-      const pgid = await currentProcessGroup(pid);
-      if (identity === undefined || !processIdentityMatches(fields[1]!, identity)) return false;
-      if (pgid === undefined) continue;
-      if (pgid !== reference.pgid) return false;
-      authorizedLiveMember = true;
+      const pgid = Number(fields[2]);
+      if (pgid !== reference.pgid) continue;
+      const member = { pid, pgid, identity: fields[1]! };
+      const previous = authorized.get(pid);
+      if (previous !== undefined && (previous.identity !== member.identity || previous.pgid !== member.pgid)) return false;
+      authorized.set(pid, member);
     }
   }
-  if (!authorizedLiveMember) {
-    return (await processGroupHasLiveProcess(reference.pgid)) === false;
+  if (authorized.size === 0) return (await processGroupHasLiveProcess(reference.pgid)) === false;
+  const currentPgid = await currentProcessGroup(process.pid);
+  if (currentPgid === undefined || currentPgid === reference.pgid) return false;
+  const currentMembers = await readCurrentProcessGroupMembers(reference.pgid);
+  if (currentMembers === undefined) return false;
+  for (const member of currentMembers) {
+    const expected = authorized.get(member.pid);
+    if (expected === undefined || !processIdentityMatches(expected.identity, member.identity)) return false;
   }
-  try {
-    process.kill(-reference.pgid, "SIGKILL");
-  } catch {
-    // The authorized group may have exited between validation and the signal.
+  if (currentMembers.length === 0) return true;
+  for (const member of currentMembers) {
+    try {
+      process.kill(member.pid, "SIGKILL");
+    } catch {
+      // The authorized member may have exited between validation and the signal.
+    }
   }
   return waitForProcessGroupGone(reference.pgid);
 }

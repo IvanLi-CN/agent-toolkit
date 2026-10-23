@@ -2,7 +2,7 @@
 
 import { constants, type Dirent } from "node:fs";
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
-import { lstat, link, mkdir, mkdtemp, open, opendir, realpath, rename, rm, unlink, type FileHandle } from "node:fs/promises";
+import { lstat, link, mkdir, mkdtemp, open, opendir, realpath, rename, rm, rmdir, unlink, type FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawnSupervised, SUPERVISOR_UNKNOWN_TARGET_STATUS, type SupervisedChild } from "./process_supervisor.ts";
@@ -64,6 +64,7 @@ const SNAPSHOT_OWNER_KEY_FILE_ENV = "DST_SNAPSHOT_OWNER_KEY_FILE";
 const SNAPSHOT_OWNER_KEY_BYTES = 32;
 const SNAPSHOT_TEMP_STALE_MS = 15 * 60 * 1000;
 const MAX_SNAPSHOT_TEMP_SCAN_ENTRIES = 128;
+const SNAPSHOT_DELETE_PREFIX = ".dst-snapshot-delete-";
 const SNAPSHOT_OWNER_WAIT_ATTEMPTS = 400;
 let snapshotOwnerKeyPromise: Promise<Uint8Array> | undefined;
 
@@ -547,8 +548,8 @@ export function redactSensitiveText(text: string): string {
     .replace(AUTHORIZATION_TOKEN, "$1 [REDACTED]")
     .replace(BRACKETED_SENSITIVE_ASSIGNMENT, "$1[REDACTED]")
     .replace(ENCODED_SENSITIVE_ASSIGNMENT, "$1[REDACTED]")
-    .replace(PERCENT_ENCODED_KEY_ASSIGNMENT, (match, rawKey: string, separator: string) => {
-      if (!rawKey.includes("%")) return match;
+    .replace(PERCENT_ENCODED_KEY_ASSIGNMENT, (match, rawKey: string, separator: string, value: string) => {
+      if (!rawKey.includes("%") && !separator.startsWith("%")) return match;
       let decodedKey: string;
       try {
         decodedKey = decodeURIComponent(rawKey);
@@ -556,7 +557,7 @@ export function redactSensitiveText(text: string): string {
         return match;
       }
       return new RegExp(`^${SENSITIVE_KEY}$`, "i").test(decodedKey)
-        ? `${rawKey}${separator} [REDACTED]`
+        ? `${match.slice(0, match.length - value.length)}[REDACTED]`
         : match;
     })
     .replace(SENSITIVE_ASSIGNMENT, "$1[REDACTED]")
@@ -571,7 +572,15 @@ export function redactOperationalText(text: string, values: string[] = []): stri
   for (const value of values.filter((candidate) => candidate.length > 0).sort((left, right) => right.length - left.length)) {
     redacted = redacted.split(value).join("<redacted-path>");
   }
-  return redactSensitiveText(redacted)
+  // Decode only path-relevant escapes before path redaction. Remote tools may
+  // percent-encode separators in diagnostics, which must not bypass the
+  // public path boundary.
+  redacted = redactSensitiveText(redacted)
+    .replace(/%2f/gi, "/")
+    .replace(/%5c/gi, "\\")
+    .replace(/%3a/gi, ":")
+    .replace(/%2e/gi, ".");
+  return redacted
     .replace(/\/(?:[^"'<>`\n,;)\]}]|\\ )+?(?=$|[\n"'<>`,;)\]}]|\s+[A-Za-z0-9_.-]+\s*[:=])/g, "<redacted-path>")
     .replace(/\b[A-Za-z]:[\\/](?:[^"'<>`\n,;)\]}]|\\ )+?(?=$|[\n"'<>`,;)\]}]|\s+[A-Za-z0-9_.-]+\s*[:=])/g, "<redacted-path>")
     .replace(/(^|[\s"'(=:])(?:\.\.?[\\/])+[^"'<>`\n,;)\]}]+/g, "$1<redacted-path>")
@@ -924,7 +933,45 @@ async function cleanupSnapshotTemporaryDirectories(root: string): Promise<void> 
         const metadata = await lstat(path);
         if (!metadata.isDirectory() || metadata.isSymbolicLink() || Date.now() - metadata.mtimeMs < SNAPSHOT_TEMP_STALE_MS) continue;
         if (await readMarkerForCleanup(join(path, ".owner"), `temp:${path}`) !== true) continue;
-        await rm(path, { recursive: true, force: true, maxRetries: 0 });
+        const initialIdentity = { dev: metadata.dev, ino: metadata.ino };
+        const tombstone = join(root, `${SNAPSHOT_DELETE_PREFIX}${randomUUID()}`);
+        await rename(path, tombstone);
+        try {
+          const moved = await lstat(tombstone);
+          if (!moved.isDirectory() || moved.isSymbolicLink() || moved.dev !== initialIdentity.dev || moved.ino !== initialIdentity.ino) throw new Error("snapshot temporary identity changed");
+          const children: Array<{ name: string; dev: number; ino: number }> = [];
+          const tombstoneDirectory = await opendir(tombstone);
+          try {
+            for await (const child of tombstoneDirectory) {
+              if (child.isDirectory()) throw new Error("snapshot temporary directory contains a nested directory");
+              const childMetadata = await lstat(join(tombstone, child.name));
+              if (childMetadata.isDirectory()) throw new Error("snapshot temporary directory contains a nested directory");
+              children.push({ name: child.name, dev: childMetadata.dev, ino: childMetadata.ino });
+            }
+          } finally {
+            await tombstoneDirectory.close().catch(() => undefined);
+          }
+          const beforeDelete = await lstat(tombstone);
+          if (!beforeDelete.isDirectory() || beforeDelete.isSymbolicLink() || beforeDelete.dev !== initialIdentity.dev || beforeDelete.ino !== initialIdentity.ino) throw new Error("snapshot temporary identity changed");
+          for (const child of children) {
+            const childPath = join(tombstone, child.name);
+            const childMetadata = await lstat(childPath);
+            if (childMetadata.isDirectory() || childMetadata.dev !== child.dev || childMetadata.ino !== child.ino) throw new Error("snapshot temporary entry changed");
+            await unlink(childPath);
+          }
+          const beforeRemoval = await lstat(tombstone);
+          if (!beforeRemoval.isDirectory() || beforeRemoval.isSymbolicLink() || beforeRemoval.dev !== initialIdentity.dev || beforeRemoval.ino !== initialIdentity.ino) throw new Error("snapshot temporary identity changed");
+          await rmdir(tombstone);
+          await syncDirectory(root).catch(() => undefined);
+        } catch {
+          try {
+            const original = await lstat(path).catch(() => undefined);
+            const remaining = await lstat(tombstone);
+            if (original === undefined && remaining.isDirectory() && !remaining.isSymbolicLink() && remaining.dev === initialIdentity.dev && remaining.ino === initialIdentity.ino) await rename(tombstone, path);
+          } catch {
+            // Preserve the tombstone when restoration cannot be proven safe.
+          }
+        }
       } catch {
         // Preserve a concurrently changing directory for a later invocation.
       }

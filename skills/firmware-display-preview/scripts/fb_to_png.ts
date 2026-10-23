@@ -2,7 +2,7 @@
 
 import { constants } from "node:fs";
 import { createHmac, randomBytes, randomUUID } from "node:crypto";
-import { lstat, link, mkdir, mkdtemp, open, opendir, rename, rm, rmdir, unlink, type FileHandle } from "node:fs/promises";
+import { lstat, link, mkdir, mkdtemp, open, opendir, rename, rmdir, unlink, type FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { deflateSync } from "node:zlib";
 import { basename, dirname, join, resolve } from "node:path";
@@ -21,6 +21,7 @@ const OWNER_KEY_FILE_ENV = "FB_TO_PNG_OWNER_KEY_FILE";
 const OWNER_KEY_BYTES = 32;
 const MAX_TEMP_DIRECTORY_SCAN_ENTRIES = 128;
 const TEMP_DIRECTORY_STALE_MS = 15 * 60 * 1000;
+const TEMP_DELETE_PREFIX = ".fb-to-png-delete-";
 let ownerKeyPromise: Promise<Uint8Array> | undefined;
 
 function noFollowFlag(): number {
@@ -514,6 +515,78 @@ export function parseArgs(args: string[]): CliOptions | "help" {
   return { format, width, height, input, output, strideBytes, endian, bitOrder, ssd1306BitOrder, invert };
 }
 
+type DirectoryIdentity = { dev: number; ino: number };
+
+function sameDirectoryIdentity(left: DirectoryIdentity, right: DirectoryIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+async function inspectTemporaryDirectory(path: string, outputName: string, requireOutput: boolean): Promise<DirectoryIdentity | undefined> {
+  try {
+    const metadata = await lstat(path);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink() || (metadata.mode & 0o777) !== 0o700) return undefined;
+    const entries: string[] = [];
+    const directory = await opendir(path);
+    try {
+      for await (const entry of directory) {
+        if (entry.name !== ".owner" && entry.name !== outputName) return undefined;
+        if (entry.isSymbolicLink() || !entry.isFile()) return undefined;
+        entries.push(entry.name);
+      }
+    } finally {
+      await directory.close().catch(() => undefined);
+    }
+    if (!entries.includes(".owner") || (requireOutput && !entries.includes(outputName))) return undefined;
+    return { dev: metadata.dev, ino: metadata.ino };
+  } catch {
+    return undefined;
+  }
+}
+
+async function restoreTemporaryDirectory(original: string, tombstone: string, expected: DirectoryIdentity): Promise<void> {
+  try {
+    await lstat(original);
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
+  }
+  try {
+    const metadata = await lstat(tombstone);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink() || !sameDirectoryIdentity({ dev: metadata.dev, ino: metadata.ino }, expected)) return;
+    await rename(tombstone, original);
+  } catch {
+    // Preserve the tombstone when restoration cannot be proven safe.
+  }
+}
+
+async function removeTemporaryDirectory(path: string, outputName: string, requireOutput: boolean): Promise<boolean> {
+  const initial = await inspectTemporaryDirectory(path, outputName, requireOutput);
+  if (initial === undefined) return false;
+  const tombstone = join(dirname(path), `${TEMP_DELETE_PREFIX}${randomUUID()}`);
+  try {
+    await rename(path, tombstone);
+    const moved = await inspectTemporaryDirectory(tombstone, outputName, requireOutput);
+    if (moved === undefined || !sameDirectoryIdentity(moved, initial)) {
+      await restoreTemporaryDirectory(path, tombstone, initial);
+      return false;
+    }
+    const entries: string[] = [];
+    const directory = await opendir(tombstone);
+    try {
+      for await (const entry of directory) entries.push(entry.name);
+    } finally {
+      await directory.close().catch(() => undefined);
+    }
+    for (const entry of entries) await unlink(join(tombstone, entry));
+    await rmdir(tombstone);
+    await syncDirectory(dirname(path)).catch(() => undefined);
+    return true;
+  } catch {
+    await restoreTemporaryDirectory(path, tombstone, initial);
+    return false;
+  }
+}
+
 async function cleanupStaleTemporaryDirectories(parent: string): Promise<void> {
   let directory;
   try {
@@ -535,22 +608,7 @@ async function cleanupStaleTemporaryDirectories(parent: string): Promise<void> {
         if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) continue;
         const ownedOutput = await ownedTemporaryOutput(join(temporaryDirectory, ".owner"), basename(temporaryDirectory));
         if (ownedOutput === undefined || ownerProcessMayBeAlive(ownedOutput.ownerPid)) continue;
-        const outputName = ownedOutput.outputName;
-        const entries: string[] = [];
-        const contents = await opendir(temporaryDirectory);
-        try {
-          for await (const child of contents) {
-            if (child.name !== ".owner" && child.name !== outputName) throw new Error("unexpected framebuffer temp entry");
-            if (child.isSymbolicLink() || !child.isFile()) throw new Error("unsafe framebuffer temp entry");
-            entries.push(child.name);
-          }
-        } finally {
-          await contents.close().catch(() => undefined);
-        }
-        if (entries.length !== 2 || !entries.includes(outputName)) continue;
-        await unlink(join(temporaryDirectory, outputName));
-        await unlink(join(temporaryDirectory, ".owner"));
-        await rmdir(temporaryDirectory);
+        await removeTemporaryDirectory(temporaryDirectory, ownedOutput.outputName, true);
       } catch {
         // Preserve an unexpected or concurrently changing directory.
       }
@@ -595,8 +653,14 @@ async function writePngAtomically(outputPath: string, data: Uint8Array): Promise
     }
   } finally {
     await unlink(temporaryPath).catch(() => undefined);
-    await rm(temporaryDirectory, { recursive: true, force: true });
+    await removeTemporaryDirectory(temporaryDirectory, basename(outputPath), false);
   }
+}
+
+function redactDiagnosticMessage(message: string): string {
+  return message
+    .replace(/(^|[\s"'(=:])((?:\/|[A-Za-z]:[\\/])[^"'<>`\n,;)}\] ]*)/g, "$1<redacted-path>")
+    .replace(/(^|[\s"'(=:])(?:\.\.?[\\/])+[^"'<>`\n,;)}\]]+/g, "$1<redacted-path>");
 }
 
 export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> {
@@ -625,7 +689,8 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     console.log("[OK] Wrote: " + outputPath);
     return 0;
   } catch (error) {
-    console.error(`error: ${error instanceof Error ? error.message : String(error)}`);
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`error: ${redactDiagnosticMessage(message)}`);
     return error instanceof CliError ? error.exitCode : 1;
   }
 }

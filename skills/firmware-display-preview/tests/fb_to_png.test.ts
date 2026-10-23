@@ -16,6 +16,17 @@ async function captureStdout<T>(callback: () => Promise<T>): Promise<{ value: T;
   }
 }
 
+async function captureStderr<T>(callback: () => Promise<T>): Promise<{ value: T; stderr: string[] }> {
+  const originalError = console.error;
+  const stderr: string[] = [];
+  console.error = (...args: unknown[]) => stderr.push(args.map(String).join(" "));
+  try {
+    return { value: await callback(), stderr };
+  } finally {
+    console.error = originalError;
+  }
+}
+
 function crc32(data: Uint8Array): number {
   let value = 0xffffffff;
   for (const byte of data) {
@@ -172,6 +183,20 @@ describe("framebuffer to PNG helper", () => {
     expect(await main(["--width"])).toBe(2);
     expect(await main(["--format", "invalid", "--width", "1", "--height", "1", "--in", "fixture", "--out", "fixture"])).toBe(2);
     expect(parseArgs(["--format=gray8", "--width=+1", "--height=+1", "--in=fixture", "--out=fixture"])).toMatchObject({ format: "gray8", width: 1, height: 1, input: "fixture", output: "fixture" });
+  });
+
+  test("redacts absolute paths from CLI diagnostics", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-fb-diagnostic-path-"));
+    try {
+      const input = join(root, "private", "frame.raw");
+      const output = join(root, "preview.png");
+      const captured = await captureStderr(() => main(["--format", "gray8", "--width", "1", "--height", "1", "--in", input, "--out", output]));
+      expect(captured.value).toBe(1);
+      expect(captured.stderr.join(" ")).toContain("<redacted-path>");
+      expect(captured.stderr.join(" ")).not.toContain(input);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test("rejects input files with unbounded trailing data", async () => {

@@ -2,7 +2,7 @@
 
 import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, link, mkdir, mkdtemp, open, opendir, readFile, readlink, realpath, rename, rm, rmdir, unlink, utimes } from "node:fs/promises";
+import { lstat, link, mkdir, mkdtemp, open, opendir, readFile, readlink, realpath, rename, rmdir, unlink, utimes } from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
@@ -798,7 +798,29 @@ async function removeDirectoryIfIdentityMatches(
     if (!await validate(path)) return false;
     const beforeRemoval = await lstat(path);
     if (!beforeRemoval.isDirectory() || beforeRemoval.isSymbolicLink() || !sameDirectoryIdentity(directoryIdentity(beforeRemoval), expectedIdentity)) return false;
-    await rm(path, { recursive: true, force: true, maxRetries: 0 });
+    const entries: Array<{ name: string; identity: DirectoryIdentity }> = [];
+    const directory = await opendir(path);
+    try {
+      for await (const entry of directory) {
+        if (entry.isDirectory()) return false;
+        const child = await lstat(join(path, entry.name));
+        if (child.isDirectory()) return false;
+        entries.push({ name: entry.name, identity: directoryIdentity(child) });
+      }
+    } finally {
+      await directory.close().catch(() => undefined);
+    }
+    const beforeDelete = await lstat(path);
+    if (!beforeDelete.isDirectory() || beforeDelete.isSymbolicLink() || !sameDirectoryIdentity(directoryIdentity(beforeDelete), expectedIdentity)) return false;
+    for (const entry of entries) {
+      const childPath = join(path, entry.name);
+      const child = await lstat(childPath);
+      if (child.isDirectory() || !sameDirectoryIdentity(directoryIdentity(child), entry.identity)) return false;
+      await unlink(childPath);
+    }
+    const beforeRmdir = await lstat(path);
+    if (!beforeRmdir.isDirectory() || beforeRmdir.isSymbolicLink() || !sameDirectoryIdentity(directoryIdentity(beforeRmdir), expectedIdentity)) return false;
+    await rmdir(path);
     return true;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
@@ -1267,6 +1289,7 @@ export async function discardInstalledLockDirectory(directory: string, expectedO
   try {
     const metadata = await lstat(directory);
     if (!metadata.isDirectory() || metadata.isSymbolicLink()) return;
+    const initialIdentity = directoryIdentity(metadata);
     const owner = new TextDecoder().decode(await readRegularFile(join(directory, "owner"), 128)).trim();
     if (owner !== expectedOwner) return;
     for (const name of LOCK_ENTRY_NAMES) {
@@ -1281,8 +1304,21 @@ export async function discardInstalledLockDirectory(directory: string, expectedO
     }
     tombstone = join(dirname(directory), `${DELETE_TOMBSTONE_PREFIX}${randomUUID()}`);
     await rename(directory, tombstone);
-    for (const name of preservedEntries.keys()) await unlink(join(tombstone, name));
-    await rmdir(tombstone);
+    const tombstoneMetadata = await lstat(tombstone);
+    if (!tombstoneMetadata.isDirectory() || tombstoneMetadata.isSymbolicLink() || !sameDirectoryIdentity(directoryIdentity(tombstoneMetadata), initialIdentity)) {
+      await restoreRenamedDirectory(directory, tombstone, initialIdentity);
+      return;
+    }
+    const removed = await removeDirectoryIfIdentityMatches(tombstone, directoryIdentity(tombstoneMetadata), async (candidate) => {
+      const listing = await readDirectoryEntriesBounded(candidate, LOCK_ENTRY_NAMES.size + 1);
+      if (listing.truncated || listing.entries.some((entry) => entry.isDirectory() || entry.isSymbolicLink() || !LOCK_ENTRY_NAMES.has(entry.name))) return false;
+      const ownerText = new TextDecoder().decode(await readRegularFile(join(candidate, "owner"), 128)).trim();
+      return ownerText === expectedOwner;
+    });
+    if (!removed) {
+      await restoreRenamedDirectory(directory, tombstone, directoryIdentity(tombstoneMetadata));
+      return;
+    }
     tombstone = undefined;
     preservedEntries.clear();
     await syncDirectory(dirname(directory)).catch(() => undefined);

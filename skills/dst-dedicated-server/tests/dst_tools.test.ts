@@ -104,6 +104,9 @@ describe.serial("DST local Bun tooling", () => {
     const mixedSecrets = ["passphrase", "=", "fixture-secret", " pwd ", "fixture-secret"].join("");
     expect(redactSensitiveText(mixedSecrets)).toBe("passphrase=[REDACTED] pwd [REDACTED]");
     expect(redactOperationalText("permission denied: foo\\..\\private\\fixture-secret")).toContain("<redacted-path>");
+    expect(redactOperationalText("file=%2FUsers%2Fivan%2Fprivate%2Fkey")).toContain("<redacted-path>");
+    expect(redactOperationalText("path=..%2F..%2Fprivate%2Fkey")).toContain("<redacted-path>");
+    expect(redactOperationalText("file=C%3A%5CUsers%5Civan%5Cprivate%5Ckey")).toContain("<redacted-path>");
     expect(redactOperationalText("provider credentials fixture-secret")).not.toContain("fixture-secret");
     expect(redactOperationalText("access_token fixture-access-token-secret")).not.toContain("fixture-access-token-secret");
     expect(redactOperationalText("accessToken fixture-camel-token-secret")).not.toContain("fixture-camel-token-secret");

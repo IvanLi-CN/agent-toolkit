@@ -2,7 +2,7 @@
 
 import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, link, mkdir, mkdtemp, open, opendir, readFile, readlink, rename, rm, unlink, utimes } from "node:fs/promises";
+import { lstat, link, mkdir, mkdtemp, open, opendir, readFile, readlink, realpath, rename, rm, unlink, utimes } from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
@@ -766,6 +766,17 @@ async function syncDirectory(path: string): Promise<void> {
   }
 }
 
+async function resolveRealOutputDirectory(path: string, create = false): Promise<string> {
+  const resolved = resolve(path);
+  if (create) await mkdir(resolved, { recursive: true });
+  const metadata = await lstat(resolved);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error("output directory must be a real directory");
+  const canonical = await realpath(resolved);
+  const canonicalMetadata = await lstat(canonical);
+  if (!canonicalMetadata.isDirectory() || canonicalMetadata.isSymbolicLink()) throw new Error("output directory must be a real directory");
+  return canonical;
+}
+
 type DirectoryIdentity = Pick<Awaited<ReturnType<typeof lstat>>, "dev" | "ino">;
 
 function directoryIdentity(metadata: Awaited<ReturnType<typeof lstat>>): DirectoryIdentity {
@@ -792,6 +803,27 @@ async function removeDirectoryIfIdentityMatches(
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw error;
+  }
+}
+
+async function restoreRenamedDirectory(
+  original: string,
+  tombstone: string,
+  expectedIdentity: DirectoryIdentity,
+): Promise<boolean> {
+  try {
+    await lstat(original);
+    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
+  }
+  try {
+    const metadata = await lstat(tombstone);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink() || !sameDirectoryIdentity(directoryIdentity(metadata), expectedIdentity)) return false;
+    await rename(tombstone, original);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -828,11 +860,15 @@ async function removeTransactionDirectory(directory: string): Promise<void> {
   const tombstoneIdentity = await inspect(tombstone);
   if (tombstoneIdentity === undefined
     || tombstoneIdentity.dev !== initialIdentity.dev
-    || tombstoneIdentity.ino !== initialIdentity.ino) return;
+    || tombstoneIdentity.ino !== initialIdentity.ino) {
+    await restoreRenamedDirectory(directory, tombstone, initialIdentity);
+    return;
+  }
   if (await removeDirectoryIfIdentityMatches(tombstone, tombstoneIdentity, async (candidate) => {
     const identity = await inspect(candidate);
     return identity !== undefined && sameDirectoryIdentity(identity, tombstoneIdentity);
   })) await syncDirectory(dirname(directory));
+  else await restoreRenamedDirectory(directory, tombstone, tombstoneIdentity);
 }
 
 async function cleanupDeleteTombstones(outDir: string, startingScan = 0): Promise<number> {
@@ -1182,7 +1218,10 @@ async function removeLockDirectory(directory: string, expectedOwner?: string): P
   if (tombstoneMetadata === undefined
     || !tombstoneMetadata.isDirectory()
     || tombstoneMetadata.isSymbolicLink()
-    || !sameDirectoryIdentity(directoryIdentity(tombstoneMetadata), initialIdentity)) return false;
+    || !sameDirectoryIdentity(directoryIdentity(tombstoneMetadata), initialIdentity)) {
+    await restoreRenamedDirectory(directory, tombstone, initialIdentity);
+    return false;
+  }
   const removed = await removeDirectoryIfIdentityMatches(tombstone, directoryIdentity(tombstoneMetadata), async (candidate) => {
     const listing = await readDirectoryEntriesBounded(candidate, LOCK_ENTRY_NAMES.size + 1);
     if (listing.truncated || listing.entries.length === 0 || listing.entries.some((entry) => entry.isDirectory() || entry.isSymbolicLink() || !LOCK_ENTRY_NAMES.has(entry.name))) return false;
@@ -1190,7 +1229,10 @@ async function removeLockDirectory(directory: string, expectedOwner?: string): P
     const owner = new TextDecoder().decode(await readRegularFile(join(candidate, "owner"), 128)).trim();
     return owner === expectedOwner;
   });
-  if (!removed) return false;
+  if (!removed) {
+    await restoreRenamedDirectory(directory, tombstone, directoryIdentity(tombstoneMetadata));
+    return false;
+  }
   await syncDirectory(dirname(directory));
   return true;
 }
@@ -1205,11 +1247,15 @@ async function discardTemporaryLockDirectory(directory: string): Promise<void> {
     const tombstone = join(dirname(directory), `${DELETE_TOMBSTONE_PREFIX}${randomUUID()}`);
     await rename(directory, tombstone);
     const tombstoneMetadata = await lstat(tombstone);
-    if (!tombstoneMetadata.isDirectory() || tombstoneMetadata.isSymbolicLink() || !sameDirectoryIdentity(directoryIdentity(tombstoneMetadata), initialIdentity)) return;
+    if (!tombstoneMetadata.isDirectory() || tombstoneMetadata.isSymbolicLink() || !sameDirectoryIdentity(directoryIdentity(tombstoneMetadata), initialIdentity)) {
+      await restoreRenamedDirectory(directory, tombstone, initialIdentity);
+      return;
+    }
     if (await removeDirectoryIfIdentityMatches(tombstone, directoryIdentity(tombstoneMetadata), async (candidate) => {
       const currentListing = await readDirectoryEntriesBounded(candidate, LOCK_ENTRY_NAMES.size + 1);
       return !currentListing.truncated && currentListing.entries.every((entry) => !entry.isDirectory() && !entry.isSymbolicLink() && LOCK_ENTRY_NAMES.has(entry.name));
     })) await syncDirectory(dirname(directory));
+    else await restoreRenamedDirectory(directory, tombstone, directoryIdentity(tombstoneMetadata));
   } catch {
     // An incomplete temporary lock is never the canonical lock; preserve it for a later retry.
   }
@@ -1414,18 +1460,16 @@ async function publishOutputs(outDir: string, stem: string, midi: Uint8Array, wa
 
 export async function readPublishedPair(outDir: string, stem: string): Promise<{ midi: Uint8Array; wav: Uint8Array }> {
   validateStem(stem);
-  const resolvedOutDir = resolve(outDir);
-  const outDirMetadata = await lstat(resolvedOutDir);
-  if (!outDirMetadata.isDirectory() || outDirMetadata.isSymbolicLink()) throw new Error("output directory must be a real directory");
+  const resolvedOutDir = await resolveRealOutputDirectory(outDir);
   const midiPath = join(resolvedOutDir, `${stem}.mid`);
   const wavPath = join(resolvedOutDir, `${stem}.wav`);
   let lastError: unknown;
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
     try {
-      const release = await acquirePublishLock(outDir, stem, true);
+      const release = await acquirePublishLock(resolvedOutDir, stem, true);
       try {
-        await recoverPublishTransactions(outDir, stem, midiPath, wavPath);
+        await recoverPublishTransactions(resolvedOutDir, stem, midiPath, wavPath);
         return {
           midi: await readRegularFile(midiPath, MAX_PUBLISHED_MIDI_BYTES),
           wav: await readRegularFile(wavPath, MAX_PUBLISHED_WAV_BYTES),
@@ -1450,16 +1494,14 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
       return 0;
     }
     const inputPath = resolve(expandUser(parsed.input));
-    const outDir = resolve(expandUser(parsed.outDir));
-    await mkdir(outDir, { recursive: true });
-    const outDirStat = await lstat(outDir);
-    if (!outDirStat.isDirectory() || outDirStat.isSymbolicLink()) throw new CliError("--out-dir must resolve to a real directory");
+    const displayOutDir = resolve(expandUser(parsed.outDir));
+    const outDir = await resolveRealOutputDirectory(displayOutDir, true);
     const { config, events } = await parseScoreFile(inputPath);
     const stem = validateStem(parsed.stem ?? basename(inputPath, extname(inputPath)));
     const [midiPath, wavPath] = await publishOutputs(outDir, stem, encodeMidi(config, events), encodeWav(config, events));
     const totalSeconds = events.reduce((total, event) => total + event.durationS, 0);
-    console.log(`[OK] Wrote: ${midiPath}`);
-    console.log(`[OK] Wrote: ${wavPath}`);
+    console.log(`[OK] Wrote: ${join(displayOutDir, basename(midiPath))}`);
+    console.log(`[OK] Wrote: ${join(displayOutDir, basename(wavPath))}`);
     console.log(`[INFO] Duration: ${totalSeconds.toFixed(2)}s, tempo=${config.tempoBpm} bpm, waveform=${config.audio.waveform}`);
     return 0;
   } catch (error) {

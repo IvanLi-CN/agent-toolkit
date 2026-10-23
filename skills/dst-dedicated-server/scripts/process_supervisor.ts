@@ -41,6 +41,11 @@ shift
 status_dir="$(dirname -- "$status_path")"
 target_marker="\${AGENT_TOOLKIT_TARGET_MARKER:-unbound}"
 supervisor_pid="$$"
+cleanup_owner_nonce="$(LC_ALL=C od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d '[:space:]' || true)"
+case "$cleanup_owner_nonce" in
+  [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]) ;;
+  *) cleanup_owner_nonce="$target_marker" ;;
+esac
 ready_path="$status_dir/ready"
 cleanup_started_path="$status_dir/cleanup-started"
 cleanup_complete_path="$status_dir/cleanup-complete"
@@ -128,6 +133,11 @@ safe_write_file() {
     print {$fh} $value, "\n" or exit 1;
     close($fh) or exit 1;
   ' "$marker_path" "$marker_value" "$supervisor_no_follow"
+}
+atomic_rename_path() {
+  [ -n "$supervisor_no_follow" ] || return 1
+  if ! command -v perl >/dev/null 2>&1; then return 1; fi
+  perl -e 'rename $ARGV[0], $ARGV[1] or exit 1' "$1" "$2"
 }
 safe_append_line() {
   marker_path="$1"
@@ -328,8 +338,23 @@ ensure_marker() {
 acquire_cleanup_owner() {
   # The signal path and detached cleaner share status_dir; only one may mutate
   # the ledger or publish the cleanup acknowledgement.
-  if ! mkdir "$cleanup_owner_path" 2>/dev/null; then return 1; fi
-  write_marker_exclusive "$cleanup_owner_path/pid" "$$"
+  cleanup_owner_candidate="$(mktemp -d "$status_dir/.cleanup-owner-candidate.XXXXXX" 2>/dev/null || true)"
+  if [ -z "$cleanup_owner_candidate" ] || ! write_marker_exclusive "$cleanup_owner_candidate/owner" "$$:$cleanup_owner_nonce"; then
+    if [ -n "$cleanup_owner_candidate" ]; then rm -f -- "$cleanup_owner_candidate/owner" 2>/dev/null || true; rmdir "$cleanup_owner_candidate" 2>/dev/null || true; fi
+    return 2
+  fi
+  if atomic_rename_path "$cleanup_owner_candidate" "$cleanup_owner_path"; then return 0; fi
+  rm -f -- "$cleanup_owner_candidate/owner" 2>/dev/null || true
+  rmdir "$cleanup_owner_candidate" 2>/dev/null || true
+  if [ -d "$cleanup_owner_path" ] && [ ! -L "$cleanup_owner_path" ]; then
+    cleanup_owner_record="$(read_regular_marker "$cleanup_owner_path/owner" 256 2>/dev/null || true)"
+    if [ "$cleanup_owner_record" = "$$:$cleanup_owner_nonce" ]; then return 1; fi
+    rm -f -- "$cleanup_owner_path/owner" 2>/dev/null || true
+    if rmdir "$cleanup_owner_path" 2>/dev/null; then
+      return 2
+    fi
+  fi
+  return 2
 }
 cleanup() {
   if [ -e "$descendant_scan_truncated_path" ] || [ -e "$descendant_scan_failed_path" ] || [ -e "$snapshot_failed_path" ]; then cleanup_ack_enabled=0; fi
@@ -2205,7 +2230,17 @@ stop_watchdog() {
 }
 terminate_supervised_tree() {
   if [ "$termination_started" = "1" ]; then return 0; fi
-  if ! acquire_cleanup_owner; then return 0; fi
+  acquire_cleanup_owner
+  cleanup_owner_status=$?
+  case "$cleanup_owner_status" in
+    0) ;;
+    1) return 0 ;;
+    *)
+      cleanup_ack_enabled=0
+      cleanup
+      return 1
+      ;;
+  esac
   termination_started=1
   ensure_marker "$cleanup_started_path" || cleanup_ack_enabled=0
   signal_tree TERM

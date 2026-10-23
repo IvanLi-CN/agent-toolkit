@@ -61,6 +61,8 @@ describe.serial("DST local Bun tooling", () => {
     expect(redactSensitiveText('["api_key"] [0] = spaced-index-secret')).not.toContain("spaced-index-secret");
     expect(redactSensitiveText('["api_key"][0]%3Dencoded-index-secret')).not.toContain("encoded-index-secret");
     expect(redactSensitiveText("api_key%3Dfixture-secret")).not.toContain("fixture-secret");
+    expect(redactSensitiveText("api%5Fkey=percent-encoded-key-secret")).not.toContain("percent-encoded-key-secret");
+    expect(redactSensitiveText("api%5Fkey%3Dencoded-separator-secret")).not.toContain("encoded-separator-secret");
     expect(redactSensitiveText("password: |\n  fixture-secret\nnext: visible")).not.toContain("fixture-secret");
     expect(redactSensitiveText("api_\u001b[31mkey=fixture-secret")).not.toContain("fixture-secret");
     expect(redactSensitiveText("token\u001b[31mANSI_SECRET")).not.toContain("ANSI_SECRET");
@@ -1754,6 +1756,61 @@ try {
         try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
         await supervised.wrapperExited.catch(() => undefined);
         await supervised.cleanup();
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("recovers when the target preclaims the cleanup owner directory", { timeout: 90_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-owner-canary-"));
+    const marker = join(root, "child.pid");
+    const claimed = join(root, "claimed");
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    let childPid: number | undefined;
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    try {
+      supervised = await spawnSupervised([
+        "sh",
+        "-c",
+        "sleep 30 & child=$!; printf '%s\\n' \"$child\" > \"$1\"; attempt=0; while [ \"$attempt\" -lt 1000 ]; do for path in \"$3\"/.agent-toolkit-dst-supervisor-*; do if [ -d \"$path\" ] && mkdir \"$path/cleanup-owner\" 2>/dev/null; then : > \"$2\"; break 2; fi; done; attempt=$((attempt + 1)); sleep 0.01; done; wait \"$child\"",
+        "agent-toolkit-supervised-target",
+        marker,
+        claimed,
+        tmpdir(),
+      ]);
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        try {
+          childPid = Number((await readFile(marker, "utf8")).trim());
+          if (Number.isInteger(childPid) && childPid > 0 && (await lstat(claimed).catch(() => undefined))?.isFile() === true) break;
+        } catch {
+          // The target may still be publishing its markers.
+        }
+        await Bun.sleep(25);
+      }
+      expect(childPid).toBeDefined();
+      expect((await lstat(claimed).catch(() => undefined))?.isFile()).toBe(true);
+      expect(isAlive(childPid!)).toBe(true);
+      supervised.child.kill("SIGTERM");
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(true);
+      await supervised.wrapperExited;
+      for (let attempt = 0; attempt < 40 && isAlive(childPid!); attempt += 1) await Bun.sleep(100);
+      expect(isAlive(childPid!)).toBe(false);
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (childPid !== undefined && isAlive(childPid)) {
+        try { process.kill(childPid, "SIGKILL"); } catch { /* The child may have exited. */ }
       }
       await rm(root, { recursive: true, force: true });
     }

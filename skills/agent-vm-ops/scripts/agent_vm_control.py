@@ -104,13 +104,15 @@ TASK_STATES = frozenset(("absent", "cached", "preparing", "active", "closing", "
 
 
 GUEST_ROOT_GROWTH_SCRIPT = r"""
-import json, os, re, shutil, subprocess, sys, tempfile, time
+import json, os, re, selectors, shutil, signal, subprocess, sys, time
 
 TARGET_BYTES = int(sys.argv[1]) * 1024**3
 MINIMUM_FILESYSTEM_RATIO = 95
 COMMAND_TIMEOUT = 45
 STDOUT_LIMIT = 8192
 STDERR_LIMIT = 4000
+REPORT_STDOUT_LIMIT = 1024
+REPORT_STDERR_LIMIT = 512
 capacity = {"requested_bytes": TARGET_BYTES, "verified": False}
 attempts = []
 
@@ -120,6 +122,52 @@ def clip(value, limit=4000, *, tail=True):
         value = value.decode("utf-8", "replace")
     value = str(value or "")
     return value[-limit:] if tail else value[:limit]
+
+
+def compact_failure(value, stdout_limit, stderr_limit):
+    if not isinstance(value, dict):
+        return value
+    compacted = dict(value)
+    for key, limit, tail in (("stdout", stdout_limit, False), ("stderr", stderr_limit, True)):
+        if key not in compacted:
+            continue
+        raw = compacted[key]
+        compacted[key] = clip(raw, limit, tail=tail)
+        compacted[key + "_truncated"] = bool(value.get(key + "_truncated")) or len(
+            str(raw or "").encode("utf-8", "replace")
+        ) > limit
+    retry_of = compacted.get("retry_of")
+    if isinstance(retry_of, dict):
+        compacted["retry_of"] = compact_failure(retry_of, stdout_limit, stderr_limit)
+    failure_capacity = compacted.get("capacity")
+    if isinstance(failure_capacity, dict):
+        failure_capacity = dict(failure_capacity)
+        for key in ("filesystem", "source", "parent", "partition"):
+            if isinstance(failure_capacity.get(key), str):
+                failure_capacity[key] = clip(failure_capacity[key], 256, tail=False)
+        tools = failure_capacity.get("tools")
+        if isinstance(tools, dict):
+            failure_capacity["tools"] = {
+                key: clip(value, 256, tail=False) if isinstance(value, str) else value
+                for key, value in tools.items()
+            }
+        records = failure_capacity.get("attempts")
+        if isinstance(records, list):
+            compacted_records = []
+            for record in records:
+                if not isinstance(record, dict):
+                    compacted_records.append(record)
+                    continue
+                compacted_record = dict(record)
+                for key in ("error", "refresh_error"):
+                    if isinstance(compacted_record.get(key), dict):
+                        compacted_record[key] = compact_failure(
+                            compacted_record[key], stdout_limit, stderr_limit
+                        )
+                compacted_records.append(compacted_record)
+            failure_capacity["attempts"] = compacted_records
+        compacted["capacity"] = failure_capacity
+    return compacted
 
 
 def transient_failure(command, stdout, stderr):
@@ -142,7 +190,8 @@ def transient_failure(command, stdout, stderr):
 class GuestFailure(Exception):
     def __init__(self, phase, command=None, returncode=None, stdout="", stderr="",
                  *, cause=None, transient=False, retry_of=None,
-                 stdout_truncated=False, stderr_truncated=False):
+                 stdout_truncated=False, stderr_truncated=False,
+                 process_group_killed=None, process_group_cleanup_error=None):
         super().__init__(phase)
         self.phase = phase
         self.command = list(command or [])
@@ -154,14 +203,16 @@ class GuestFailure(Exception):
         self.retry_of = retry_of
         self.stdout_truncated = stdout_truncated
         self.stderr_truncated = stderr_truncated
+        self.process_group_killed = process_group_killed
+        self.process_group_cleanup_error = process_group_cleanup_error
 
-    def as_dict(self):
+    def as_dict(self, *, report=False, stdout_limit=None, stderr_limit=None):
         value = {
             "phase": self.phase,
             "command": self.command,
             "returncode": self.returncode,
             "stdout": clip(self.stdout, STDOUT_LIMIT, tail=False),
-            "stderr": clip(self.stderr),
+            "stderr": clip(self.stderr, STDERR_LIMIT),
             "capacity": dict(capacity),
             "transient": self.transient,
             "stdout_truncated": self.stdout_truncated,
@@ -171,64 +222,193 @@ class GuestFailure(Exception):
             value["cause"] = self.cause
         if self.retry_of:
             value["retry_of"] = self.retry_of
-        return value
+        if self.process_group_killed is not None:
+            value["process_group_killed"] = self.process_group_killed
+            value["process_group_cleanup_error"] = self.process_group_cleanup_error
+        if not report:
+            return value
+        return compact_failure(
+            value,
+            REPORT_STDOUT_LIMIT if stdout_limit is None else stdout_limit,
+            REPORT_STDERR_LIMIT if stderr_limit is None else stderr_limit,
+        )
 
 
 def run(command, phase, *, check=True):
-    def bounded_output(handle, fallback, limit, *, tail=False):
-        handle.flush()
-        handle.seek(0, os.SEEK_END)
-        size = handle.tell()
-        if size:
-            handle.seek(max(0, size - limit) if tail else 0)
-            value = handle.read(limit)
-            return value.decode("utf-8", "replace"), size > limit
-        if fallback is None:
-            return "", False
-        if isinstance(fallback, str):
-            fallback = fallback.encode("utf-8", "replace")
-        value = fallback[-limit:] if tail else fallback[:limit]
-        return value.decode("utf-8", "replace"), len(fallback) > limit
+    stdout = bytearray()
+    stderr = bytearray()
+    stdout_truncated = False
+    stderr_truncated = False
 
-    try:
-        with tempfile.SpooledTemporaryFile(max_size=STDOUT_LIMIT) as stdout_file, \
-             tempfile.SpooledTemporaryFile(max_size=STDERR_LIMIT) as stderr_file:
+    def retain_stdout(chunk):
+        nonlocal stdout_truncated
+        available = max(0, STDOUT_LIMIT - len(stdout))
+        if available:
+            stdout.extend(chunk[:available])
+        if len(chunk) > available:
+            stdout_truncated = True
+
+    def retain_stderr(chunk):
+        nonlocal stderr_truncated
+        stderr.extend(chunk)
+        if len(stderr) > STDERR_LIMIT:
+            stderr_truncated = True
+            del stderr[:-STDERR_LIMIT]
+
+    def read_ready(selector, events):
+        for key, _ in events:
             try:
-                result = subprocess.run(
-                    command,
-                    check=False,
-                    stdout=stdout_file,
-                    stderr=stderr_file,
-                    timeout=COMMAND_TIMEOUT,
-                )
-            except subprocess.TimeoutExpired as error:
-                stdout, stdout_truncated = bounded_output(stdout_file, error.stdout, STDOUT_LIMIT)
-                stderr, stderr_truncated = bounded_output(stderr_file, error.stderr, STDERR_LIMIT, tail=True)
-                raise GuestFailure(
-                    phase,
-                    command,
-                    stdout=stdout,
-                    stderr=stderr,
-                    cause="command_timeout",
-                    stdout_truncated=stdout_truncated,
-                    stderr_truncated=stderr_truncated,
-                ) from error
-            stdout, stdout_truncated = bounded_output(stdout_file, result.stdout, STDOUT_LIMIT)
-            stderr, stderr_truncated = bounded_output(stderr_file, result.stderr, STDERR_LIMIT, tail=True)
-    except FileNotFoundError:
-        raise GuestFailure(phase, command, cause="command_missing")
-    if check and result.returncode:
+                chunk = os.read(key.fileobj.fileno(), 65536)
+            except (OSError, ValueError):
+                chunk = b""
+            if not chunk:
+                try:
+                    selector.unregister(key.fileobj)
+                except (KeyError, ValueError):
+                    pass
+                continue
+            if key.data == "stdout":
+                retain_stdout(chunk)
+            else:
+                retain_stderr(chunk)
+
+    def drain_until(selector, deadline):
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            read_ready(selector, selector.select(min(0.25, remaining)))
+        return True
+
+    def process_group_members(pgid):
+        members = []
+        complete = True
+        try:
+            entries = os.scandir("/proc")
+        except OSError as error:
+            return [], False, type(error).__name__
+        with entries:
+            for entry in entries:
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    with open(os.path.join(entry.path, "stat"), encoding="utf-8") as handle:
+                        raw_stat = handle.read()
+                    close_paren = raw_stat.rfind(")")
+                    fields = raw_stat[close_paren + 2:].split()
+                    if close_paren < 0 or len(fields) < 3:
+                        raise ValueError("invalid process stat")
+                    if fields[0] != "Z" and int(fields[2]) == pgid:
+                        members.append(int(entry.name))
+                except FileNotFoundError:
+                    continue
+                except (OSError, ValueError):
+                    complete = False
+        return members, complete, None
+
+    def kill_process_group_members(pgid):
+        cleanup_error = None
+        for _ in range(3):
+            members, complete, inspection_error = process_group_members(pgid)
+            if not complete:
+                return False, inspection_error or "process_group_inspection_failed"
+            if not members:
+                return True, cleanup_error
+            for pid in members:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    continue
+                except OSError as error:
+                    cleanup_error = type(error).__name__
+        members, complete, inspection_error = process_group_members(pgid)
+        if complete and not members:
+            return True, cleanup_error
+        return False, cleanup_error or inspection_error or "process_group_members_remain"
+
+    process = None
+    selector = selectors.DefaultSelector()
+    try:
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+        except FileNotFoundError:
+            raise GuestFailure(phase, command, cause="command_missing")
+        for stream, name in ((process.stdout, "stdout"), (process.stderr, "stderr")):
+            if stream is not None:
+                selector.register(stream, selectors.EVENT_READ, name)
+        deadline = time.monotonic() + COMMAND_TIMEOUT
+        if not drain_until(selector, deadline):
+            raise subprocess.TimeoutExpired(command, COMMAND_TIMEOUT)
+        remaining = max(0, deadline - time.monotonic())
+        try:
+            returncode = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            raise
+    except subprocess.TimeoutExpired as error:
+        process_group_killed = False
+        process_group_cleanup_error = None
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+            process_group_killed, fallback_error = kill_process_group_members(process.pid)
+            if fallback_error:
+                process_group_cleanup_error = fallback_error
+        except ProcessLookupError:
+            process_group_killed = True
+        except (AttributeError, PermissionError, OSError) as group_error:
+            process_group_cleanup_error = type(group_error).__name__
+            process_group_killed, fallback_error = kill_process_group_members(process.pid)
+            if fallback_error:
+                process_group_cleanup_error += ":" + fallback_error
+            if process is not None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+        try:
+            process.wait(timeout=2)
+        except (subprocess.TimeoutExpired, ChildProcessError):
+            pass
+        drain_until(selector, time.monotonic() + 1)
         raise GuestFailure(
             phase,
             command,
-            result.returncode,
+            stdout=bytes(stdout).decode("utf-8", "replace"),
+            stderr=bytes(stderr).decode("utf-8", "replace"),
+            cause="command_timeout",
+            stdout_truncated=stdout_truncated,
+            stderr_truncated=stderr_truncated,
+            process_group_killed=process_group_killed,
+            process_group_cleanup_error=process_group_cleanup_error,
+        ) from error
+    except FileNotFoundError:
+        raise GuestFailure(phase, command, cause="command_missing")
+    finally:
+        selector.close()
+        for stream in (getattr(process, "stdout", None), getattr(process, "stderr", None)):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+    stdout = bytes(stdout).decode("utf-8", "replace")
+    stderr = bytes(stderr).decode("utf-8", "replace")
+    if check and returncode:
+        raise GuestFailure(
+            phase,
+            command,
+            returncode,
             stdout,
             stderr,
             transient=transient_failure(command, stdout, stderr),
             stdout_truncated=stdout_truncated,
             stderr_truncated=stderr_truncated,
         )
-    result = subprocess.CompletedProcess(command, result.returncode, stdout, stderr)
+    result = subprocess.CompletedProcess(command, returncode, stdout, stderr)
     result.stdout_truncated = stdout_truncated
     result.stderr_truncated = stderr_truncated
     return result
@@ -275,6 +455,7 @@ def inspect_layout():
     source = os.path.realpath(source)
     fstype_command = ["findmnt", "-n", "-o", "FSTYPE", "-T", "/"]
     fstype = one_line(run(fstype_command, "topology-filesystem"), "topology-filesystem", fstype_command)
+    capacity.update({"source": source, "filesystem": fstype})
     if not source.startswith("/dev/") or fstype not in ("ext4", "xfs"):
         raise GuestFailure(
             "capability-check",
@@ -398,6 +579,36 @@ def report(status, before, layout):
     }
 
 
+def emit_failure(failure):
+    payload = {"ok": False, "error": failure.as_dict()}
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    size = len(encoded.encode("utf-8"))
+    if size <= STDERR_LIMIT:
+        print(encoded, file=sys.stderr)
+        return
+    if size <= STDOUT_LIMIT:
+        print(encoded, file=sys.stdout)
+        return
+    for stdout_limit, stderr_limit in ((1024, 512), (512, 256), (256, 128), (128, 64)):
+        payload = {
+            "ok": False,
+            "error": failure.as_dict(
+                report=True,
+                stdout_limit=stdout_limit,
+                stderr_limit=stderr_limit,
+            ),
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        size = len(encoded.encode("utf-8"))
+        if size <= STDERR_LIMIT:
+            print(encoded, file=sys.stderr)
+            return
+        if size <= STDOUT_LIMIT:
+            print(encoded, file=sys.stdout)
+            return
+    print(encoded, file=sys.stdout)
+
+
 try:
     layout = inspect_layout()
     before = dict(capacity)
@@ -460,7 +671,7 @@ try:
             sys.exit(0)
         if attempt > 1 and isinstance(attempts[-2].get("error"), dict):
             failure.retry_of = attempts[-2]["error"]
-        attempt_record["error"] = failure.as_dict()
+        attempt_record["error"] = failure.as_dict(report=True)
         if not failure.transient or attempt == 2:
             raise failure
         try:
@@ -468,14 +679,14 @@ try:
             layout = inspect_layout()
         except GuestFailure as refresh_failure:
             refresh_failure.retry_of = attempt_record["error"]
-            attempt_record["refresh_error"] = refresh_failure.as_dict()
+            attempt_record["refresh_error"] = refresh_failure.as_dict(report=True)
             if not refresh_failure.transient:
                 raise refresh_failure
 
     raise GuestFailure("filesystem-verify", filesystem_command, cause="retry_exhausted")
 except GuestFailure as failure:
     capacity["attempts"] = list(attempts)
-    print(json.dumps({"ok": False, "error": failure.as_dict()}, sort_keys=True), file=sys.stderr)
+    emit_failure(failure)
     sys.exit(1)
 except Exception as error:
     capacity["attempts"] = list(attempts)
@@ -4394,6 +4605,7 @@ class Control:
 
     def _cleanup_task_locked(self, task: Mapping[str, Any]) -> tuple[list[str], list[str]]:
         errors, completed = [], []
+        pending_proxy_removals: dict[str, tuple[Mapping[str, Any], str, bool]] = {}
         current = self._cleanup_current(task)
         if current is None:
             return ["stale-cleanup:generation"], completed
@@ -4413,20 +4625,26 @@ class Control:
                 errors.append("stale-cleanup:generation")
                 break
             task = current
+            proxy_error = None
             try:
                 if exists: self._remove_proxy(task, port)
             except ControlError as exc:
-                errors.append("remove-proxy:" + port["device_name"] + ":" + exc.code)
+                proxy_error = "remove-proxy:" + port["device_name"] + ":" + exc.code
             current = self._cleanup_current(task)
             if current is None:
                 errors.append("stale-cleanup:generation")
                 break
             task = current
+            conntrack_ok = False
             try:
                 self._conntrack_delete(port, task)
-                completed.append("withdraw:" + port["device_name"])
+                conntrack_ok = True
             except ControlError as exc:
                 errors.append("withdraw:" + port["device_name"] + ":" + exc.code)
+            if proxy_error is None and conntrack_ok:
+                completed.append("withdraw:" + port["device_name"])
+            elif proxy_error is not None:
+                pending_proxy_removals[port["device_name"]] = (port, proxy_error, conntrack_ok)
         # A mapping or conntrack failure must never suppress the stop attempt.
         if exists:
             current = self._cleanup_current(task)
@@ -4444,6 +4662,21 @@ class Control:
                 except ControlError as exc: errors.append("stop:" + exc.code)
         else:
             completed.append("instance-absent")
+        # A stopped instance makes a late retry safe and avoids retaining a
+        # native proxy after a transient removal failure.
+        for device_name, (port, proxy_error, conntrack_ok) in pending_proxy_removals.items():
+            current = self._cleanup_current(task)
+            if current is None:
+                errors.extend([proxy_error, "remove-proxy-retry:" + device_name + ":stale-cleanup"])
+                continue
+            task = current
+            try:
+                self._remove_proxy(task, port)
+            except ControlError as exc:
+                errors.extend([proxy_error, "remove-proxy-retry:" + device_name + ":" + exc.code])
+            else:
+                if conntrack_ok:
+                    completed.append("withdraw:" + device_name)
         return errors, completed
 
     def _proxy_properties(self, task: Mapping[str, Any], port: Mapping[str, Any]) -> dict[str, str]:
@@ -5136,6 +5369,8 @@ class Control:
                     or (current["returncode"] is not None and (isinstance(current["returncode"], bool) or not isinstance(current["returncode"], int)))
                     or not isinstance(current["stdout"], str)
                     or not isinstance(current["stderr"], str)
+                    or len(current["stdout"].encode("utf-8", "replace")) > DIAGNOSTIC_LOG_LIMIT
+                    or len(current["stderr"].encode("utf-8", "replace")) > 4000
                     or not isinstance(failure_capacity, Mapping)
                     or not isinstance(failure_capacity.get("verified"), bool)
                     or isinstance(failure_capacity.get("requested_bytes"), bool)
@@ -5143,7 +5378,20 @@ class Control:
                     or not isinstance(current["transient"], bool)
                     or not isinstance(current["stdout_truncated"], bool)
                     or not isinstance(current["stderr_truncated"], bool)
+                    or ("process_group_killed" in current and not isinstance(current["process_group_killed"], bool))
+                    or (
+                        "process_group_cleanup_error" in current
+                        and current["process_group_cleanup_error"] is not None
+                        and not isinstance(current["process_group_cleanup_error"], str)
+                    )
                     or ("cause" in current and not isinstance(current["cause"], str))
+                    or (
+                        current.get("cause") == "command_timeout"
+                        and (
+                            not isinstance(current.get("process_group_killed"), bool)
+                            or "process_group_cleanup_error" not in current
+                        )
+                    )
                 ):
                     return False
                 if complete:
@@ -5172,13 +5420,13 @@ class Control:
         def matches_guest_failure(reference: Mapping[str, Any], candidate: Mapping[str, Any]) -> bool:
             return all(candidate.get(key) == reference.get(key) for key in (
                 "phase", "command", "returncode", "stdout", "stderr", "capacity", "transient", "cause",
-                "stdout_truncated", "stderr_truncated",
+                "stdout_truncated", "stderr_truncated", "process_group_killed", "process_group_cleanup_error",
             ))
 
         def same_guest_failure(reference: Mapping[str, Any], candidate: Mapping[str, Any]) -> bool:
             return all(candidate.get(key) == reference.get(key) for key in (
                 "phase", "command", "returncode", "stdout", "stderr", "transient", "cause", "retry_of",
-                "stdout_truncated", "stderr_truncated",
+                "stdout_truncated", "stderr_truncated", "process_group_killed", "process_group_cleanup_error",
             ))
 
         def valid_guest_attempts(attempts: Any) -> bool:
@@ -5235,7 +5483,7 @@ class Control:
             return True
 
         guest_error = None
-        for line in reversed(stderr.splitlines()):
+        for line in reversed((stderr + "\n" + stdout).splitlines()):
             try:
                 parsed = json.loads(line)
             except (TypeError, ValueError):
@@ -5271,7 +5519,10 @@ class Control:
                 "control_stderr": stderr,
                 "guest_capacity": guest_error.get("capacity", {"verified": False}),
             }
-            for key in ("transient", "retry_of", "cause"):
+            for key in (
+                "transient", "retry_of", "cause", "stdout_truncated", "stderr_truncated",
+                "process_group_killed", "process_group_cleanup_error",
+            ):
                 if key in guest_error:
                     detail[key] = guest_error[key]
             raise ControlError(
@@ -5319,6 +5570,16 @@ class Control:
             }
             max_failure_retry_depth = 2
 
+            def failure_capacity_matches_report(failure_capacity: Mapping[str, Any]) -> bool:
+                return all(
+                    failure_capacity.get(key) == capacity.get(key)
+                    for key in (
+                        "requested_bytes", "disk_bytes", "filesystem_before",
+                        "filesystem_threshold_bytes", "filesystem", "source", "parent",
+                        "partition", "tools", "verified",
+                    )
+                )
+
             def valid_failure(error: Any) -> bool:
                 pending = [(error, 0)]
                 while pending:
@@ -5338,13 +5599,28 @@ class Control:
                         or (current["returncode"] is not None and (isinstance(current["returncode"], bool) or not isinstance(current["returncode"], int)))
                         or not isinstance(current["stdout"], str)
                         or not isinstance(current["stderr"], str)
+                        or len(current["stdout"].encode("utf-8", "replace")) > DIAGNOSTIC_LOG_LIMIT
+                        or len(current["stderr"].encode("utf-8", "replace")) > 4000
                         or not isinstance(failure_capacity, Mapping)
                         or not failure_capacity_keys.issubset(failure_capacity)
                         or failure_capacity.get("verified") is not True
                         or not isinstance(current["transient"], bool)
                         or not isinstance(current["stdout_truncated"], bool)
                         or not isinstance(current["stderr_truncated"], bool)
+                        or ("process_group_killed" in current and not isinstance(current["process_group_killed"], bool))
+                        or (
+                            "process_group_cleanup_error" in current
+                            and current["process_group_cleanup_error"] is not None
+                            and not isinstance(current["process_group_cleanup_error"], str)
+                        )
                         or ("cause" in current and not isinstance(current["cause"], str))
+                        or (
+                            current.get("cause") == "command_timeout"
+                            and (
+                                not isinstance(current.get("process_group_killed"), bool)
+                                or "process_group_cleanup_error" not in current
+                            )
+                        )
                     ):
                         return False
                     for key in (
@@ -5359,6 +5635,7 @@ class Control:
                         or not isinstance(failure_capacity.get("parent"), str)
                         or not isinstance(failure_capacity.get("partition"), str)
                         or not isinstance(failure_capacity.get("tools"), Mapping)
+                        or not failure_capacity_matches_report(failure_capacity)
                     ):
                         return False
                     if "retry_of" in current:
@@ -5394,7 +5671,7 @@ class Control:
                         or not matches_failure(previous_error, refresh_error["retry_of"])
                     ):
                         raise ValueError()
-            if status == "grown_after_retry":
+            if status in {"grown_after_retry", "already_grown"} and len(attempt_records) == 2:
                 first_error = attempt_records[0].get("error") if attempt_records else None
                 if (
                     len(attempt_records) != 2
@@ -5446,7 +5723,11 @@ class Control:
                         or value["filesystem_bytes"] <= value["filesystem_before"]
                     )
                 )
-                or (status == "already_grown" and value["filesystem_before"] < expected_threshold)
+                or (
+                    status == "already_grown"
+                    and value["attempts"] == 0
+                    and value["filesystem_before"] < expected_threshold
+                )
                 or capacity["disk_bytes"] < target_bytes
                 or capacity["partition_bytes"] > capacity["disk_bytes"]
                 or capacity["partition_bytes"] < 0
@@ -5466,7 +5747,7 @@ class Control:
                 or value["attempts"] > 2
                 or (status == "grown" and value["attempts"] != 1)
                 or (status == "grown_after_retry" and value["attempts"] != 2)
-                or (status == "already_grown" and value["attempts"] not in {0, 1})
+                or (status == "already_grown" and value["attempts"] not in {0, 1, 2})
             ):
                 raise ValueError()
             return value

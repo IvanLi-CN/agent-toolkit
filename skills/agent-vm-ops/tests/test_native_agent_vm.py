@@ -439,7 +439,9 @@ class Fixture(unittest.TestCase):
         size = disk_gib * GIB
         filesystem = size - 1000000
         threshold = size * 95 // 100
-        filesystem_before = filesystem if status == "already_grown" else threshold - 1000000
+        filesystem_before = (
+            filesystem if status == "already_grown" and attempts == 0 else threshold - 1000000
+        )
         failure_capacity = {
             "requested_bytes": size,
             "disk_bytes": size,
@@ -461,7 +463,7 @@ class Fixture(unittest.TestCase):
             "verified": True,
         }
         attempt_records = [{"attempt": index + 1} for index in range(attempts)]
-        if status == "grown_after_retry" and attempt_records:
+        if status in {"grown_after_retry", "already_grown"} and attempts == 2:
             attempt_records[0]["error"] = {
                 "phase": "filesystem-grow",
                 "command": ["resize2fs", "/dev/sda2"],
@@ -1373,6 +1375,30 @@ class LifecycleTests(Fixture):
         self.assertTrue(failure["cleanup"]["ok"])
         self.assertEqual(failure["error"]["detail"]["phase"], "filesystem-grow")
 
+    def test_resize_guest_growth_cleanup_retries_proxy_withdrawal_after_stop(self):
+        self.acquire()
+        task = self.store.get_task(session_id="thread-a")
+        device_name = "agent-vm-" + task["task_id"] + "-ssh-tcp"
+        remove_attempts = 0
+
+        def fail_first_proxy_removal(args):
+            nonlocal remove_attempts
+            if len(args) >= 6 and args[3:6] == ["config", "device", "remove"]:
+                remove_attempts += 1
+                return remove_attempts == 1
+            return False
+
+        self.runner.failure = fail_first_proxy_removal
+        self.runner.guest_growth_results = [self.guest_growth_failure(disk_gib=40)]
+        self.error("resize_partial", self.call, "resize", disk_gib=40, allow_restart=True)
+
+        task = self.store.get_task(session_id="thread-a")
+        self.assertEqual(remove_attempts, 2)
+        self.assertEqual(task["state"], "cached")
+        self.assertEqual(self.store.get_ports(task["task_id"]), [])
+        self.assertNotIn(device_name, self.runner.instances[task["instance_name"]]["devices"])
+        self.assertEqual(self.runner.instances[task["instance_name"]]["status"], "Stopped")
+
     def test_acquire_guest_growth_failure_can_retry_from_cached_state(self):
         self.runner.guest_growth_results = [self.guest_growth_failure()]
         self.error("guest_resize_unverified", self.acquire)
@@ -1507,6 +1533,63 @@ class LifecycleTests(Fixture):
         self.assertEqual(failure["phase"], "guest-report")
         self.assertEqual(failure["cause"], "invalid_failure_report")
 
+    def test_guest_growth_failure_report_rejects_oversized_nested_output(self):
+        for attribute, limit in (("stdout", 8192), ("stderr", 4000)):
+            with self.subTest(attribute=attribute):
+                response = self.guest_growth_failure()
+                payload = json.loads(response.stderr)
+                payload["error"]["capacity"]["attempts"][0]["error"][attribute] = "x" * (limit + 1)
+                response.stderr = (json.dumps(payload) + "\n").encode()
+                self.runner.guest_growth_results = [response]
+
+                self.error("guest_resize_unverified", self.acquire)
+
+                failure = json.loads(self.store.get_task(session_id="thread-a")["last_error"])
+                self.assertEqual(failure["phase"], "guest-report")
+                self.assertEqual(failure["cause"], "invalid_failure_report")
+
+    def test_guest_growth_failure_report_persists_truncation_flags(self):
+        response = self.guest_growth_failure()
+        payload = json.loads(response.stderr)
+        report_error = payload["error"]
+        attempt_error = report_error["capacity"]["attempts"][0]["error"]
+        for error in (report_error, attempt_error):
+            error["stdout_truncated"] = True
+            error["stderr_truncated"] = True
+        response.stderr = (json.dumps(payload) + "\n").encode()
+        self.runner.guest_growth_results = [response]
+
+        self.error("guest_resize_unverified", self.acquire)
+
+        failure = json.loads(self.store.get_task(session_id="thread-a")["last_error"])
+        self.assertTrue(failure["stdout_truncated"])
+        self.assertTrue(failure["stderr_truncated"])
+
+    def test_guest_growth_failure_report_requires_timeout_cleanup_evidence(self):
+        response = self.guest_growth_failure()
+        payload = json.loads(response.stderr)
+        report_error = payload["error"]
+        report_error["cause"] = "command_timeout"
+        report_error["capacity"]["attempts"][0]["error"]["cause"] = "command_timeout"
+        response.stderr = (json.dumps(payload) + "\n").encode()
+        self.runner.guest_growth_results = [response]
+
+        self.error("guest_resize_unverified", self.acquire)
+
+        failure = json.loads(self.store.get_task(session_id="thread-a")["last_error"])
+        self.assertEqual(failure["phase"], "guest-report")
+
+    def test_guest_growth_failure_report_accepts_stdout_transport(self):
+        response = self.guest_growth_failure()
+        response.stdout = response.stderr
+        response.stderr = b""
+        self.runner.guest_growth_results = [response]
+
+        self.error("guest_resize_unverified", self.acquire)
+
+        failure = json.loads(self.store.get_task(session_id="thread-a")["last_error"])
+        self.assertEqual(failure["phase"], "filesystem-grow")
+
     def test_guest_growth_failure_report_rejects_verified_empty_attempts(self):
         response = self.guest_growth_failure()
         payload = json.loads(response.stderr)
@@ -1569,6 +1652,20 @@ class LifecycleTests(Fixture):
                 self.assertEqual(failure["phase"], "guest-exec")
                 self.assertEqual(failure[attribute], True)
 
+    def test_guest_growth_report_rejects_oversized_nested_output(self):
+        for attribute, limit in (("stdout", 8192), ("stderr", 4000)):
+            with self.subTest(attribute=attribute):
+                response = self.guest_growth_result(status="grown_after_retry", attempts=2)
+                payload = json.loads(response.stdout)
+                payload["capacity"]["attempts"][0]["error"][attribute] = "x" * (limit + 1)
+                response.stdout = json.dumps(payload).encode()
+                self.runner.guest_growth_results = [response]
+
+                self.error("guest_resize_unverified", self.acquire)
+
+                failure = json.loads(self.store.get_task(session_id="thread-a")["last_error"])
+                self.assertEqual(failure["phase"], "guest-report")
+
     def test_already_grown_guest_root_is_an_idempotent_success(self):
         self.acquire()
         self.call("release")
@@ -1580,6 +1677,27 @@ class LifecycleTests(Fixture):
         self.assertEqual(result["guest_filesystem"]["status"], "already_grown")
         self.assertEqual(result["guest_filesystem"]["attempts"], 0)
         self.assertEqual(len(result["ports"]), 1)
+
+    def test_already_grown_guest_root_after_transient_retry_is_accepted(self):
+        self.runner.guest_growth_results = [self.guest_growth_result(status="already_grown", attempts=2)]
+
+        result = self.acquire()
+
+        self.assertEqual(result["state"], "active")
+        self.assertEqual(result["guest_filesystem"]["status"], "already_grown")
+        self.assertEqual(result["guest_filesystem"]["attempts"], 2)
+
+    def test_already_grown_after_retry_rejects_mismatched_attempt_topology(self):
+        response = self.guest_growth_result(status="already_grown", attempts=2)
+        payload = json.loads(response.stdout)
+        payload["capacity"]["attempts"][0]["error"]["capacity"]["source"] = "/dev/sdb2"
+        response.stdout = json.dumps(payload).encode()
+        self.runner.guest_growth_results = [response]
+
+        self.error("guest_resize_unverified", self.acquire)
+
+        failure = json.loads(self.store.get_task(session_id="thread-a")["last_error"])
+        self.assertEqual(failure["phase"], "guest-report")
 
     def test_guest_growth_threshold_uses_requested_capacity_when_disk_is_larger(self):
         response = self.guest_growth_result(status="already_grown", attempts=0)
@@ -1644,11 +1762,17 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         initial_partition=None,
         initial_filesystem=None,
         resize_returncode=0,
+        resize_returncodes=None,
+        resize_failure_completes=False,
         growpart_returncode=0,
+        growpart_returncodes=None,
+        growpart_expands_partition=False,
         growpart_stdout="",
         growpart_stderr="",
         filesystem_type="ext4",
         timeout_command=None,
+        command_timeout=None,
+        killpg_error=False,
         source_output="/dev/sda2\n",
         partition_marker_exists=True,
         udevadm_available=False,
@@ -1662,45 +1786,107 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         }
         marker = "/sys/class/block/sda2/partition"
         calls = []
+        growpart_calls = 0
+        resize_calls = 0
 
-        def completed(command, returncode=0, stdout="", stderr=""):
-            return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+        real_popen = subprocess.Popen
 
-        def run(command, **kwargs):
+        def popen(command, **kwargs):
+            nonlocal growpart_calls, resize_calls
             command = list(command)
             calls.append(command)
+            output = b""
+            error = b""
+            returncode = 0
             if timeout_command is not None and command == timeout_command:
-                raise subprocess.TimeoutExpired(command, 45, output=b"partial stdout", stderr=b"partial stderr")
-            if command == ["findmnt", "-n", "-o", "SOURCE", "-T", "/"]:
-                return completed(command, stdout=source_output)
-            if command == ["findmnt", "-n", "-o", "FSTYPE", "-T", "/"]:
-                return completed(command, stdout=filesystem_type + "\n")
-            if command[:4] == ["lsblk", "-n", "-o", "PKNAME"]:
-                return completed(command, stdout="sda\n")
-            if command[:4] == ["lsblk", "-n", "-o", "TYPE"]:
-                return completed(command, stdout=("part\n" if command[-1] == "/dev/sda2" else "disk\n"))
-            if command[:2] == ["blockdev", "--getsize64"]:
+                output = b"partial stdout"
+                error = b"partial stderr"
+                timeout = True
+            elif command == ["findmnt", "-n", "-o", "SOURCE", "-T", "/"]:
+                output = source_output.encode()
+                timeout = False
+            elif command == ["findmnt", "-n", "-o", "FSTYPE", "-T", "/"]:
+                output = (filesystem_type + "\n").encode()
+                timeout = False
+            elif command[:4] == ["lsblk", "-n", "-o", "PKNAME"]:
+                output = b"sda\n"
+                timeout = False
+            elif command[:4] == ["lsblk", "-n", "-o", "TYPE"]:
+                output = ("part\n" if command[-1] == "/dev/sda2" else "disk\n").encode()
+                timeout = False
+            elif command[:2] == ["blockdev", "--getsize64"]:
                 value = target if command[-1] == "/dev/sda" else state["partition"]
-                return completed(command, stdout=f"{value}\n")
-            if command[:2] == ["blockdev", "--rereadpt"]:
+                output = f"{value}\n".encode()
+                timeout = False
+            elif command[:2] == ["blockdev", "--rereadpt"]:
                 state["partition"] = target
-                return completed(command)
-            if command[:2] == ["udevadm", "settle"]:
-                stderr = "udevadm: settle failed\n" if udevadm_returncode else ""
-                return completed(command, udevadm_returncode, stderr=stderr)
-            if command[0] == "growpart":
-                return completed(command, growpart_returncode, stdout=growpart_stdout, stderr=growpart_stderr)
-            if command[0] == "resize2fs":
-                if resize_returncode:
-                    return completed(command, resize_returncode, stderr="resize2fs: Device or resource busy\n")
-                state["filesystem"] = threshold
-                return completed(command)
-            if command[0] == "xfs_growfs":
-                if resize_returncode:
-                    return completed(command, resize_returncode, stderr="xfs_growfs: Device or resource busy\n")
-                state["filesystem"] = threshold
-                return completed(command)
-            raise AssertionError(command)
+                timeout = False
+            elif command[:2] == ["udevadm", "settle"]:
+                returncode = udevadm_returncode
+                error = ("udevadm: settle failed\n" if udevadm_returncode else "").encode()
+                timeout = False
+            elif command[0] == "growpart":
+                returncode = (
+                    growpart_returncodes[growpart_calls]
+                    if growpart_returncodes is not None and growpart_calls < len(growpart_returncodes)
+                    else growpart_returncode
+                )
+                growpart_calls += 1
+                if returncode == 0 and growpart_expands_partition:
+                    state["partition"] = target
+                output = growpart_stdout.encode()
+                error = (growpart_stderr if returncode else "").encode()
+                timeout = False
+            elif command[0] == "resize2fs":
+                selected_returncode = (
+                    resize_returncodes[resize_calls]
+                    if resize_returncodes is not None and resize_calls < len(resize_returncodes)
+                    else resize_returncode
+                )
+                resize_calls += 1
+                if selected_returncode:
+                    returncode = selected_returncode
+                    error = b"resize2fs: Device or resource busy\n"
+                    if resize_failure_completes:
+                        state["filesystem"] = threshold
+                else:
+                    state["filesystem"] = threshold
+                timeout = False
+            elif command[0] == "xfs_growfs":
+                selected_returncode = (
+                    resize_returncodes[resize_calls]
+                    if resize_returncodes is not None and resize_calls < len(resize_returncodes)
+                    else resize_returncode
+                )
+                resize_calls += 1
+                if selected_returncode:
+                    returncode = selected_returncode
+                    error = b"xfs_growfs: Device or resource busy\n"
+                    if resize_failure_completes:
+                        state["filesystem"] = threshold
+                else:
+                    state["filesystem"] = threshold
+                timeout = False
+            else:
+                raise AssertionError(command)
+
+            helper = (
+                "import sys; sys.stdout.buffer.write(" + repr(output) + "); "
+                "sys.stderr.buffer.write(" + repr(error) + "); "
+                "sys.stdout.flush(); sys.stderr.flush(); sys.exit(" + str(returncode) + ")"
+            )
+            if timeout:
+                helper = helper.replace("import sys;", "import sys, time;").replace(
+                    "; sys.exit(" + str(returncode),
+                    "; time.sleep(10); sys.exit(" + str(returncode),
+                )
+            process = real_popen(
+                [os.sys.executable, "-c", helper],
+                stdout=kwargs.get("stdout"),
+                stderr=kwargs.get("stderr"),
+                start_new_session=True,
+            )
+            return process
 
         def which(name):
             if name == "udevadm":
@@ -1720,7 +1906,15 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
 
         captured_stdout = io.StringIO()
         captured_stderr = io.StringIO()
-        with mock.patch.object(CONTROL.subprocess, "run", side_effect=run), \
+        script = CONTROL.GUEST_ROOT_GROWTH_SCRIPT
+        if command_timeout is not None:
+            script = script.replace("COMMAND_TIMEOUT = 45", f"COMMAND_TIMEOUT = {command_timeout}")
+        killpg_patch = mock.patch.object(
+            CONTROL.os,
+            "killpg",
+            side_effect=PermissionError("denied"),
+        ) if killpg_error else mock.patch.object(CONTROL.os, "killpg", wraps=CONTROL.os.killpg)
+        with mock.patch.object(CONTROL.subprocess, "Popen", side_effect=popen), \
              mock.patch.object(CONTROL.os, "statvfs", side_effect=statvfs), \
              mock.patch.object(
                  CONTROL.os.path,
@@ -1731,9 +1925,10 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
              mock.patch.object(CONTROL.time, "sleep", return_value=None), \
              mock.patch.object(CONTROL.sys, "argv", ["guest-root-growth", "20"]), \
              mock.patch("builtins.open", side_effect=fake_open), \
+             killpg_patch, \
              redirect_stdout(captured_stdout), redirect_stderr(captured_stderr):
             try:
-                exec(CONTROL.GUEST_ROOT_GROWTH_SCRIPT, {"__name__": "__main__"})
+                exec(script, {"__name__": "__main__"})
             except SystemExit as stopped:
                 exit_code = stopped.code
             else:
@@ -1743,8 +1938,9 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
     def test_guest_root_growth_script_grows_on_first_attempt(self):
         target = 20 * GIB
         exit_code, stdout, stderr, calls = self.execute_script(
-            initial_partition=target,
+            initial_partition=target // 2,
             initial_filesystem=target // 4,
+            growpart_expands_partition=True,
         )
 
         self.assertEqual(exit_code, 0)
@@ -1769,6 +1965,22 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         self.assertEqual(first_error["cause"], "stale_partition_capacity_below_target")
         self.assertTrue(first_error["transient"])
         self.assertIn(["blockdev", "--rereadpt", "/dev/sda"], calls)
+
+    def test_guest_root_growth_script_reports_already_grown_after_transient_resize(self):
+        target = 20 * GIB
+        exit_code, stdout, stderr, calls = self.execute_script(
+            initial_partition=target,
+            initial_filesystem=target // 4,
+            resize_returncodes=[1],
+            resize_failure_completes=True,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        payload = json.loads(stdout)
+        self.assertEqual(payload["status"], "already_grown")
+        self.assertEqual(payload["attempts"], 2)
+        self.assertEqual(len([command for command in calls if command[0] == "resize2fs"]), 1)
 
     def test_guest_root_growth_script_fails_closed_on_growpart_error(self):
         exit_code, stdout, stderr, calls = self.execute_script(
@@ -1797,6 +2009,20 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         self.assertTrue(error["transient"])
         self.assertEqual(error["retry_of"]["phase"], "partition-grow")
         self.assertEqual(len(error["capacity"]["attempts"]), 2)
+        self.assertEqual(len([command for command in calls if command[0] == "growpart"]), 2)
+        self.assertIn(["blockdev", "--rereadpt", "/dev/sda"], calls)
+
+    def test_guest_root_growth_script_recovers_from_transient_growpart_error(self):
+        exit_code, stdout, stderr, calls = self.execute_script(
+            growpart_returncodes=[1, 0],
+            growpart_stderr="growpart: Device or resource busy\n",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        payload = json.loads(stdout)
+        self.assertEqual(payload["status"], "grown_after_retry")
+        self.assertEqual(payload["attempts"], 2)
         self.assertEqual(len([command for command in calls if command[0] == "growpart"]), 2)
         self.assertIn(["blockdev", "--rereadpt", "/dev/sda"], calls)
 
@@ -1877,6 +2103,8 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         error = json.loads(stderr)["error"]
         self.assertEqual(error["phase"], "capability-check")
         self.assertIn("direct ext4/xfs", error["cause"])
+        self.assertEqual(error["capacity"]["source"], "/dev/sda2")
+        self.assertEqual(error["capacity"]["filesystem"], "btrfs")
 
     def test_guest_root_growth_script_rejects_missing_partition_marker(self):
         exit_code, stdout, stderr, _ = self.execute_script(partition_marker_exists=False)
@@ -1889,7 +2117,7 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
 
     def test_guest_root_growth_script_preserves_timeout_evidence(self):
         command = ["findmnt", "-n", "-o", "SOURCE", "-T", "/"]
-        exit_code, stdout, stderr, _ = self.execute_script(timeout_command=command)
+        exit_code, stdout, stderr, _ = self.execute_script(timeout_command=command, command_timeout=0.05)
 
         self.assertEqual(exit_code, 1)
         self.assertEqual(stdout, "")
@@ -1900,6 +2128,21 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         self.assertEqual(error["stderr"], "partial stderr")
         self.assertFalse(error["stdout_truncated"])
         self.assertFalse(error["stderr_truncated"])
+        self.assertEqual(error["process_group_killed"], Path("/proc").is_dir())
+
+    def test_guest_root_growth_script_falls_back_when_group_kill_is_denied(self):
+        command = ["findmnt", "-n", "-o", "SOURCE", "-T", "/"]
+        exit_code, stdout, stderr, _ = self.execute_script(
+            timeout_command=command,
+            command_timeout=0.05,
+            killpg_error=True,
+        )
+
+        self.assertEqual(exit_code, 1)
+        error = json.loads(stderr)["error"]
+        self.assertEqual(error["cause"], "command_timeout")
+        self.assertTrue(error["process_group_cleanup_error"].startswith("PermissionError"))
+        self.assertEqual(error["process_group_killed"], Path("/proc").is_dir())
 
     def test_guest_root_growth_script_bounds_command_output(self):
         exit_code, stdout, stderr, _ = self.execute_script(source_output="/dev/sda2\n" + "x" * 20000 + "\n")
@@ -1908,14 +2151,26 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         error = json.loads(stderr)["error"]
         self.assertEqual(error["phase"], "topology-source")
         self.assertTrue(error["stdout_truncated"])
-        self.assertLessEqual(len(error["stdout"]), 8192)
+        self.assertEqual(error["stdout"], ("/dev/sda2\n" + "x" * 20000 + "\n")[:1024])
+
+    def test_guest_root_growth_script_bounds_file_backed_stderr(self):
+        source = "growpart: " + "e" * 5000
+        exit_code, stdout, stderr, _ = self.execute_script(
+            growpart_returncode=2,
+            growpart_stderr=source,
+        )
+
+        self.assertEqual(exit_code, 1)
+        error = json.loads(stderr or stdout)["error"]
+        self.assertTrue(error["stderr_truncated"])
+        self.assertEqual(error["stderr"], source[-4000:])
 
     def test_guest_root_growth_script_preserves_stdout_below_capture_limit(self):
         source_output = "/dev/sda2\n" + "x" * 5000 + "\n"
         exit_code, stdout, stderr, _ = self.execute_script(source_output=source_output)
 
         self.assertEqual(exit_code, 1)
-        error = json.loads(stderr)["error"]
+        error = json.loads(stderr or stdout)["error"]
         self.assertFalse(error["stdout_truncated"])
         self.assertEqual(len(error["stdout"]), len(source_output))
 

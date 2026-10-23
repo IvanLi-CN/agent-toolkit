@@ -10,6 +10,7 @@ const SUPERVISOR_UNEXPECTED_EXIT_SETTLE_MS = 250;
 const SUPERVISOR_ORPHAN_CLEANUP_TIMEOUT_MS = 5_000;
 const SUPERVISOR_CLEANUP_DEADLINE_SECONDS = Math.ceil(SUPERVISOR_CLEANUP_TIMEOUT_MS / 1_000);
 const SUPERVISOR_STATUS_PIPE_TIMEOUT_MS = 2_000;
+const SUPERVISOR_TARGET_REFERENCE_TIMEOUT_MS = 5_000;
 export const SUPERVISOR_UNKNOWN_TARGET_STATUS = 125;
 const MAX_SUPERVISOR_MARKER_BYTES = 256;
 
@@ -1673,6 +1674,17 @@ captured_descendants_confined_to_target_group() {
       "$target_pgid"|"$wrapper_pgid") ;;
       *) return 1 ;;
     esac
+    process_liveness "$confined_pid"
+    case "$process_liveness_result" in
+      dead) continue ;;
+      live) ;;
+      *) return 1 ;;
+    esac
+    confined_current_identity="$(process_identity "$confined_pid" 2>/dev/null || true)"
+    confined_current_identity="$(normalize_process_identity "$confined_current_identity" 2>/dev/null || true)"
+    captured_identity_matches "$confined_identity" "$confined_current_identity" || return 1
+    confined_current_pgid="$(process_group_id "$confined_pid" 2>/dev/null || true)"
+    [ "$confined_current_pgid" = "$confined_pgid" ] || return 1
   done <<EOF
 $captured_descendants_read_data
 EOF
@@ -1682,8 +1694,13 @@ signal_tree() {
   signal="$1"
   set_snapshot_deadline
   target_group_fast_path=0
-  if [ "$target_identity_mode" = "proc" ] && [ -e "$completion_path" ] && target_identity_matches && captured_descendants_confined_to_target_group; then
-    target_group_fast_path=1
+  if [ "$target_identity_mode" = "proc" ] && [ -e "$completion_path" ] && target_identity_matches; then
+    # Completion can race with a child leaving the target tree. Refresh the
+    # authenticated ledger before accepting the process-group fast path.
+    start_snapshot || true
+    if [ "$snapshot_ready_observed" = "1" ] && [ ! -e "$snapshot_failed_path" ] && captured_descendants_confined_to_target_group; then
+      target_group_fast_path=1
+    fi
   fi
   group_quiescence_required=0
   rm -f "$quiesced_groups_path" 2>/dev/null || cleanup_ack_enabled=0
@@ -1730,7 +1747,10 @@ signal_tree() {
   fi
   wait_for_snapshot
   if [ -e "$descendant_scan_truncated_path" ] || [ -e "$descendant_scan_failed_path" ] || [ -e "$snapshot_failed_path" ] || [ "$snapshot_ready_before_signal" != "1" ]; then cleanup_ack_enabled=0; fi
-  if [ "$signal" = "KILL" ] && [ "$target_group_fast_path" != "1" ] && [ "$snapshot_ready_before_signal" = "1" ] && [ ! -e "$snapshot_failed_path" ]; then
+  if [ "$signal" = "KILL" ]; then
+    # A fresh scan can fail after an earlier authenticated ledger was
+    # captured. Keep the acknowledgement failed closed, but still reap the
+    # already-authorized records through identity-checked signaling.
     signal_captured_descendants
   fi
   # If the anchor died before the group signal, retain the captured target
@@ -1746,6 +1766,7 @@ signal_tree() {
     process_liveness "$pid"
     case "$process_liveness_result" in
       dead) continue ;;
+      live) ;;
       *) cleanup_ack_enabled=0; continue ;;
     esac
     descendant_identity="$(process_identity "$pid" 2>/dev/null || true)"
@@ -2500,7 +2521,7 @@ async function waitForTargetReference(
   wrapperPid: number,
   wrapperExited: Promise<number>,
 ): Promise<TargetReference | undefined> {
-  const deadline = Date.now() + SUPERVISOR_STATUS_PIPE_TIMEOUT_MS;
+  const deadline = Date.now() + SUPERVISOR_TARGET_REFERENCE_TIMEOUT_MS;
   while (Date.now() < deadline) {
     const reference = await readTargetReference(statusPath, wrapperPid);
     if (reference !== undefined) return reference;

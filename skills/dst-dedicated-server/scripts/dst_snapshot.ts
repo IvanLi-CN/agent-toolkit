@@ -1117,7 +1117,16 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
   }
 
   const outputPath = expandUser(parsed.out ?? `/tmp/dst-snapshot-${fileTimestamp()}.md`);
-  const remoteScript = await Bun.file(join(import.meta.dir, "dst_snapshot_remote.sh")).text();
+  let remoteScript = "";
+  if (!parsed.noRemote) {
+    try {
+      remoteScript = await Bun.file(join(import.meta.dir, "dst_snapshot_remote.sh")).text();
+    } catch (error) {
+      const detail = redactOperationalText(error instanceof Error ? error.message : String(error), [import.meta.dir]);
+      console.error(`error: cannot load remote collector: ${detail || "collector unavailable"}`);
+      return 2;
+    }
+  }
   const report: string[] = [
     "# DST snapshot",
     "",

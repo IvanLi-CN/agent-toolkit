@@ -130,6 +130,8 @@ The project MUST preserve the defined CLI, outputs, error behavior, authorizatio
 
 For the migrated helper CLIs, successful Buzzer and framebuffer runs MUST print each generated output path as `[OK] Wrote: <path>`; diagnostic failures MUST retain the underlying error message after the `error:` prefix; DST snapshot runs MUST print the actual report path after a successful atomic publish, while publish-failure paths remain represented as `<configured-output>` and their diagnostic detail remains redacted. Snapshot file contents remain subject to the public redaction boundary.
 
+Helper artifacts MUST use the accepted atomic publication contract in [ADR 0029](../../adr/0029-helper-output-publication.md): publish through owner-private temporary files, use mode `0600` for newly published files, replace existing regular outputs atomically, and replace a pre-existing output symlink without following or modifying its target.
+
 ### REQ-FOUNDATION-COMMON-05
 
 The project MUST change implementation, tests, invocation sites, links, CI discovery, and prerequisite documentation together. Retire replaced production implementations rather than maintaining both as active code. Keep unrelated user/private-source content intact.

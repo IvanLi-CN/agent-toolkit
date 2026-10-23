@@ -957,7 +957,7 @@ exec /bin/ps "$@"
       const trigger = join(root, "fail-process-scan");
       await writeFile(fakeSsh, `#!/bin/sh
 case "$*" in
-  *"echo ok"*) sleep 0.5; touch "$AGENT_TOOLKIT_TEST_PS_FAIL"; echo "fixture SSH connectivity denied" >&2; exit 1 ;;
+  *"echo ok"*) sleep 2; touch "$AGENT_TOOLKIT_TEST_PS_FAIL"; echo "fixture SSH connectivity denied" >&2; exit 1 ;;
   *) cat >/dev/null; exit 0 ;;
 esac
 `);
@@ -1751,6 +1751,59 @@ exec /bin/ps "$@"
     }
   });
 
+  test("cleans an authenticated child that detaches before the target completion marker", { timeout: 90_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-completion-race-"));
+    const marker = join(root, "detached.pid");
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    let detachedPid: number | undefined;
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    try {
+      supervised = await spawnSupervised([
+        "sh",
+        "-c",
+        "perl -MPOSIX -e 'select undef, undef, undef, 0.15; POSIX::setsid() < 0 and exit 125; exec @ARGV' -- sleep 30 & child=$!; printf '%s\\n' \"$child\" > \"$1\"; sleep 0.6; exit 0",
+        "agent-toolkit-supervised-target",
+        marker,
+      ]);
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        try {
+          detachedPid = Number((await readFile(marker, "utf8")).trim());
+          if (Number.isInteger(detachedPid) && detachedPid > 0) break;
+        } catch {
+          // The target may still be writing its child marker.
+        }
+        await Bun.sleep(25);
+      }
+      expect(Number.isInteger(detachedPid)).toBe(true);
+      expect(detachedPid === undefined ? false : isAlive(detachedPid)).toBe(true);
+      await Bun.sleep(250);
+      expect(await supervised.exited).toBe(0);
+      supervised.child.kill("SIGTERM");
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(true);
+      await supervised.wrapperExited;
+      for (let attempt = 0; attempt < 40 && detachedPid !== undefined && isAlive(detachedPid); attempt += 1) await Bun.sleep(25);
+      expect(detachedPid === undefined ? false : isAlive(detachedPid)).toBe(false);
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (detachedPid !== undefined && isAlive(detachedPid)) {
+        try { process.kill(detachedPid, "SIGKILL"); } catch { /* The detached process may have exited. */ }
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("cleans an orphaned group after its captured leader exits during termination", { timeout: 90_000 }, async () => {
     if (process.platform === "win32") return;
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-orphaned-group-"));
@@ -1778,7 +1831,7 @@ exec /bin/ps "$@"
     try {
       supervised = await spawnSupervised(["sh", controllerScript, leaderScript, leaderMarker, childMarker, childScript]);
       let leaderPid: number | undefined;
-      for (let attempt = 0; attempt < 40; attempt += 1) {
+      for (let attempt = 0; attempt < 200; attempt += 1) {
         try {
           leaderPid = Number((await readFile(leaderMarker, "utf8")).trim());
           break;
@@ -1790,7 +1843,7 @@ exec /bin/ps "$@"
       expect(leaderPid === undefined ? false : isAlive(leaderPid)).toBe(true);
       supervised.child.kill("SIGTERM");
       expect(await supervised.waitForCleanupAcknowledged()).toBe(true);
-      for (let attempt = 0; attempt < 40; attempt += 1) {
+      for (let attempt = 0; attempt < 200; attempt += 1) {
         try {
           descendantPid = Number((await readFile(childMarker, "utf8")).trim());
           break;
@@ -1875,8 +1928,6 @@ exec /bin/ps "$@"
 
   test("fails closed when detached descendant enumeration cannot scan processes", { timeout: 90_000 }, async () => {
     if (process.platform === "win32") return;
-    const procRoot = await lstat("/proc").catch(() => undefined);
-    if (!procRoot?.isDirectory()) return;
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-descendant-scan-failure-"));
     const ps = join(root, "ps");
     const trigger = join(root, "trigger");

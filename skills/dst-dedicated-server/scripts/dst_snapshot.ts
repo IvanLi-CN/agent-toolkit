@@ -390,9 +390,12 @@ async function syncDirectory(path: string): Promise<void> {
 
 const SENSITIVE_NAME = "(?:password|passwd|pass[ _-]?phrase|pwd|secret|token|credential(?:s)?|jwt|private[_ -]?key|api[_ -]?key|access[_ -]?key|signing[_ -]?key|encryption[_ -]?key|database[_ -]?url|mongo[_ -]?uri|authorization|bearer|cookie|set[ _-]?cookie|session(?:[_ -]?id)?)";
 const SENSITIVE_INDEX_SUFFIX = `(?:\\[[^\\]\\r\\n]*\\])*`;
-const SENSITIVE_BARE_KEY = `(?:[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*${SENSITIVE_INDEX_SUFFIX})`;
-const SENSITIVE_KEY = `(?:[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*${SENSITIVE_INDEX_SUFFIX}|"[^"\\r\\n]*${SENSITIVE_NAME}[^"\\r\\n]*"|'[^'\\r\\n]*${SENSITIVE_NAME}[^'\\r\\n]*')`;
-const SENSITIVE_KEY_TOKEN = `(?:${SENSITIVE_BARE_KEY}|\\[[^\\]\\r\\n]*${SENSITIVE_NAME}[^\\]\\r\\n]*\\])`;
+const SENSITIVE_BARE_BASE = `[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*`;
+const SENSITIVE_BRACKET_BASE = `\\[[^\\]\\r\\n]*${SENSITIVE_NAME}[^\\]\\r\\n]*\\]`;
+const SENSITIVE_QUOTED_BASE = `(?:"[^"\\r\\n]*${SENSITIVE_NAME}[^"\\r\\n]*"|'[^'\\r\\n]*${SENSITIVE_NAME}[^'\\r\\n]*')`;
+const SENSITIVE_BARE_KEY = `(?:${SENSITIVE_BARE_BASE}${SENSITIVE_INDEX_SUFFIX})`;
+const SENSITIVE_KEY = `(?:${SENSITIVE_BARE_BASE}|${SENSITIVE_BRACKET_BASE}|${SENSITIVE_QUOTED_BASE})${SENSITIVE_INDEX_SUFFIX}`;
+const SENSITIVE_KEY_TOKEN = SENSITIVE_KEY;
 const SENSITIVE_ASSIGNMENT = new RegExp(
   `(${SENSITIVE_BARE_KEY}\\s*[:=]\\s*)(?!\\s*\\[REDACTED\\])("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|(?:Bearer|Basic)\\s+[^;\\r\\n]+?(?=[ \\t]+\\b${SENSITIVE_NAME}\\b(?:[ \\t]+|[:=])|\\r?\\n|$)|[^;\\r\\n]+?(?=[ \\t]+\\b${SENSITIVE_NAME}\\b(?:[ \\t]+|[:=])|\\r?\\n|$))`,
   "gi",

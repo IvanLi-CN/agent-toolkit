@@ -767,29 +767,28 @@ async function syncDirectory(path: string): Promise<void> {
 }
 
 async function removeTransactionDirectory(directory: string): Promise<void> {
-  let entries;
-  try {
-    const metadata = await lstat(directory);
-    if (!metadata.isDirectory() || metadata.isSymbolicLink()) return;
-    const listing = await readDirectoryEntriesBounded(directory, TRANSACTION_ENTRY_NAMES.size + 1);
-    if (listing.truncated) return;
-    entries = listing.entries;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-    throw error;
-  }
-  if (entries.length === 0 || entries.some((entry) => entry.isDirectory() || !TRANSACTION_ENTRY_NAMES.has(entry.name))) return;
-  for (const entry of entries) {
-    if (!entry.isSymbolicLink()) continue;
-    if (entry.name !== "midi.backup" && entry.name !== "wav.backup") return;
-    const marker = join(directory, entry.name === "midi.backup" ? "midi.symlink" : "wav.symlink");
+  const inspect = async (path: string): Promise<{ dev: number; ino: number } | undefined> => {
     try {
-      const expectedTarget = JSON.parse(new TextDecoder().decode(await readRegularFile(marker)));
-      if (typeof expectedTarget !== "string" || expectedTarget !== await readlink(join(directory, entry.name))) return;
+      const metadata = await lstat(path);
+      if (!metadata.isDirectory() || metadata.isSymbolicLink()) return undefined;
+      const listing = await readDirectoryEntriesBounded(path, TRANSACTION_ENTRY_NAMES.size + 1);
+      if (listing.truncated || listing.entries.length === 0) return undefined;
+      if (listing.entries.some((entry) => entry.isDirectory() || !TRANSACTION_ENTRY_NAMES.has(entry.name))) return undefined;
+      for (const entry of listing.entries) {
+        if (!entry.isSymbolicLink()) continue;
+        if (entry.name !== "midi.backup" && entry.name !== "wav.backup") return undefined;
+        const marker = join(path, entry.name === "midi.backup" ? "midi.symlink" : "wav.symlink");
+        const expectedTarget = JSON.parse(new TextDecoder().decode(await readRegularFile(marker)));
+        if (typeof expectedTarget !== "string" || expectedTarget !== await readlink(join(path, entry.name))) return undefined;
+      }
+      return { dev: metadata.dev, ino: metadata.ino };
     } catch {
-      return;
+      return undefined;
     }
-  }
+  };
+
+  const initialIdentity = await inspect(directory);
+  if (initialIdentity === undefined) return;
   const tombstone = join(dirname(directory), `${DELETE_TOMBSTONE_PREFIX}${randomUUID()}`);
   try {
     await rename(directory, tombstone);
@@ -797,6 +796,10 @@ async function removeTransactionDirectory(directory: string): Promise<void> {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
     throw error;
   }
+  const tombstoneIdentity = await inspect(tombstone);
+  if (tombstoneIdentity === undefined
+    || tombstoneIdentity.dev !== initialIdentity.dev
+    || tombstoneIdentity.ino !== initialIdentity.ino) return;
   await rm(tombstone, { recursive: true, force: true, maxRetries: 0 });
   await syncDirectory(dirname(directory));
 }

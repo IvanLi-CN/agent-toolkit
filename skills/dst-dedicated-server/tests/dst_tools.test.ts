@@ -55,6 +55,9 @@ describe.serial("DST local Bun tooling", () => {
     expect(redactSensitiveText("[api_key]=fixture-secret")).not.toContain("fixture-secret");
     expect(redactSensitiveText("password[0]=indexed-secret")).not.toContain("indexed-secret");
     expect(redactSensitiveText("api_keys[0]: indexed-api-secret")).not.toContain("indexed-api-secret");
+    expect(redactSensitiveText("[api_key][0]=bracket-index-secret")).not.toContain("bracket-index-secret");
+    expect(redactSensitiveText('["api_key"][0]=quoted-bracket-secret')).not.toContain("quoted-bracket-secret");
+    expect(redactSensitiveText('"api_key"[0]=quoted-index-secret')).not.toContain("quoted-index-secret");
     expect(redactSensitiveText("api_key%3Dfixture-secret")).not.toContain("fixture-secret");
     expect(redactSensitiveText("password: |\n  fixture-secret\nnext: visible")).not.toContain("fixture-secret");
     expect(redactSensitiveText("api_\u001b[31mkey=fixture-secret")).not.toContain("fixture-secret");

@@ -276,7 +276,7 @@ def inspect_layout():
     disk_bytes = number_from(["blockdev", "--getsize64", disk], "capacity-diagnostic", "disk_bytes")
     partition_bytes = number_from(["blockdev", "--getsize64", source], "capacity-diagnostic", "partition_bytes")
     filesystem_size = filesystem_bytes()
-    capacity["filesystem_threshold_bytes"] = disk_bytes * MINIMUM_FILESYSTEM_RATIO // 100
+    capacity["filesystem_threshold_bytes"] = TARGET_BYTES * MINIMUM_FILESYSTEM_RATIO // 100
     if disk_bytes < TARGET_BYTES:
         raise GuestFailure(
             "capacity-diagnostic",
@@ -351,6 +351,7 @@ def report(status, before, layout):
 try:
     layout = inspect_layout()
     before = dict(capacity)
+    capacity["filesystem_before"] = before.get("filesystem_bytes")
     if filesystem_is_complete():
         print(json.dumps(report("already_grown", before, layout), sort_keys=True))
         sys.exit(0)
@@ -403,6 +404,8 @@ try:
             status = "grown_after_retry" if attempt > 1 else "grown"
             print(json.dumps(report(status, before, layout), sort_keys=True))
             sys.exit(0)
+        if attempt > 1 and isinstance(attempts[-2].get("error"), dict):
+            failure.retry_of = attempts[-2]["error"]
         attempt_record["error"] = failure.as_dict()
         if not failure.transient or attempt == 2:
             raise failure
@@ -410,7 +413,7 @@ try:
             settle_partition(layout)
             layout = inspect_layout()
         except GuestFailure as refresh_failure:
-            refresh_failure.retry_of = failure.as_dict()
+            refresh_failure.retry_of = attempt_record["error"]
             if not refresh_failure.transient:
                 raise refresh_failure
             attempt_record["refresh_error"] = refresh_failure.as_dict()
@@ -855,6 +858,37 @@ class CommandRunner:
         for stream, name in streams:
             if stream is not None:
                 selector.register(stream, selectors.EVENT_READ, name)
+
+        def retain_stdout(chunk: bytes) -> None:
+            nonlocal stdout_truncated
+            available = max(0, stdout_limit - len(stdout))
+            if available:
+                stdout.extend(chunk[:available])
+            if len(chunk) > available:
+                stdout_truncated = True
+
+        def retain_stderr(chunk: bytes) -> None:
+            nonlocal stderr_truncated
+            stderr.extend(chunk)
+            if len(stderr) > stderr_limit:
+                stderr_truncated = True
+                del stderr[:-stderr_limit]
+
+        def read_ready(events) -> None:
+            for key, _ in events:
+                try:
+                    chunk = os.read(key.fileobj.fileno(), 65536)
+                except (OSError, ValueError):
+                    chunk = b""
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                    continue
+                if key.data == "stdout":
+                    retain_stdout(chunk)
+                else:
+                    retain_stderr(chunk)
+
         started = time.monotonic()
         try:
             while selector.get_map():
@@ -864,23 +898,7 @@ class CommandRunner:
                 events = selector.select(remaining)
                 if not events:
                     continue
-                for key, _ in events:
-                    chunk = os.read(key.fileobj.fileno(), 65536)
-                    if not chunk:
-                        selector.unregister(key.fileobj)
-                        key.fileobj.close()
-                        continue
-                    if key.data == "stdout":
-                        available = max(0, stdout_limit - len(stdout))
-                        if available:
-                            stdout.extend(chunk[:available])
-                        if len(chunk) > available:
-                            stdout_truncated = True
-                    else:
-                        stderr.extend(chunk)
-                        if len(stderr) > stderr_limit:
-                            stderr_truncated = True
-                            del stderr[:-stderr_limit]
+                read_ready(events)
             remaining = timeout - (time.monotonic() - started)
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(argv[0], timeout)
@@ -911,6 +929,12 @@ class CommandRunner:
                 reaped = True
             except subprocess.TimeoutExpired:
                 pass
+            drain_deadline = time.monotonic() + 1
+            while selector.get_map() and time.monotonic() < drain_deadline:
+                events = selector.select(max(0, drain_deadline - time.monotonic()))
+                if not events:
+                    break
+                read_ready(events)
             raise ControlError(
                 "command_timeout",
                 f"command timed out: {argv[0]}",
@@ -5049,10 +5073,17 @@ class Control:
             if not isinstance(capacity.get("attempts"), list) or len(capacity["attempts"]) != value["attempts"]:
                 raise ValueError()
 
+            failure_capacity_keys = {
+                "requested_bytes", "disk_bytes", "partition_bytes", "filesystem_bytes",
+                "filesystem_before", "filesystem_threshold_bytes", "filesystem", "source",
+                "parent", "partition", "tools", "verified",
+            }
+
             def valid_failure(error: Any) -> bool:
                 required = {"phase", "command", "returncode", "stdout", "stderr", "capacity", "transient"}
                 if not isinstance(error, Mapping) or not required.issubset(error):
                     return False
+                failure_capacity = error["capacity"]
                 if (
                     not isinstance(error["phase"], str)
                     or not isinstance(error["command"], list)
@@ -5061,16 +5092,34 @@ class Control:
                     or (error["returncode"] is not None and (isinstance(error["returncode"], bool) or not isinstance(error["returncode"], int)))
                     or not isinstance(error["stdout"], str)
                     or not isinstance(error["stderr"], str)
-                    or not isinstance(error["capacity"], Mapping)
+                    or not isinstance(failure_capacity, Mapping)
+                    or not failure_capacity_keys.issubset(failure_capacity)
+                    or failure_capacity.get("verified") is not True
                     or not isinstance(error["transient"], bool)
-                    or ("retry_of" in error and not isinstance(error["retry_of"], Mapping))
+                    or ("cause" in error and not isinstance(error["cause"], str))
                 ):
+                    return False
+                for key in (
+                    "requested_bytes", "disk_bytes", "partition_bytes", "filesystem_bytes",
+                    "filesystem_before", "filesystem_threshold_bytes",
+                ):
+                    if isinstance(failure_capacity.get(key), bool) or not isinstance(failure_capacity.get(key), int):
+                        return False
+                if (
+                    not isinstance(failure_capacity.get("filesystem"), str)
+                    or not isinstance(failure_capacity.get("source"), str)
+                    or not isinstance(failure_capacity.get("parent"), str)
+                    or not isinstance(failure_capacity.get("partition"), str)
+                    or not isinstance(failure_capacity.get("tools"), Mapping)
+                ):
+                    return False
+                if "retry_of" in error and not valid_failure(error["retry_of"]):
                     return False
                 return True
 
             def matches_failure(reference: Mapping[str, Any], candidate: Mapping[str, Any]) -> bool:
                 return all(candidate.get(key) == reference.get(key) for key in (
-                    "phase", "command", "returncode", "stdout", "stderr", "transient"
+                    "phase", "command", "returncode", "stdout", "stderr", "capacity", "transient", "cause"
                 ))
 
             attempt_records = capacity["attempts"]
@@ -5107,7 +5156,7 @@ class Control:
             elif any("error" in record for record in attempt_records):
                 raise ValueError()
             target_bytes = disk_gib * 1024**3
-            expected_threshold = capacity["disk_bytes"] * 95 // 100
+            expected_threshold = target_bytes * 95 // 100
             filesystem = value.get("filesystem")
             source = value.get("source")
             parent = value.get("parent")

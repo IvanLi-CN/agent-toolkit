@@ -424,6 +424,27 @@ class Fixture(unittest.TestCase):
     def guest_growth_result(disk_gib=20, *, status="grown", attempts=1, returncode=0, stderr=""):
         size = disk_gib * GIB
         filesystem = size - 1000000
+        threshold = size * 95 // 100
+        failure_capacity = {
+            "requested_bytes": size,
+            "disk_bytes": size,
+            "partition_bytes": size,
+            "filesystem_bytes": filesystem,
+            "filesystem_before": filesystem,
+            "filesystem_threshold_bytes": threshold,
+            "filesystem": "ext4",
+            "source": "/dev/sda2",
+            "parent": "/dev/sda",
+            "partition": "2",
+            "tools": {
+                "findmnt": "/usr/bin/findmnt",
+                "lsblk": "/usr/bin/lsblk",
+                "blockdev": "/usr/sbin/blockdev",
+                "growpart": "/usr/bin/growpart",
+                "resize2fs": "/usr/sbin/resize2fs",
+            },
+            "verified": True,
+        }
         attempt_records = [{"attempt": index + 1} for index in range(attempts)]
         if status == "grown_after_retry" and attempt_records:
             attempt_records[0]["error"] = {
@@ -432,7 +453,7 @@ class Fixture(unittest.TestCase):
                 "returncode": 1,
                 "stdout": "",
                 "stderr": "resize2fs: Device or resource busy",
-                "capacity": {"verified": True},
+                "capacity": failure_capacity,
                 "transient": True,
             }
         payload = {
@@ -441,7 +462,7 @@ class Fixture(unittest.TestCase):
             "partition_bytes": size,
             "filesystem_before": filesystem,
             "filesystem_bytes": filesystem,
-            "filesystem_threshold_bytes": size * 95 // 100,
+            "filesystem_threshold_bytes": threshold,
             "filesystem": "ext4",
             "source": "/dev/sda2",
             "parent": "/dev/sda",
@@ -454,7 +475,7 @@ class Fixture(unittest.TestCase):
                 "partition_bytes": size,
                 "filesystem_bytes": filesystem,
                 "filesystem_before": filesystem,
-                "filesystem_threshold_bytes": size * 95 // 100,
+                "filesystem_threshold_bytes": threshold,
                 "filesystem": "ext4",
                 "source": "/dev/sda2",
                 "parent": "/dev/sda",
@@ -1346,6 +1367,34 @@ class LifecycleTests(Fixture):
         self.assertEqual(result["guest_filesystem"]["attempts"], 0)
         self.assertEqual(len(result["ports"]), 1)
 
+    def test_guest_growth_threshold_uses_requested_capacity_when_disk_is_larger(self):
+        response = self.guest_growth_result(status="already_grown", attempts=0)
+        payload = json.loads(response.stdout)
+        observed = 24 * GIB
+        threshold = 20 * GIB * 95 // 100
+        payload.update(
+            virtual_bytes=observed,
+            partition_bytes=observed,
+            filesystem_before=threshold,
+            filesystem_bytes=threshold,
+            filesystem_threshold_bytes=threshold,
+        )
+        payload["capacity"].update(
+            disk_bytes=observed,
+            partition_bytes=observed,
+            filesystem_before=threshold,
+            filesystem_bytes=threshold,
+            filesystem_threshold_bytes=threshold,
+        )
+        response.stdout = json.dumps(payload).encode()
+        self.runner.guest_growth_results = [response]
+
+        result = self.acquire()
+
+        self.assertEqual(result["state"], "active")
+        self.assertEqual(result["guest_filesystem"]["status"], "already_grown")
+        self.assertEqual(result["guest_filesystem"]["filesystem_threshold_bytes"], threshold)
+
     def test_restart_and_resize_refuse_imminent_expiry(self):
         first = self.acquire()
         self.now = CONTROL.parse_time(first["lease_expires_at"]) - dt.timedelta(seconds=20)
@@ -1420,7 +1469,7 @@ class CommandRunnerTests(unittest.TestCase):
         )
         with self.assertRaises(CONTROL.ControlError) as failure:
             CONTROL.CommandRunner().run_bounded(
-                [os.sys.executable, "-c", code], timeout=0.05, stdout_limit=128, stderr_limit=128
+                [os.sys.executable, "-c", code], timeout=1, stdout_limit=128, stderr_limit=128
             )
         self.assertEqual(failure.exception.code, "command_timeout")
         self.assertEqual(failure.exception.detail["stdout"], "partial-out")

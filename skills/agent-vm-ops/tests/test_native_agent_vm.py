@@ -470,6 +470,8 @@ class Fixture(unittest.TestCase):
                 "stderr": "resize2fs: Device or resource busy",
                 "capacity": failure_capacity,
                 "transient": True,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
             }
         payload = {
             "status": status,
@@ -544,6 +546,8 @@ class Fixture(unittest.TestCase):
             "stderr": stderr,
             "capacity": attempt_capacity,
             "transient": False,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
         }
         report_capacity = dict(attempt_capacity, attempts=[])
         report_capacity["attempts"] = [{"attempt": 1, "error": error}]
@@ -1604,6 +1608,9 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         initial_partition=None,
         initial_filesystem=None,
         resize_returncode=0,
+        growpart_returncode=0,
+        growpart_stdout="",
+        growpart_stderr="",
         filesystem_type="ext4",
         timeout_command=None,
         source_output="/dev/sda2\n",
@@ -1646,7 +1653,7 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
                 stderr = "udevadm: settle failed\n" if udevadm_returncode else ""
                 return completed(command, udevadm_returncode, stderr=stderr)
             if command[0] == "growpart":
-                return completed(command)
+                return completed(command, growpart_returncode, stdout=growpart_stdout, stderr=growpart_stderr)
             if command[0] == "resize2fs":
                 if resize_returncode:
                     return completed(command, resize_returncode, stderr="resize2fs: Device or resource busy\n")
@@ -1709,6 +1716,36 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         self.assertEqual(first_error["phase"], "partition-verify")
         self.assertEqual(first_error["cause"], "stale_partition_capacity_below_target")
         self.assertTrue(first_error["transient"])
+        self.assertIn(["blockdev", "--rereadpt", "/dev/sda"], calls)
+
+    def test_guest_root_growth_script_fails_closed_on_growpart_error(self):
+        exit_code, stdout, stderr, calls = self.execute_script(
+            growpart_returncode=2,
+            growpart_stderr="growpart: invalid geometry\n",
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout, "")
+        error = json.loads(stderr)["error"]
+        self.assertEqual(error["phase"], "partition-grow")
+        self.assertFalse(error["transient"])
+        self.assertEqual(len([command for command in calls if command[0] == "growpart"]), 1)
+        self.assertNotIn(["blockdev", "--rereadpt", "/dev/sda"], calls)
+
+    def test_guest_root_growth_script_retries_transient_growpart_error_once(self):
+        exit_code, stdout, stderr, calls = self.execute_script(
+            growpart_returncode=1,
+            growpart_stderr="growpart: Device or resource busy\n",
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout, "")
+        error = json.loads(stderr)["error"]
+        self.assertEqual(error["phase"], "partition-grow")
+        self.assertTrue(error["transient"])
+        self.assertEqual(error["retry_of"]["phase"], "partition-grow")
+        self.assertEqual(len(error["capacity"]["attempts"]), 2)
+        self.assertEqual(len([command for command in calls if command[0] == "growpart"]), 2)
         self.assertIn(["blockdev", "--rereadpt", "/dev/sda"], calls)
 
     def test_guest_root_growth_script_settles_partition_when_udevadm_is_available(self):
@@ -1819,6 +1856,15 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         self.assertEqual(error["phase"], "topology-source")
         self.assertTrue(error["stdout_truncated"])
         self.assertLessEqual(len(error["stdout"]), 8192)
+
+    def test_guest_root_growth_script_preserves_stdout_below_capture_limit(self):
+        source_output = "/dev/sda2\n" + "x" * 5000 + "\n"
+        exit_code, stdout, stderr, _ = self.execute_script(source_output=source_output)
+
+        self.assertEqual(exit_code, 1)
+        error = json.loads(stderr)["error"]
+        self.assertFalse(error["stdout_truncated"])
+        self.assertEqual(len(error["stdout"]), len(source_output))
 
     def test_guest_root_growth_script_rejects_ambiguous_topology_output(self):
         exit_code, stdout, stderr, _ = self.execute_script(source_output="/dev/sda2\n/dev/sda3\n")

@@ -115,10 +115,11 @@ capacity = {"requested_bytes": TARGET_BYTES, "verified": False}
 attempts = []
 
 
-def clip(value):
+def clip(value, limit=4000, *, tail=True):
     if isinstance(value, bytes):
         value = value.decode("utf-8", "replace")
-    return str(value or "")[-4000:]
+    value = str(value or "")
+    return value[-limit:] if tail else value[:limit]
 
 
 def transient_failure(command, stdout, stderr):
@@ -159,7 +160,7 @@ class GuestFailure(Exception):
             "phase": self.phase,
             "command": self.command,
             "returncode": self.returncode,
-            "stdout": clip(self.stdout),
+            "stdout": clip(self.stdout, STDOUT_LIMIT, tail=False),
             "stderr": clip(self.stderr),
             "capacity": dict(capacity),
             "transient": self.transient,
@@ -483,7 +484,12 @@ except Exception as error:
             "phase": "guest-root-growth",
             "command": ["python3", "-c", "guest-root-growth"],
             "returncode": 1,
+            "stdout": "",
+            "stderr": "",
             "capacity": dict(capacity),
+            "transient": False,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
             "cause": type(error).__name__,
         },
     }, sort_keys=True), file=sys.stderr)
@@ -5114,7 +5120,10 @@ class Control:
             pending = [(error, 0)]
             while pending:
                 current, depth = pending.pop()
-                required = {"phase", "command", "returncode", "stdout", "stderr", "capacity", "transient"}
+                required = {
+                    "phase", "command", "returncode", "stdout", "stderr", "capacity", "transient",
+                    "stdout_truncated", "stderr_truncated",
+                }
                 if not isinstance(current, Mapping) or not required.issubset(current):
                     return False
                 failure_capacity = current["capacity"]
@@ -5131,9 +5140,9 @@ class Control:
                     or isinstance(failure_capacity.get("requested_bytes"), bool)
                     or not isinstance(failure_capacity.get("requested_bytes"), int)
                     or not isinstance(current["transient"], bool)
+                    or not isinstance(current["stdout_truncated"], bool)
+                    or not isinstance(current["stderr_truncated"], bool)
                     or ("cause" in current and not isinstance(current["cause"], str))
-                    or ("stdout_truncated" in current and not isinstance(current["stdout_truncated"], bool))
-                    or ("stderr_truncated" in current and not isinstance(current["stderr_truncated"], bool))
                 ):
                     return False
                 if complete:
@@ -5306,7 +5315,10 @@ class Control:
                 pending = [(error, 0)]
                 while pending:
                     current, depth = pending.pop()
-                    required = {"phase", "command", "returncode", "stdout", "stderr", "capacity", "transient"}
+                    required = {
+                        "phase", "command", "returncode", "stdout", "stderr", "capacity", "transient",
+                        "stdout_truncated", "stderr_truncated",
+                    }
                     if not isinstance(current, Mapping) or not required.issubset(current):
                         return False
                     failure_capacity = current["capacity"]
@@ -5322,6 +5334,8 @@ class Control:
                         or not failure_capacity_keys.issubset(failure_capacity)
                         or failure_capacity.get("verified") is not True
                         or not isinstance(current["transient"], bool)
+                        or not isinstance(current["stdout_truncated"], bool)
+                        or not isinstance(current["stderr_truncated"], bool)
                         or ("cause" in current and not isinstance(current["cause"], str))
                     ):
                         return False
@@ -5347,7 +5361,8 @@ class Control:
 
             def matches_failure(reference: Mapping[str, Any], candidate: Mapping[str, Any]) -> bool:
                 return all(candidate.get(key) == reference.get(key) for key in (
-                    "phase", "command", "returncode", "stdout", "stderr", "capacity", "transient", "cause"
+                    "phase", "command", "returncode", "stdout", "stderr", "capacity", "transient", "cause",
+                    "stdout_truncated", "stderr_truncated",
                 ))
 
             attempt_records = capacity["attempts"]

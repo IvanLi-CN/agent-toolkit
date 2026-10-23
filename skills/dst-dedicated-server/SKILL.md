@@ -13,7 +13,7 @@ Use this Skill for a configured server whose SSH alias, user and local client di
 - `DST_USER` is the remote operator account.
 - `DST_LOCAL_DIR` is the optional local client data directory.
 - `DST_CLUSTER` selects the cluster on the remote host.
-- The local CLI uses the Bun installed on the host and requires local Perl and `ps` runtimes for POSIX process supervision; the supervisor fails closed with `supervisor_requires_perl` or `supervisor_requires_ps` when either is unavailable. Remote collection keeps its native Shell boundary and does not require Bun on the game server.
+- The local CLI uses the Bun installed on the host and requires POSIX process-group support plus local Perl and `ps` runtimes for process supervision; Windows is rejected with `supervisor_unsupported_platform`, while missing POSIX tools fail closed with `supervisor_requires_perl` or `supervisor_requires_ps`. Remote collection keeps its native Shell boundary and does not require Bun on the game server.
 - The remote collection scripts are executed with Bash on the inspected host and require a standard Perl runtime for nonblocking, no-follow file reads; if either prerequisite is unavailable they fail closed instead of opening an unbounded remote stream.
 
 Set these values outside tracked files or pass them to the scripts. Missing host configuration fails closed; do not guess an address or path.

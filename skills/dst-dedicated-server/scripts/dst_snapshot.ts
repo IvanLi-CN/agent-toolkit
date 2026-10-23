@@ -60,6 +60,7 @@ const SNAPSHOT_TEMP_ROOT_NAME = ".agent-toolkit-dst-snapshot-tmp";
 const SNAPSHOT_OWNER_MARKER = "agent-toolkit-dst-snapshot-v1\n";
 const SNAPSHOT_TEMP_STALE_MS = 15 * 60 * 1000;
 const MAX_SNAPSHOT_TEMP_SCAN_ENTRIES = 128;
+const SNAPSHOT_OWNER_WAIT_ATTEMPTS = 400;
 
 async function readBounded(
   stream: ReadableStream<Uint8Array>,
@@ -402,7 +403,14 @@ function redactSensitiveContinuations(text: string): string {
 }
 
 export function redactSensitiveText(text: string): string {
-  const normalized = text.replace(ANSI_ESCAPE, "").replace(CONTROL_CHARACTERS, "");
+  // Preserve a separator at control boundaries so a key and its value cannot
+  // be concatenated into a token that bypasses the assignment patterns. The
+  // punctuation cleanup keeps split names such as `api_\u001b[31mkey` intact.
+  const normalized = text
+    .replace(ANSI_ESCAPE, " ")
+    .replace(CONTROL_CHARACTERS, " ")
+    .replace(/([A-Za-z0-9])\s+([_.-])(?=[A-Za-z0-9])/g, "$1$2")
+    .replace(/([_.-])\s+([A-Za-z0-9])/g, "$1$2");
   const redacted = redactSensitiveCollections(redactSensitiveBlocks(redactSensitiveContinuations(normalized)))
     .replace(SENSITIVE_MULTILINE_ASSIGNMENT, "$1[REDACTED]")
     .replace(PRIVATE_KEY_BLOCK, "[REDACTED]")
@@ -700,7 +708,7 @@ async function ensureSnapshotTemporaryRoot(parent: string): Promise<string> {
     }
     return root;
   }
-  for (let attempt = 0; attempt < 20; attempt += 1) {
+  for (let attempt = 0; attempt < SNAPSHOT_OWNER_WAIT_ATTEMPTS; attempt += 1) {
     const value = await readMarker();
     if (value === true) return root;
     if (value === false) throw new Error("snapshot temporary root owner marker is invalid");
@@ -776,7 +784,7 @@ async function cleanupSnapshotTemporaryDirectories(root: string): Promise<void> 
       try {
         const metadata = await lstat(path);
         if (!metadata.isDirectory() || metadata.isSymbolicLink() || Date.now() - metadata.mtimeMs < SNAPSHOT_TEMP_STALE_MS) continue;
-        if (await readMarkerForCleanup(join(path, ".owner")) === false) continue;
+        if (await readMarkerForCleanup(join(path, ".owner")) !== true) continue;
         await rm(path, { recursive: true, force: true, maxRetries: 0 });
       } catch {
         // Preserve a concurrently changing directory for a later invocation.

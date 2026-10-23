@@ -2508,9 +2508,15 @@ async function cleanupOrphanedTarget(rememberedReference?: TargetReference): Pro
   if (targetPid === undefined || targetPgid === undefined || targetPid === process.pid) return false;
   const currentPgid = await currentProcessGroup(process.pid);
   if (currentPgid === undefined || currentPgid === targetPgid) return false;
-  const currentIdentity = await currentProcessIdentity(targetPid);
-  if (reference.identity.length === 0 || currentIdentity === undefined || !processIdentityMatches(reference.identity, currentIdentity)) return false;
-  if (await currentProcessGroup(targetPid) !== targetPgid) return false;
+  const verifyTargetReference = async (): Promise<boolean> => {
+    const currentIdentity = await currentProcessIdentity(targetPid);
+    if (reference.identity.length === 0 || currentIdentity === undefined || !processIdentityMatches(reference.identity, currentIdentity)) return false;
+    return await currentProcessGroup(targetPid) === targetPgid;
+  };
+  if (!await verifyTargetReference()) return false;
+  // Re-read the authenticated identity and group immediately before the
+  // negative-PGID signal so a reused PID or group cannot pass a stale check.
+  if (!await verifyTargetReference()) return false;
   try {
     process.kill(-targetPgid, "SIGKILL");
   } catch {
@@ -2586,8 +2592,8 @@ async function waitForCleanupAck(fd: number, cleanupStartedPath: string, wrapper
   let timeoutMs = SUPERVISOR_CLEANUP_TIMEOUT_MS + SUPERVISOR_CLEANUP_ACK_SETTLE_MS;
   if (wrapperResult.done) {
     const cleanupStarted = await readRegularMarker(cleanupStartedPath);
-    timeoutMs = wrapperResult.code === 0 && cleanupStarted === undefined
-      ? SUPERVISOR_CLEANUP_ACK_SETTLE_MS
+    timeoutMs = wrapperResult.code === 0
+      ? SUPERVISOR_CLEANUP_TIMEOUT_MS
       : cleanupStarted !== undefined
         ? SUPERVISOR_CLEANUP_TIMEOUT_MS
         : SUPERVISOR_UNEXPECTED_EXIT_SETTLE_MS;
@@ -2612,17 +2618,7 @@ async function createSupervisorMarker(path: string): Promise<boolean> {
 }
 
 export async function spawnSupervised(args: string[]): Promise<SupervisedChild> {
-  if (process.platform === "win32") {
-    const child = Bun.spawn(args, { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
-    return {
-      child,
-      exited: child.exited,
-      wrapperExited: child.exited,
-      waitForCleanupAcknowledged: () => Promise.resolve(true),
-      forceCleanup: () => Promise.resolve(false),
-      cleanup: async () => undefined,
-    };
-  }
+  if (process.platform === "win32") throw new Error("supervisor_unsupported_platform");
 
   if (Bun.which("perl") === null) throw new Error("supervisor_requires_perl");
   if (Bun.which("ps") === null) throw new Error("supervisor_requires_ps");

@@ -56,6 +56,9 @@ describe.serial("DST local Bun tooling", () => {
     expect(redactSensitiveText("api_key%3Dfixture-secret")).not.toContain("fixture-secret");
     expect(redactSensitiveText("password: |\n  fixture-secret\nnext: visible")).not.toContain("fixture-secret");
     expect(redactSensitiveText("api_\u001b[31mkey=fixture-secret")).not.toContain("fixture-secret");
+    expect(redactSensitiveText("token\u001b[31mANSI_SECRET")).not.toContain("ANSI_SECRET");
+    expect(redactSensitiveText("api_key\u001b[31m=fixture-secret")).not.toContain("fixture-secret");
+    expect(redactSensitiveText("api_key=\u001b[31mfixture-secret")).not.toContain("fixture-secret");
     expect(redactSensitiveText("api_key=\n  fixture-secret\nvisible=ok")).not.toContain("fixture-secret");
     expect(redactSensitiveText('{"api_keys": [\n  "json-secret"\n], "nested": {"token": "nested-secret"}}')).not.toMatch(/json-secret|nested-secret/);
     expect(redactSensitiveText('api_key="prefix\\"LEAK"')).toBe("api_key=[REDACTED]");
@@ -1098,7 +1101,8 @@ exec /bin/ps "$@"
       const output = join(root, "snapshot.md");
       expect(await snapshotMain(["--no-local", "--no-remote", "--out", output])).toBe(0);
       expect(await readdir(tempRoot)).not.toContain(".dst-snapshot-tmp-stale");
-      expect(await readdir(tempRoot)).not.toContain(".dst-snapshot-tmp-ownerless");
+      expect(await readdir(tempRoot)).toContain(".dst-snapshot-tmp-ownerless");
+      expect(await readFile(join(ownerless, "partial.md"), "utf8")).toBe("interrupted");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

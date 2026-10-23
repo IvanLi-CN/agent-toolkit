@@ -737,7 +737,8 @@ case "$*" in
     case "$supervisor_pid" in ''|*[!0-9]*) exit 97 ;; esac
     sleep 0.5
     kill -KILL "$supervisor_pid" 2>/dev/null || true
-    while :; do sleep 1; done
+    sleep 1
+    exit 0
     ;;
   *) cat >/dev/null; exit 0 ;;
 esac

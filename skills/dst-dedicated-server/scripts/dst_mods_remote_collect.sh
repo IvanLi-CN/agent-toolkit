@@ -151,7 +151,22 @@ temporary_dir="$(mktemp -d)"
 temporary="$temporary_dir/input"
 verification="$temporary_dir/verification"
 projection="$temporary_dir/projection"
-trap 'rm -rf "$temporary_dir"' EXIT
+temporary_dir_identity="$(stat -Lc '%d:%i' "$temporary_dir" 2>/dev/null || stat -f '%d:%i' "$temporary_dir" 2>/dev/null || true)"
+cleanup_temporary_dir() {
+  local current_identity
+  current_identity="$(stat -Lc '%d:%i' "$temporary_dir" 2>/dev/null || stat -f '%d:%i' "$temporary_dir" 2>/dev/null || true)"
+  [[ -n "$temporary_dir_identity" && "$current_identity" == "$temporary_dir_identity" ]] || return 0
+  for path in "$temporary" "$verification" "$projection"; do
+    if [[ -e "$path" || -L "$path" ]]; then
+      [[ -f "$path" && ! -L "$path" ]] || return 0
+      rm -f -- "$path" || return 0
+    fi
+  done
+  current_identity="$(stat -Lc '%d:%i' "$temporary_dir" 2>/dev/null || stat -f '%d:%i' "$temporary_dir" 2>/dev/null || true)"
+  [[ "$current_identity" == "$temporary_dir_identity" ]] || return 0
+  rmdir -- "$temporary_dir" 2>/dev/null || true
+}
+trap cleanup_temporary_dir EXIT
 if ! read_bounded_regular_file "$file" "$temporary" $((max_bytes + 1)); then
   printf 'cannot safely read modoverrides.lua\n' >&2
   exit 1

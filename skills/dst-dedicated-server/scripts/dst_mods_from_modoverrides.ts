@@ -39,7 +39,8 @@ class CliError extends Error {
 
 function formatCliError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
-  return message.startsWith("error:") ? message : `error: ${message}`;
+  const redacted = redactOperationalText(message);
+  return redacted.startsWith("error:") ? redacted : `error: ${redacted}`;
 }
 
 function maskLuaSyntax(line: string): string {

@@ -2,7 +2,7 @@
 
 import { constants } from "node:fs";
 import { createHmac, randomBytes, randomUUID } from "node:crypto";
-import { lstat, link, mkdir, mkdtemp, open, opendir, rename, rmdir, unlink, type FileHandle } from "node:fs/promises";
+import { lstat, link, mkdir, mkdtemp, open, opendir, realpath, rename, rmdir, unlink, type FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { deflateSync } from "node:zlib";
 import { basename, dirname, join, resolve } from "node:path";
@@ -631,9 +631,9 @@ async function cleanupStaleTemporaryDirectories(parent: string): Promise<void> {
         if (ownedOutput === undefined || ownerProcessMayBeAlive(ownedOutput.ownerPid)) continue;
         const identity = { dev: metadata.dev, ino: metadata.ino };
         if (isTombstone) {
-          if (await removeTemporaryDirectoryContents(temporaryDirectory, ownedOutput.outputName, true, identity)) await syncDirectory(parent).catch(() => undefined);
+          if (await removeTemporaryDirectoryContents(temporaryDirectory, ownedOutput.outputName, false, identity)) await syncDirectory(parent).catch(() => undefined);
         } else {
-          await removeTemporaryDirectory(temporaryDirectory, ownedOutput.outputName, true);
+          await removeTemporaryDirectory(temporaryDirectory, ownedOutput.outputName, false);
         }
       } catch {
         // Preserve an unexpected or concurrently changing directory.
@@ -647,7 +647,18 @@ async function cleanupStaleTemporaryDirectories(parent: string): Promise<void> {
 async function writePngAtomically(outputPath: string, data: Uint8Array): Promise<void> {
   if (basename(outputPath) === ".owner") throw new Error("--out cannot use .owner as the output filename");
   const parent = dirname(outputPath);
+  await realpath(parent);
+  const parentMetadata = await lstat(parent);
+  if (!parentMetadata.isDirectory() || parentMetadata.isSymbolicLink()) throw new Error("framebuffer output parent must be a real directory");
+  const parentIdentity = { dev: parentMetadata.dev, ino: parentMetadata.ino };
+  const assertParentStable = async (): Promise<void> => {
+    const current = await lstat(parent);
+    if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== parentIdentity.dev || current.ino !== parentIdentity.ino) {
+      throw new Error("framebuffer output parent changed during publication");
+    }
+  };
   await cleanupStaleTemporaryDirectories(parent);
+  await assertParentStable();
   const temporaryDirectory = await mkdtemp(join(parent, TEMP_DIRECTORY_PREFIX));
   const temporaryPath = join(temporaryDirectory, basename(outputPath));
   try {
@@ -665,7 +676,9 @@ async function writePngAtomically(outputPath: string, data: Uint8Array): Promise
     } finally {
       await handle.close();
     }
+    await assertParentStable();
     await rename(temporaryPath, outputPath);
+    await assertParentStable();
     try {
       const directoryHandle = await open(parent, "r");
       try {

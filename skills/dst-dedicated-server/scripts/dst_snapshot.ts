@@ -2,7 +2,7 @@
 
 import { constants, type Dirent } from "node:fs";
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
-import { lstat, link, mkdir, mkdtemp, open, opendir, realpath, rename, rm, rmdir, unlink, type FileHandle } from "node:fs/promises";
+import { lstat, link, mkdir, mkdtemp, open, opendir, realpath, rename, rmdir, unlink, type FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawnSupervised, SUPERVISOR_UNKNOWN_TARGET_STATUS, type SupervisedChild } from "./process_supervisor.ts";
@@ -33,7 +33,8 @@ class CliError extends Error {
 
 function formatCliError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
-  return message.startsWith("error:") ? message : `error: ${message}`;
+  const redacted = redactOperationalText(message);
+  return redacted.startsWith("error:") ? redacted : `error: ${redacted}`;
 }
 
 function expandUser(path: string): string {
@@ -816,8 +817,16 @@ async function renderKnownLogListing(localDir: string, entries: Dirent[], redact
 }
 
 async function ensureSnapshotTemporaryRoot(parent: string): Promise<string> {
+  await realpath(parent);
   const parentMetadata = await lstat(parent);
   if (!parentMetadata.isDirectory() || parentMetadata.isSymbolicLink()) throw new Error("snapshot output parent must be a real directory");
+  const parentIdentity = { dev: parentMetadata.dev, ino: parentMetadata.ino };
+  const assertParentStable = async (): Promise<void> => {
+    const current = await lstat(parent);
+    if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== parentIdentity.dev || current.ino !== parentIdentity.ino) {
+      throw new Error("snapshot output parent changed during publication");
+    }
+  };
   const root = join(parent, SNAPSHOT_TEMP_ROOT_NAME);
   let createdRoot = false;
   try {
@@ -827,6 +836,7 @@ async function ensureSnapshotTemporaryRoot(parent: string): Promise<string> {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
   }
   const metadata = await lstat(root);
+  await assertParentStable();
   if (!metadata.isDirectory() || metadata.isSymbolicLink() || (metadata.mode & 0o077) !== 0) throw new Error("snapshot temporary root must be a private directory");
   if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) throw new Error("snapshot temporary root is not owned by the current user");
   const marker = join(root, ".owner");
@@ -947,7 +957,7 @@ async function ensureSnapshotTemporaryRoot(parent: string): Promise<string> {
   return root;
 }
 
-async function cleanupSnapshotTemporaryDirectories(root: string): Promise<void> {
+async function cleanupSnapshotTemporaryDirectories(root: string, requestedPath?: string): Promise<void> {
   const removeDirectoryContents = async (path: string, expectedIdentity: { dev: number; ino: number }): Promise<boolean> => {
     try {
       const moved = await lstat(path);
@@ -1016,7 +1026,7 @@ async function cleanupSnapshotTemporaryDirectories(root: string): Promise<void> 
         if (!metadata.isDirectory() || metadata.isSymbolicLink()) continue;
         const originalName = isTombstone ? tombstoneMatch![1]! : entry.name;
         const originalPath = join(root, originalName);
-        if (!isTombstone && Date.now() - metadata.mtimeMs < SNAPSHOT_TEMP_STALE_MS) continue;
+        if (!isTombstone && requestedPath !== path && Date.now() - metadata.mtimeMs < SNAPSHOT_TEMP_STALE_MS) continue;
         if (await readMarkerForCleanup(join(path, ".owner"), `temp:${originalPath}`) !== true) continue;
         const initialIdentity = { dev: metadata.dev, ino: metadata.ino };
         if (isTombstone) {
@@ -1398,6 +1408,16 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     const parent = dirname(outputPath);
     const tempRoot = await ensureSnapshotTemporaryRoot(parent);
     await cleanupSnapshotTemporaryDirectories(tempRoot);
+    const parentMetadata = await lstat(parent);
+    if (!parentMetadata.isDirectory() || parentMetadata.isSymbolicLink()) throw new Error("snapshot output parent must be a real directory");
+    const parentIdentity = { dev: parentMetadata.dev, ino: parentMetadata.ino };
+    const assertParentStable = async (): Promise<void> => {
+      const current = await lstat(parent);
+      if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== parentIdentity.dev || current.ino !== parentIdentity.ino) {
+        throw new Error("snapshot output parent changed during publication");
+      }
+    };
+    await assertParentStable();
     const tempDir = await mkdtemp(join(tempRoot, SNAPSHOT_TEMP_PREFIX));
     const tempPath = join(tempDir, basename(outputPath));
     try {
@@ -1415,10 +1435,12 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
       } finally {
         await handle.close();
       }
+      await assertParentStable();
       await rename(tempPath, outputPath);
+      await assertParentStable();
     } finally {
       await unlink(tempPath).catch(() => undefined);
-      await rm(tempDir, { recursive: true, force: true });
+      await cleanupSnapshotTemporaryDirectories(tempRoot, tempDir);
     }
     await syncDirectory(parent);
   } catch (error) {

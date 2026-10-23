@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, readlink, rm, symlink, truncate, utimes, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readlink, readdir, rm, symlink, truncate, utimes, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { inflateSync } from "node:zlib";
 import { basename, join } from "node:path";
@@ -279,6 +279,24 @@ describe("framebuffer to PNG helper", () => {
       await writeFile(input, Uint8Array.from([255]));
       expect(await main(["--format", "gray8", "--width", "1", "--height", "1", "--in", input, "--out", output])).toBe(0);
       expect(await readFile(join(temporaryDirectory, "unrelated.txt"), "utf8")).toBe("preserve");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("reclaims an owner-only temporary directory after publication interruption", async () => {
+    const root = await mkdtemp(join(process.env.TMPDIR ?? "/tmp", "agent-toolkit-fb-owner-only-"));
+    const temporaryDirectory = await mkdtemp(join(root, ".fb-to-png-tmp-"));
+    const outputName = "preview.png";
+    const staleTime = new Date(Date.now() - 60 * 60 * 1000);
+    try {
+      await writeFile(join(temporaryDirectory, ".owner"), await createFramebufferOwnerMarker(basename(temporaryDirectory), outputName, 999_999_999), { mode: 0o600 });
+      await utimes(temporaryDirectory, staleTime, staleTime);
+      const input = join(root, "frame.raw");
+      const output = join(root, outputName);
+      await writeFile(input, Uint8Array.from([255]));
+      expect(await main(["--format", "gray8", "--width", "1", "--height", "1", "--in", input, "--out", output])).toBe(0);
+      expect(await readdir(root)).not.toContain(basename(temporaryDirectory));
     } finally {
       await rm(root, { recursive: true, force: true });
     }

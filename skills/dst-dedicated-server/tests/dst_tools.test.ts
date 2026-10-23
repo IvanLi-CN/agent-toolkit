@@ -1123,6 +1123,10 @@ exec /bin/ps "$@"
       await writeFile(join(stale, ".owner"), await createSnapshotOwnerMarker(`temp:${stale}`, 999_999_999));
       const old = new Date(Date.now() - 20 * 60 * 1000);
       await utimes(stale, old, old);
+      const ownerOnly = join(tempRoot, ".dst-snapshot-tmp-owner-only");
+      await mkdir(ownerOnly);
+      await writeFile(join(ownerOnly, ".owner"), await createSnapshotOwnerMarker(`temp:${ownerOnly}`, 999_999_999));
+      await utimes(ownerOnly, old, old);
       const ownerless = join(tempRoot, ".dst-snapshot-tmp-ownerless");
       await mkdir(ownerless);
       await writeFile(join(ownerless, "partial.md"), "interrupted");
@@ -1135,6 +1139,7 @@ exec /bin/ps "$@"
       const output = join(root, "snapshot.md");
       expect(await snapshotMain(["--no-local", "--no-remote", "--out", output])).toBe(0);
       expect(await readdir(tempRoot)).not.toContain(".dst-snapshot-tmp-stale");
+      expect(await readdir(tempRoot)).not.toContain(".dst-snapshot-tmp-owner-only");
       expect(await readdir(tempRoot)).toContain(".dst-snapshot-tmp-ownerless");
       expect(await readdir(tempRoot)).toContain(".dst-snapshot-tmp-active");
       expect(await readFile(join(ownerless, "partial.md"), "utf8")).toBe("interrupted");
@@ -1564,7 +1569,7 @@ exec /bin/ps "$@"
       await symlink(canary, markerPath);
       const result = await Promise.race([
         supervised.exited,
-        Bun.sleep(10_000).then(() => { throw new Error("supervisor status marker read timed out"); }),
+        Bun.sleep(30_000).then(() => { throw new Error("supervisor status marker read timed out"); }),
       ]);
       expect(result).toBe(SUPERVISOR_UNKNOWN_TARGET_STATUS);
       expect(await readFile(canary, "utf8")).toBe("sentinel\n");

@@ -2479,7 +2479,7 @@ async function processGroupHasLiveProcess(pgid: number): Promise<boolean | undef
   }
   for (const line of (await output).split("\n")) {
     if (line.trim().length === 0) continue;
-    const match = /^\s*([0-9]+)\s+([0-9]+)\s+([A-Za-z?]+)/.exec(line);
+    const match = /^\s*([0-9]+)\s+([0-9]+)\s+(\S+)/.exec(line);
     if (match === null) return undefined;
     const pid = Number(match[1]);
     const observedPgid = Number(match[2]);

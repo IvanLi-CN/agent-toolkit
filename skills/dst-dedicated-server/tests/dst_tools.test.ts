@@ -1629,6 +1629,42 @@ exec /bin/ps "$@"
     }
   });
 
+  test("accepts POSIX process state modifiers during target cleanup", { timeout: 30_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-state-modifiers-"));
+    const fakePs = join(root, "ps");
+    const fixture = join(root, "fixture.ts");
+    const previousPath = process.env.PATH;
+    const moduleUrl = pathToFileURL(join(import.meta.dir, "..", "scripts", "process_supervisor.ts")).href;
+    try {
+      await writeFile(fakePs, `#!/bin/sh
+case "$*" in
+  *"-axo pid=,pgid=,state="*)
+    printf '100 200 S+\\n101 201 S<\\n102 202 Ss+\\n'
+    exit 0
+    ;;
+  *) exec /bin/ps "$@" ;;
+esac
+`);
+      await chmod(fakePs, 0o755);
+      await writeFile(fixture, `import { spawnSupervised } from ${JSON.stringify(moduleUrl)};
+const supervised = await spawnSupervised(["sh", "-c", "sleep 30"]);
+try {
+  process.stdout.write(String(await supervised.forceCleanup()));
+} finally {
+  try { supervised.child.kill("SIGKILL"); } catch {}
+  await supervised.wrapperExited.catch(() => undefined);
+  await supervised.cleanup();
+}
+`);
+      const result = await runTool(fixture, [], { ...process.env, PATH: `${root}:${previousPath ?? ""}` } as Record<string, string>);
+      expect(result.status).toBe(0);
+      expect(result.stdout.trim()).toBe("true");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("cleans the authenticated target group after its anchor dies", { timeout: 30_000 }, async () => {
     if (process.platform === "win32") return;
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-anchor-loss-"));

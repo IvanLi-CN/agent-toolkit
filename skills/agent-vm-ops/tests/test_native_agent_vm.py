@@ -88,6 +88,7 @@ class NativeCommands(CONTROL.CommandRunner):
         self.project_limits = {}
         self.storage_source = None
         self.on_config_set = None
+        self.guest_growth_results = []
 
     def run(self, argv, *, input_data=None, timeout=30, check=True):
         args = list(argv)
@@ -172,11 +173,41 @@ class NativeCommands(CONTROL.CommandRunner):
                 if "cat /etc/ssh/ssh_host_ed25519_key.pub" in command: body = KEY.encode()
                 elif command[-2:] == ["cat", "/proc/sys/kernel/random/boot_id"]:
                     body = self.instances[command[1]].get("boot_id", "00000000-0000-4000-8000-000000000001").encode()
-                elif "python3" in command:
+                elif command[3:5] == ["python3", "-c"]:
+                    if self.guest_growth_results:
+                        response = self.guest_growth_results.pop(0)
+                        if isinstance(response, CONTROL.ControlError):
+                            raise response
+                        return subprocess.CompletedProcess(args, response.returncode, response.stdout, response.stderr)
                     size = self.instances[command[1]]["guest_disk_bytes"]
                     if size < int(command[-1]) * GIB:
                         raise CONTROL.ControlError("command_failed", "guest virtual disk size is stale")
-                    body = json.dumps({"virtual_bytes": size, "filesystem_bytes": size-1000000}).encode()
+                    filesystem = size - 1000000
+                    body = json.dumps({
+                        "status": "grown",
+                        "virtual_bytes": size,
+                        "partition_bytes": size,
+                        "filesystem_before": filesystem,
+                        "filesystem_bytes": filesystem,
+                        "filesystem_threshold_bytes": size * 95 // 100,
+                        "filesystem": "ext4",
+                        "source": "/dev/sda2",
+                        "parent": "/dev/sda",
+                        "partition": "2",
+                        "attempts": 1,
+                        "capacity": {
+                            "requested_bytes": int(command[-1]) * GIB,
+                            "disk_bytes": size,
+                            "partition_bytes": size,
+                            "filesystem_bytes": filesystem,
+                            "filesystem_threshold_bytes": size * 95 // 100,
+                            "filesystem": "ext4",
+                            "source": "/dev/sda2",
+                            "parent": "/dev/sda",
+                            "partition": "2",
+                            "verified": True,
+                        },
+                    }).encode()
             else: raise AssertionError(command)
         else: raise AssertionError(args)
         return subprocess.CompletedProcess(args, 0, body, b"")
@@ -378,6 +409,65 @@ class Fixture(unittest.TestCase):
 
     def acquire(self, session="thread-a"):
         return self.call("acquire", session, public_key=KEY)
+
+    @staticmethod
+    def guest_growth_result(disk_gib=20, *, status="grown", attempts=1, returncode=0, stderr=""):
+        size = disk_gib * GIB
+        filesystem = size - 1000000
+        payload = {
+            "status": status,
+            "virtual_bytes": size,
+            "partition_bytes": size,
+            "filesystem_before": filesystem,
+            "filesystem_bytes": filesystem,
+            "filesystem_threshold_bytes": size * 95 // 100,
+            "filesystem": "ext4",
+            "source": "/dev/sda2",
+            "parent": "/dev/sda",
+            "partition": "2",
+            "attempts": attempts,
+            "capacity": {
+                "requested_bytes": size,
+                "disk_bytes": size,
+                "partition_bytes": size,
+                "filesystem_bytes": filesystem,
+                "filesystem_threshold_bytes": size * 95 // 100,
+                "filesystem": "ext4",
+                "source": "/dev/sda2",
+                "parent": "/dev/sda",
+                "partition": "2",
+                "verified": True,
+            },
+        }
+        return subprocess.CompletedProcess(
+            [], returncode,
+            json.dumps(payload).encode() if returncode == 0 else b"",
+            stderr.encode() if isinstance(stderr, str) else stderr,
+        )
+
+    @staticmethod
+    def guest_growth_failure(*, phase="filesystem-grow", command=None, returncode=1, stderr="resize2fs: transient guest failure"):
+        error = {
+            "phase": phase,
+            "command": command or ["resize2fs", "/dev/sda2"],
+            "returncode": returncode,
+            "stdout": "",
+            "stderr": stderr,
+            "capacity": {
+                "requested_bytes": 20 * GIB,
+                "disk_bytes": 20 * GIB,
+                "partition_bytes": 20 * GIB,
+                "filesystem_bytes": 10 * GIB,
+                "filesystem_threshold_bytes": 19 * GIB,
+                "filesystem": "ext4",
+                "source": "/dev/sda2",
+                "parent": "/dev/sda",
+                "partition": "2",
+                "verified": True,
+            },
+            "transient": False,
+        }
+        return subprocess.CompletedProcess([], returncode, b"", (json.dumps({"ok": False, "error": error}) + "\n").encode())
 
     def error(self, code, function, *args, **kwargs):
         with self.assertRaises(CONTROL.ControlError) as context: function(*args, **kwargs)
@@ -1149,6 +1239,50 @@ class LifecycleTests(Fixture):
         self.assertEqual(self.call("status")["last_error"]["code"], "resize_partial")
         self.assertEqual(self.call("status")["state"], "cached")
 
+    def test_acquire_guest_growth_failure_is_structured_and_closed(self):
+        self.runner.guest_growth_results = [self.guest_growth_failure()]
+        self.error("guest_resize_unverified", self.acquire)
+
+        task = self.store.get_task(session_id="thread-a")
+        self.assertEqual(task["state"], "cached")
+        self.assertIsNone(task["lease_expires_at"])
+        self.assertIsNone(task["ssh_host_port"])
+        self.assertEqual(self.store.get_ports(task["task_id"]), [])
+        self.assertEqual(self.runner.instances[task["instance_name"]]["status"], "Stopped")
+        failure = json.loads(task["last_error"])
+        self.assertEqual(failure["code"], "acquire_partial")
+        self.assertEqual(failure["phase"], "filesystem-grow")
+        self.assertEqual(failure["command"], ["resize2fs", "/dev/sda2"])
+        self.assertEqual(failure["returncode"], 1)
+        self.assertEqual(failure["stderr"], "resize2fs: transient guest failure")
+        self.assertEqual(failure["guest_capacity"]["disk_bytes"], 20 * GIB)
+
+    def test_acquire_guest_growth_failure_can_retry_from_cached_state(self):
+        self.runner.guest_growth_results = [self.guest_growth_failure()]
+        self.error("guest_resize_unverified", self.acquire)
+        self.runner.guest_growth_results = [self.guest_growth_result(status="grown_after_retry", attempts=2)]
+
+        result = self.acquire()
+
+        self.assertEqual(result["state"], "active")
+        self.assertEqual(result["guest_filesystem"]["status"], "grown_after_retry")
+        self.assertNotIn("last_error", result)
+        task = self.store.get_task(session_id="thread-a")
+        self.assertTrue(result["effective_lease"])
+        self.assertEqual([port["port_name"] for port in self.store.get_ports(task["task_id"])], ["ssh"])
+
+    def test_already_grown_guest_root_is_an_idempotent_success(self):
+        self.acquire()
+        self.call("release")
+        self.runner.guest_growth_results = [self.guest_growth_result(status="already_grown", attempts=0)]
+
+        result = self.acquire()
+
+        self.assertEqual(result["state"], "active")
+        self.assertEqual(result["guest_filesystem"]["status"], "already_grown")
+        self.assertEqual(result["guest_filesystem"]["attempts"], 0)
+        self.assertEqual(len(result["ports"]), 1)
+
     def test_restart_and_resize_refuse_imminent_expiry(self):
         first = self.acquire()
         self.now = CONTROL.parse_time(first["lease_expires_at"]) - dt.timedelta(seconds=20)
@@ -1178,6 +1312,10 @@ class LifecycleTests(Fixture):
 
 
 class CommandRunnerTests(unittest.TestCase):
+    def test_guest_root_growth_script_compiles_with_bounded_attempts(self):
+        compile(CONTROL.GUEST_ROOT_GROWTH_SCRIPT, "<guest-root-growth>", "exec")
+        self.assertIn("for attempt in (1, 2)", CONTROL.GUEST_ROOT_GROWTH_SCRIPT)
+
     def test_bounded_runner_discards_stdout_after_limit(self):
         code = "import sys; sys.stdout.write('x' * 1000000)"
         result = CONTROL.CommandRunner().run_bounded(

@@ -103,6 +103,330 @@ RESOURCE_KEYS = frozenset(("cpu", "memory_mib", "disk_gib"))
 TASK_STATES = frozenset(("absent", "cached", "preparing", "active", "closing", "deleting", "failed"))
 
 
+GUEST_ROOT_GROWTH_SCRIPT = r"""
+import json, os, re, shutil, subprocess, sys, time
+
+TARGET_BYTES = int(sys.argv[1]) * 1024**3
+MINIMUM_FILESYSTEM_RATIO = 95
+COMMAND_TIMEOUT = 45
+capacity = {"requested_bytes": TARGET_BYTES, "verified": False}
+attempts = []
+
+
+def clip(value):
+    return str(value or "")[-4000:]
+
+
+def transient_failure(command, stdout, stderr):
+    if not command:
+        return False
+    if command[0] not in {"growpart", "resize2fs", "xfs_growfs", "blockdev"}:
+        return False
+    if command[0] == "blockdev" and "--rereadpt" not in command:
+        return False
+    text = (str(stdout or "") + "\n" + str(stderr or "")).lower()
+    return any(marker in text for marker in (
+        "device or resource busy",
+        "resource temporarily unavailable",
+        "old partition table",
+        "re-read partition table",
+        "reread partition table",
+        "try again",
+    ))
+
+
+class GuestFailure(Exception):
+    def __init__(self, phase, command=None, returncode=None, stdout="", stderr="",
+                 *, cause=None, transient=False, retry_of=None):
+        super().__init__(phase)
+        self.phase = phase
+        self.command = list(command or [])
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.cause = cause
+        self.transient = transient
+        self.retry_of = retry_of
+
+    def as_dict(self):
+        value = {
+            "phase": self.phase,
+            "command": self.command,
+            "returncode": self.returncode,
+            "stdout": clip(self.stdout),
+            "stderr": clip(self.stderr),
+            "capacity": dict(capacity),
+            "transient": self.transient,
+        }
+        if self.cause:
+            value["cause"] = self.cause
+        if self.retry_of:
+            value["retry_of"] = self.retry_of
+        return value
+
+
+def run(command, phase, *, check=True):
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=COMMAND_TIMEOUT,
+        )
+    except FileNotFoundError:
+        raise GuestFailure(phase, command, cause="command_missing")
+    except subprocess.TimeoutExpired as error:
+        raise GuestFailure(phase, command, cause="command_timeout") from error
+    if check and result.returncode:
+        raise GuestFailure(
+            phase,
+            command,
+            result.returncode,
+            result.stdout,
+            result.stderr,
+            transient=transient_failure(command, result.stdout, result.stderr),
+        )
+    return result
+
+
+def one_line(result, phase, command):
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(lines) != 1:
+        raise GuestFailure(phase, command, result.returncode, result.stdout, result.stderr,
+                           cause="ambiguous_output")
+    return lines[0]
+
+
+def number_from(command, phase, key):
+    result = run(command, phase)
+    raw = result.stdout.strip()
+    if not re.fullmatch(r"[0-9]+", raw):
+        raise GuestFailure(phase, command, result.returncode, result.stdout, result.stderr,
+                           cause="invalid_integer")
+    value = int(raw)
+    capacity[key] = value
+    return value
+
+
+def filesystem_bytes():
+    try:
+        value = os.statvfs("/")
+        result = value.f_blocks * value.f_frsize
+    except (AttributeError, OSError, ValueError) as error:
+        raise GuestFailure("filesystem-diagnostic", ["statvfs", "/"], cause=type(error).__name__) from error
+    if result <= 0:
+        raise GuestFailure("filesystem-diagnostic", ["statvfs", "/"], cause="non_positive_capacity")
+    capacity["filesystem_bytes"] = result
+    return result
+
+
+def inspect_layout():
+    source_command = ["findmnt", "-n", "-o", "SOURCE", "-T", "/"]
+    source = one_line(run(source_command, "topology-source"), "topology-source", source_command)
+    source = os.path.realpath(source)
+    fstype_command = ["findmnt", "-n", "-o", "FSTYPE", "-T", "/"]
+    fstype = one_line(run(fstype_command, "topology-filesystem"), "topology-filesystem", fstype_command)
+    if not source.startswith("/dev/") or fstype not in ("ext4", "xfs"):
+        raise GuestFailure(
+            "capability-check",
+            source_command,
+            cause="automatic growth supports direct ext4/xfs root partitions only",
+        )
+    name = os.path.basename(source)
+    partition_marker = "/sys/class/block/" + name + "/partition"
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", name) or not os.path.isfile(partition_marker):
+        raise GuestFailure("topology-check", ["test", "-f", partition_marker], cause="root_is_not_partition")
+    try:
+        with open(partition_marker, encoding="ascii") as handle:
+            number = handle.read().strip()
+    except OSError as error:
+        raise GuestFailure("topology-check", ["cat", partition_marker], cause=type(error).__name__) from error
+    if not re.fullmatch(r"[0-9]+", number):
+        raise GuestFailure("topology-check", ["cat", partition_marker], cause="invalid_partition_number")
+
+    parent_command = ["lsblk", "-n", "-o", "PKNAME", source]
+    parent_lines = [line.strip() for line in run(parent_command, "topology-parent").stdout.splitlines() if line.strip()]
+    if len(parent_lines) != 1 or "/" in parent_lines[0]:
+        raise GuestFailure("topology-check", parent_command, cause="ambiguous_root_disk")
+    parent = parent_lines[0]
+    disk = "/dev/" + parent
+    source_type_command = ["lsblk", "-n", "-o", "TYPE", source]
+    if one_line(run(source_type_command, "topology-type"), "topology-type", source_type_command) != "part":
+        raise GuestFailure("topology-check", source_type_command, cause="root_is_not_partition")
+    disk_type_command = ["lsblk", "-n", "-o", "TYPE", disk]
+    if one_line(run(disk_type_command, "topology-type"), "topology-type", disk_type_command) != "disk":
+        raise GuestFailure("topology-check", disk_type_command, cause="parent_is_not_disk")
+
+    filesystem_tool = "resize2fs" if fstype == "ext4" else "xfs_growfs"
+    required_tools = ["findmnt", "lsblk", "blockdev", "growpart", filesystem_tool]
+    tools = {tool: shutil.which(tool) for tool in required_tools}
+    capacity.update({"source": source, "filesystem": fstype, "parent": disk, "partition": number, "tools": tools})
+    missing = [tool for tool, path in tools.items() if not path]
+    if missing:
+        raise GuestFailure("capability-check", ["command", "-v", missing[0]], cause="missing_guest_tool")
+
+    disk_bytes = number_from(["blockdev", "--getsize64", disk], "capacity-diagnostic", "disk_bytes")
+    partition_bytes = number_from(["blockdev", "--getsize64", source], "capacity-diagnostic", "partition_bytes")
+    filesystem_size = filesystem_bytes()
+    capacity["filesystem_threshold_bytes"] = disk_bytes * MINIMUM_FILESYSTEM_RATIO // 100
+    if disk_bytes < TARGET_BYTES:
+        raise GuestFailure(
+            "capacity-diagnostic",
+            ["blockdev", "--getsize64", disk],
+            0,
+            cause="guest_virtual_disk_size_is_stale",
+        )
+    if partition_bytes > disk_bytes:
+        raise GuestFailure("topology-check", ["blockdev", "--getsize64", source], 0,
+                           cause="partition_exceeds_parent_disk")
+    capacity["verified"] = True
+    return {
+        "source": source,
+        "fstype": fstype,
+        "disk": disk,
+        "number": number,
+        "filesystem_tool": filesystem_tool,
+        "filesystem_bytes": filesystem_size,
+        "disk_bytes": disk_bytes,
+        "partition_bytes": partition_bytes,
+    }
+
+
+def filesystem_is_complete():
+    return capacity.get("filesystem_bytes", 0) >= capacity.get("filesystem_threshold_bytes", TARGET_BYTES)
+
+
+def verify_partition(layout):
+    required = TARGET_BYTES * MINIMUM_FILESYSTEM_RATIO // 100
+    if capacity.get("partition_bytes", 0) < required:
+        raise GuestFailure(
+            "partition-verify",
+            ["blockdev", "--getsize64", layout["source"]],
+            0,
+            cause="partition_capacity_below_target",
+        )
+
+
+def settle_partition(layout):
+    reread_command = ["blockdev", "--rereadpt", layout["disk"]]
+    reread = run(reread_command, "partition-reread", check=False)
+    if reread.returncode and not transient_failure(reread_command, reread.stdout, reread.stderr):
+        raise GuestFailure("partition-reread", reread_command, reread.returncode, reread.stdout, reread.stderr)
+    if shutil.which("udevadm"):
+        settle_command = ["udevadm", "settle", "--timeout=5"]
+        settled = run(settle_command, "partition-settle", check=False)
+        if settled.returncode and not transient_failure(settle_command, settled.stdout, settled.stderr):
+            raise GuestFailure("partition-settle", settle_command, settled.returncode, settled.stdout, settled.stderr)
+    time.sleep(1)
+
+
+def report(status, before, layout):
+    capacity["status"] = status
+    capacity["attempts"] = list(attempts)
+    return {
+        "status": status,
+        "virtual_bytes": capacity["disk_bytes"],
+        "partition_bytes": capacity["partition_bytes"],
+        "filesystem_before": before.get("filesystem_bytes"),
+        "filesystem_bytes": capacity["filesystem_bytes"],
+        "filesystem_threshold_bytes": capacity["filesystem_threshold_bytes"],
+        "filesystem": layout["fstype"],
+        "source": layout["source"],
+        "parent": layout["disk"],
+        "partition": layout["number"],
+        "attempts": len(attempts),
+        "capacity": dict(capacity),
+    }
+
+
+try:
+    layout = inspect_layout()
+    before = dict(capacity)
+    if filesystem_is_complete():
+        print(json.dumps(report("already_grown", before, layout), sort_keys=True))
+        sys.exit(0)
+
+    filesystem_command = [layout["filesystem_tool"], layout["source"] if layout["fstype"] == "ext4" else "/"]
+    for attempt in (1, 2):
+        attempt_record = {"attempt": attempt}
+        attempts.append(attempt_record)
+        failure = None
+        try:
+            growpart_command = ["growpart", layout["disk"], layout["number"]]
+            grown = run(growpart_command, "partition-grow", check=False)
+            if grown.returncode and not (grown.returncode == 1 and "NOCHANGE" in grown.stdout.upper()):
+                failure = GuestFailure(
+                    "partition-grow",
+                    growpart_command,
+                    grown.returncode,
+                    grown.stdout,
+                    grown.stderr,
+                    transient=transient_failure(growpart_command, grown.stdout, grown.stderr),
+                )
+            if failure is None:
+                layout = inspect_layout()
+                verify_partition(layout)
+                if filesystem_is_complete():
+                    print(json.dumps(report("already_grown", before, layout), sort_keys=True))
+                    sys.exit(0)
+                grown_filesystem = run(filesystem_command, "filesystem-grow", check=False)
+                if grown_filesystem.returncode:
+                    failure = GuestFailure(
+                        "filesystem-grow",
+                        filesystem_command,
+                        grown_filesystem.returncode,
+                        grown_filesystem.stdout,
+                        grown_filesystem.stderr,
+                        transient=transient_failure(filesystem_command, grown_filesystem.stdout, grown_filesystem.stderr),
+                    )
+                else:
+                    layout = inspect_layout()
+                    if not filesystem_is_complete():
+                        failure = GuestFailure(
+                            "filesystem-verify",
+                            filesystem_command,
+                            0,
+                            cause="filesystem_capacity_below_target",
+                        )
+        except GuestFailure as error:
+            failure = error
+        if failure is None:
+            status = "grown_after_retry" if attempt > 1 else "grown"
+            print(json.dumps(report(status, before, layout), sort_keys=True))
+            sys.exit(0)
+        attempt_record["error"] = failure.as_dict()
+        if not failure.transient or attempt == 2:
+            raise failure
+        try:
+            settle_partition(layout)
+            layout = inspect_layout()
+        except GuestFailure as refresh_failure:
+            refresh_failure.retry_of = failure.as_dict()
+            if not refresh_failure.transient:
+                raise refresh_failure
+            attempt_record["refresh_error"] = refresh_failure.as_dict()
+
+    raise GuestFailure("filesystem-verify", filesystem_command, cause="retry_exhausted")
+except GuestFailure as failure:
+    capacity["attempts"] = list(attempts)
+    print(json.dumps({"ok": False, "error": failure.as_dict()}, sort_keys=True), file=sys.stderr)
+    sys.exit(1)
+except Exception as error:
+    print(json.dumps({
+        "ok": False,
+        "error": {
+            "phase": "guest-root-growth",
+            "command": ["python3", "-c", "guest-root-growth"],
+            "returncode": 1,
+            "capacity": dict(capacity),
+            "cause": type(error).__name__,
+        },
+    }, sort_keys=True), file=sys.stderr)
+    sys.exit(1)
+"""
+
+
 def runtime_artifact_paths(config: Mapping[str, Any], manifest_path: Path, manifest: Mapping[str, Any]) -> dict[str, Path]:
     return {
         item["path"]: (
@@ -4620,40 +4944,83 @@ class Control:
             raise ControlError("resize_partial", "live memory adjustment is unverified; conservative allocation retained, no restart fallback", detail) from exc
 
     def _grow_guest_root(self, task: Mapping[str, Any], disk_gib: int) -> dict[str, Any]:
-        script = r"""
-import json, os, subprocess, sys
-
-def run(args):
-    return subprocess.run(args, check=True, capture_output=True, text=True, timeout=45).stdout
-source = run(['findmnt', '-n', '-o', 'SOURCE', '/']).strip()
-source = os.path.realpath(source)
-fstype = run(['findmnt', '-n', '-o', 'FSTYPE', '/']).strip()
-name = os.path.basename(source)
-partition = '/sys/class/block/' + name + '/partition'
-if not os.path.isfile(partition) or fstype not in ('ext4', 'xfs'):
-    raise RuntimeError('automatic growth supports a direct ext4/xfs root partition only')
-number = open(partition).read().strip()
-parent = run(['lsblk', '-n', '-o', 'PKNAME', source]).strip()
-if not parent or '/' in parent: raise RuntimeError('ambiguous root disk')
-disk = '/dev/' + parent
-size = int(run(['blockdev', '--getsize64', disk]).strip())
-if size < int(sys.argv[1]) * 1024**3: raise RuntimeError('guest virtual disk size is stale')
-before = os.statvfs('/').f_blocks * os.statvfs('/').f_frsize
-grown = subprocess.run(['growpart', disk, number], capture_output=True, text=True, timeout=45)
-if grown.returncode and not (grown.returncode == 1 and 'NOCHANGE' in grown.stdout):
-    raise RuntimeError('growpart failed: ' + grown.stderr)
-run(['resize2fs', source] if fstype == 'ext4' else ['xfs_growfs', '/'])
-after = os.statvfs('/').f_blocks * os.statvfs('/').f_frsize
-if after <= before and after < size * 0.85: raise RuntimeError('root filesystem did not grow')
-print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesystem_bytes': after, 'filesystem': fstype}))
-"""
-        result = self.incus.exec(task["instance_name"], ["python3", "-c", script, str(disk_gib)], timeout=120)
+        command = ["python3", "-c", GUEST_ROOT_GROWTH_SCRIPT, str(disk_gib)]
         try:
-            value = json.loads(result.stdout)
-            if not isinstance(value, dict) or value["virtual_bytes"] < disk_gib * 1024**3: raise ValueError()
+            result = self.incus.exec(task["instance_name"], command, timeout=120, check=False)
+        except ControlError as exc:
+            raise ControlError(
+                "guest_resize_unverified",
+                "guest root filesystem growth command was not completed",
+                {
+                    "phase": "guest-exec",
+                    "command": ["incus", "exec", task["instance_name"], "--", "python3", "-c", "guest-root-growth"],
+                    "returncode": None,
+                    "stderr": "",
+                    "guest_capacity": {"verified": False, "error": exc.as_dict()},
+                },
+            ) from exc
+        stdout = result.stdout.decode("utf-8", "replace")
+        stderr = result.stderr.decode("utf-8", "replace")
+        guest_error = None
+        for line in reversed(stderr.splitlines()):
+            try:
+                parsed = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(parsed, Mapping) and isinstance(parsed.get("error"), Mapping):
+                guest_error = dict(parsed["error"])
+                break
+        if result.returncode != 0:
+            guest_error = guest_error or {}
+            detail = {
+                "phase": guest_error.get("phase", "guest-exec"),
+                "command": guest_error.get(
+                    "command",
+                    ["incus", "exec", task["instance_name"], "--", "python3", "-c", "guest-root-growth"],
+                ),
+                "returncode": guest_error.get("returncode", result.returncode),
+                "stderr": guest_error.get("stderr", stderr),
+                "stdout": guest_error.get("stdout", stdout),
+                "control_stderr": stderr,
+                "guest_capacity": guest_error.get("capacity", {"verified": False}),
+            }
+            for key in ("transient", "retry_of", "cause"):
+                if key in guest_error:
+                    detail[key] = guest_error[key]
+            raise ControlError(
+                "guest_resize_unverified",
+                "guest root filesystem growth is unverified",
+                detail,
+            )
+        try:
+            value = json.loads(stdout)
+            if not isinstance(value, dict):
+                raise ValueError()
+            if value.get("status", "grown") not in {"grown", "grown_after_retry", "already_grown"}:
+                raise ValueError()
+            for key in ("virtual_bytes", "filesystem_bytes", "filesystem_threshold_bytes"):
+                if isinstance(value.get(key), bool) or not isinstance(value.get(key), int):
+                    raise ValueError()
+            if value["virtual_bytes"] < disk_gib * 1024**3 or value["filesystem_bytes"] < value["filesystem_threshold_bytes"]:
+                raise ValueError()
+            if value.get("filesystem") not in {"ext4", "xfs"}:
+                raise ValueError()
+            if not isinstance(value.get("capacity"), Mapping) or value["capacity"].get("verified") is not True:
+                raise ValueError()
             return value
         except (ValueError, KeyError, TypeError) as exc:
-            raise ControlError("guest_resize_unverified", "guest capacity report is invalid") from exc
+            raise ControlError(
+                "guest_resize_unverified",
+                "guest capacity report is invalid",
+                {
+                    "phase": "guest-report",
+                    "command": ["incus", "exec", task["instance_name"], "--", "python3", "-c", "guest-root-growth"],
+                    "returncode": result.returncode,
+                    "stderr": stderr,
+                    "stdout": stdout,
+                    "guest_capacity": {"verified": False},
+                },
+            ) from exc
 
 
     def ssh_info(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:

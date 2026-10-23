@@ -1521,6 +1521,42 @@ class LifecycleTests(Fixture):
         self.assertEqual(failure["phase"], "guest-report")
         self.assertEqual(failure["cause"], "invalid_failure_report")
 
+    def test_guest_growth_failure_report_preserves_nontransient_refresh_error(self):
+        response = self.guest_growth_failure()
+        payload = json.loads(response.stderr)
+        report_error = payload["error"]
+        attempt = report_error["capacity"]["attempts"][0]
+        previous = attempt["error"]
+        refresh = dict(
+            previous,
+            phase="partition-settle",
+            command=["udevadm", "settle", "--timeout=5"],
+            returncode=1,
+            stderr="udevadm: settle failed",
+            transient=False,
+            retry_of=previous,
+        )
+        attempt["refresh_error"] = refresh
+        report_error.update(
+            phase="partition-settle",
+            command=["udevadm", "settle", "--timeout=5"],
+            returncode=1,
+            stderr="udevadm: settle failed",
+            transient=False,
+            retry_of=previous,
+        )
+        response.stderr = (json.dumps(payload) + "\n").encode()
+        self.runner.guest_growth_results = [response]
+
+        self.error("guest_resize_unverified", self.acquire)
+
+        failure = json.loads(self.store.get_task(session_id="thread-a")["last_error"])
+        self.assertEqual(failure["phase"], "partition-settle")
+        self.assertEqual(
+            failure["guest_capacity"]["attempts"][0]["refresh_error"]["phase"],
+            "partition-settle",
+        )
+
     def test_guest_growth_report_rejects_bounded_output_truncation(self):
         for attribute in ("stdout_truncated", "stderr_truncated"):
             with self.subTest(attribute=attribute):
@@ -1704,6 +1740,22 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
                 exit_code = 0
         return exit_code, captured_stdout.getvalue(), captured_stderr.getvalue(), calls
 
+    def test_guest_root_growth_script_grows_on_first_attempt(self):
+        target = 20 * GIB
+        exit_code, stdout, stderr, calls = self.execute_script(
+            initial_partition=target,
+            initial_filesystem=target // 4,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        payload = json.loads(stdout)
+        self.assertEqual(payload["status"], "grown")
+        self.assertEqual(payload["attempts"], 1)
+        self.assertGreaterEqual(payload["filesystem_bytes"], payload["filesystem_threshold_bytes"])
+        self.assertEqual(len([command for command in calls if command[0] == "growpart"]), 1)
+        self.assertNotIn(["blockdev", "--rereadpt", "/dev/sda"], calls)
+
     def test_guest_root_growth_script_retries_stale_partition_and_grows(self):
         exit_code, stdout, stderr, calls = self.execute_script()
 
@@ -1766,6 +1818,7 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         error = json.loads(stderr)["error"]
         self.assertEqual(error["phase"], "partition-settle")
         self.assertEqual(error["retry_of"]["phase"], "partition-verify")
+        self.assertEqual(error["capacity"]["attempts"][0]["refresh_error"]["phase"], "partition-settle")
         self.assertIn(["udevadm", "settle", "--timeout=5"], calls)
 
     def test_guest_root_growth_script_grows_xfs_root(self):

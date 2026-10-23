@@ -468,9 +468,9 @@ try:
             layout = inspect_layout()
         except GuestFailure as refresh_failure:
             refresh_failure.retry_of = attempt_record["error"]
+            attempt_record["refresh_error"] = refresh_failure.as_dict()
             if not refresh_failure.transient:
                 raise refresh_failure
-            attempt_record["refresh_error"] = refresh_failure.as_dict()
 
     raise GuestFailure("filesystem-verify", filesystem_command, cause="retry_exhausted")
 except GuestFailure as failure:
@@ -478,6 +478,7 @@ except GuestFailure as failure:
     print(json.dumps({"ok": False, "error": failure.as_dict()}, sort_keys=True), file=sys.stderr)
     sys.exit(1)
 except Exception as error:
+    capacity["attempts"] = list(attempts)
     print(json.dumps({
         "ok": False,
         "error": {
@@ -5197,11 +5198,14 @@ class Control:
                     refresh_error = record["refresh_error"]
                     previous_error = record.get("error")
                     if (
-                        refresh_error.get("transient") is not True
-                        or not isinstance(refresh_error.get("retry_of"), Mapping)
+                        not isinstance(refresh_error.get("retry_of"), Mapping)
                         or not isinstance(previous_error, Mapping)
                         or not matches_guest_failure(previous_error, refresh_error["retry_of"])
                     ):
+                        return False
+                    if refresh_error.get("transient") is False and index != len(attempts) - 1:
+                        return False
+                    if refresh_error.get("transient") is True and index == len(attempts) - 1:
                         return False
             return True
 
@@ -5221,7 +5225,11 @@ class Control:
             if not isinstance(final_error, Mapping) or not same_guest_failure(error, final_error):
                 return False
             if "retry_of" in error:
-                previous = attempts[-2].get("error") if len(attempts) > 1 else None
+                previous = (
+                    final_record.get("error")
+                    if "refresh_error" in final_record
+                    else attempts[-2].get("error") if len(attempts) > 1 else None
+                )
                 if not isinstance(previous, Mapping) or not matches_guest_failure(previous, error["retry_of"]):
                     return False
             return True

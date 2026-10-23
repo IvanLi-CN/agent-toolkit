@@ -180,7 +180,11 @@ class NativeCommands(CONTROL.CommandRunner):
                         response = self.guest_growth_results.pop(0)
                         if isinstance(response, CONTROL.ControlError):
                             raise response
-                        return subprocess.CompletedProcess(args, response.returncode, response.stdout, response.stderr)
+                        result = subprocess.CompletedProcess(args, response.returncode, response.stdout, response.stderr)
+                        for attribute in ("stdout_truncated", "stderr_truncated"):
+                            if hasattr(response, attribute):
+                                setattr(result, attribute, getattr(response, attribute))
+                        return result
                     size = self.instances[command[1]]["guest_disk_bytes"]
                     if size < int(command[-1]) * GIB:
                         raise CONTROL.ControlError("command_failed", "guest virtual disk size is stale")
@@ -228,8 +232,8 @@ class NativeCommands(CONTROL.CommandRunner):
 
     def run_bounded(self, argv, *, input_data=None, timeout=30, stdout_limit=0, stderr_limit=0, check=True):
         result = self.run(argv, input_data=input_data, timeout=timeout, check=check)
-        result.stdout_truncated = False
-        result.stderr_truncated = False
+        result.stdout_truncated = getattr(result, "stdout_truncated", False)
+        result.stderr_truncated = getattr(result, "stderr_truncated", False)
         return result
 
 
@@ -1408,6 +1412,26 @@ class LifecycleTests(Fixture):
         failure = json.loads(self.store.get_task(session_id="thread-a")["last_error"])
         self.assertEqual(failure["phase"], "guest-report")
 
+    def test_guest_growth_report_rejects_malformed_host_output(self):
+        for body in (b"", b"[]", b"not-json\n"):
+            with self.subTest(body=body):
+                self.runner.guest_growth_results = [subprocess.CompletedProcess([], 0, body, b"")]
+                self.error("guest_resize_unverified", self.acquire)
+
+                failure = json.loads(self.store.get_task(session_id="thread-a")["last_error"])
+                self.assertEqual(failure["phase"], "guest-report")
+
+    def test_guest_growth_report_rejects_bounded_output_truncation(self):
+        for attribute in ("stdout_truncated", "stderr_truncated"):
+            with self.subTest(attribute=attribute):
+                response = self.guest_growth_result()
+                setattr(response, attribute, True)
+                self.runner.guest_growth_results = [response]
+                self.error("guest_resize_unverified", self.acquire)
+
+                failure = json.loads(self.store.get_task(session_id="thread-a")["last_error"])
+                self.assertEqual(failure["phase"], "guest-exec")
+
     def test_already_grown_guest_root_is_an_idempotent_success(self):
         self.acquire()
         self.call("release")
@@ -1486,6 +1510,7 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         filesystem_type="ext4",
         timeout_command=None,
         source_output="/dev/sda2\n",
+        partition_marker_exists=True,
     ):
         target = 20 * GIB
         threshold = target * 95 // 100
@@ -1545,7 +1570,11 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         captured_stderr = io.StringIO()
         with mock.patch.object(CONTROL.subprocess, "run", side_effect=run), \
              mock.patch.object(CONTROL.os, "statvfs", side_effect=statvfs), \
-             mock.patch.object(CONTROL.os.path, "isfile", side_effect=lambda path: path == marker), \
+             mock.patch.object(
+                 CONTROL.os.path,
+                 "isfile",
+                 side_effect=lambda path: partition_marker_exists and path == marker,
+             ), \
              mock.patch.object(CONTROL.shutil, "which", side_effect=which), \
              mock.patch.object(CONTROL.time, "sleep", return_value=None), \
              mock.patch.object(CONTROL.sys, "argv", ["guest-root-growth", "20"]), \
@@ -1606,6 +1635,15 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         error = json.loads(stderr)["error"]
         self.assertEqual(error["phase"], "capability-check")
         self.assertIn("direct ext4/xfs", error["cause"])
+
+    def test_guest_root_growth_script_rejects_missing_partition_marker(self):
+        exit_code, stdout, stderr, _ = self.execute_script(partition_marker_exists=False)
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout, "")
+        error = json.loads(stderr)["error"]
+        self.assertEqual(error["phase"], "topology-check")
+        self.assertEqual(error["cause"], "root_is_not_partition")
 
     def test_guest_root_growth_script_preserves_timeout_evidence(self):
         command = ["findmnt", "-n", "-o", "SOURCE", "-T", "/"]

@@ -5039,6 +5039,115 @@ class Control:
                     "guest_capacity": {"verified": False},
                 },
             )
+
+        failure_capacity_keys = {
+            "requested_bytes", "disk_bytes", "partition_bytes", "filesystem_bytes",
+            "filesystem_before", "filesystem_threshold_bytes", "filesystem", "source",
+            "parent", "partition", "tools", "verified",
+        }
+        max_failure_retry_depth = 2
+
+        def valid_guest_failure(error: Any, *, complete: bool) -> bool:
+            pending = [(error, 0)]
+            while pending:
+                current, depth = pending.pop()
+                required = {"phase", "command", "returncode", "stdout", "stderr", "capacity", "transient"}
+                if not isinstance(current, Mapping) or not required.issubset(current):
+                    return False
+                failure_capacity = current["capacity"]
+                if (
+                    not isinstance(current["phase"], str)
+                    or not isinstance(current["command"], list)
+                    or not current["command"]
+                    or any(not isinstance(item, str) for item in current["command"])
+                    or (current["returncode"] is not None and (isinstance(current["returncode"], bool) or not isinstance(current["returncode"], int)))
+                    or not isinstance(current["stdout"], str)
+                    or not isinstance(current["stderr"], str)
+                    or not isinstance(failure_capacity, Mapping)
+                    or not isinstance(failure_capacity.get("verified"), bool)
+                    or isinstance(failure_capacity.get("requested_bytes"), bool)
+                    or not isinstance(failure_capacity.get("requested_bytes"), int)
+                    or not isinstance(current["transient"], bool)
+                    or ("cause" in current and not isinstance(current["cause"], str))
+                ):
+                    return False
+                if complete:
+                    if not failure_capacity_keys.issubset(failure_capacity):
+                        return False
+                    for key in (
+                        "disk_bytes", "partition_bytes", "filesystem_bytes",
+                        "filesystem_before", "filesystem_threshold_bytes",
+                    ):
+                        if isinstance(failure_capacity.get(key), bool) or not isinstance(failure_capacity.get(key), int):
+                            return False
+                    if (
+                        not isinstance(failure_capacity.get("filesystem"), str)
+                        or not isinstance(failure_capacity.get("source"), str)
+                        or not isinstance(failure_capacity.get("parent"), str)
+                        or not isinstance(failure_capacity.get("partition"), str)
+                        or not isinstance(failure_capacity.get("tools"), Mapping)
+                    ):
+                        return False
+                if "retry_of" in current:
+                    if depth >= max_failure_retry_depth or not isinstance(current["retry_of"], Mapping):
+                        return False
+                    pending.append((current["retry_of"], depth + 1))
+            return True
+
+        def matches_guest_failure(reference: Mapping[str, Any], candidate: Mapping[str, Any]) -> bool:
+            return all(candidate.get(key) == reference.get(key) for key in (
+                "phase", "command", "returncode", "stdout", "stderr", "capacity", "transient", "cause"
+            ))
+
+        def same_guest_failure(reference: Mapping[str, Any], candidate: Mapping[str, Any]) -> bool:
+            return all(candidate.get(key) == reference.get(key) for key in (
+                "phase", "command", "returncode", "stdout", "stderr", "transient", "cause", "retry_of"
+            ))
+
+        def valid_guest_attempts(attempts: Any) -> bool:
+            if not isinstance(attempts, list) or not attempts or len(attempts) > 2:
+                return False
+            for index, record in enumerate(attempts):
+                if (
+                    not isinstance(record, Mapping)
+                    or isinstance(record.get("attempt"), bool)
+                    or not isinstance(record.get("attempt"), int)
+                    or record.get("attempt") != index + 1
+                    or ("error" in record and not valid_guest_failure(record["error"], complete=True))
+                    or ("refresh_error" in record and not valid_guest_failure(record["refresh_error"], complete=True))
+                ):
+                    return False
+                if "refresh_error" in record:
+                    refresh_error = record["refresh_error"]
+                    previous_error = record.get("error")
+                    if (
+                        refresh_error.get("transient") is not True
+                        or not isinstance(refresh_error.get("retry_of"), Mapping)
+                        or not isinstance(previous_error, Mapping)
+                        or not matches_guest_failure(previous_error, refresh_error["retry_of"])
+                    ):
+                        return False
+            return True
+
+        def valid_guest_failure_report(error: Any) -> bool:
+            if not isinstance(error, Mapping) or not valid_guest_failure(error, complete=False):
+                return False
+            failure_capacity = error["capacity"]
+            attempts = failure_capacity.get("attempts") if isinstance(failure_capacity, Mapping) else None
+            if attempts is None:
+                return "retry_of" not in error
+            if not valid_guest_failure(error, complete=True) or not valid_guest_attempts(attempts):
+                return False
+            final_record = attempts[-1]
+            final_error = final_record.get("refresh_error") or final_record.get("error")
+            if not isinstance(final_error, Mapping) or not same_guest_failure(error, final_error):
+                return False
+            if "retry_of" in error:
+                previous = attempts[-2].get("error") if len(attempts) > 1 else None
+                if not isinstance(previous, Mapping) or not matches_guest_failure(previous, error["retry_of"]):
+                    return False
+            return True
+
         guest_error = None
         for line in reversed(stderr.splitlines()):
             try:
@@ -5050,6 +5159,20 @@ class Control:
                 break
         if result.returncode != 0:
             guest_error = guest_error or {}
+            if not valid_guest_failure_report(guest_error):
+                raise ControlError(
+                    "guest_resize_unverified",
+                    "guest failure report is invalid",
+                    {
+                        "phase": "guest-report",
+                        "command": ["incus", "exec", task["instance_name"], "--", "python3", "-c", "guest-root-growth"],
+                        "returncode": result.returncode,
+                        "stderr": stderr,
+                        "stdout": stdout,
+                        "cause": "invalid_failure_report",
+                        "guest_capacity": {"verified": False},
+                    },
+                )
             detail = {
                 "phase": guest_error.get("phase", "guest-exec"),
                 "command": guest_error.get(

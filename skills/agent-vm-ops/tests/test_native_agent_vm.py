@@ -1421,6 +1421,19 @@ class LifecycleTests(Fixture):
                 failure = json.loads(self.store.get_task(session_id="thread-a")["last_error"])
                 self.assertEqual(failure["phase"], "guest-report")
 
+    def test_guest_growth_failure_report_validates_retry_linkage(self):
+        response = self.guest_growth_failure()
+        payload = json.loads(response.stderr)
+        payload["error"]["retry_of"] = {"phase": "filesystem-grow"}
+        response.stderr = (json.dumps(payload) + "\n").encode()
+        self.runner.guest_growth_results = [response]
+
+        self.error("guest_resize_unverified", self.acquire)
+
+        failure = json.loads(self.store.get_task(session_id="thread-a")["last_error"])
+        self.assertEqual(failure["phase"], "guest-report")
+        self.assertEqual(failure["cause"], "invalid_failure_report")
+
     def test_guest_growth_report_rejects_bounded_output_truncation(self):
         for attribute in ("stdout_truncated", "stderr_truncated"):
             with self.subTest(attribute=attribute):
@@ -1738,6 +1751,7 @@ class CommandRunnerTests(unittest.TestCase):
             "PermissionError:process_group_inspection_failed",
         )
 
+    @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
     def test_bounded_runner_kills_descendants_holding_pipes(self):
         with tempfile.TemporaryDirectory() as directory:
             pid_path = Path(directory) / "child.pid"

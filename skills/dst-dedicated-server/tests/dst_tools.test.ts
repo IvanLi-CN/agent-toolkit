@@ -60,6 +60,7 @@ describe.serial("DST local Bun tooling", () => {
     expect(redactSensitiveText("api_key\u001b[31m=fixture-secret")).not.toContain("fixture-secret");
     expect(redactSensitiveText("api_key=\u001b[31mfixture-secret")).not.toContain("fixture-secret");
     expect(redactSensitiveText("token\u200B=UNICODE_SECRET")).not.toContain("UNICODE_SECRET");
+    expect(redactSensitiveText("to\u200Bken=UNICODE_KEY_SECRET")).not.toContain("UNICODE_KEY_SECRET");
     expect(redactSensitiveText("token=\u0000NUL_SECRET")).not.toContain("NUL_SECRET");
     expect(redactSensitiveText("api_key=\n  fixture-secret\nvisible=ok")).not.toContain("fixture-secret");
     expect(redactSensitiveText('{"api_keys": [\n  "json-secret"\n], "nested": {"token": "nested-secret"}}')).not.toMatch(/json-secret|nested-secret/);
@@ -1015,7 +1016,8 @@ case "$*" in
     case "$supervisor_pid" in ''|*[!0-9]*) exit 97 ;; esac
     sleep 0.5
     kill -KILL "$supervisor_pid" 2>/dev/null || true
-    while :; do sleep 1; done
+    sleep 1
+    exit 0
     ;;
 esac
 `);

@@ -2677,13 +2677,16 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
       wrapperExited,
       waitForCleanupAcknowledged,
       forceCleanup: async () => {
+        const reference = rememberedTargetReference ?? await readTargetReference(statusPath, child.pid);
+        const targetCleanup = cleanupOrphanedTarget(reference);
         try { child.kill("SIGKILL"); } catch { /* The wrapper may already be gone. */ }
         await wrapperExited.catch(() => undefined);
         if (cleanupFdForParent !== undefined) {
           await closeFileDescriptor(cleanupFdForParent);
           cleanupFdForParent = undefined;
         }
-        return cleanupOrphanedTarget(rememberedTargetReference);
+        if (await targetCleanup) return true;
+        return cleanupOrphanedTarget(reference);
       },
       cleanup: async () => {
         await cleanupOrphanedTarget(rememberedTargetReference);

@@ -531,6 +531,7 @@ export function redactSensitiveText(text: string): string {
   const normalized = text
     .replace(ANSI_ESCAPE, " ")
     .replace(CONTROL_CHARACTERS, " ")
+    .replace(/(?<=[A-Za-z0-9_.-])\p{Cf}+(?=[A-Za-z0-9_.-])/gu, "")
     .replace(UNICODE_FORMAT_CHARACTERS, " ")
     .replace(/([A-Za-z0-9])\s+([_.-])(?=[A-Za-z0-9])/g, "$1$2")
     .replace(/([_.-])\s+([A-Za-z0-9])/g, "$1$2");

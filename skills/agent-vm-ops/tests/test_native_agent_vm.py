@@ -432,6 +432,7 @@ class Fixture(unittest.TestCase):
                 "returncode": 1,
                 "stdout": "",
                 "stderr": "resize2fs: Device or resource busy",
+                "capacity": {"verified": True},
                 "transient": True,
             }
         payload = {
@@ -1325,7 +1326,7 @@ class LifecycleTests(Fixture):
     def test_guest_growth_report_requires_transient_retry_evidence(self):
         response = self.guest_growth_result(status="grown_after_retry", attempts=2)
         payload = json.loads(response.stdout)
-        payload["capacity"]["attempts"] = [{"attempt": 1}, {"attempt": 2}]
+        payload["capacity"]["attempts"] = [{"attempt": 1, "error": {"transient": True}}, {"attempt": 2}]
         response.stdout = json.dumps(payload).encode()
         self.runner.guest_growth_results = [response]
         self.error("guest_resize_unverified", self.acquire)
@@ -1410,6 +1411,22 @@ class CommandRunnerTests(unittest.TestCase):
         self.assertEqual(failure.exception.code, "command_timeout")
         self.assertTrue(failure.exception.detail["reaped"])
         self.assertTrue(failure.exception.detail["process_group_killed"])
+
+    def test_bounded_runner_timeout_preserves_output(self):
+        code = (
+            "import sys,time; "
+            "sys.stdout.write('partial-out'); sys.stderr.write('partial-err'); "
+            "sys.stdout.flush(); sys.stderr.flush(); time.sleep(10)"
+        )
+        with self.assertRaises(CONTROL.ControlError) as failure:
+            CONTROL.CommandRunner().run_bounded(
+                [os.sys.executable, "-c", code], timeout=0.05, stdout_limit=128, stderr_limit=128
+            )
+        self.assertEqual(failure.exception.code, "command_timeout")
+        self.assertEqual(failure.exception.detail["stdout"], "partial-out")
+        self.assertEqual(failure.exception.detail["stderr"], "partial-err")
+        self.assertFalse(failure.exception.detail["stdout_truncated"])
+        self.assertFalse(failure.exception.detail["stderr_truncated"])
 
     def test_bounded_runner_reports_process_group_cleanup_failure(self):
         sleeper = "import time; time.sleep(10)"

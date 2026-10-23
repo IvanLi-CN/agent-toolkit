@@ -849,6 +849,7 @@ class CommandRunner:
         stdout = bytearray()
         stderr = bytearray()
         stdout_truncated = False
+        stderr_truncated = False
         selector = selectors.DefaultSelector()
         streams = ((process.stdout, "stdout"), (process.stderr, "stderr"))
         for stream, name in streams:
@@ -878,6 +879,7 @@ class CommandRunner:
                     else:
                         stderr.extend(chunk)
                         if len(stderr) > stderr_limit:
+                            stderr_truncated = True
                             del stderr[:-stderr_limit]
             remaining = timeout - (time.monotonic() - started)
             if remaining <= 0:
@@ -913,6 +915,10 @@ class CommandRunner:
                 "command_timeout",
                 f"command timed out: {argv[0]}",
                 {
+                    "stdout": bytes(stdout).decode("utf-8", "replace"),
+                    "stderr": bytes(stderr).decode("utf-8", "replace"),
+                    "stdout_truncated": stdout_truncated,
+                    "stderr_truncated": stderr_truncated,
                     "reaped": reaped,
                     "process_group_killed": process_group_killed,
                     "process_group_cleanup_error": process_group_cleanup_error,
@@ -928,6 +934,7 @@ class CommandRunner:
             list(argv), returncode, bytes(stdout), bytes(stderr)
         )
         result.stdout_truncated = stdout_truncated
+        result.stderr_truncated = stderr_truncated
         if check and returncode != 0:
             detail = {
                 "returncode": returncode,
@@ -5041,22 +5048,60 @@ class Control:
                     raise ValueError()
             if not isinstance(capacity.get("attempts"), list) or len(capacity["attempts"]) != value["attempts"]:
                 raise ValueError()
+
+            def valid_failure(error: Any) -> bool:
+                required = {"phase", "command", "returncode", "stdout", "stderr", "capacity", "transient"}
+                if not isinstance(error, Mapping) or not required.issubset(error):
+                    return False
+                if (
+                    not isinstance(error["phase"], str)
+                    or not isinstance(error["command"], list)
+                    or not error["command"]
+                    or any(not isinstance(item, str) for item in error["command"])
+                    or (error["returncode"] is not None and (isinstance(error["returncode"], bool) or not isinstance(error["returncode"], int)))
+                    or not isinstance(error["stdout"], str)
+                    or not isinstance(error["stderr"], str)
+                    or not isinstance(error["capacity"], Mapping)
+                    or not isinstance(error["transient"], bool)
+                    or ("retry_of" in error and not isinstance(error["retry_of"], Mapping))
+                ):
+                    return False
+                return True
+
+            def matches_failure(reference: Mapping[str, Any], candidate: Mapping[str, Any]) -> bool:
+                return all(candidate.get(key) == reference.get(key) for key in (
+                    "phase", "command", "returncode", "stdout", "stderr", "transient"
+                ))
+
             attempt_records = capacity["attempts"]
             for index, record in enumerate(attempt_records):
                 if (
                     not isinstance(record, Mapping)
                     or isinstance(record.get("attempt"), bool)
+                    or not isinstance(record.get("attempt"), int)
                     or record.get("attempt") != index + 1
-                    or any(key in record and not isinstance(record[key], Mapping) for key in ("error", "refresh_error"))
+                    or ("error" in record and not valid_failure(record["error"]))
+                    or ("refresh_error" in record and not valid_failure(record["refresh_error"]))
                 ):
                     raise ValueError()
+                if "refresh_error" in record:
+                    refresh_error = record["refresh_error"]
+                    previous_error = record.get("error")
+                    if (
+                        refresh_error.get("transient") is not True
+                        or not isinstance(refresh_error.get("retry_of"), Mapping)
+                        or not isinstance(previous_error, Mapping)
+                        or not matches_failure(previous_error, refresh_error["retry_of"])
+                    ):
+                        raise ValueError()
             if status == "grown_after_retry":
                 first_error = attempt_records[0].get("error") if attempt_records else None
                 if (
                     len(attempt_records) != 2
-                    or not isinstance(first_error, Mapping)
+                    or not valid_failure(first_error)
                     or first_error.get("transient") is not True
                     or "error" in attempt_records[1]
+                    or "refresh_error" in attempt_records[1]
                 ):
                     raise ValueError()
             elif any("error" in record for record in attempt_records):

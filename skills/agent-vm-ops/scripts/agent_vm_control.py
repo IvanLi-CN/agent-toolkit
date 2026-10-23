@@ -104,11 +104,13 @@ TASK_STATES = frozenset(("absent", "cached", "preparing", "active", "closing", "
 
 
 GUEST_ROOT_GROWTH_SCRIPT = r"""
-import json, os, re, shutil, subprocess, sys, time
+import json, os, re, shutil, subprocess, sys, tempfile, time
 
 TARGET_BYTES = int(sys.argv[1]) * 1024**3
 MINIMUM_FILESYSTEM_RATIO = 95
 COMMAND_TIMEOUT = 45
+STDOUT_LIMIT = 8192
+STDERR_LIMIT = 4000
 capacity = {"requested_bytes": TARGET_BYTES, "verified": False}
 attempts = []
 
@@ -138,7 +140,8 @@ def transient_failure(command, stdout, stderr):
 
 class GuestFailure(Exception):
     def __init__(self, phase, command=None, returncode=None, stdout="", stderr="",
-                 *, cause=None, transient=False, retry_of=None):
+                 *, cause=None, transient=False, retry_of=None,
+                 stdout_truncated=False, stderr_truncated=False):
         super().__init__(phase)
         self.phase = phase
         self.command = list(command or [])
@@ -148,6 +151,8 @@ class GuestFailure(Exception):
         self.cause = cause
         self.transient = transient
         self.retry_of = retry_of
+        self.stdout_truncated = stdout_truncated
+        self.stderr_truncated = stderr_truncated
 
     def as_dict(self):
         value = {
@@ -158,6 +163,8 @@ class GuestFailure(Exception):
             "stderr": clip(self.stderr),
             "capacity": dict(capacity),
             "transient": self.transient,
+            "stdout_truncated": self.stdout_truncated,
+            "stderr_truncated": self.stderr_truncated,
         }
         if self.cause:
             value["cause"] = self.cause
@@ -167,33 +174,62 @@ class GuestFailure(Exception):
 
 
 def run(command, phase, *, check=True):
+    def bounded_output(handle, fallback, limit, *, tail=False):
+        handle.flush()
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        if size:
+            handle.seek(max(0, size - limit) if tail else 0)
+            value = handle.read(limit)
+            return value.decode("utf-8", "replace"), size > limit
+        if fallback is None:
+            return "", False
+        if isinstance(fallback, str):
+            fallback = fallback.encode("utf-8", "replace")
+        value = fallback[-limit:] if tail else fallback[:limit]
+        return value.decode("utf-8", "replace"), len(fallback) > limit
+
     try:
-        result = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=COMMAND_TIMEOUT,
-        )
+        with tempfile.SpooledTemporaryFile(max_size=STDOUT_LIMIT) as stdout_file, \
+             tempfile.SpooledTemporaryFile(max_size=STDERR_LIMIT) as stderr_file:
+            try:
+                result = subprocess.run(
+                    command,
+                    check=False,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    timeout=COMMAND_TIMEOUT,
+                )
+            except subprocess.TimeoutExpired as error:
+                stdout, stdout_truncated = bounded_output(stdout_file, error.stdout, STDOUT_LIMIT)
+                stderr, stderr_truncated = bounded_output(stderr_file, error.stderr, STDERR_LIMIT, tail=True)
+                raise GuestFailure(
+                    phase,
+                    command,
+                    stdout=stdout,
+                    stderr=stderr,
+                    cause="command_timeout",
+                    stdout_truncated=stdout_truncated,
+                    stderr_truncated=stderr_truncated,
+                ) from error
+            stdout, stdout_truncated = bounded_output(stdout_file, result.stdout, STDOUT_LIMIT)
+            stderr, stderr_truncated = bounded_output(stderr_file, result.stderr, STDERR_LIMIT, tail=True)
     except FileNotFoundError:
         raise GuestFailure(phase, command, cause="command_missing")
-    except subprocess.TimeoutExpired as error:
-        raise GuestFailure(
-            phase,
-            command,
-            stdout=clip(error.stdout),
-            stderr=clip(error.stderr),
-            cause="command_timeout",
-        ) from error
     if check and result.returncode:
         raise GuestFailure(
             phase,
             command,
             result.returncode,
-            result.stdout,
-            result.stderr,
-            transient=transient_failure(command, result.stdout, result.stderr),
+            stdout,
+            stderr,
+            transient=transient_failure(command, stdout, stderr),
+            stdout_truncated=stdout_truncated,
+            stderr_truncated=stderr_truncated,
         )
+    result = subprocess.CompletedProcess(command, result.returncode, stdout, stderr)
+    result.stdout_truncated = stdout_truncated
+    result.stderr_truncated = stderr_truncated
     return result
 
 
@@ -201,7 +237,9 @@ def one_line(result, phase, command):
     lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     if len(lines) != 1:
         raise GuestFailure(phase, command, result.returncode, result.stdout, result.stderr,
-                           cause="ambiguous_output")
+                           cause="ambiguous_output",
+                           stdout_truncated=getattr(result, "stdout_truncated", False),
+                           stderr_truncated=getattr(result, "stderr_truncated", False))
     return lines[0]
 
 
@@ -210,7 +248,9 @@ def number_from(command, phase, key):
     raw = result.stdout.strip()
     if not re.fullmatch(r"[0-9]+", raw):
         raise GuestFailure(phase, command, result.returncode, result.stdout, result.stderr,
-                           cause="invalid_integer")
+                           cause="invalid_integer",
+                           stdout_truncated=getattr(result, "stdout_truncated", False),
+                           stderr_truncated=getattr(result, "stderr_truncated", False))
     value = int(raw)
     capacity[key] = value
     return value
@@ -320,12 +360,20 @@ def settle_partition(layout):
     reread_command = ["blockdev", "--rereadpt", layout["disk"]]
     reread = run(reread_command, "partition-reread", check=False)
     if reread.returncode and not transient_failure(reread_command, reread.stdout, reread.stderr):
-        raise GuestFailure("partition-reread", reread_command, reread.returncode, reread.stdout, reread.stderr)
+        raise GuestFailure(
+            "partition-reread", reread_command, reread.returncode, reread.stdout, reread.stderr,
+            stdout_truncated=getattr(reread, "stdout_truncated", False),
+            stderr_truncated=getattr(reread, "stderr_truncated", False),
+        )
     if shutil.which("udevadm"):
         settle_command = ["udevadm", "settle", "--timeout=5"]
         settled = run(settle_command, "partition-settle", check=False)
         if settled.returncode and not transient_failure(settle_command, settled.stdout, settled.stderr):
-            raise GuestFailure("partition-settle", settle_command, settled.returncode, settled.stdout, settled.stderr)
+            raise GuestFailure(
+                "partition-settle", settle_command, settled.returncode, settled.stdout, settled.stderr,
+                stdout_truncated=getattr(settled, "stdout_truncated", False),
+                stderr_truncated=getattr(settled, "stderr_truncated", False),
+            )
     time.sleep(1)
 
 
@@ -373,6 +421,8 @@ try:
                     grown.stdout,
                     grown.stderr,
                     transient=transient_failure(growpart_command, grown.stdout, grown.stderr),
+                    stdout_truncated=getattr(grown, "stdout_truncated", False),
+                    stderr_truncated=getattr(grown, "stderr_truncated", False),
                 )
             if failure is None:
                 layout = inspect_layout()
@@ -389,6 +439,8 @@ try:
                         grown_filesystem.stdout,
                         grown_filesystem.stderr,
                         transient=transient_failure(filesystem_command, grown_filesystem.stdout, grown_filesystem.stderr),
+                        stdout_truncated=getattr(grown_filesystem, "stdout_truncated", False),
+                        stderr_truncated=getattr(grown_filesystem, "stderr_truncated", False),
                     )
                 else:
                     layout = inspect_layout()
@@ -4839,6 +4891,7 @@ class Control:
                 raise
         completed = []
         guest = None
+        guest_growth_attempted = False
         phase = "native-stop"
         stage_timings: dict[str, Any] = {}
         readiness = None
@@ -4870,6 +4923,7 @@ class Control:
             self._expected_vm_ip = task["vm_ip"]
             self._guest_ip(task["instance_name"])
             if values["disk_gib"] is not None:
+                guest_growth_attempted = True
                 guest = self._grow_guest_root(task, target["disk_gib"])
                 completed.append("guest_filesystem")
             stage_timings["post_check_seconds"] = round(max(0.0, time.monotonic() - post_check_started), 3)
@@ -4884,8 +4938,9 @@ class Control:
         except ControlError as exc:
             # Native changes cannot be rolled back safely (especially disk growth).
             # Retain conservative reservations and report every observed stage.
-            cleanup = {"performed": needs_restart, "ok": True}
-            if needs_restart:
+            cleanup_performed = needs_restart or guest_growth_attempted
+            cleanup = {"performed": cleanup_performed, "ok": True}
+            if cleanup_performed:
                 try:
                     cleanup["result"] = self._release_task(self.store.get_task(task_id=task["task_id"]))
                 except ControlError as cleanup_error:
@@ -5030,7 +5085,9 @@ class Control:
             ) from exc
         stdout = result.stdout.decode("utf-8", "replace")
         stderr = result.stderr.decode("utf-8", "replace")
-        if getattr(result, "stdout_truncated", False) or getattr(result, "stderr_truncated", False):
+        stdout_truncated = getattr(result, "stdout_truncated", False) is True
+        stderr_truncated = getattr(result, "stderr_truncated", False) is True
+        if stdout_truncated or stderr_truncated:
             raise ControlError(
                 "guest_resize_unverified",
                 "guest root filesystem growth report was truncated",
@@ -5040,6 +5097,8 @@ class Control:
                     "returncode": result.returncode,
                     "stdout": stdout,
                     "stderr": stderr,
+                    "stdout_truncated": stdout_truncated,
+                    "stderr_truncated": stderr_truncated,
                     "guest_capacity": {"verified": False},
                 },
             )
@@ -5073,6 +5132,8 @@ class Control:
                     or not isinstance(failure_capacity.get("requested_bytes"), int)
                     or not isinstance(current["transient"], bool)
                     or ("cause" in current and not isinstance(current["cause"], str))
+                    or ("stdout_truncated" in current and not isinstance(current["stdout_truncated"], bool))
+                    or ("stderr_truncated" in current and not isinstance(current["stderr_truncated"], bool))
                 ):
                     return False
                 if complete:
@@ -5100,12 +5161,14 @@ class Control:
 
         def matches_guest_failure(reference: Mapping[str, Any], candidate: Mapping[str, Any]) -> bool:
             return all(candidate.get(key) == reference.get(key) for key in (
-                "phase", "command", "returncode", "stdout", "stderr", "capacity", "transient", "cause"
+                "phase", "command", "returncode", "stdout", "stderr", "capacity", "transient", "cause",
+                "stdout_truncated", "stderr_truncated",
             ))
 
         def same_guest_failure(reference: Mapping[str, Any], candidate: Mapping[str, Any]) -> bool:
             return all(candidate.get(key) == reference.get(key) for key in (
-                "phase", "command", "returncode", "stdout", "stderr", "transient", "cause", "retry_of"
+                "phase", "command", "returncode", "stdout", "stderr", "transient", "cause", "retry_of",
+                "stdout_truncated", "stderr_truncated",
             ))
 
         def valid_guest_attempts(attempts: Any) -> bool:
@@ -5141,7 +5204,7 @@ class Control:
             if not isinstance(attempts, list) or len(attempts) > 2:
                 return False
             if not attempts:
-                return "retry_of" not in error
+                return error["capacity"].get("verified") is False and "retry_of" not in error
             if not valid_guest_failure(error, complete=True) or not valid_guest_attempts(attempts):
                 return False
             final_record = attempts[-1]

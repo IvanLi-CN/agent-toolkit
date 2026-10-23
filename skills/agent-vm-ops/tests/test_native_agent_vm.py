@@ -1320,6 +1320,20 @@ class LifecycleTests(Fixture):
         self.assertEqual(self.call("status")["last_error"]["code"], "resize_partial")
         self.assertEqual(self.call("status")["state"], "cached")
 
+    def test_same_capacity_guest_growth_failure_closes_active_access(self):
+        self.acquire()
+        self.runner.guest_growth_results = [self.guest_growth_failure()]
+        self.error("resize_partial", self.call, "resize", disk_gib=20, allow_restart=True)
+
+        task = self.store.get_task(session_id="thread-a")
+        self.assertEqual(task["state"], "cached")
+        self.assertIsNone(task["lease_expires_at"])
+        self.assertIsNone(task["ssh_host_port"])
+        self.assertEqual(self.store.get_ports(task["task_id"]), [])
+        failure = json.loads(task["last_error"])
+        self.assertTrue(failure["cleanup"]["performed"])
+        self.assertEqual(failure["error"]["detail"]["phase"], "filesystem-grow")
+
     def test_acquire_guest_growth_failure_is_structured_and_closed(self):
         self.runner.guest_growth_results = [self.guest_growth_failure()]
         self.error("guest_resize_unverified", self.acquire)
@@ -1489,6 +1503,20 @@ class LifecycleTests(Fixture):
         self.assertEqual(failure["phase"], "guest-report")
         self.assertEqual(failure["cause"], "invalid_failure_report")
 
+    def test_guest_growth_failure_report_rejects_verified_empty_attempts(self):
+        response = self.guest_growth_failure()
+        payload = json.loads(response.stderr)
+        payload["error"]["capacity"]["attempts"] = []
+        payload["error"]["capacity"]["verified"] = True
+        response.stderr = (json.dumps(payload) + "\n").encode()
+        self.runner.guest_growth_results = [response]
+
+        self.error("guest_resize_unverified", self.acquire)
+
+        failure = json.loads(self.store.get_task(session_id="thread-a")["last_error"])
+        self.assertEqual(failure["phase"], "guest-report")
+        self.assertEqual(failure["cause"], "invalid_failure_report")
+
     def test_guest_growth_report_rejects_bounded_output_truncation(self):
         for attribute in ("stdout_truncated", "stderr_truncated"):
             with self.subTest(attribute=attribute):
@@ -1499,6 +1527,7 @@ class LifecycleTests(Fixture):
 
                 failure = json.loads(self.store.get_task(session_id="thread-a")["last_error"])
                 self.assertEqual(failure["phase"], "guest-exec")
+                self.assertEqual(failure[attribute], True)
 
     def test_already_grown_guest_root_is_an_idempotent_success(self):
         self.acquire()
@@ -1579,6 +1608,8 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         timeout_command=None,
         source_output="/dev/sda2\n",
         partition_marker_exists=True,
+        udevadm_available=False,
+        udevadm_returncode=0,
     ):
         target = 20 * GIB
         threshold = target * 95 // 100
@@ -1611,6 +1642,9 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
             if command[:2] == ["blockdev", "--rereadpt"]:
                 state["partition"] = target
                 return completed(command)
+            if command[:2] == ["udevadm", "settle"]:
+                stderr = "udevadm: settle failed\n" if udevadm_returncode else ""
+                return completed(command, udevadm_returncode, stderr=stderr)
             if command[0] == "growpart":
                 return completed(command)
             if command[0] == "resize2fs":
@@ -1626,7 +1660,9 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
             raise AssertionError(command)
 
         def which(name):
-            return None if name == "udevadm" else f"/usr/bin/{name}"
+            if name == "udevadm":
+                return "/usr/bin/udevadm" if udevadm_available else None
+            return f"/usr/bin/{name}"
 
         def statvfs(path):
             self.assertEqual(path, "/")
@@ -1674,6 +1710,26 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         self.assertEqual(first_error["cause"], "stale_partition_capacity_below_target")
         self.assertTrue(first_error["transient"])
         self.assertIn(["blockdev", "--rereadpt", "/dev/sda"], calls)
+
+    def test_guest_root_growth_script_settles_partition_when_udevadm_is_available(self):
+        exit_code, stdout, stderr, calls = self.execute_script(udevadm_available=True)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn(["udevadm", "settle", "--timeout=5"], calls)
+
+    def test_guest_root_growth_script_reports_udevadm_settle_failure(self):
+        exit_code, stdout, stderr, calls = self.execute_script(
+            udevadm_available=True,
+            udevadm_returncode=1,
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout, "")
+        error = json.loads(stderr)["error"]
+        self.assertEqual(error["phase"], "partition-settle")
+        self.assertEqual(error["retry_of"]["phase"], "partition-verify")
+        self.assertIn(["udevadm", "settle", "--timeout=5"], calls)
 
     def test_guest_root_growth_script_grows_xfs_root(self):
         exit_code, stdout, stderr, calls = self.execute_script(filesystem_type="xfs")
@@ -1752,6 +1808,17 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         self.assertEqual(error["cause"], "command_timeout")
         self.assertEqual(error["stdout"], "partial stdout")
         self.assertEqual(error["stderr"], "partial stderr")
+        self.assertFalse(error["stdout_truncated"])
+        self.assertFalse(error["stderr_truncated"])
+
+    def test_guest_root_growth_script_bounds_command_output(self):
+        exit_code, stdout, stderr, _ = self.execute_script(source_output="/dev/sda2\n" + "x" * 20000 + "\n")
+
+        self.assertEqual(exit_code, 1)
+        error = json.loads(stderr)["error"]
+        self.assertEqual(error["phase"], "topology-source")
+        self.assertTrue(error["stdout_truncated"])
+        self.assertLessEqual(len(error["stdout"]), 8192)
 
     def test_guest_root_growth_script_rejects_ambiguous_topology_output(self):
         exit_code, stdout, stderr, _ = self.execute_script(source_output="/dev/sda2\n/dev/sda3\n")

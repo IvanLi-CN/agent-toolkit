@@ -1900,6 +1900,16 @@ exec /bin/ps "$@"
       }
       expect(Number.isInteger(leaderPid)).toBe(true);
       expect(leaderPid === undefined ? false : isAlive(leaderPid)).toBe(true);
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        try {
+          const childPid = Number((await readFile(childMarker, "utf8")).trim());
+          if (Number.isInteger(childPid) && childPid > 0) break;
+        } catch {
+          await Bun.sleep(25);
+        }
+      }
+      expect((await readFile(childMarker, "utf8")).trim()).toMatch(/^[0-9]+$/);
+      await Bun.sleep(250);
       supervised.child.kill("SIGTERM");
       expect(await supervised.waitForCleanupAcknowledged()).toBe(true);
       for (let attempt = 0; attempt < 200; attempt += 1) {

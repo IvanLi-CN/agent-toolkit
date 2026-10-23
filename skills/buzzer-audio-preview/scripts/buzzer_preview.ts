@@ -2,7 +2,7 @@
 
 import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, link, mkdir, mkdtemp, open, opendir, readFile, readlink, realpath, rename, rm, unlink, utimes } from "node:fs/promises";
+import { lstat, link, mkdir, mkdtemp, open, opendir, readFile, readlink, realpath, rename, rm, rmdir, unlink, utimes } from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
@@ -1261,6 +1261,39 @@ async function discardTemporaryLockDirectory(directory: string): Promise<void> {
   }
 }
 
+export async function discardInstalledLockDirectory(directory: string, expectedOwner: string): Promise<void> {
+  let tombstone: string | undefined;
+  const preservedEntries = new Map<string, Uint8Array>();
+  try {
+    const metadata = await lstat(directory);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) return;
+    const owner = new TextDecoder().decode(await readRegularFile(join(directory, "owner"), 128)).trim();
+    if (owner !== expectedOwner) return;
+    for (const name of LOCK_ENTRY_NAMES) {
+      const source = join(directory, name);
+      try {
+        const entry = await lstat(source);
+        if (!entry.isFile() || entry.isSymbolicLink()) return;
+        preservedEntries.set(name, await readBoundedRegularFile(source, MAX_TRANSACTION_METADATA_BYTES, "lock entry"));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
+      }
+    }
+    tombstone = join(dirname(directory), `${DELETE_TOMBSTONE_PREFIX}${randomUUID()}`);
+    await rename(directory, tombstone);
+    for (const name of preservedEntries.keys()) await unlink(join(tombstone, name));
+    await rmdir(tombstone);
+    tombstone = undefined;
+    preservedEntries.clear();
+    await syncDirectory(dirname(directory)).catch(() => undefined);
+  } catch {
+    if (tombstone !== undefined) {
+      for (const [name, data] of preservedEntries) await writeSyncedFile(join(tombstone, name), data).catch(() => undefined);
+      await rename(tombstone, directory).catch(() => undefined);
+    }
+  }
+}
+
 async function processIdentity(pid: number): Promise<string | undefined> {
   if (!Number.isInteger(pid) || pid <= 0 || process.platform === "win32") return undefined;
   if (process.platform === "linux") {
@@ -1306,6 +1339,8 @@ async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner
   await cleanupAbandonedStaging(outDir, stem, scanned);
   for (let attempt = 0; attempt < 2; attempt += 1) {
     let temporaryDirectory: string | undefined;
+    let installedLock = false;
+    let installedOwner: string | undefined;
     try {
       temporaryDirectory = await mkdtemp(join(outDir, `${LOCK_TEMPORARY_PREFIX}${stem}-`));
       const ownerToken = await createOwnerRecord();
@@ -1327,15 +1362,25 @@ async function acquirePublishLock(outDir: string, stem: string, reclaimDeadOwner
       }
       await rename(temporaryDirectory, lockDirectory);
       temporaryDirectory = undefined;
+      installedLock = true;
+      installedOwner = ownerToken;
       await syncDirectory(outDir);
+      installedLock = false;
       const heartbeatPath = join(lockDirectory, "heartbeat");
       const heartbeat = setInterval(() => { void refreshLockHeartbeat(heartbeatPath); }, LOCK_HEARTBEAT_MS);
       return async () => {
         clearInterval(heartbeat);
-        await removeLockDirectory(lockDirectory, ownerToken);
+        try {
+          if (await removeLockDirectory(lockDirectory, ownerToken)) return;
+        } catch {
+          // Fall back to the known-owner path when the parent directory has
+          // become unreadable after the lock was installed.
+        }
+        await discardInstalledLockDirectory(lockDirectory, ownerToken);
       };
     } catch (error) {
       if (temporaryDirectory !== undefined) await discardTemporaryLockDirectory(temporaryDirectory);
+      if (installedLock && installedOwner !== undefined) await discardInstalledLockDirectory(lockDirectory, installedOwner);
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "EEXIST" && code !== "ENOTEMPTY") throw error;
       let stale = false;

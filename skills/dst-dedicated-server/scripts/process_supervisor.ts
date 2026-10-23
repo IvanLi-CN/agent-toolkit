@@ -15,8 +15,10 @@ const SUPERVISOR_STATUS_PIPE_TIMEOUT_MS = 2_000;
 // authenticated reference checks fail-closed while allowing a loaded runner
 // enough time to complete the probe sequence.
 const SUPERVISOR_TARGET_REFERENCE_TIMEOUT_MS = 15_000;
+const SUPERVISOR_GROUP_MEMBER_CAPTURE_TIMEOUT_MS = 2_000;
 export const SUPERVISOR_UNKNOWN_TARGET_STATUS = 125;
 const MAX_SUPERVISOR_MARKER_BYTES = 256;
+const MAX_SUPERVISOR_DESCENDANT_BYTES = 1024 * 1024;
 
 function closeFileDescriptor(fd: number): Promise<void> {
   return new Promise((resolve) => closeFileDescriptorCallback(fd, () => resolve()));
@@ -2452,6 +2454,12 @@ interface TargetReference {
   identity: string;
 }
 
+interface TargetGroupMember {
+  pid: number;
+  pgid: number;
+  identity: string;
+}
+
 async function processStartTime(pid: number): Promise<string | undefined> {
   try {
     const stat = await readFile(`/proc/${pid}/stat`, "utf8");
@@ -2548,6 +2556,22 @@ async function currentProcessParent(pid: number): Promise<number | undefined> {
   return /^[1-9][0-9]*$/.test(value) ? Number(value) : undefined;
 }
 
+function processIsAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function processIsZombie(pid: number): Promise<boolean> {
+  if (POSIX_PS === undefined) return false;
+  const result = await boundedCommandOutput([POSIX_PS, "-o", "state=", "-p", String(pid)]);
+  return result !== undefined && result.exitCode === 0 && /^\s*Z/.test(result.stdout);
+}
+
 async function readTargetReference(statusPath: string, wrapperPid: number): Promise<TargetReference | undefined> {
   const directory = dirname(statusPath);
   const [pid, pgid, identity] = await Promise.all([
@@ -2589,6 +2613,107 @@ async function processGroupHasLiveProcess(pgid: number): Promise<boolean | undef
   return false;
 }
 
+async function captureTargetGroupMembers(reference: TargetReference, wrapperExited: Promise<number>): Promise<TargetGroupMember[] | undefined> {
+  const deadline = Date.now() + SUPERVISOR_GROUP_MEMBER_CAPTURE_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const result = POSIX_PS === undefined ? undefined : await boundedCommandOutput([POSIX_PS, "-axo", "pid=,pgid=,state="]);
+    if (result !== undefined && result.exitCode === 0) {
+      const members: TargetGroupMember[] = [];
+      let malformed = false;
+      for (const line of result.stdout.split("\n")) {
+        if (line.trim().length === 0) continue;
+        const match = /^\s*([0-9]+)\s+([0-9]+)\s+(\S+)/.exec(line);
+        if (match === null) {
+          malformed = true;
+          break;
+        }
+        const pid = Number(match[1]);
+        const pgid = Number(match[2]);
+        if (!Number.isInteger(pid) || !Number.isInteger(pgid) || pgid !== reference.pgid || match[3]!.startsWith("Z")) continue;
+        const identity = await currentProcessIdentity(pid);
+        if (identity === undefined) {
+          if (processIsAlive(pid)) {
+            malformed = true;
+            break;
+          }
+          continue;
+        }
+        const currentPgid = await currentProcessGroup(pid);
+        if (currentPgid !== reference.pgid) {
+          malformed = true;
+          break;
+        }
+        if (pid === reference.pid && !processIdentityMatches(reference.identity, identity)) {
+          malformed = true;
+          break;
+        }
+        members.push({ pid, pgid, identity });
+      }
+      if (!malformed && members.some((member) => member.pid === reference.pid)
+        && (members.length > 1 || Date.now() + 100 >= deadline)) return members;
+    }
+    const wrapperDone = await raceWithTimeout(wrapperExited.then(() => true, () => true), 20, false);
+    if (wrapperDone) return undefined;
+    await Bun.sleep(25);
+  }
+  return undefined;
+}
+
+async function cleanupAuthorizedTargetGroup(
+  statusDirectory: string,
+  reference: TargetReference,
+  rememberedMembers?: readonly TargetGroupMember[],
+): Promise<boolean> {
+  const members = rememberedMembers === undefined
+    ? undefined
+    : rememberedMembers.filter((member) => member.pgid === reference.pgid);
+  const ledger = members === undefined ? await readRegularMarker(join(statusDirectory, "descendants"), MAX_SUPERVISOR_DESCENDANT_BYTES) : undefined;
+  if (members === undefined && ledger === undefined) return false;
+  const currentPgid = await currentProcessGroup(process.pid);
+  if (currentPgid === undefined || currentPgid === reference.pgid) return false;
+  let authorizedLiveMember = false;
+  if (members !== undefined) {
+    for (const member of members) {
+      if (member.pid === reference.pid || member.pid === process.pid || !processIsAlive(member.pid) || await processIsZombie(member.pid)) {
+        continue;
+      }
+      const identity = await currentProcessIdentity(member.pid);
+      const pgid = await currentProcessGroup(member.pid);
+      if (identity === undefined || !processIdentityMatches(member.identity, identity)) {
+        return false;
+      }
+      if (pgid === undefined) continue;
+      if (pgid !== reference.pgid) return false;
+      authorizedLiveMember = true;
+    }
+  } else {
+    for (const line of ledger!.split(/\r?\n/)) {
+      if (line.trim().length === 0) continue;
+      const fields = line.split("|");
+      if (fields.length !== 3 || !/^[1-9][0-9]*$/.test(fields[0]!) || fields[1]!.length === 0 || !/^[1-9][0-9]*$/.test(fields[2]!)) return false;
+      if (fields[2] !== String(reference.pgid)) continue;
+      const pid = Number(fields[0]);
+      if (pid === process.pid) return false;
+      if (!processIsAlive(pid) || await processIsZombie(pid)) continue;
+      const identity = await currentProcessIdentity(pid);
+      const pgid = await currentProcessGroup(pid);
+      if (identity === undefined || !processIdentityMatches(fields[1]!, identity)) return false;
+      if (pgid === undefined) continue;
+      if (pgid !== reference.pgid) return false;
+      authorizedLiveMember = true;
+    }
+  }
+  if (!authorizedLiveMember) {
+    return (await processGroupHasLiveProcess(reference.pgid)) === false;
+  }
+  try {
+    process.kill(-reference.pgid, "SIGKILL");
+  } catch {
+    // The authorized group may have exited between validation and the signal.
+  }
+  return waitForProcessGroupGone(reference.pgid);
+}
+
 async function waitForProcessGroupGone(pgid: number): Promise<boolean> {
   const deadline = Date.now() + SUPERVISOR_ORPHAN_CLEANUP_TIMEOUT_MS;
   while (Date.now() < deadline) {
@@ -2600,7 +2725,11 @@ async function waitForProcessGroupGone(pgid: number): Promise<boolean> {
   return (await processGroupHasLiveProcess(pgid)) === false;
 }
 
-async function cleanupOrphanedTarget(rememberedReference?: TargetReference): Promise<boolean> {
+async function cleanupOrphanedTarget(
+  rememberedReference?: TargetReference,
+  statusDirectory?: string,
+  rememberedMembers?: readonly TargetGroupMember[],
+): Promise<boolean> {
   if (process.platform === "win32") return false;
   const reference = rememberedReference;
   if (reference === undefined) return false;
@@ -2614,10 +2743,14 @@ async function cleanupOrphanedTarget(rememberedReference?: TargetReference): Pro
     if (reference.identity.length === 0 || currentIdentity === undefined || !processIdentityMatches(reference.identity, currentIdentity)) return false;
     return await currentProcessGroup(targetPid) === targetPgid;
   };
-  if (!await verifyTargetReference()) return false;
+  if (!await verifyTargetReference()) {
+    return statusDirectory === undefined ? false : cleanupAuthorizedTargetGroup(statusDirectory, reference, rememberedMembers);
+  }
   // Re-read the authenticated identity and group immediately before the
   // negative-PGID signal so a reused PID or group cannot pass a stale check.
-  if (!await verifyTargetReference()) return false;
+  if (!await verifyTargetReference()) {
+    return statusDirectory === undefined ? false : cleanupAuthorizedTargetGroup(statusDirectory, reference, rememberedMembers);
+  }
   try {
     process.kill(-targetPgid, "SIGKILL");
   } catch {
@@ -2631,13 +2764,14 @@ async function waitForTarget(
   statusFd: number | undefined,
   wrapperExited: Promise<number>,
   rememberedReference?: () => TargetReference | undefined,
+  rememberedMembers?: () => readonly TargetGroupMember[] | undefined,
 ): Promise<number> {
   const wrapperCode = await wrapperExited;
   const status = statusFd === undefined ? undefined : await readStatusPipe(statusFd);
   if (wrapperCode === 0 && status !== undefined && await readRegularMarker(parentDeadPath) === undefined) {
     return status;
   }
-  await cleanupOrphanedTarget(rememberedReference?.());
+  await cleanupOrphanedTarget(rememberedReference?.(), dirname(parentDeadPath), rememberedMembers?.());
   return SUPERVISOR_UNKNOWN_TARGET_STATUS;
 }
 
@@ -2769,6 +2903,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
     const cleanupFd = cleanupFdForParent;
     const wrapperExited = child.exited;
     let rememberedTargetReference: TargetReference | undefined;
+    let rememberedTargetGroupMembers: TargetGroupMember[] | undefined;
     let cleanupAckPromise: Promise<boolean> | undefined;
     const waitForCleanupAcknowledged = (): Promise<boolean> => {
       cleanupAckPromise ??= waitForCleanupAck(cleanupFd, cleanupStartedPath, wrapperExited, directory).finally(() => {
@@ -2778,12 +2913,18 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
     };
     const supervised: SupervisedChild = {
       child,
-      exited: waitForTarget(join(directory, "parent-dead"), statusFd, wrapperExited, () => rememberedTargetReference),
+      exited: waitForTarget(
+        join(directory, "parent-dead"),
+        statusFd,
+        wrapperExited,
+        () => rememberedTargetReference,
+        () => rememberedTargetGroupMembers,
+      ),
       wrapperExited,
       waitForCleanupAcknowledged,
       forceCleanup: async () => {
         const reference = rememberedTargetReference ?? await readTargetReference(statusPath, child.pid);
-        const targetCleanup = cleanupOrphanedTarget(reference);
+        const targetCleanup = cleanupOrphanedTarget(reference, directory, rememberedTargetGroupMembers);
         try { child.kill("SIGKILL"); } catch { /* The wrapper may already be gone. */ }
         await wrapperExited.catch(() => undefined);
         if (cleanupFdForParent !== undefined) {
@@ -2791,10 +2932,10 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
           cleanupFdForParent = undefined;
         }
         if (await targetCleanup) return true;
-        return cleanupOrphanedTarget(reference);
+        return cleanupOrphanedTarget(reference, directory, rememberedTargetGroupMembers);
       },
       cleanup: async () => {
-        await cleanupOrphanedTarget(rememberedTargetReference);
+        await cleanupOrphanedTarget(rememberedTargetReference, directory, rememberedTargetGroupMembers);
         if ((await readRegularMarker(cleanupCompletePath))?.trim() === "complete") {
           await rm(directory, { recursive: true, force: true });
         }
@@ -2843,6 +2984,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
       throw new Error("supervisor_target_authorization_unavailable");
     }
     rememberedTargetReference = targetReference;
+    rememberedTargetGroupMembers = await captureTargetGroupMembers(targetReference, wrapperExited);
     return supervised;
   } catch (error) {
     if (statusFdForCleanup !== undefined) await closeFileDescriptor(statusFdForCleanup);

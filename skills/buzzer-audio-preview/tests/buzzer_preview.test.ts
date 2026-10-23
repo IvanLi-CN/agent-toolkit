@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHmac, randomBytes } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, readlink, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -10,6 +10,7 @@ import {
   MAX_PUBLISHED_WAV_BYTES,
   MAX_SCORE_INPUT_BYTES,
   MAX_SCORE_EVENTS,
+  discardInstalledLockDirectory,
   main,
   parseScore,
   parseScoreFile,
@@ -331,6 +332,26 @@ describe("buzzer MIDI and WAV helper", () => {
       expect(await main(["--in", input, "--out-dir", output])).toBe(1);
       expect(await readdir(output)).toContain(".buzzer-preview-fixture.lock");
     } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("discards its installed lock when the parent becomes unreadable", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-installed-lock-cleanup-"));
+    const output = join(root, "out");
+    const lock = join(output, ".buzzer-preview-fixture.lock");
+    const owner = (await fixtureOwnerRecord(FIXTURE_LOCK_NONCE)).trim();
+    try {
+      await mkdir(lock, { recursive: true });
+      await writeFile(join(lock, "pid"), `${process.pid}\n`);
+      await writeFile(join(lock, "owner"), `${owner}\n`);
+      await writeFile(join(lock, "heartbeat"), `${Date.now()}\n`);
+      await writeFile(join(lock, "ready"), "");
+      await chmod(output, 0o300);
+      await discardInstalledLockDirectory(lock, owner);
+      expect(await lstat(lock).catch(() => undefined)).toBeUndefined();
+    } finally {
+      await chmod(output, 0o700).catch(() => undefined);
       await rm(root, { recursive: true, force: true });
     }
   });

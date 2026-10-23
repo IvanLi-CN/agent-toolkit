@@ -1736,6 +1736,68 @@ try {
     }
   });
 
+  test("force-cleans authorized descendants after the target anchor disappears", { timeout: 45_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-force-anchor-loss-"));
+    const anchorMarker = join(root, "anchor.pid");
+    const descendantMarker = join(root, "descendant.pid");
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    let anchorPid: number | undefined;
+    let descendantPid: number | undefined;
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    try {
+      supervised = await spawnSupervised([
+        "sh",
+        "-c",
+        "trap ':' HUP TERM; printf '%s\\n' \"$PPID\" > \"$1\"; perl -e '$SIG{HUP}=\"IGNORE\"; $SIG{TERM}=\"IGNORE\"; open my $fh, \">\", $ARGV[0] or exit 1; print $fh \"$$\\n\"; close $fh or exit 1; sleep 30' \"$2\"",
+        "agent-toolkit-supervised-target",
+        anchorMarker,
+        descendantMarker,
+      ]);
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        try {
+          anchorPid = Number((await readFile(anchorMarker, "utf8")).trim());
+          descendantPid = Number((await readFile(descendantMarker, "utf8")).trim());
+          if (Number.isInteger(anchorPid) && anchorPid > 0 && Number.isInteger(descendantPid) && descendantPid > 0) break;
+        } catch {
+          // The target command may still be writing its markers.
+        }
+        await Bun.sleep(25);
+      }
+      expect(anchorPid).toBeDefined();
+      expect(descendantPid).toBeDefined();
+      expect(isAlive(anchorPid!)).toBe(true);
+      expect(isAlive(descendantPid!)).toBe(true);
+      await Bun.sleep(250);
+      process.kill(anchorPid!, "SIGKILL");
+      await Bun.sleep(50);
+      expect(isAlive(descendantPid!)).toBe(true);
+      try { supervised.child.kill("SIGKILL"); } catch { /* The wrapper may already be gone. */ }
+      expect(isAlive(descendantPid!)).toBe(true);
+      const cleaned = await supervised.forceCleanup();
+      expect(cleaned).toBe(true);
+      for (let attempt = 0; attempt < 80 && isAlive(descendantPid!); attempt += 1) await Bun.sleep(25);
+      expect(isAlive(descendantPid!)).toBe(false);
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (descendantPid !== undefined && isAlive(descendantPid)) {
+        try { process.kill(descendantPid, "SIGKILL"); } catch { /* The descendant may have exited. */ }
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("fails closed when the target truncates the descendant ledger", { timeout: 30_000 }, async () => {
     if (process.platform === "win32") return;
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-ledger-canary-"));

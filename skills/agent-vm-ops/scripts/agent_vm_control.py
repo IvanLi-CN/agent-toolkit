@@ -1155,7 +1155,18 @@ class IncusClient:
         input_data: bytes | str | None = None,
         timeout: float = 60,
         check: bool = True,
+        bounded: bool = False,
     ) -> subprocess.CompletedProcess[bytes]:
+        if bounded:
+            if input_data is not None:
+                raise ControlError("invalid_request", "bounded Incus exec does not accept input")
+            return self.runner.run_bounded(
+                self.prefix + ["exec", name, "--", *argv],
+                timeout=timeout,
+                stdout_limit=DIAGNOSTIC_LOG_LIMIT,
+                stderr_limit=4000,
+                check=check,
+            )
         return self.call(["exec", name, "--", *argv], input_data=input_data, timeout=timeout, check=check)
 
 
@@ -4995,7 +5006,7 @@ class Control:
     def _grow_guest_root(self, task: Mapping[str, Any], disk_gib: int) -> dict[str, Any]:
         command = ["python3", "-c", GUEST_ROOT_GROWTH_SCRIPT, str(disk_gib)]
         try:
-            result = self.incus.exec(task["instance_name"], command, timeout=120, check=False)
+            result = self.incus.exec(task["instance_name"], command, timeout=120, check=False, bounded=True)
         except ControlError as exc:
             underlying = exc.as_dict()
             transport = underlying.get("detail")
@@ -5015,6 +5026,19 @@ class Control:
             ) from exc
         stdout = result.stdout.decode("utf-8", "replace")
         stderr = result.stderr.decode("utf-8", "replace")
+        if getattr(result, "stdout_truncated", False) or getattr(result, "stderr_truncated", False):
+            raise ControlError(
+                "guest_resize_unverified",
+                "guest root filesystem growth report was truncated",
+                {
+                    "phase": "guest-exec",
+                    "command": ["incus", "exec", task["instance_name"], "--", "python3", "-c", "guest-root-growth"],
+                    "returncode": result.returncode,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "guest_capacity": {"verified": False},
+                },
+            )
         guest_error = None
         for line in reversed(stderr.splitlines()):
             try:
@@ -5071,7 +5095,12 @@ class Control:
                         "filesystem_before", "filesystem_threshold_bytes"):
                 if isinstance(capacity.get(key), bool) or not isinstance(capacity.get(key), int):
                     raise ValueError()
-            if not isinstance(capacity.get("attempts"), list) or len(capacity["attempts"]) != value["attempts"]:
+            if (
+                not isinstance(capacity.get("attempts"), list)
+                or value["attempts"] > 2
+                or len(capacity["attempts"]) > 2
+                or len(capacity["attempts"]) != value["attempts"]
+            ):
                 raise ValueError()
 
             failure_capacity_keys = {
@@ -5195,6 +5224,14 @@ class Control:
                 or value["filesystem_before"] < 0
                 or value["filesystem_before"] > value["filesystem_bytes"]
                 or value["filesystem_bytes"] < value["filesystem_threshold_bytes"]
+                or (
+                    status in {"grown", "grown_after_retry"}
+                    and (
+                        value["filesystem_before"] >= expected_threshold
+                        or value["filesystem_bytes"] <= value["filesystem_before"]
+                    )
+                )
+                or (status == "already_grown" and value["filesystem_before"] < expected_threshold)
                 or capacity["disk_bytes"] < target_bytes
                 or capacity["partition_bytes"] > capacity["disk_bytes"]
                 or capacity["partition_bytes"] < 0

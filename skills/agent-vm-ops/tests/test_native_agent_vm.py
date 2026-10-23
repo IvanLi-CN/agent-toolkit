@@ -185,13 +185,15 @@ class NativeCommands(CONTROL.CommandRunner):
                     if size < int(command[-1]) * GIB:
                         raise CONTROL.ControlError("command_failed", "guest virtual disk size is stale")
                     filesystem = size - 1000000
+                    threshold = int(command[-1]) * GIB * 95 // 100
+                    filesystem_before = threshold - 1000000
                     body = json.dumps({
                         "status": "grown",
                         "virtual_bytes": size,
                         "partition_bytes": size,
-                        "filesystem_before": filesystem,
+                        "filesystem_before": filesystem_before,
                         "filesystem_bytes": filesystem,
-                        "filesystem_threshold_bytes": size * 95 // 100,
+                        "filesystem_threshold_bytes": threshold,
                         "filesystem": "ext4",
                         "source": "/dev/sda2",
                         "parent": "/dev/sda",
@@ -203,8 +205,8 @@ class NativeCommands(CONTROL.CommandRunner):
                             "disk_bytes": size,
                             "partition_bytes": size,
                             "filesystem_bytes": filesystem,
-                            "filesystem_before": filesystem,
-                            "filesystem_threshold_bytes": size * 95 // 100,
+                            "filesystem_before": filesystem_before,
+                            "filesystem_threshold_bytes": threshold,
                             "filesystem": "ext4",
                             "source": "/dev/sda2",
                             "parent": "/dev/sda",
@@ -223,6 +225,12 @@ class NativeCommands(CONTROL.CommandRunner):
             else: raise AssertionError(command)
         else: raise AssertionError(args)
         return subprocess.CompletedProcess(args, 0, body, b"")
+
+    def run_bounded(self, argv, *, input_data=None, timeout=30, stdout_limit=0, stderr_limit=0, check=True):
+        result = self.run(argv, input_data=input_data, timeout=timeout, check=check)
+        result.stdout_truncated = False
+        result.stderr_truncated = False
+        return result
 
 
 class NativeTimerTests(unittest.TestCase):
@@ -427,12 +435,13 @@ class Fixture(unittest.TestCase):
         size = disk_gib * GIB
         filesystem = size - 1000000
         threshold = size * 95 // 100
+        filesystem_before = filesystem if status == "already_grown" else threshold - 1000000
         failure_capacity = {
             "requested_bytes": size,
             "disk_bytes": size,
             "partition_bytes": size,
             "filesystem_bytes": filesystem,
-            "filesystem_before": filesystem,
+            "filesystem_before": filesystem_before,
             "filesystem_threshold_bytes": threshold,
             "filesystem": "ext4",
             "source": "/dev/sda2",
@@ -462,7 +471,7 @@ class Fixture(unittest.TestCase):
             "status": status,
             "virtual_bytes": size,
             "partition_bytes": size,
-            "filesystem_before": filesystem,
+            "filesystem_before": filesystem_before,
             "filesystem_bytes": filesystem,
             "filesystem_threshold_bytes": threshold,
             "filesystem": "ext4",
@@ -476,7 +485,7 @@ class Fixture(unittest.TestCase):
                 "disk_bytes": size,
                 "partition_bytes": size,
                 "filesystem_bytes": filesystem,
-                "filesystem_before": filesystem,
+                "filesystem_before": filesystem_before,
                 "filesystem_threshold_bytes": threshold,
                 "filesystem": "ext4",
                 "source": "/dev/sda2",
@@ -1373,6 +1382,32 @@ class LifecycleTests(Fixture):
         failure = json.loads(self.store.get_task(session_id="thread-a")["last_error"])
         self.assertEqual(failure["phase"], "guest-report")
 
+    def test_guest_growth_report_requires_growth_delta_for_mutating_status(self):
+        response = self.guest_growth_result()
+        payload = json.loads(response.stdout)
+        payload["filesystem_before"] = payload["filesystem_bytes"]
+        payload["capacity"]["filesystem_before"] = payload["capacity"]["filesystem_bytes"]
+        response.stdout = json.dumps(payload).encode()
+        self.runner.guest_growth_results = [response]
+
+        self.error("guest_resize_unverified", self.acquire)
+
+        failure = json.loads(self.store.get_task(session_id="thread-a")["last_error"])
+        self.assertEqual(failure["phase"], "guest-report")
+
+    def test_guest_growth_report_bounds_attempt_records(self):
+        response = self.guest_growth_result()
+        payload = json.loads(response.stdout)
+        payload["attempts"] = 3
+        payload["capacity"]["attempts"] = [{"attempt": 1}, {"attempt": 2}, {"attempt": 3}]
+        response.stdout = json.dumps(payload).encode()
+        self.runner.guest_growth_results = [response]
+
+        self.error("guest_resize_unverified", self.acquire)
+
+        failure = json.loads(self.store.get_task(session_id="thread-a")["last_error"])
+        self.assertEqual(failure["phase"], "guest-report")
+
     def test_already_grown_guest_root_is_an_idempotent_success(self):
         self.acquire()
         self.call("release")
@@ -1442,7 +1477,16 @@ class LifecycleTests(Fixture):
 
 
 class GuestRootGrowthScriptTests(unittest.TestCase):
-    def execute_script(self, *, initial_partition=None, initial_filesystem=None, resize_returncode=0):
+    def execute_script(
+        self,
+        *,
+        initial_partition=None,
+        initial_filesystem=None,
+        resize_returncode=0,
+        filesystem_type="ext4",
+        timeout_command=None,
+        source_output="/dev/sda2\n",
+    ):
         target = 20 * GIB
         threshold = target * 95 // 100
         state = {
@@ -1458,10 +1502,12 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         def run(command, **kwargs):
             command = list(command)
             calls.append(command)
+            if timeout_command is not None and command == timeout_command:
+                raise subprocess.TimeoutExpired(command, 45, output=b"partial stdout", stderr=b"partial stderr")
             if command == ["findmnt", "-n", "-o", "SOURCE", "-T", "/"]:
-                return completed(command, stdout="/dev/sda2\n")
+                return completed(command, stdout=source_output)
             if command == ["findmnt", "-n", "-o", "FSTYPE", "-T", "/"]:
-                return completed(command, stdout="ext4\n")
+                return completed(command, stdout=filesystem_type + "\n")
             if command[:4] == ["lsblk", "-n", "-o", "PKNAME"]:
                 return completed(command, stdout="sda\n")
             if command[:4] == ["lsblk", "-n", "-o", "TYPE"]:
@@ -1551,6 +1597,36 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         self.assertEqual(payload["status"], "already_grown")
         self.assertEqual(payload["attempts"], 0)
         self.assertFalse(any(command[0] in {"growpart", "resize2fs"} for command in calls))
+
+    def test_guest_root_growth_script_rejects_unsupported_filesystem(self):
+        exit_code, stdout, stderr, _ = self.execute_script(filesystem_type="btrfs")
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout, "")
+        error = json.loads(stderr)["error"]
+        self.assertEqual(error["phase"], "capability-check")
+        self.assertIn("direct ext4/xfs", error["cause"])
+
+    def test_guest_root_growth_script_preserves_timeout_evidence(self):
+        command = ["findmnt", "-n", "-o", "SOURCE", "-T", "/"]
+        exit_code, stdout, stderr, _ = self.execute_script(timeout_command=command)
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout, "")
+        error = json.loads(stderr)["error"]
+        self.assertEqual(error["phase"], "topology-source")
+        self.assertEqual(error["cause"], "command_timeout")
+        self.assertEqual(error["stdout"], "partial stdout")
+        self.assertEqual(error["stderr"], "partial stderr")
+
+    def test_guest_root_growth_script_rejects_ambiguous_topology_output(self):
+        exit_code, stdout, stderr, _ = self.execute_script(source_output="/dev/sda2\n/dev/sda3\n")
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout, "")
+        error = json.loads(stderr)["error"]
+        self.assertEqual(error["phase"], "topology-source")
+        self.assertEqual(error["cause"], "ambiguous_output")
 
 
 class CommandRunnerTests(unittest.TestCase):
@@ -1724,6 +1800,21 @@ class IncusWaitTests(unittest.TestCase):
         self.runner.run.side_effect = CONTROL.ControlError("command_timeout", "wait transport timed out")
         with self.assertRaises(CONTROL.GuestWaitTimeout):
             self.client.wait("vm", "agent", 1)
+
+    def test_bounded_exec_uses_process_group_safe_runner(self):
+        self.runner.run_bounded.return_value = subprocess.CompletedProcess([], 0, b"ok", b"")
+
+        result = self.client.exec("vm", ["python3", "-c", "print('ok')"], timeout=120, check=False, bounded=True)
+
+        self.assertEqual(result.stdout, b"ok")
+        self.runner.run_bounded.assert_called_once_with(
+            ["incus", "--project", "agents", "exec", "vm", "--", "python3", "-c", "print('ok')"],
+            timeout=120,
+            stdout_limit=CONTROL.DIAGNOSTIC_LOG_LIMIT,
+            stderr_limit=4000,
+            check=False,
+        )
+        self.runner.run.assert_not_called()
 
     def test_instance_log_uses_bounded_runner_and_marks_truncation(self):
         result = subprocess.CompletedProcess([], 0, b"x" * CONTROL.DIAGNOSTIC_LOG_LIMIT, b"")

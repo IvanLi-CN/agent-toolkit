@@ -766,6 +766,35 @@ async function syncDirectory(path: string): Promise<void> {
   }
 }
 
+type DirectoryIdentity = Pick<Awaited<ReturnType<typeof lstat>>, "dev" | "ino">;
+
+function directoryIdentity(metadata: Awaited<ReturnType<typeof lstat>>): DirectoryIdentity {
+  return { dev: metadata.dev, ino: metadata.ino };
+}
+
+function sameDirectoryIdentity(left: DirectoryIdentity, right: DirectoryIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+async function removeDirectoryIfIdentityMatches(
+  path: string,
+  expectedIdentity: DirectoryIdentity,
+  validate: (candidate: string) => Promise<boolean>,
+): Promise<boolean> {
+  try {
+    const beforeValidation = await lstat(path);
+    if (!beforeValidation.isDirectory() || beforeValidation.isSymbolicLink() || !sameDirectoryIdentity(directoryIdentity(beforeValidation), expectedIdentity)) return false;
+    if (!await validate(path)) return false;
+    const beforeRemoval = await lstat(path);
+    if (!beforeRemoval.isDirectory() || beforeRemoval.isSymbolicLink() || !sameDirectoryIdentity(directoryIdentity(beforeRemoval), expectedIdentity)) return false;
+    await rm(path, { recursive: true, force: true, maxRetries: 0 });
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
 async function removeTransactionDirectory(directory: string): Promise<void> {
   const inspect = async (path: string): Promise<{ dev: number; ino: number } | undefined> => {
     try {
@@ -800,8 +829,10 @@ async function removeTransactionDirectory(directory: string): Promise<void> {
   if (tombstoneIdentity === undefined
     || tombstoneIdentity.dev !== initialIdentity.dev
     || tombstoneIdentity.ino !== initialIdentity.ino) return;
-  await rm(tombstone, { recursive: true, force: true, maxRetries: 0 });
-  await syncDirectory(dirname(directory));
+  if (await removeDirectoryIfIdentityMatches(tombstone, tombstoneIdentity, async (candidate) => {
+    const identity = await inspect(candidate);
+    return identity !== undefined && sameDirectoryIdentity(identity, tombstoneIdentity);
+  })) await syncDirectory(dirname(directory));
 }
 
 async function cleanupDeleteTombstones(outDir: string, startingScan = 0): Promise<number> {
@@ -821,13 +852,18 @@ async function cleanupDeleteTombstones(outDir: string, startingScan = 0): Promis
       if (!DELETE_TOMBSTONE_NAME.test(entry.name)) continue;
       const tombstone = join(outDir, entry.name);
       try {
-        const listing = await readDirectoryEntriesBounded(tombstone, DELETE_TOMBSTONE_ENTRY_NAMES.size + 1);
-        if (listing.truncated || listing.entries.some((candidate) => candidate.isDirectory() || !DELETE_TOMBSTONE_ENTRY_NAMES.has(candidate.name))) continue;
-        const ownerEntry = listing.entries.find((candidate) => candidate.name === ".owner" || candidate.name === "owner");
-        if (ownerEntry === undefined) continue;
-        const owner = new TextDecoder().decode(await readRegularFile(join(tombstone, ownerEntry.name), 256)).trim();
-        if (!await hasValidOwnerRecord(owner)) continue;
-        await rm(tombstone, { recursive: true, force: true, maxRetries: 0 });
+        const metadata = await lstat(tombstone);
+        if (!metadata.isDirectory() || metadata.isSymbolicLink()) continue;
+        const identity = directoryIdentity(metadata);
+        const removed = await removeDirectoryIfIdentityMatches(tombstone, identity, async (candidate) => {
+          const listing = await readDirectoryEntriesBounded(candidate, DELETE_TOMBSTONE_ENTRY_NAMES.size + 1);
+          if (listing.truncated || listing.entries.some((child) => child.isDirectory() || !DELETE_TOMBSTONE_ENTRY_NAMES.has(child.name))) return false;
+          const ownerEntry = listing.entries.find((child) => child.name === ".owner" || child.name === "owner");
+          if (ownerEntry === undefined) return false;
+          const owner = new TextDecoder().decode(await readRegularFile(join(candidate, ownerEntry.name), 256)).trim();
+          return await hasValidOwnerRecord(owner);
+        });
+        if (removed) await syncDirectory(outDir);
       } catch {
         // Preserve an unexpected or concurrently changing tombstone for a later retry.
       }
@@ -1116,9 +1152,11 @@ async function isProcessAlive(pid: number): Promise<boolean> {
 
 async function removeLockDirectory(directory: string, expectedOwner?: string): Promise<boolean> {
   let entries;
+  let initialIdentity: DirectoryIdentity;
   try {
     const metadata = await lstat(directory);
     if (!metadata.isDirectory() || metadata.isSymbolicLink()) return false;
+    initialIdentity = directoryIdentity(metadata);
     const listing = await readDirectoryEntriesBounded(directory, LOCK_ENTRY_NAMES.size + 1);
     if (listing.truncated) return false;
     entries = listing.entries;
@@ -1140,19 +1178,19 @@ async function removeLockDirectory(directory: string, expectedOwner?: string): P
   } catch {
     return false;
   }
-  if (expectedOwner !== undefined) {
-    try {
-      const owner = new TextDecoder().decode(await readRegularFile(join(tombstone, "owner"), 128)).trim();
-      if (owner !== expectedOwner) {
-        await rename(tombstone, directory).catch(() => undefined);
-        return false;
-      }
-    } catch {
-      await rename(tombstone, directory).catch(() => undefined);
-      return false;
-    }
-  }
-  await rm(tombstone, { recursive: true, force: true, maxRetries: 0 });
+  const tombstoneMetadata = await lstat(tombstone).catch(() => undefined);
+  if (tombstoneMetadata === undefined
+    || !tombstoneMetadata.isDirectory()
+    || tombstoneMetadata.isSymbolicLink()
+    || !sameDirectoryIdentity(directoryIdentity(tombstoneMetadata), initialIdentity)) return false;
+  const removed = await removeDirectoryIfIdentityMatches(tombstone, directoryIdentity(tombstoneMetadata), async (candidate) => {
+    const listing = await readDirectoryEntriesBounded(candidate, LOCK_ENTRY_NAMES.size + 1);
+    if (listing.truncated || listing.entries.length === 0 || listing.entries.some((entry) => entry.isDirectory() || entry.isSymbolicLink() || !LOCK_ENTRY_NAMES.has(entry.name))) return false;
+    if (expectedOwner === undefined) return true;
+    const owner = new TextDecoder().decode(await readRegularFile(join(candidate, "owner"), 128)).trim();
+    return owner === expectedOwner;
+  });
+  if (!removed) return false;
   await syncDirectory(dirname(directory));
   return true;
 }
@@ -1161,12 +1199,17 @@ async function discardTemporaryLockDirectory(directory: string): Promise<void> {
   try {
     const metadata = await lstat(directory);
     if (!metadata.isDirectory() || metadata.isSymbolicLink()) return;
+    const initialIdentity = directoryIdentity(metadata);
     const listing = await readDirectoryEntriesBounded(directory, LOCK_ENTRY_NAMES.size + 1);
     if (listing.truncated || listing.entries.some((entry) => entry.isDirectory() || entry.isSymbolicLink() || !LOCK_ENTRY_NAMES.has(entry.name))) return;
     const tombstone = join(dirname(directory), `${DELETE_TOMBSTONE_PREFIX}${randomUUID()}`);
     await rename(directory, tombstone);
-    await rm(tombstone, { recursive: true, force: true, maxRetries: 0 });
-    await syncDirectory(dirname(directory));
+    const tombstoneMetadata = await lstat(tombstone);
+    if (!tombstoneMetadata.isDirectory() || tombstoneMetadata.isSymbolicLink() || !sameDirectoryIdentity(directoryIdentity(tombstoneMetadata), initialIdentity)) return;
+    if (await removeDirectoryIfIdentityMatches(tombstone, directoryIdentity(tombstoneMetadata), async (candidate) => {
+      const currentListing = await readDirectoryEntriesBounded(candidate, LOCK_ENTRY_NAMES.size + 1);
+      return !currentListing.truncated && currentListing.entries.every((entry) => !entry.isDirectory() && !entry.isSymbolicLink() && LOCK_ENTRY_NAMES.has(entry.name));
+    })) await syncDirectory(dirname(directory));
   } catch {
     // An incomplete temporary lock is never the canonical lock; preserve it for a later retry.
   }

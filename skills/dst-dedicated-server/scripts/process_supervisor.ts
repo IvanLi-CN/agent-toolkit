@@ -44,6 +44,7 @@ supervisor_pid="$$"
 ready_path="$status_dir/ready"
 cleanup_started_path="$status_dir/cleanup-started"
 cleanup_complete_path="$status_dir/cleanup-complete"
+cleanup_owner_path="$status_dir/cleanup-owner"
 cleanup_ack_enabled=1
 captured_descendants_read_data=""
 captured_group_members_read_data=""
@@ -323,6 +324,12 @@ ensure_marker() {
     return $?
   fi
   create_marker_exclusive "$marker_path"
+}
+acquire_cleanup_owner() {
+  # The signal path and detached cleaner share status_dir; only one may mutate
+  # the ledger or publish the cleanup acknowledgement.
+  if ! mkdir "$cleanup_owner_path" 2>/dev/null; then return 1; fi
+  write_marker_exclusive "$cleanup_owner_path/pid" "$$"
 }
 cleanup() {
   if [ -e "$descendant_scan_truncated_path" ] || [ -e "$descendant_scan_failed_path" ] || [ -e "$snapshot_failed_path" ]; then cleanup_ack_enabled=0; fi
@@ -608,6 +615,7 @@ target_identity_matches() {
     return
   fi
   if [ "$target_identity_mode" = "ps" ]; then
+    kill -0 "$target_pid" 2>/dev/null || return 1
     current_target_ps_start="$(ps_identity_for_pid "$target_pid" 2>/dev/null || true)"
     [ -n "$current_target_ps_start" ] && captured_identity_matches "$target_ps_start" "$current_target_ps_start"
     return
@@ -736,6 +744,17 @@ process_liveness() {
     return 0
   fi
   if process_identity "$process_id" >/dev/null 2>&1; then process_liveness_result=live; else process_liveness_result=unknown; fi
+}
+retry_process_liveness() {
+  retry_process_id="$1"
+  retry_process_attempt=0
+  process_liveness "$retry_process_id"
+  while [ "$process_liveness_result" = "unknown" ] && [ "$retry_process_attempt" -lt 3 ]; do
+    snapshot_deadline_exceeded && return 0
+    sleep 0.025
+    process_liveness "$retry_process_id"
+    retry_process_attempt=$((retry_process_attempt + 1))
+  done
 }
 wait_for_process_dead() {
   process_wait_pid="$1"
@@ -968,6 +987,20 @@ captured_group_has_live_process() {
   [ "$captured_group_probe_status" -eq 0 ] || return "$captured_group_probe_status"
   printf '%s' "$captured_group_members_read_data" | run_process_probe awk -F'|' '$2 !~ /^Z/ { found = 1; exit } END { exit(found ? 0 : 1) }'
 }
+retry_captured_group_has_live_process() {
+  retry_captured_group="$1"
+  retry_captured_group_attempt=0
+  captured_group_has_live_process "$retry_captured_group"
+  retry_captured_group_status=$?
+  while [ "$retry_captured_group_status" -eq 2 ] && [ "$retry_captured_group_attempt" -lt 3 ]; do
+    snapshot_deadline_exceeded && return "$retry_captured_group_status"
+    sleep 0.025
+    captured_group_has_live_process "$retry_captured_group"
+    retry_captured_group_status=$?
+    retry_captured_group_attempt=$((retry_captured_group_attempt + 1))
+  done
+  return "$retry_captured_group_status"
+}
 send_group_signal_or_confirm_empty() {
   signal_group="$1"
   signal_name="$2"
@@ -1097,6 +1130,21 @@ EOF
     return 0
   fi
   [ "$captured_group_live_count" -gt 0 ]
+}
+retry_captured_group_can_be_signaled() {
+  retry_captured_group_identity="$1"
+  retry_captured_group="$2"
+  retry_captured_group_attempt=0
+  captured_group_can_be_signaled "$retry_captured_group_identity" "$retry_captured_group"
+  retry_captured_group_status=$?
+  while [ "$retry_captured_group_status" -eq 2 ] && [ "$retry_captured_group_attempt" -lt 3 ]; do
+    snapshot_deadline_exceeded && return "$retry_captured_group_status"
+    sleep 0.025
+    captured_group_can_be_signaled "$retry_captured_group_identity" "$retry_captured_group"
+    retry_captured_group_status=$?
+    retry_captured_group_attempt=$((retry_captured_group_attempt + 1))
+  done
+  return "$retry_captured_group_status"
 }
 scan_target_marker_processes() {
   marker_output_path="$1"
@@ -1513,7 +1561,7 @@ quiesce_captured_descendants() {
     identity_is_valid "$captured_identity" || { cleanup_ack_enabled=0; return 1; }
     case "$captured_pgid" in ''|0|*[!0-9]*) cleanup_ack_enabled=0; return 1 ;; esac
     validate_authorized_record "$captured_pid" "$captured_identity" "$captured_pgid" || return 1
-    process_liveness "$captured_pid"
+    retry_process_liveness "$captured_pid"
     case "$process_liveness_result" in
       dead)
         continue
@@ -1607,18 +1655,18 @@ reconcile_captured_descendants() {
     identity_is_valid "$captured_identity" || { cleanup_ack_enabled=0; return 1; }
     case "$captured_pgid" in ''|0|*[!0-9]*) cleanup_ack_enabled=0; return 1 ;; esac
     validate_authorized_record "$captured_pid" "$captured_identity" "$captured_pgid" || { cleanup_ack_enabled=0; return 1; }
-    process_liveness "$captured_pid"
+    retry_process_liveness "$captured_pid"
     case "$process_liveness_result" in
       dead)
         if [ "$captured_pgid" = "$reconcile_target_pgid" ]; then
           safe_append_line "$reconcile_next_path" "$captured_pid|$captured_identity|$captured_pgid" || { cleanup_ack_enabled=0; return 1; }
           continue
         fi
-        captured_group_has_live_process "$captured_pgid"
+        retry_captured_group_has_live_process "$captured_pgid"
         captured_group_live_status=$?
         case "$captured_group_live_status" in
           0)
-            captured_group_can_be_signaled "$captured_identity" "$captured_pgid"
+            retry_captured_group_can_be_signaled "$captured_identity" "$captured_pgid"
             captured_group_signal_status=$?
             if [ "$captured_group_signal_status" -ne 0 ]; then cleanup_ack_enabled=0; return 1; fi
             ;;
@@ -2148,6 +2196,7 @@ EOF
 }
 watchdog_pid=""
 termination_started=0
+termination_requested=0
 stop_watchdog() {
   if [ -n "$watchdog_pid" ]; then
     kill "$watchdog_pid" 2>/dev/null || true
@@ -2156,6 +2205,7 @@ stop_watchdog() {
 }
 terminate_supervised_tree() {
   if [ "$termination_started" = "1" ]; then return 0; fi
+  if ! acquire_cleanup_owner; then return 0; fi
   termination_started=1
   ensure_marker "$cleanup_started_path" || cleanup_ack_enabled=0
   signal_tree TERM
@@ -2168,7 +2218,9 @@ terminate_supervised_tree() {
   cleanup
 }
 hold_pid=""
-trap 'if [ "$termination_started" = "1" ]; then :; else if [ -n "$hold_pid" ]; then kill "$hold_pid" 2>/dev/null || true; fi; terminate_supervised_tree; exit 143; fi' HUP INT TERM
+# Let an in-flight bounded probe finish before starting cleanup. This prevents
+# a signal trap from racing a snapshot writer against the cleanup verifier.
+trap 'termination_requested=1; if [ "$termination_started" != "1" ] && [ -n "$hold_pid" ]; then kill "$hold_pid" 2>/dev/null || true; fi' HUP INT TERM
 parent_is_alive() {
   if [ "$parent_identity_mode" = "proc" ] && [ -r "/proc/$parent_pid/stat" ]; then
     parent_identity="$(run_watchdog_probe awk '{ sub(/.*\\) /, ""); print $1 " " $20 }' "/proc/$parent_pid/stat" 2>/dev/null || true)"
@@ -2220,6 +2272,10 @@ snapshot_probe_count=0
 start_snapshot || true
 target_status_invalid=0
 while [ ! -e "$completion_path" ]; do
+  if [ "$termination_requested" = "1" ]; then
+    terminate_supervised_tree
+    exit 143
+  fi
   if ! target_is_alive; then
     target_status_invalid=1
     break
@@ -2233,6 +2289,10 @@ while [ ! -e "$completion_path" ]; do
   if [ "$snapshot_probe_count" -ge 5 ]; then
     start_snapshot || true
     snapshot_probe_count=0
+  fi
+  if [ "$termination_requested" = "1" ]; then
+    terminate_supervised_tree
+    exit 143
   fi
   sleep 0.01
 done

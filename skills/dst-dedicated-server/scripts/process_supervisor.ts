@@ -2595,9 +2595,12 @@ async function readTargetReference(statusPath: string, wrapperPid: number): Prom
   ]);
   const normalizedIdentity = identity?.trim() ?? "";
   if (pid === undefined || pgid === undefined || normalizedIdentity.length === 0) return undefined;
-  if (await currentProcessParent(pid) !== wrapperPid) return undefined;
-  const currentPgid = await currentProcessGroup(pid);
-  const currentIdentity = await currentProcessIdentity(pid);
+  const [currentParent, currentPgid, currentIdentity] = await Promise.all([
+    currentProcessParent(pid),
+    currentProcessGroup(pid),
+    currentProcessIdentity(pid),
+  ]);
+  if (currentParent !== wrapperPid) return undefined;
   if (currentPgid !== pgid || currentIdentity === undefined || !processIdentityMatches(normalizedIdentity, currentIdentity)) return undefined;
   return { pid, pgid, identity: normalizedIdentity };
 }

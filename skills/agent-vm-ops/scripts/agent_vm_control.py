@@ -330,6 +330,7 @@ def settle_partition(layout):
 
 def report(status, before, layout):
     capacity["status"] = status
+    capacity["filesystem_before"] = before.get("filesystem_bytes")
     capacity["attempts"] = list(attempts)
     return {
         "status": status,
@@ -760,7 +761,16 @@ class CommandRunner:
         except FileNotFoundError as exc:
             raise ControlError("command_missing", f"command not found: {argv[0]}") from exc
         except subprocess.TimeoutExpired as exc:
-            raise ControlError("command_timeout", f"command timed out: {argv[0]}") from exc
+            def captured(value: bytes | str | None) -> str:
+                if isinstance(value, bytes):
+                    return value.decode("utf-8", "replace")[-4000:]
+                return str(value or "")[-4000:]
+
+            raise ControlError(
+                "command_timeout",
+                f"command timed out: {argv[0]}",
+                {"stdout": captured(exc.stdout), "stderr": captured(exc.stderr)},
+            ) from exc
         if check and result.returncode != 0:
             stderr = result.stderr.decode("utf-8", "replace").strip()
             raise ControlError(
@@ -5020,16 +5030,36 @@ class Control:
                 raise ValueError()
             required_capacity = {
                 "status", "requested_bytes", "disk_bytes", "partition_bytes", "filesystem_bytes",
-                "filesystem_threshold_bytes", "filesystem", "source", "parent", "partition", "tools",
+                "filesystem_before", "filesystem_threshold_bytes", "filesystem", "source", "parent", "partition", "tools",
                 "attempts",
             }
             if not required_capacity.issubset(capacity):
                 raise ValueError()
             for key in ("requested_bytes", "disk_bytes", "partition_bytes", "filesystem_bytes",
-                        "filesystem_threshold_bytes"):
+                        "filesystem_before", "filesystem_threshold_bytes"):
                 if isinstance(capacity.get(key), bool) or not isinstance(capacity.get(key), int):
                     raise ValueError()
             if not isinstance(capacity.get("attempts"), list) or len(capacity["attempts"]) != value["attempts"]:
+                raise ValueError()
+            attempt_records = capacity["attempts"]
+            for index, record in enumerate(attempt_records):
+                if (
+                    not isinstance(record, Mapping)
+                    or isinstance(record.get("attempt"), bool)
+                    or record.get("attempt") != index + 1
+                    or any(key in record and not isinstance(record[key], Mapping) for key in ("error", "refresh_error"))
+                ):
+                    raise ValueError()
+            if status == "grown_after_retry":
+                first_error = attempt_records[0].get("error") if attempt_records else None
+                if (
+                    len(attempt_records) != 2
+                    or not isinstance(first_error, Mapping)
+                    or first_error.get("transient") is not True
+                    or "error" in attempt_records[1]
+                ):
+                    raise ValueError()
+            elif any("error" in record for record in attempt_records):
                 raise ValueError()
             target_bytes = disk_gib * 1024**3
             expected_threshold = capacity["disk_bytes"] * 95 // 100
@@ -5038,8 +5068,16 @@ class Control:
             parent = value.get("parent")
             partition = value.get("partition")
             direct_device = lambda item: isinstance(item, str) and item.startswith("/dev/") and item.count("/") == 2
+            parent_name = parent.rsplit("/", 1)[-1] if isinstance(parent, str) else ""
+            expected_source = (
+                parent + ("p" if parent_name[-1:].isdigit() else "") + partition
+                if isinstance(parent, str) and isinstance(partition, str)
+                else ""
+            )
             tools = capacity.get("tools")
             required_tools = {"findmnt", "lsblk", "blockdev", "growpart", "resize2fs" if filesystem == "ext4" else "xfs_growfs"}
+            if value["partition"] != capacity["partition"]:
+                raise ValueError()
             if (
                 capacity["status"] != status
                 or capacity["requested_bytes"] != target_bytes
@@ -5050,22 +5088,28 @@ class Control:
                 or value["filesystem"] != capacity["filesystem"]
                 or value["source"] != capacity["source"]
                 or value["parent"] != capacity["parent"]
-                or value["partition"] != capacity["partition"]
+                or capacity["filesystem_before"] != value["filesystem_before"]
                 or value["virtual_bytes"] < target_bytes
                 or value["partition_bytes"] < target_bytes * 95 // 100
+                or value["filesystem_before"] < 0
+                or value["filesystem_before"] > value["filesystem_bytes"]
                 or value["filesystem_bytes"] < value["filesystem_threshold_bytes"]
                 or capacity["disk_bytes"] < target_bytes
                 or capacity["partition_bytes"] > capacity["disk_bytes"]
+                or capacity["partition_bytes"] < 0
+                or capacity["filesystem_before"] < 0
                 or capacity["filesystem_bytes"] > capacity["partition_bytes"]
                 or capacity["filesystem_threshold_bytes"] != expected_threshold
                 or filesystem not in {"ext4", "xfs"}
                 or not direct_device(source)
                 or not direct_device(parent)
                 or source == parent
+                or source != expected_source
                 or not isinstance(partition, str)
                 or re.fullmatch(r"[0-9]+", partition) is None
                 or not isinstance(tools, Mapping)
                 or any(not isinstance(tools.get(tool), str) or not tools[tool] for tool in required_tools)
+                or value["attempts"] < 0
                 or value["attempts"] > 2
                 or (status == "grown" and value["attempts"] != 1)
                 or (status == "grown_after_retry" and value["attempts"] != 2)

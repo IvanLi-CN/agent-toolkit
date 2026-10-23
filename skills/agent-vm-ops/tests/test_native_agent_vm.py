@@ -201,6 +201,7 @@ class NativeCommands(CONTROL.CommandRunner):
                             "disk_bytes": size,
                             "partition_bytes": size,
                             "filesystem_bytes": filesystem,
+                            "filesystem_before": filesystem,
                             "filesystem_threshold_bytes": size * 95 // 100,
                             "filesystem": "ext4",
                             "source": "/dev/sda2",
@@ -423,6 +424,16 @@ class Fixture(unittest.TestCase):
     def guest_growth_result(disk_gib=20, *, status="grown", attempts=1, returncode=0, stderr=""):
         size = disk_gib * GIB
         filesystem = size - 1000000
+        attempt_records = [{"attempt": index + 1} for index in range(attempts)]
+        if status == "grown_after_retry" and attempt_records:
+            attempt_records[0]["error"] = {
+                "phase": "filesystem-grow",
+                "command": ["resize2fs", "/dev/sda2"],
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "resize2fs: Device or resource busy",
+                "transient": True,
+            }
         payload = {
             "status": status,
             "virtual_bytes": size,
@@ -441,6 +452,7 @@ class Fixture(unittest.TestCase):
                 "disk_bytes": size,
                 "partition_bytes": size,
                 "filesystem_bytes": filesystem,
+                "filesystem_before": filesystem,
                 "filesystem_threshold_bytes": size * 95 // 100,
                 "filesystem": "ext4",
                 "source": "/dev/sda2",
@@ -453,7 +465,7 @@ class Fixture(unittest.TestCase):
                     "growpart": "/usr/bin/growpart",
                     "resize2fs": "/usr/sbin/resize2fs",
                 },
-                "attempts": [{"attempt": index + 1} for index in range(attempts)],
+                "attempts": attempt_records,
                 "verified": True,
             },
         }
@@ -1302,7 +1314,18 @@ class LifecycleTests(Fixture):
     def test_guest_growth_report_requires_consistent_topology(self):
         response = self.guest_growth_result()
         payload = json.loads(response.stdout)
-        del payload["capacity"]["source"]
+        payload["partition"] = "3"
+        response.stdout = json.dumps(payload).encode()
+        self.runner.guest_growth_results = [response]
+        self.error("guest_resize_unverified", self.acquire)
+
+        failure = json.loads(self.store.get_task(session_id="thread-a")["last_error"])
+        self.assertEqual(failure["phase"], "guest-report")
+
+    def test_guest_growth_report_requires_transient_retry_evidence(self):
+        response = self.guest_growth_result(status="grown_after_retry", attempts=2)
+        payload = json.loads(response.stdout)
+        payload["capacity"]["attempts"] = [{"attempt": 1}, {"attempt": 2}]
         response.stdout = json.dumps(payload).encode()
         self.runner.guest_growth_results = [response]
         self.error("guest_resize_unverified", self.acquire)
@@ -1355,6 +1378,13 @@ class CommandRunnerTests(unittest.TestCase):
         compile(CONTROL.GUEST_ROOT_GROWTH_SCRIPT, "<guest-root-growth>", "exec")
         self.assertIn("for attempt in (1, 2)", CONTROL.GUEST_ROOT_GROWTH_SCRIPT)
         self.assertNotIn('"try again"', CONTROL.GUEST_ROOT_GROWTH_SCRIPT)
+
+    def test_command_timeout_preserves_bounded_output(self):
+        timeout = subprocess.TimeoutExpired(["incus"], 1, output=b"partial stdout", stderr=b"partial stderr")
+        with mock.patch.object(CONTROL.subprocess, "run", side_effect=timeout), self.assertRaises(CONTROL.ControlError) as failure:
+            CONTROL.CommandRunner().run(["incus", "exec", "guest"])
+        self.assertEqual(failure.exception.code, "command_timeout")
+        self.assertEqual(failure.exception.detail, {"stdout": "partial stdout", "stderr": "partial stderr"})
 
     def test_bounded_runner_discards_stdout_after_limit(self):
         code = "import sys; sys.stdout.write('x' * 1000000)"

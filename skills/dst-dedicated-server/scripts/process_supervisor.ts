@@ -45,8 +45,12 @@ set +e
 set +m 2>/dev/null || true
 status_path="$1"
 shift
-status_dir="$(dirname -- "$status_path")"
-status_dir_path="$status_dir"
+status_dir_path="$(dirname -- "$status_path")"
+target_working_directory="$(pwd)"
+if [ ! -d "$status_dir_path" ] || [ -L "$status_dir_path" ] || ! cd "$status_dir_path"; then exit 1; fi
+export AGENT_TOOLKIT_TARGET_CWD="$target_working_directory"
+status_dir="."
+status_path="./status"
 target_marker="\${AGENT_TOOLKIT_TARGET_MARKER:-unbound}"
 supervisor_pid="$$"
 cleanup_owner_nonce="$(LC_ALL=C od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d '[:space:]' || true)"
@@ -85,7 +89,16 @@ if command -v perl >/dev/null 2>&1; then
   supervisor_no_follow="$(perl -MFcntl -e 'print eval { Fcntl::O_NOFOLLOW() } // ""' 2>/dev/null || true)"
 fi
 status_dir_is_current() {
-  [ -d "$status_dir_path" ] && [ ! -L "$status_dir_path" ]
+  [ -d "." ] && [ ! -L "." ]
+}
+status_dir_path_matches_anchor() {
+  if ! command -v perl >/dev/null 2>&1; then return 1; fi
+  perl -e '
+    my @path = lstat($ARGV[0]);
+    my @cwd = stat(".");
+    exit 1 unless @path && @cwd && (($path[2] & 0170000) == 0040000) && (($cwd[2] & 0170000) == 0040000);
+    exit 1 unless $path[0] == $cwd[0] && $path[1] == $cwd[1];
+  ' "$status_dir_path"
 }
 read_regular_marker() {
   marker_path="$1"
@@ -156,6 +169,7 @@ atomic_rename_path() {
 }
 safe_remove_status_directory() {
   status_dir_is_current || return 1
+  status_dir_path_matches_anchor || return 1
   cleanup_tombstone_nonce="$(LC_ALL=C od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d '[:space:]' || true)"
   case "$cleanup_tombstone_nonce" in
     ''|*[!0-9a-fA-F]*) return 1 ;;
@@ -630,7 +644,7 @@ if command -v setsid >/dev/null 2>&1 && [ "\${AGENT_TOOLKIT_SUPERVISOR_DISABLE_S
     if ! write_target_marker "$anchor_path" "$$"; then exit 125; fi
     while [ ! -e "$start_path" ]; do sleep 0.01; done
     while [ ! -e "$authorized_path" ]; do sleep 0.01; done
-    "$@" 3>&- 4>&- &
+    (cd "$AGENT_TOOLKIT_TARGET_CWD" && "$@") 3>&- 4>&- &
     target_pid=$!
     (trap ':' HUP INT TERM; while [ ! -e "$stop_path" ]; do sleep 0.02; done; kill -TERM "-$$" 2>/dev/null || true; sleep 0.25; kill -KILL "-$$" 2>/dev/null || true) &
     stop_watcher_pid=$!
@@ -672,7 +686,7 @@ else
     if ! write_target_marker "$anchor_path" "$$"; then exit 125; fi
     while [ ! -e "$start_path" ]; do sleep 0.01; done
     while [ ! -e "$authorized_path" ]; do sleep 0.01; done
-    "$@" 3>&- 4>&- &
+    (cd "$AGENT_TOOLKIT_TARGET_CWD" && "$@") 3>&- 4>&- &
     target_pid=$!
     (trap ':' HUP INT TERM; while [ ! -e "$stop_path" ]; do sleep 0.02; done; kill -TERM "-$$" 2>/dev/null || true; sleep 0.25; kill -KILL "-$$" 2>/dev/null || true) &
     stop_watcher_pid=$!

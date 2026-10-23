@@ -389,7 +389,7 @@ async function syncDirectory(path: string): Promise<void> {
 }
 
 const SENSITIVE_NAME = "(?:password|passwd|pass[ _-]?phrase|pwd|secret|token|credential(?:s)?|jwt|private[_ -]?key|api[_ -]?key|access[_ -]?key|signing[_ -]?key|encryption[_ -]?key|database[_ -]?url|mongo[_ -]?uri|authorization|bearer|cookie|set[ _-]?cookie|session(?:[_ -]?id)?)";
-const SENSITIVE_INDEX_SUFFIX = `(?:\\[[^\\]\\r\\n]*\\])*`;
+const SENSITIVE_INDEX_SUFFIX = `(?:(?:[ \\t]*)\\[[^\\]\\r\\n]*\\])*`;
 const SENSITIVE_BARE_BASE = `[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*`;
 const SENSITIVE_BRACKET_BASE = `\\[[^\\]\\r\\n]*${SENSITIVE_NAME}[^\\]\\r\\n]*\\]`;
 const SENSITIVE_QUOTED_BASE = `(?:"[^"\\r\\n]*${SENSITIVE_NAME}[^"\\r\\n]*"|'[^'\\r\\n]*${SENSITIVE_NAME}[^'\\r\\n]*')`;
@@ -409,7 +409,7 @@ const UNREDACTED_SENSITIVE_ASSIGNMENT = new RegExp(`(?:${SENSITIVE_BARE_KEY}|${S
 const AUTHORIZATION_TOKEN = /\b(Bearer|Basic)(?:\s*[:=])?\s*([^\s,;]+)/gi;
 const JSON_AUTHORIZATION_ASSIGNMENT = /(["'])(Bearer|Basic)\1\s*:\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^,}\r\n]+)/gi;
 const BRACKETED_SENSITIVE_ASSIGNMENT = new RegExp(`(\\[[^\\]\\r\\n]*${SENSITIVE_NAME}[^\\]\\r\\n]*\\]\\s*[:=]\\s*)(?!\\s*\\[REDACTED\\])([^\\r\\n]+)`, "gi");
-const ENCODED_SENSITIVE_ASSIGNMENT = new RegExp(`(\\b${SENSITIVE_BARE_KEY}\\s*%3[dD]\\s*)(?!\\s*\\[REDACTED\\])([^\\r\\n]+)`, "gi");
+const ENCODED_SENSITIVE_ASSIGNMENT = new RegExp(`((?<![A-Za-z0-9_.-])${SENSITIVE_KEY}\\s*%3[dD]\\s*)(?!\\s*\\[REDACTED\\])([^\\r\\n]+)`, "gi");
 const SENSITIVE_BLOCK_HEADER = new RegExp(`^([ \\t]*${SENSITIVE_KEY_TOKEN}\\s*[:=]\\s*[|>][-+0-9]*)\\s*$`, "i");
 const PRIVATE_KEY_BLOCK = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/gi;
 const SENSITIVE_FILENAME = new RegExp("(?<![A-Za-z0-9])(?:[A-Za-z0-9_.-]*(?:" + SENSITIVE_NAME + "|env|id[_ -]?rsa|private[._-]?(?:key|pem)|api[._-]?key|auth[._-]?json)[A-Za-z0-9_.-]*)(?![A-Za-z0-9])", "gi");

@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 
 const SUPERVISOR_CLEANUP_TIMEOUT_MS = 60_000;
 const SUPERVISOR_CLEANUP_ACK_SETTLE_MS = 15_000;
+const SUPERVISOR_CLEANUP_MARKER_SETTLE_MS = 2_000;
 const SUPERVISOR_UNEXPECTED_EXIT_SETTLE_MS = 250;
 const SUPERVISOR_ORPHAN_CLEANUP_TIMEOUT_MS = 5_000;
 const SUPERVISOR_CLEANUP_DEADLINE_SECONDS = Math.ceil(SUPERVISOR_CLEANUP_TIMEOUT_MS / 1_000);
@@ -2582,8 +2583,13 @@ async function settleSupervisorDirectory(path: string, acknowledgement: number |
   // it merely because the wrapper exited can interrupt a still-running
   // descendant verification pass.
   if (acknowledgement !== 1) return;
-  if ((await readRegularMarker(join(path, "cleanup-complete")))?.trim() === "complete") {
-    await removeSupervisorDirectory(path);
+  const deadline = Date.now() + SUPERVISOR_CLEANUP_MARKER_SETTLE_MS;
+  while (Date.now() < deadline) {
+    if ((await readRegularMarker(join(path, "cleanup-complete")))?.trim() === "complete") {
+      await removeSupervisorDirectory(path);
+      return;
+    }
+    await Bun.sleep(Math.min(25, Math.max(1, deadline - Date.now())));
   }
 }
 

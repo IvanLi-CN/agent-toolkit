@@ -349,10 +349,11 @@ acquire_cleanup_owner() {
   if [ -d "$cleanup_owner_path" ] && [ ! -L "$cleanup_owner_path" ]; then
     cleanup_owner_record="$(read_regular_marker "$cleanup_owner_path/owner" 256 2>/dev/null || true)"
     if [ "$cleanup_owner_record" = "$$:$cleanup_owner_nonce" ]; then return 1; fi
-    rm -f -- "$cleanup_owner_path/owner" 2>/dev/null || true
-    if rmdir "$cleanup_owner_path" 2>/dev/null; then
-      return 2
-    fi
+    # A valid foreign owner is still live, and an invalid marker may be
+    # changing concurrently. Only reclaim a directory that is atomically
+    # observed to be empty; never remove another owner's marker.
+    [ -z "$cleanup_owner_record" ] || return 2
+    if rmdir "$cleanup_owner_path" 2>/dev/null; then return 2; fi
   fi
   return 2
 }

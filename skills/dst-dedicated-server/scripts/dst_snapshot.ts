@@ -555,7 +555,7 @@ export function redactSensitiveText(text: string): string {
       } catch {
         return match;
       }
-      return new RegExp(`^${SENSITIVE_BARE_BASE}$`, "i").test(decodedKey)
+      return new RegExp(`^${SENSITIVE_KEY}$`, "i").test(decodedKey)
         ? `${rawKey}${separator} [REDACTED]`
         : match;
     })

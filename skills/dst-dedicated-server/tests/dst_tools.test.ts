@@ -63,6 +63,8 @@ describe.serial("DST local Bun tooling", () => {
     expect(redactSensitiveText("api_key%3Dfixture-secret")).not.toContain("fixture-secret");
     expect(redactSensitiveText("api%5Fkey=percent-encoded-key-secret")).not.toContain("percent-encoded-key-secret");
     expect(redactSensitiveText("api%5Fkey%3Dencoded-separator-secret")).not.toContain("encoded-separator-secret");
+    expect(redactSensitiveText("%5Bapi_key%5D=percent-encoded-bracket-secret")).not.toContain("percent-encoded-bracket-secret");
+    expect(redactSensitiveText("%22api_key%22%3Dpercent-encoded-quote-secret")).not.toContain("percent-encoded-quote-secret");
     expect(redactSensitiveText("password: |\n  fixture-secret\nnext: visible")).not.toContain("fixture-secret");
     expect(redactSensitiveText("api_\u001b[31mkey=fixture-secret")).not.toContain("fixture-secret");
     expect(redactSensitiveText("token\u001b[31mANSI_SECRET")).not.toContain("ANSI_SECRET");
@@ -256,6 +258,10 @@ describe.serial("DST local Bun tooling", () => {
     enabled = false,
   },
 }`)).toEqual([{ id: "600", state: "false" }]);
+
+    expect(parseModOverrides('return { ["workshop-700"] = { ["configuration_options"] = { enabled = true }, enabled = false } }')).toEqual([
+      { id: "700", state: "false" },
+    ]);
   });
 
   test("ignores braces and enabled assignments inside Lua strings and comments", () => {
@@ -438,7 +444,7 @@ describe.serial("DST local Bun tooling", () => {
       const home = join(root, "home");
       const shard = join(home, ".klei", "DoNotStarveTogether", "fixture", "Master");
       await mkdir(shard, { recursive: true });
-      await writeFile(join(shard, "modoverrides.lua"), '["workshop-123"] = { configuration_options = { password = "fixture-secret", enabled = false }, enabled = true }\n');
+      await writeFile(join(shard, "modoverrides.lua"), '["workshop-123"] = { ["configuration_options"] = { password = "fixture-secret", enabled = false }, enabled = true }\n');
       const child = Bun.spawn(["bash", join(import.meta.dir, "..", "scripts", "dst_mods_remote_collect.sh"), "fixture", "Master"], {
         env: { ...process.env, HOME: home }, stdout: "pipe", stderr: "pipe",
       });

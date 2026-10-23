@@ -194,7 +194,7 @@ function mask_lua(value, output, position, character, next_character, quote, esc
       else if (character == "\\") escaped = 1
       else if (character == quote) {
         literal = substr(value, quote_start, position - quote_start + 1)
-        if (literal ~ /^"workshop-[0-9]+"$/ && substr(value, quote_start - 1, 1) == "[" && substr(value, position + 1, 1) == "]") output = substr(output, 1, length(output) - length(literal)) literal
+        if ((literal ~ /^"workshop-[0-9]+"$/ || literal ~ /^"configuration_options"$/ || literal ~ /^\047configuration_options\047$/) && substr(value, quote_start - 1, 1) == "[" && substr(value, position + 1, 1) == "]") output = substr(output, 1, length(output) - length(literal)) literal
         quote = ""
         quote_start = 0
       }
@@ -281,7 +281,7 @@ function process_outside(value, enabled) {
     process_outside(substr(line, closing + 1))
     next
   }
-  marker = match(masked_line, /configuration_options[[:space:]]*=/)
+  marker = match(masked_line, /configuration_options([[:space:]]*|["\047][[:space:]]*\][[:space:]]*)=/)
   if (marker) {
     marker_start = RSTART
     process_outside(substr(masked_line, 1, marker_start - 1))

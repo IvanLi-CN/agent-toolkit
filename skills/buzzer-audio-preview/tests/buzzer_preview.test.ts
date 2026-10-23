@@ -52,6 +52,17 @@ async function captureStdout<T>(callback: () => Promise<T>): Promise<{ value: T;
   }
 }
 
+async function captureStderr<T>(callback: () => Promise<T>): Promise<{ value: T; stderr: string[] }> {
+  const originalError = console.error;
+  const stderr: string[] = [];
+  console.error = (...args: unknown[]) => stderr.push(args.map(String).join(" "));
+  try {
+    return { value: await callback(), stderr };
+  } finally {
+    console.error = originalError;
+  }
+}
+
 function readU16BE(data: Uint8Array, offset: number): number {
   return (data[offset]! << 8) | data[offset + 1]!;
 }
@@ -254,6 +265,13 @@ describe("buzzer MIDI and WAV helper", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  test("redacts absolute paths from CLI diagnostics", async () => {
+    const captured = await captureStderr(() => main(["--in", ".", "--out-dir", "."]));
+    expect(captured.value).toBe(1);
+    expect(captured.stderr.join(" ")).toContain("<redacted-path>");
+    expect(captured.stderr.join(" ")).not.toContain(process.cwd());
   });
 
   test("rejects output stems that escape the selected directory", () => {

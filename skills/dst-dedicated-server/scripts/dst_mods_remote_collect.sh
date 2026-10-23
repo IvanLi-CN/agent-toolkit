@@ -180,7 +180,7 @@ if (( actual != size || verification_size != size )) || [[ "$file_after_stat" !=
 fi
 
 if ! awk '
-function mask_lua(value, output, position, character, next_character, quote, escaped, comment, quote_start, literal) {
+function mask_lua(value, output, position, character, next_character, quote, escaped, comment, quote_start, literal, prefix, suffix) {
   output = ""
   escaped = 0
   quote = ""
@@ -194,7 +194,9 @@ function mask_lua(value, output, position, character, next_character, quote, esc
       else if (character == "\\") escaped = 1
       else if (character == quote) {
         literal = substr(value, quote_start, position - quote_start + 1)
-        if ((literal ~ /^"workshop-[0-9]+"$/ || literal ~ /^"configuration_options"$/ || literal ~ /^\047configuration_options\047$/) && substr(value, quote_start - 1, 1) == "[" && substr(value, position + 1, 1) == "]") output = substr(output, 1, length(output) - length(literal)) literal
+        prefix = substr(value, 1, quote_start - 1)
+        suffix = substr(value, position + 1)
+        if ((literal ~ /^"workshop-[0-9]+"$/ || literal ~ /^"configuration_options"$/ || literal ~ /^\047configuration_options\047$/) && prefix ~ /\[[[:space:]]*$/ && suffix ~ /^[[:space:]]*\]/) output = substr(output, 1, length(output) - length(literal)) literal
         quote = ""
         quote_start = 0
       }
@@ -244,9 +246,12 @@ function flush_record() {
 }
 function process_outside(value, enabled) {
   value = mask_lua(value)
-  if (match(value, /\["workshop-[0-9]+"\]/)) {
+  if (match(value, /\[[[:space:]]*"workshop-[0-9]+"[[:space:]]*\]/)) {
     flush_record()
-    current_id = substr(value, RSTART + 2, RLENGTH - 4)
+    record = substr(value, RSTART, RLENGTH)
+    sub(/^.*workshop-/, "", record)
+    sub(/[^0-9].*$/, "", record)
+    current_id = "workshop-" record
   }
   if (current_id != "" && match(value, /enabled[[:space:]]*=[[:space:]]*(true|false)/)) {
     enabled = substr(value, RSTART, RLENGTH)

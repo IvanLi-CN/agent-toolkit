@@ -57,7 +57,7 @@ function maskLuaSyntax(line: string): string {
       else if (character === quote) {
         const literal = line.slice(quoteStart, index + 1);
         const preservedKey = /^(?:"workshop-\d+"|"configuration_options"|'configuration_options')$/.test(literal);
-        if (preservedKey && line[quoteStart - 1] === "[" && line[index + 1] === "]") {
+        if (preservedKey && /\[[ \t]*$/.test(line.slice(0, quoteStart)) && /^[ \t]*\]/.test(line.slice(index + 1))) {
           for (let literalIndex = quoteStart; literalIndex <= index; literalIndex += 1) output[literalIndex] = line[literalIndex]!;
         }
         quote = undefined;
@@ -79,7 +79,7 @@ function maskLuaSyntax(line: string): string {
 }
 
 function isRecordStart(line: string): RegExpExecArray | null {
-  return /\["workshop-(\d+)"\]/.exec(line);
+  return /\[[ \t]*"workshop-(\d+)"[ \t]*\]/.exec(line);
 }
 
 function stripConfigurationSegment(line: string, start: number, initialDepth: number): { outside: string; depth: number } {

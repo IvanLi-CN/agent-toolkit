@@ -11,7 +11,10 @@ const SUPERVISOR_UNEXPECTED_EXIT_SETTLE_MS = 250;
 const SUPERVISOR_ORPHAN_CLEANUP_TIMEOUT_MS = 5_000;
 const SUPERVISOR_CLEANUP_DEADLINE_SECONDS = Math.ceil(SUPERVISOR_CLEANUP_TIMEOUT_MS / 1_000);
 const SUPERVISOR_STATUS_PIPE_TIMEOUT_MS = 2_000;
-const SUPERVISOR_TARGET_REFERENCE_TIMEOUT_MS = 5_000;
+// macOS identity probes invoke several bounded ps/awk commands. Keep the
+// authenticated reference checks fail-closed while allowing a loaded runner
+// enough time to complete the probe sequence.
+const SUPERVISOR_TARGET_REFERENCE_TIMEOUT_MS = 15_000;
 export const SUPERVISOR_UNKNOWN_TARGET_STATUS = 125;
 const MAX_SUPERVISOR_MARKER_BYTES = 256;
 

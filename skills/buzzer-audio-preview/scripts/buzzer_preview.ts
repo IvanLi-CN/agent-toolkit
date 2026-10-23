@@ -726,7 +726,7 @@ async function readBoundedRegularFile(path: string, maxBytes: number, label: str
   const handle = await open(path, constants.O_RDONLY | noFollowFlag() | (constants.O_NONBLOCK ?? 0));
   try {
     const metadata = await handle.stat();
-    if (!metadata.isFile()) throw new Error(`${label} is not a regular file: ${path}`);
+    if (!metadata.isFile() || metadata.dev !== initialMetadata.dev || metadata.ino !== initialMetadata.ino) throw new Error(`${label} changed while opening: ${path}`);
     const size = Number(metadata.size);
     if (!Number.isSafeInteger(size) || size > maxBytes) throw new Error(`${label} exceeds the ${maxBytes}-byte limit: ${path}`);
     const data = Buffer.alloc(size);
@@ -737,7 +737,7 @@ async function readBoundedRegularFile(path: string, maxBytes: number, label: str
       offset += result.bytesRead;
     }
     const finalMetadata = await handle.stat();
-    if (offset !== size || finalMetadata.size !== metadata.size) throw new Error(`${label} changed while reading: ${path}`);
+    if (offset !== size || finalMetadata.size !== metadata.size || finalMetadata.dev !== metadata.dev || finalMetadata.ino !== metadata.ino) throw new Error(`${label} changed while reading: ${path}`);
     return data;
   } finally {
     await handle.close();
@@ -1486,7 +1486,16 @@ export async function readPublishedPair(outDir: string, stem: string): Promise<{
   throw lastError instanceof Error ? lastError : new Error("could not read published output pair");
 }
 
+function redactErrorPaths(message: string, paths: readonly string[]): string {
+  let redacted = message;
+  for (const path of [...new Set(paths)].filter((value) => value.length > 0).sort((left, right) => right.length - left.length)) {
+    redacted = redacted.split(path).join("<redacted-path>");
+  }
+  return redacted.replace(/(^|[\\s("'=:])((?:\/|[A-Za-z]:[\\/])[^"'<>`\\n,;)}\\] ]*)/g, "$1<redacted-path>");
+}
+
 export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> {
+  const diagnosticPaths: string[] = [process.cwd()];
   try {
     const parsed = parseArgs(args);
     if (parsed === "help") {
@@ -1495,7 +1504,9 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     }
     const inputPath = resolve(expandUser(parsed.input));
     const displayOutDir = resolve(expandUser(parsed.outDir));
+    diagnosticPaths.push(inputPath, displayOutDir, dirname(inputPath));
     const outDir = await resolveRealOutputDirectory(displayOutDir, true);
+    diagnosticPaths.push(outDir);
     const { config, events } = await parseScoreFile(inputPath);
     const stem = validateStem(parsed.stem ?? basename(inputPath, extname(inputPath)));
     const [midiPath, wavPath] = await publishOutputs(outDir, stem, encodeMidi(config, events), encodeWav(config, events));
@@ -1505,17 +1516,17 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     console.log(`[INFO] Duration: ${totalSeconds.toFixed(2)}s, tempo=${config.tempoBpm} bpm, waveform=${config.audio.waveform}`);
     return 0;
   } catch (error) {
-    console.error(`error: ${formatError(error)}`);
+    console.error(`error: ${formatError(error, diagnosticPaths)}`);
     return error instanceof CliError ? error.exitCode : 1;
   }
 }
 
-function formatError(error: unknown): string {
+function formatError(error: unknown, diagnosticPaths: readonly string[] = []): string {
   if (error instanceof AggregateError) {
-    const causes = error.errors.map((cause) => formatError(cause)).filter((message) => message.length > 0);
-    return [error.message, ...causes].join("; ");
+    const causes = error.errors.map((cause) => formatError(cause, diagnosticPaths)).filter((message) => message.length > 0);
+    return redactErrorPaths([error.message, ...causes].join("; "), diagnosticPaths);
   }
-  return error instanceof Error ? error.message : String(error);
+  return redactErrorPaths(error instanceof Error ? error.message : String(error), diagnosticPaths);
 }
 
 if (import.meta.main) process.exitCode = await main();

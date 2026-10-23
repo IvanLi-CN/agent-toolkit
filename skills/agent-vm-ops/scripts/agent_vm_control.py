@@ -5012,6 +5012,8 @@ class Control:
             transport = underlying.get("detail")
             if not isinstance(transport, Mapping):
                 transport = {}
+            stdout_truncated = transport.get("stdout_truncated") is True
+            stderr_truncated = transport.get("stderr_truncated") is True
             raise ControlError(
                 "guest_resize_unverified",
                 "guest root filesystem growth command was not completed",
@@ -5021,6 +5023,8 @@ class Control:
                     "returncode": None,
                     "stdout": str(transport.get("stdout") or ""),
                     "stderr": str(transport.get("stderr") or ""),
+                    "stdout_truncated": stdout_truncated,
+                    "stderr_truncated": stderr_truncated,
                     "guest_capacity": {"verified": False, "error": underlying},
                 },
             ) from exc
@@ -5134,7 +5138,9 @@ class Control:
                 return False
             failure_capacity = error["capacity"]
             attempts = failure_capacity.get("attempts") if isinstance(failure_capacity, Mapping) else None
-            if attempts is None:
+            if not isinstance(attempts, list) or len(attempts) > 2:
+                return False
+            if not attempts:
                 return "retry_of" not in error
             if not valid_guest_failure(error, complete=True) or not valid_guest_attempts(attempts):
                 return False

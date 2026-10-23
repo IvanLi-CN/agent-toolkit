@@ -91,15 +91,6 @@ fi
 status_dir_is_current() {
   [ -d "." ] && [ ! -L "." ]
 }
-status_dir_path_matches_anchor() {
-  if ! command -v perl >/dev/null 2>&1; then return 1; fi
-  perl -e '
-    my @path = lstat($ARGV[0]);
-    my @cwd = stat(".");
-    exit 1 unless @path && @cwd && (($path[2] & 0170000) == 0040000) && (($cwd[2] & 0170000) == 0040000);
-    exit 1 unless $path[0] == $cwd[0] && $path[1] == $cwd[1];
-  ' "$status_dir_path"
-}
 read_regular_marker() {
   marker_path="$1"
   if ! command -v perl >/dev/null 2>&1; then return 1; fi
@@ -169,7 +160,6 @@ atomic_rename_path() {
 }
 safe_remove_status_directory() {
   status_dir_is_current || return 1
-  status_dir_path_matches_anchor || return 1
   cleanup_tombstone_nonce="$(LC_ALL=C od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d '[:space:]' || true)"
   case "$cleanup_tombstone_nonce" in
     ''|*[!0-9a-fA-F]*) return 1 ;;

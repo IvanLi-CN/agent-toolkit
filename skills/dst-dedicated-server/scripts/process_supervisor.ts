@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { close as closeFileDescriptorCallback, constants } from "node:fs";
-import { lstat, mkdir, mkdtemp, open, readFile, rm, type FileHandle } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, opendir, readFile, rename, rmdir, unlink, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -19,6 +19,7 @@ const SUPERVISOR_GROUP_MEMBER_CAPTURE_TIMEOUT_MS = 2_000;
 export const SUPERVISOR_UNKNOWN_TARGET_STATUS = 125;
 const MAX_SUPERVISOR_MARKER_BYTES = 256;
 const MAX_SUPERVISOR_DESCENDANT_BYTES = 1024 * 1024;
+const MAX_SUPERVISOR_PROBE_BYTES = 256 * 1024;
 
 function closeFileDescriptor(fd: number): Promise<void> {
   return new Promise((resolve) => closeFileDescriptorCallback(fd, () => resolve()));
@@ -144,6 +145,81 @@ atomic_rename_path() {
   [ -n "$supervisor_no_follow" ] || return 1
   if ! command -v perl >/dev/null 2>&1; then return 1; fi
   perl -e 'rename $ARGV[0], $ARGV[1] or exit 1' "$1" "$2"
+}
+safe_remove_status_directory() {
+  cleanup_tombstone_nonce="$(LC_ALL=C od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d '[:space:]' || true)"
+  case "$cleanup_tombstone_nonce" in
+    ''|*[!0-9a-fA-F]*) return 1 ;;
+  esac
+  cleanup_tombstone="$status_dir.delete-$cleanup_tombstone_nonce"
+  if ! atomic_rename_path "$status_dir" "$cleanup_tombstone"; then return 1; fi
+  # The parent-owned directory is private, but the target can still race its
+  # old pathname. Work on the randomized tombstone and remove only the
+  # supervisor's flat files plus the known cleanup-owner directories.
+  if [ -e "$status_dir" ] || ! perl -e '
+    use strict;
+    use warnings;
+    my ($root) = @ARGV;
+    sub identity {
+      my @stat = lstat($_[0]);
+      return unless @stat;
+      return [$stat[0], $stat[1], $stat[2] & 0170000];
+    }
+    sub same_identity {
+      my ($left, $right) = @_;
+      return defined($left) && defined($right) && $left->[0] == $right->[0] && $left->[1] == $right->[1] && $left->[2] == $right->[2];
+    }
+    my $root_identity = identity($root);
+    exit 1 unless defined($root_identity) && $root_identity->[2] == 0040000;
+    opendir(my $directory, $root) or exit 1;
+    my @entries;
+    while (defined(my $name = readdir($directory))) {
+      next if $name eq "." || $name eq "..";
+      my $path = "$root/$name";
+      my $entry_identity = identity($path);
+      exit 1 unless defined($entry_identity);
+      if ($entry_identity->[2] != 0040000) {
+        push @entries, [$name, $entry_identity];
+        next;
+      }
+      exit 1 unless $name eq "cleanup-owner" || $name =~ /^\\.cleanup-owner-candidate\\.[A-Za-z0-9]+$/;
+      opendir(my $nested_directory, $path) or exit 1;
+      my @nested;
+      while (defined(my $nested_name = readdir($nested_directory))) {
+        next if $nested_name eq "." || $nested_name eq "..";
+        exit 1 unless $nested_name eq "owner";
+        my $nested_path = "$path/$nested_name";
+        my $nested_identity = identity($nested_path);
+        exit 1 unless defined($nested_identity) && $nested_identity->[2] == 0100000;
+        push @nested, [$nested_name, $nested_identity];
+      }
+      closedir($nested_directory) or exit 1;
+      push @entries, [$name, $entry_identity, \\@nested];
+    }
+    closedir($directory) or exit 1;
+    exit 1 unless same_identity(identity($root), $root_identity);
+    for my $entry (@entries) {
+      my ($name, $entry_identity, $nested) = @$entry;
+      my $path = "$root/$name";
+      exit 1 unless same_identity(identity($path), $entry_identity);
+      if (!defined($nested)) {
+        unlink($path) or exit 1;
+        next;
+      }
+      for my $nested_entry (@$nested) {
+        my ($nested_name, $nested_identity) = @$nested_entry;
+        my $nested_path = "$path/$nested_name";
+        exit 1 unless same_identity(identity($nested_path), $nested_identity) && $nested_identity->[2] == 0100000;
+        unlink($nested_path) or exit 1;
+      }
+      exit 1 unless same_identity(identity($path), $entry_identity) && $entry_identity->[2] == 0040000;
+      rmdir($path) or exit 1;
+    }
+    exit 1 unless same_identity(identity($root), $root_identity);
+    rmdir($root) or exit 1;
+  ' "$cleanup_tombstone"; then
+    return 1
+  fi
 }
 safe_append_line() {
   marker_path="$1"
@@ -368,8 +444,13 @@ cleanup() {
   # process group even when the supervisor's process probe is unavailable.
   ensure_marker "$stop_target_path" || cleanup_ack_enabled=0
   if [ -e "$descendant_scan_truncated_path" ] || [ -e "$descendant_scan_failed_path" ] || [ -e "$snapshot_failed_path" ]; then cleanup_ack_enabled=0; fi
+  parent_dead_cleanup=0
   if [ -e "$parent_dead_path" ]; then
-    rm -rf -- "$status_dir"
+    # The parent-owned cleanup path removes this directory after the detached
+    # cleaner has finished. Never recursively remove a path that a target can
+    # replace while it is still running.
+    cleanup_ack_enabled=0
+    parent_dead_cleanup=1
   fi
   if [ "$cleanup_ack_sent" = "1" ]; then return; fi
   cleanup_ack_sent=1
@@ -379,6 +460,7 @@ cleanup() {
     printf '0\n' >&4 2>/dev/null || true
   fi
   exec 4>&-
+  if [ "$parent_dead_cleanup" = "1" ]; then safe_remove_status_directory || true; fi
 }
 run_bounded() {
   bounded_seconds="$1"
@@ -2487,17 +2569,43 @@ async function processStartTime(pid: number): Promise<string | undefined> {
 
 const POSIX_PS = Bun.which("ps") ?? undefined;
 
+async function readProcessProbeOutput(stream: ReadableStream<Uint8Array>, maxBytes = MAX_SUPERVISOR_PROBE_BYTES): Promise<string | undefined> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (result.done) {
+        const output = new Uint8Array(total);
+        let offset = 0;
+        for (const chunk of chunks) {
+          output.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        return new TextDecoder().decode(output);
+      }
+      const chunk = result.value ?? new Uint8Array();
+      total += chunk.byteLength;
+      if (total > maxBytes) return undefined;
+      chunks.push(chunk);
+    }
+  } finally {
+    try { reader.releaseLock(); } catch { /* The probe stream may already be closed. */ }
+  }
+}
+
 async function boundedCommandOutput(command: string[], timeoutMs = 2_000): Promise<{ exitCode: number; stdout: string } | undefined> {
   const child = Bun.spawn(command, { stdout: "pipe", stderr: "ignore" });
   const result = await raceWithTimeout(
-    child.exited.then(async (exitCode) => ({
-      exitCode,
-      stdout: await new Response(child.stdout as ReadableStream<Uint8Array>).text(),
-    })),
+    child.exited.then(async (exitCode) => {
+      const stdout = await readProcessProbeOutput(child.stdout as ReadableStream<Uint8Array>);
+      return stdout === undefined ? undefined : { exitCode, stdout };
+    }),
     timeoutMs,
     undefined,
   );
-  if (result !== undefined) return result;
+  if (result !== undefined && result !== null) return result;
   try { child.kill("SIGKILL"); } catch { /* The probe may already be gone. */ }
   await child.exited.catch(() => undefined);
   return undefined;
@@ -2609,16 +2717,16 @@ async function processGroupHasLiveProcess(pgid: number): Promise<boolean | undef
   if (POSIX_PS === undefined) return undefined;
   const child = Bun.spawn([POSIX_PS, "-axo", "pid=,pgid=,state="], { stdout: "pipe", stderr: "ignore" });
   const output = await raceWithTimeout(
-    child.exited.then((exitCode) => exitCode === 0 ? new Response(child.stdout).text() : undefined),
+    child.exited.then(async (exitCode) => exitCode === 0 ? readProcessProbeOutput(child.stdout) : undefined),
     2_000,
     undefined,
   );
-  if (output === undefined) {
+  if (output === undefined || output === null) {
     try { child.kill("SIGKILL"); } catch { /* The process probe may already be gone. */ }
     await child.exited.catch(() => undefined);
     return undefined;
   }
-  for (const line of (await output).split("\n")) {
+  for (const line of output.split("\n")) {
     if (line.trim().length === 0) continue;
     const match = /^\s*([0-9]+)\s+([0-9]+)\s+(\S+)/.exec(line);
     if (match === null) return undefined;
@@ -2652,6 +2760,24 @@ async function readCurrentProcessGroupMembers(pgid: number): Promise<TargetGroup
     members.push({ pid, pgid, identity });
   }
   return members;
+}
+
+async function readCurrentGroupMember(pid: number, expectedPgid: number): Promise<TargetGroupMember | undefined> {
+  const [identity, pgid] = await Promise.all([currentProcessIdentity(pid), currentProcessGroup(pid)]);
+  if (identity === undefined || pgid !== expectedPgid) return undefined;
+  return { pid, pgid, identity };
+}
+
+type AuthorizedMemberProbe =
+  | { kind: "dead" }
+  | { kind: "unavailable" }
+  | { kind: "live"; member: TargetGroupMember };
+
+async function probeAuthorizedMember(expected: TargetGroupMember): Promise<AuthorizedMemberProbe> {
+  const [identity, pgid] = await Promise.all([currentProcessIdentity(expected.pid), currentProcessGroup(expected.pid)]);
+  if (identity === undefined || pgid === undefined) return processIsAlive(expected.pid) ? { kind: "unavailable" } : { kind: "dead" };
+  if (!processIdentityMatches(expected.identity, identity)) return { kind: "unavailable" };
+  return { kind: "live", member: { pid: expected.pid, pgid, identity } };
 }
 
 async function captureTargetGroupMembers(reference: TargetReference, wrapperExited: Promise<number>): Promise<TargetGroupMember[] | undefined> {
@@ -2701,18 +2827,19 @@ async function captureTargetGroupMembers(reference: TargetReference, wrapperExit
 }
 
 async function cleanupAuthorizedTargetGroup(
-  statusDirectory: string,
+  statusDirectory: string | undefined,
   reference: TargetReference,
   rememberedMembers?: readonly TargetGroupMember[],
+  allowCurrentGroupMembers = false,
 ): Promise<boolean> {
   const authorized = new Map<number, TargetGroupMember>();
+  authorized.set(reference.pid, reference);
   for (const member of rememberedMembers ?? []) {
-    if (member.pgid !== reference.pgid) continue;
     const previous = authorized.get(member.pid);
     if (previous !== undefined && (previous.identity !== member.identity || previous.pgid !== member.pgid)) return false;
     authorized.set(member.pid, member);
   }
-  const ledger = await readRegularMarker(join(statusDirectory, "descendants"), MAX_SUPERVISOR_DESCENDANT_BYTES);
+  const ledger = statusDirectory === undefined ? undefined : await readRegularMarker(join(statusDirectory, "descendants"), MAX_SUPERVISOR_DESCENDANT_BYTES);
   if (ledger !== undefined) {
     for (const line of ledger.split(/\r?\n/)) {
       if (line.trim().length === 0) continue;
@@ -2720,31 +2847,60 @@ async function cleanupAuthorizedTargetGroup(
       if (fields.length !== 3 || !/^[1-9][0-9]*$/.test(fields[0]!) || fields[1]!.length === 0 || !/^[1-9][0-9]*$/.test(fields[2]!)) return false;
       const pid = Number(fields[0]);
       const pgid = Number(fields[2]);
-      if (pgid !== reference.pgid) continue;
       const member = { pid, pgid, identity: fields[1]! };
       const previous = authorized.get(pid);
       if (previous !== undefined && (previous.identity !== member.identity || previous.pgid !== member.pgid)) return false;
       authorized.set(pid, member);
     }
   }
-  if (authorized.size === 0) return (await processGroupHasLiveProcess(reference.pgid)) === false;
   const currentPgid = await currentProcessGroup(process.pid);
   if (currentPgid === undefined || currentPgid === reference.pgid) return false;
-  const currentMembers = await readCurrentProcessGroupMembers(reference.pgid);
-  if (currentMembers === undefined) return false;
-  for (const member of currentMembers) {
-    const expected = authorized.get(member.pid);
-    if (expected === undefined || !processIdentityMatches(expected.identity, member.identity)) return false;
+  const groups = new Set<number>([...authorized.values()].map((member) => member.pgid));
+  const currentMembers = new Map<number, TargetGroupMember>();
+  const observedMembers = new Map<number, TargetGroupMember>();
+  for (const expected of authorized.values()) {
+    const probe = await probeAuthorizedMember(expected);
+    if (probe.kind === "unavailable") return false;
+    if (probe.kind === "live") {
+      observedMembers.set(expected.pid, probe.member);
+      groups.add(probe.member.pgid);
+      currentMembers.set(probe.member.pid, probe.member);
+    }
   }
-  if (currentMembers.length === 0) return true;
-  for (const member of currentMembers) {
+  for (const pgid of groups) {
+    const members = await readCurrentProcessGroupMembers(pgid);
+    if (members === undefined) return false;
+    for (const member of members) {
+      const expected = authorized.get(member.pid);
+      if (expected === undefined) {
+        if (pgid !== reference.pgid || !allowCurrentGroupMembers) return false;
+        const targetStillOwnsGroup = await readCurrentGroupMember(reference.pid, reference.pgid);
+        if (targetStillOwnsGroup === undefined || !processIdentityMatches(reference.identity, targetStillOwnsGroup.identity)) return false;
+        authorized.set(member.pid, member);
+      } else if (!processIdentityMatches(expected.identity, member.identity)) {
+        return false;
+      } else if (expected.pgid !== member.pgid && observedMembers.get(member.pid)?.pgid !== member.pgid) {
+        // A captured member may leave its original group, but only the group
+        // observed for that authenticated PID in this cleanup pass is safe.
+        return false;
+      }
+      currentMembers.set(member.pid, member);
+    }
+  }
+  for (const member of currentMembers.values()) {
+    const verified = await readCurrentGroupMember(member.pid, member.pgid);
+    const expected = authorized.get(member.pid);
+    if (verified === undefined || expected === undefined || !processIdentityMatches(expected.identity, verified.identity)) return false;
     try {
       process.kill(member.pid, "SIGKILL");
     } catch {
-      // The authorized member may have exited between validation and the signal.
+      // The authorized member may have exited between the final probe and the signal.
     }
   }
-  return waitForProcessGroupGone(reference.pgid);
+  for (const pgid of groups) {
+    if (!await waitForProcessGroupGone(pgid)) return false;
+  }
+  return true;
 }
 
 async function waitForProcessGroupGone(pgid: number): Promise<boolean> {
@@ -2777,19 +2933,14 @@ async function cleanupOrphanedTarget(
     return await currentProcessGroup(targetPid) === targetPgid;
   };
   if (!await verifyTargetReference()) {
-    return statusDirectory === undefined ? false : cleanupAuthorizedTargetGroup(statusDirectory, reference, rememberedMembers);
+    return cleanupAuthorizedTargetGroup(statusDirectory, reference, rememberedMembers);
   }
   // Re-read the authenticated identity and group immediately before the
   // negative-PGID signal so a reused PID or group cannot pass a stale check.
   if (!await verifyTargetReference()) {
-    return statusDirectory === undefined ? false : cleanupAuthorizedTargetGroup(statusDirectory, reference, rememberedMembers);
+    return cleanupAuthorizedTargetGroup(statusDirectory, reference, rememberedMembers);
   }
-  try {
-    process.kill(-targetPgid, "SIGKILL");
-  } catch {
-    // The target may have exited between validation and the group signal.
-  }
-  return waitForProcessGroupGone(targetPgid);
+  return cleanupAuthorizedTargetGroup(statusDirectory, reference, rememberedMembers, true);
 }
 
 async function waitForTarget(
@@ -2833,21 +2984,121 @@ async function waitForTargetReference(
   return undefined;
 }
 
-async function removeSupervisorDirectory(path: string): Promise<void> {
+async function restoreSupervisorDirectory(original: string, tombstone: string, identity: { dev: number; ino: number }): Promise<void> {
   try {
-    const stats = await lstat(path);
-    if (!stats.isDirectory() || stats.isSymbolicLink()) return;
-    await rm(path, { recursive: true, force: true });
-  } catch {
-    // Cleanup is best effort; the explicit SupervisedChild.cleanup remains the
-    // final owner of the private directory when the wrapper does not settle.
+    await lstat(original);
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
   }
+  try {
+    const metadata = await lstat(tombstone);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink() || metadata.dev !== identity.dev || metadata.ino !== identity.ino) return;
+    await rename(tombstone, original);
+  } catch {
+    // Preserve the tombstone when restoration cannot be proven safe.
+  }
+}
+
+async function removeSupervisorDirectory(path: string): Promise<void> {
+  let metadata;
+  try {
+    metadata = await lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    return;
+  }
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) return;
+  const identity = { dev: metadata.dev, ino: metadata.ino };
+  const tombstone = join(dirname(path), `.agent-toolkit-dst-supervisor-delete-${randomUUID()}`);
+  try {
+    await rename(path, tombstone);
+    const moved = await lstat(tombstone);
+    if (!moved.isDirectory() || moved.isSymbolicLink() || moved.dev !== identity.dev || moved.ino !== identity.ino) {
+      await restoreSupervisorDirectory(path, tombstone, identity);
+      return;
+    }
+    const directory = await opendir(tombstone);
+    const entries: Array<{
+      name: string;
+      dev: number;
+      ino: number;
+      nested?: Array<{ name: string; dev: number; ino: number }>;
+      nestedDev?: number;
+      nestedIno?: number;
+    }> = [];
+    try {
+      for await (const entry of directory) {
+        const childPath = join(tombstone, entry.name);
+        const child = await lstat(childPath);
+        if (!child.isDirectory() || child.isSymbolicLink()) {
+          entries.push({ name: entry.name, dev: child.dev, ino: child.ino });
+          continue;
+        }
+        if (entry.name !== "cleanup-owner" && !/^\.cleanup-owner-candidate\.[A-Za-z0-9]+$/.test(entry.name)) {
+          throw new Error("supervisor directory contains an unauthorized nested directory");
+        }
+        const nestedDirectory = await opendir(childPath);
+        const nested: Array<{ name: string; dev: number; ino: number }> = [];
+        try {
+          for await (const nestedEntry of nestedDirectory) {
+            if (nestedEntry.name !== "owner" || nestedEntry.isDirectory() || nestedEntry.isSymbolicLink()) {
+              throw new Error("supervisor cleanup owner contains an unauthorized entry");
+            }
+            const nestedChild = await lstat(join(childPath, nestedEntry.name));
+            if (nestedChild.isDirectory() || nestedChild.isSymbolicLink()) throw new Error("supervisor cleanup owner entry is not a regular file");
+            nested.push({ name: nestedEntry.name, dev: nestedChild.dev, ino: nestedChild.ino });
+          }
+        } finally {
+          await nestedDirectory.close().catch(() => undefined);
+        }
+        entries.push({ name: entry.name, dev: child.dev, ino: child.ino, nested, nestedDev: child.dev, nestedIno: child.ino });
+      }
+    } finally {
+      await directory.close().catch(() => undefined);
+    }
+    for (const entry of entries) {
+      const entryPath = join(tombstone, entry.name);
+      const current = await lstat(entryPath);
+      if (current.isSymbolicLink() || current.dev !== entry.dev || current.ino !== entry.ino) throw new Error("supervisor directory entry changed");
+      if (entry.nested === undefined) {
+        if (current.isDirectory()) throw new Error("supervisor directory entry changed");
+        await unlink(entryPath);
+        continue;
+      }
+      if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== entry.nestedDev || current.ino !== entry.nestedIno) throw new Error("supervisor cleanup owner directory changed");
+      for (const nestedEntry of entry.nested) {
+        const nestedPath = join(entryPath, nestedEntry.name);
+        const nestedCurrent = await lstat(nestedPath);
+        if (nestedCurrent.isDirectory() || nestedCurrent.isSymbolicLink() || nestedCurrent.dev !== nestedEntry.dev || nestedCurrent.ino !== nestedEntry.ino) throw new Error("supervisor cleanup owner entry changed");
+        await unlink(nestedPath);
+      }
+      const nestedBeforeRemoval = await lstat(entryPath);
+      if (!nestedBeforeRemoval.isDirectory() || nestedBeforeRemoval.isSymbolicLink() || nestedBeforeRemoval.dev !== entry.nestedDev || nestedBeforeRemoval.ino !== entry.nestedIno) throw new Error("supervisor cleanup owner directory changed");
+      await rmdir(entryPath);
+    }
+    const beforeRemoval = await lstat(tombstone);
+    if (!beforeRemoval.isDirectory() || beforeRemoval.isSymbolicLink() || beforeRemoval.dev !== identity.dev || beforeRemoval.ino !== identity.ino) throw new Error("supervisor directory changed");
+    await rmdir(tombstone);
+  } catch {
+    await restoreSupervisorDirectory(path, tombstone, identity);
+  }
+}
+
+async function removeSupervisorDirectoryAfterAcknowledgement(path: string, acknowledgement: number | undefined): Promise<void> {
+  if (acknowledgement !== 0 && acknowledgement !== 1) return;
+  if (acknowledgement === 0) await Bun.sleep(25);
+  await removeSupervisorDirectory(path);
 }
 
 async function settleSupervisorDirectory(path: string, acknowledgement: number | undefined): Promise<void> {
   // The detached cleaner owns the directory until it writes the ACK. Removing
   // it merely because the wrapper exited can interrupt a still-running
   // descendant verification pass.
+  if (acknowledgement === 0) {
+    await removeSupervisorDirectoryAfterAcknowledgement(path, acknowledgement);
+    return;
+  }
   if (acknowledgement !== 1) return;
   const deadline = Date.now() + SUPERVISOR_CLEANUP_MARKER_SETTLE_MS;
   while (Date.now() < deadline) {
@@ -2970,7 +3221,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
       cleanup: async () => {
         await cleanupOrphanedTarget(rememberedTargetReference, directory, rememberedTargetGroupMembers);
         if ((await readRegularMarker(cleanupCompletePath))?.trim() === "complete") {
-          await rm(directory, { recursive: true, force: true });
+          await removeSupervisorDirectory(directory);
         }
         if (cleanupFdForParent !== undefined) {
           await closeFileDescriptor(cleanupFdForParent);
@@ -3023,7 +3274,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
     if (statusFdForCleanup !== undefined) await closeFileDescriptor(statusFdForCleanup);
     if (cleanupFdForParent !== undefined) await closeFileDescriptor(cleanupFdForParent);
     if (statusFdForCleanup === undefined || (await readRegularMarker(cleanupCompletePath))?.trim() === "complete") {
-      await rm(directory, { recursive: true, force: true });
+      await removeSupervisorDirectory(directory);
     }
     throw error;
   }

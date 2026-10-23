@@ -22,6 +22,7 @@ const OWNER_KEY_BYTES = 32;
 const MAX_TEMP_DIRECTORY_SCAN_ENTRIES = 128;
 const TEMP_DIRECTORY_STALE_MS = 15 * 60 * 1000;
 const TEMP_DELETE_PREFIX = ".fb-to-png-delete-";
+const TEMP_DELETE_NAME = /^\.fb-to-png-delete-(\.fb-to-png-tmp-[A-Za-z0-9_-]+)--([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
 let ownerKeyPromise: Promise<Uint8Array> | undefined;
 
 function noFollowFlag(): number {
@@ -559,26 +560,42 @@ async function restoreTemporaryDirectory(original: string, tombstone: string, ex
   }
 }
 
+async function removeTemporaryDirectoryContents(path: string, outputName: string, requireOutput: boolean, expected: DirectoryIdentity): Promise<boolean> {
+  const moved = await inspectTemporaryDirectory(path, outputName, requireOutput);
+  if (moved === undefined || !sameDirectoryIdentity(moved, expected)) return false;
+  const entries: Array<{ name: string; dev: number; ino: number }> = [];
+  const directory = await opendir(path);
+  try {
+    for await (const entry of directory) {
+      const child = await lstat(join(path, entry.name));
+      if (child.isDirectory()) return false;
+      entries.push({ name: entry.name, dev: child.dev, ino: child.ino });
+    }
+  } finally {
+    await directory.close().catch(() => undefined);
+  }
+  for (const entry of entries) {
+    const childPath = join(path, entry.name);
+    const child = await lstat(childPath);
+    if (child.isDirectory() || child.dev !== entry.dev || child.ino !== entry.ino) return false;
+    await unlink(childPath);
+  }
+  const beforeRemoval = await lstat(path);
+  if (!beforeRemoval.isDirectory() || beforeRemoval.isSymbolicLink() || !sameDirectoryIdentity({ dev: beforeRemoval.dev, ino: beforeRemoval.ino }, expected)) return false;
+  await rmdir(path);
+  return true;
+}
+
 async function removeTemporaryDirectory(path: string, outputName: string, requireOutput: boolean): Promise<boolean> {
   const initial = await inspectTemporaryDirectory(path, outputName, requireOutput);
   if (initial === undefined) return false;
-  const tombstone = join(dirname(path), `${TEMP_DELETE_PREFIX}${randomUUID()}`);
+  const tombstone = join(dirname(path), `${TEMP_DELETE_PREFIX}${basename(path)}--${randomUUID()}`);
   try {
     await rename(path, tombstone);
-    const moved = await inspectTemporaryDirectory(tombstone, outputName, requireOutput);
-    if (moved === undefined || !sameDirectoryIdentity(moved, initial)) {
+    if (!await removeTemporaryDirectoryContents(tombstone, outputName, requireOutput, initial)) {
       await restoreTemporaryDirectory(path, tombstone, initial);
       return false;
     }
-    const entries: string[] = [];
-    const directory = await opendir(tombstone);
-    try {
-      for await (const entry of directory) entries.push(entry.name);
-    } finally {
-      await directory.close().catch(() => undefined);
-    }
-    for (const entry of entries) await unlink(join(tombstone, entry));
-    await rmdir(tombstone);
     await syncDirectory(dirname(path)).catch(() => undefined);
     return true;
   } catch {
@@ -600,15 +617,24 @@ async function cleanupStaleTemporaryDirectories(parent: string): Promise<void> {
     for await (const entry of directory) {
       scanned += 1;
       if (scanned > MAX_TEMP_DIRECTORY_SCAN_ENTRIES) throw new Error(`framebuffer temp directory scan exceeded ${MAX_TEMP_DIRECTORY_SCAN_ENTRIES} entries`);
-      if (!entry.name.startsWith(TEMP_DIRECTORY_PREFIX) || !entry.isDirectory() || entry.isSymbolicLink()) continue;
+      const tombstoneMatch = TEMP_DELETE_NAME.exec(entry.name);
+      const isTombstone = tombstoneMatch !== null;
+      if ((!entry.name.startsWith(TEMP_DIRECTORY_PREFIX) && !isTombstone) || !entry.isDirectory() || entry.isSymbolicLink()) continue;
       const temporaryDirectory = join(parent, entry.name);
       try {
         const metadata = await lstat(temporaryDirectory);
-        if (!metadata.isDirectory() || metadata.isSymbolicLink() || (metadata.mode & 0o777) !== 0o700 || Date.now() - metadata.mtimeMs < TEMP_DIRECTORY_STALE_MS) continue;
+        if (!metadata.isDirectory() || metadata.isSymbolicLink() || (metadata.mode & 0o777) !== 0o700) continue;
+        const originalName = isTombstone ? tombstoneMatch![1]! : entry.name;
+        if (!isTombstone && Date.now() - metadata.mtimeMs < TEMP_DIRECTORY_STALE_MS) continue;
         if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) continue;
-        const ownedOutput = await ownedTemporaryOutput(join(temporaryDirectory, ".owner"), basename(temporaryDirectory));
+        const ownedOutput = await ownedTemporaryOutput(join(temporaryDirectory, ".owner"), originalName);
         if (ownedOutput === undefined || ownerProcessMayBeAlive(ownedOutput.ownerPid)) continue;
-        await removeTemporaryDirectory(temporaryDirectory, ownedOutput.outputName, true);
+        const identity = { dev: metadata.dev, ino: metadata.ino };
+        if (isTombstone) {
+          if (await removeTemporaryDirectoryContents(temporaryDirectory, ownedOutput.outputName, true, identity)) await syncDirectory(parent).catch(() => undefined);
+        } else {
+          await removeTemporaryDirectory(temporaryDirectory, ownedOutput.outputName, true);
+        }
       } catch {
         // Preserve an unexpected or concurrently changing directory.
       }

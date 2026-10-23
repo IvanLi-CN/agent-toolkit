@@ -55,6 +55,7 @@ describe.serial("DST local Bun tooling", () => {
     expect(redactSensitiveText("[api_key]=fixture-secret")).not.toContain("fixture-secret");
     expect(redactSensitiveText("password[0]=indexed-secret")).not.toContain("indexed-secret");
     expect(redactSensitiveText("api_keys[0]: indexed-api-secret")).not.toContain("indexed-api-secret");
+    expect(redactSensitiveText("api.key=dot-separated-secret")).not.toContain("dot-separated-secret");
     expect(redactSensitiveText("[api_key][0]=bracket-index-secret")).not.toContain("bracket-index-secret");
     expect(redactSensitiveText('["api_key"][0]=quoted-bracket-secret')).not.toContain("quoted-bracket-secret");
     expect(redactSensitiveText('"api_key"[0]=quoted-index-secret')).not.toContain("quoted-index-secret");
@@ -1548,7 +1549,7 @@ exec /bin/ps "$@"
     const before = new Set((await readdir(tmpdir())).filter((entry) => entry.startsWith(".agent-toolkit-dst-supervisor-") && !entry.includes("ack-")));
     let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
     try {
-      supervised = await spawnSupervised(["sh", "-c", "sleep 1"]);
+      supervised = await spawnSupervised(["sh", "-c", "sleep 5"]);
       let resolvedEntry: string | undefined;
       for (const entry of await readdir(tmpdir())) {
         if (before.has(entry) || !entry.startsWith(".agent-toolkit-dst-supervisor-") || entry.includes("ack-")) continue;

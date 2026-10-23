@@ -548,6 +548,7 @@ const LOCK_TEMPORARY_PREFIX = ".buzzer-preview-lock-";
 type PublishState = "prepared" | "midi-backing-up" | "midi-backed-up" | "wav-backing-up" | "backups-complete" | "midi-published" | "wav-publishing" | "wav-published" | "complete";
 const TRANSACTION_ENTRY_NAMES = new Set([
   ".owner",
+  "pid",
   ".state",
   ".state.tmp",
   "midi.new",
@@ -963,7 +964,10 @@ async function cleanupAbandonedStaging(outDir: string, stem: string, startingSca
           if (await hasValidOwnerRecord(owner) && Number.isSafeInteger(pid) && pid > 0 && !await isProcessAlive(pid)) await removeLockDirectory(path);
           continue;
         }
-        if (await hasValidTransactionOwner(path) && await readPublishState(path) === undefined && !await hasRecoveryArtifacts(path)) await removeTransactionDirectory(path);
+        if (await hasValidTransactionOwner(path)
+          && await readPublishState(path) === undefined
+          && !await hasRecoveryArtifacts(path)
+          && !await transactionOwnerMayBeAlive(path)) await removeTransactionDirectory(path);
       } catch {
         // Preserve an unexpected or concurrently changing staging directory.
       }
@@ -1018,6 +1022,16 @@ async function hasValidTransactionOwner(directory: string): Promise<boolean> {
     return await hasValidOwnerRecord(owner);
   } catch {
     return false;
+  }
+}
+
+async function transactionOwnerMayBeAlive(directory: string): Promise<boolean> {
+  try {
+    const pid = Number(new TextDecoder().decode(await readRegularFile(join(directory, "pid"), 128)).trim());
+    return Number.isSafeInteger(pid) && pid > 0 && await isProcessAlive(pid);
+  } catch {
+    // Legacy or incomplete transactions are preserved for explicit recovery.
+    return true;
   }
 }
 
@@ -1481,6 +1495,7 @@ async function publishOutputsLocked(outDir: string, stem: string, midi: Uint8Arr
   const tempWavPath = join(transaction, "wav.new");
   try {
     await writeSyncedFile(join(transaction, ".owner"), new TextEncoder().encode(`${await createOwnerRecord()}\n`));
+    await writeSyncedFile(join(transaction, "pid"), new TextEncoder().encode(`${process.pid}\n`));
     await writeSyncedFile(tempMidiPath, midi);
     await writeSyncedFile(tempWavPath, wav);
     await writePublishState(transaction, "prepared");

@@ -65,8 +65,23 @@ const SNAPSHOT_OWNER_KEY_BYTES = 32;
 const SNAPSHOT_TEMP_STALE_MS = 15 * 60 * 1000;
 const MAX_SNAPSHOT_TEMP_SCAN_ENTRIES = 128;
 const SNAPSHOT_DELETE_PREFIX = ".dst-snapshot-delete-";
+const SNAPSHOT_DELETE_NAME = /^\.dst-snapshot-delete-(\.dst-snapshot-tmp-[A-Za-z0-9_-]+)--([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
 const SNAPSHOT_OWNER_WAIT_ATTEMPTS = 400;
 let snapshotOwnerKeyPromise: Promise<Uint8Array> | undefined;
+
+async function raceWithTimeout<T, U>(promise: Promise<T>, timeoutMs: number, timeoutValue: U): Promise<T | U> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T | U>((resolve) => {
+        timer = setTimeout(() => resolve(timeoutValue), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
 
 function noFollowFlag(): number {
   if (typeof constants.O_NOFOLLOW !== "number") throw new Error("nofollow_unsupported_platform");
@@ -198,6 +213,17 @@ async function readBounded(
   let remaining = maxBytes;
   let truncated = false;
   let cancelPromise: Promise<void> | undefined;
+  const appendChunk = (chunk: Uint8Array): boolean => {
+    if (chunk.byteLength > remaining) {
+      text += decoder.decode(chunk.slice(0, remaining), { stream: true });
+      truncated = true;
+      onLimit();
+      return false;
+    }
+    text += decoder.decode(chunk, { stream: true });
+    remaining -= chunk.byteLength;
+    return true;
+  };
   const cancelReader = (): Promise<void> => {
     if (cancelPromise === undefined) cancelPromise = reader.cancel().catch(() => undefined);
     return Promise.race([cancelPromise, Bun.sleep(100).then(() => undefined)]);
@@ -229,8 +255,20 @@ async function readBounded(
       const result = await Promise.race([readPromise, timeoutPromise, ...(stopPromiseResult === undefined ? [] : [stopPromiseResult])]);
       if (timer !== undefined) clearTimeout(timer);
       if (result.kind === "stopped") {
+        // A supervisor can publish its exit marker before the last bytes have
+        // drained from the inherited stdout/stderr pipe. Drain a short grace
+        // window before cancelling so the wrapper status cannot discard the
+        // tail of a bounded response.
+        const drainDeadline = Date.now() + SUPERVISOR_STOP_GRACE_MS;
+        let pendingRead: Promise<ReadOutcome> = readPromise;
+        while (Date.now() < drainDeadline) {
+          const pending = await raceWithTimeout(pendingRead, Math.max(1, drainDeadline - Date.now()), undefined);
+          if (pending === undefined || pending.kind !== "data") break;
+          if (pending.value.done) break;
+          if (!appendChunk(pending.value.value ?? new Uint8Array())) break;
+          pendingRead = reader.read().then((value) => ({ kind: "data" as const, value }), () => ({ kind: "data" as const, value: { done: true, value: undefined } }));
+        }
         await cancelReader();
-        await Promise.race([readPromise, Bun.sleep(100).then(() => undefined)]);
         break;
       }
       if (result.kind === "timeout") {
@@ -242,15 +280,10 @@ async function readBounded(
       const { done, value } = result.value;
       if (done) break;
       const chunk = value ?? new Uint8Array();
-      if (chunk.byteLength > remaining) {
-        text += decoder.decode(chunk.slice(0, remaining), { stream: true });
-        truncated = true;
-        onLimit();
+      if (!appendChunk(chunk)) {
         await cancelReader();
         break;
       }
-      text += decoder.decode(chunk, { stream: true });
-      remaining -= chunk.byteLength;
     }
     return { text: text + decoder.decode(), truncated };
   } finally {
@@ -389,7 +422,7 @@ async function syncDirectory(path: string): Promise<void> {
   }
 }
 
-const SENSITIVE_NAME = "(?:password|passwd|pass[ _-]?phrase|pwd|secret|token|credential(?:s)?|jwt|private[_ -]?key|api[_ -]?key|access[_ -]?key|signing[_ -]?key|encryption[_ -]?key|database[_ -]?url|mongo[_ -]?uri|authorization|bearer|cookie|set[ _-]?cookie|session(?:[_ -]?id)?)";
+const SENSITIVE_NAME = "(?:password|passwd|pass[._ -]?phrase|pwd|secret|token|credential(?:s)?|jwt|private[._ -]?key|api[._ -]?key|access[._ -]?key|signing[._ -]?key|encryption[._ -]?key|database[._ -]?url|mongo[._ -]?uri|authorization|bearer|cookie|set[._ -]?cookie|session(?:[._ -]?id)?)";
 const SENSITIVE_INDEX_SUFFIX = `(?:(?:[ \\t]*)\\[[^\\]\\r\\n]*\\])*`;
 const SENSITIVE_BARE_BASE = `[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*`;
 const SENSITIVE_BRACKET_BASE = `\\[[^\\]\\r\\n]*${SENSITIVE_NAME}[^\\]\\r\\n]*\\]`;
@@ -915,6 +948,53 @@ async function ensureSnapshotTemporaryRoot(parent: string): Promise<string> {
 }
 
 async function cleanupSnapshotTemporaryDirectories(root: string): Promise<void> {
+  const removeDirectoryContents = async (path: string, expectedIdentity: { dev: number; ino: number }): Promise<boolean> => {
+    try {
+      const moved = await lstat(path);
+      if (!moved.isDirectory() || moved.isSymbolicLink() || moved.dev !== expectedIdentity.dev || moved.ino !== expectedIdentity.ino) return false;
+      const children: Array<{ name: string; dev: number; ino: number }> = [];
+      const tombstoneDirectory = await opendir(path);
+      try {
+        for await (const child of tombstoneDirectory) {
+          if (child.isDirectory()) return false;
+          const childMetadata = await lstat(join(path, child.name));
+          if (childMetadata.isDirectory()) return false;
+          children.push({ name: child.name, dev: childMetadata.dev, ino: childMetadata.ino });
+        }
+      } finally {
+        await tombstoneDirectory.close().catch(() => undefined);
+      }
+      const beforeDelete = await lstat(path);
+      if (!beforeDelete.isDirectory() || beforeDelete.isSymbolicLink() || beforeDelete.dev !== expectedIdentity.dev || beforeDelete.ino !== expectedIdentity.ino) return false;
+      for (const child of children) {
+        const childPath = join(path, child.name);
+        const childMetadata = await lstat(childPath);
+        if (childMetadata.isDirectory() || childMetadata.dev !== child.dev || childMetadata.ino !== child.ino) return false;
+        await unlink(childPath);
+      }
+      const beforeRemoval = await lstat(path);
+      if (!beforeRemoval.isDirectory() || beforeRemoval.isSymbolicLink() || beforeRemoval.dev !== expectedIdentity.dev || beforeRemoval.ino !== expectedIdentity.ino) return false;
+      await rmdir(path);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const restoreDirectory = async (original: string, tombstone: string, identity: { dev: number; ino: number }): Promise<void> => {
+    try {
+      await lstat(original);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
+    }
+    try {
+      const metadata = await lstat(tombstone);
+      if (!metadata.isDirectory() || metadata.isSymbolicLink() || metadata.dev !== identity.dev || metadata.ino !== identity.ino) return;
+      await rename(tombstone, original);
+    } catch {
+      // Preserve the tombstone when restoration cannot be proven safe.
+    }
+  };
   let directory;
   try {
     directory = await opendir(root);
@@ -927,51 +1007,26 @@ async function cleanupSnapshotTemporaryDirectories(root: string): Promise<void> 
     for await (const entry of directory) {
       scanned += 1;
       if (scanned > MAX_SNAPSHOT_TEMP_SCAN_ENTRIES) throw new Error(`snapshot temp directory scan exceeded ${MAX_SNAPSHOT_TEMP_SCAN_ENTRIES} entries`);
-      if (!entry.name.startsWith(SNAPSHOT_TEMP_PREFIX) || !entry.isDirectory() || entry.isSymbolicLink()) continue;
+      const tombstoneMatch = SNAPSHOT_DELETE_NAME.exec(entry.name);
+      const isTombstone = tombstoneMatch !== null;
+      if ((!entry.name.startsWith(SNAPSHOT_TEMP_PREFIX) && !isTombstone) || !entry.isDirectory() || entry.isSymbolicLink()) continue;
       const path = join(root, entry.name);
       try {
         const metadata = await lstat(path);
-        if (!metadata.isDirectory() || metadata.isSymbolicLink() || Date.now() - metadata.mtimeMs < SNAPSHOT_TEMP_STALE_MS) continue;
-        if (await readMarkerForCleanup(join(path, ".owner"), `temp:${path}`) !== true) continue;
+        if (!metadata.isDirectory() || metadata.isSymbolicLink()) continue;
+        const originalName = isTombstone ? tombstoneMatch![1]! : entry.name;
+        const originalPath = join(root, originalName);
+        if (!isTombstone && Date.now() - metadata.mtimeMs < SNAPSHOT_TEMP_STALE_MS) continue;
+        if (await readMarkerForCleanup(join(path, ".owner"), `temp:${originalPath}`) !== true) continue;
         const initialIdentity = { dev: metadata.dev, ino: metadata.ino };
-        const tombstone = join(root, `${SNAPSHOT_DELETE_PREFIX}${randomUUID()}`);
-        await rename(path, tombstone);
-        try {
-          const moved = await lstat(tombstone);
-          if (!moved.isDirectory() || moved.isSymbolicLink() || moved.dev !== initialIdentity.dev || moved.ino !== initialIdentity.ino) throw new Error("snapshot temporary identity changed");
-          const children: Array<{ name: string; dev: number; ino: number }> = [];
-          const tombstoneDirectory = await opendir(tombstone);
-          try {
-            for await (const child of tombstoneDirectory) {
-              if (child.isDirectory()) throw new Error("snapshot temporary directory contains a nested directory");
-              const childMetadata = await lstat(join(tombstone, child.name));
-              if (childMetadata.isDirectory()) throw new Error("snapshot temporary directory contains a nested directory");
-              children.push({ name: child.name, dev: childMetadata.dev, ino: childMetadata.ino });
-            }
-          } finally {
-            await tombstoneDirectory.close().catch(() => undefined);
-          }
-          const beforeDelete = await lstat(tombstone);
-          if (!beforeDelete.isDirectory() || beforeDelete.isSymbolicLink() || beforeDelete.dev !== initialIdentity.dev || beforeDelete.ino !== initialIdentity.ino) throw new Error("snapshot temporary identity changed");
-          for (const child of children) {
-            const childPath = join(tombstone, child.name);
-            const childMetadata = await lstat(childPath);
-            if (childMetadata.isDirectory() || childMetadata.dev !== child.dev || childMetadata.ino !== child.ino) throw new Error("snapshot temporary entry changed");
-            await unlink(childPath);
-          }
-          const beforeRemoval = await lstat(tombstone);
-          if (!beforeRemoval.isDirectory() || beforeRemoval.isSymbolicLink() || beforeRemoval.dev !== initialIdentity.dev || beforeRemoval.ino !== initialIdentity.ino) throw new Error("snapshot temporary identity changed");
-          await rmdir(tombstone);
-          await syncDirectory(root).catch(() => undefined);
-        } catch {
-          try {
-            const original = await lstat(path).catch(() => undefined);
-            const remaining = await lstat(tombstone);
-            if (original === undefined && remaining.isDirectory() && !remaining.isSymbolicLink() && remaining.dev === initialIdentity.dev && remaining.ino === initialIdentity.ino) await rename(tombstone, path);
-          } catch {
-            // Preserve the tombstone when restoration cannot be proven safe.
-          }
+        if (isTombstone) {
+          if (await removeDirectoryContents(path, initialIdentity)) await syncDirectory(root).catch(() => undefined);
+          continue;
         }
+        const tombstone = join(root, `${SNAPSHOT_DELETE_PREFIX}${entry.name}--${randomUUID()}`);
+        await rename(path, tombstone);
+        if (await removeDirectoryContents(tombstone, initialIdentity)) await syncDirectory(root).catch(() => undefined);
+        else await restoreDirectory(path, tombstone, initialIdentity);
       } catch {
         // Preserve a concurrently changing directory for a later invocation.
       }

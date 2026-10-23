@@ -17,6 +17,20 @@ function closeFileDescriptor(fd: number): Promise<void> {
   return new Promise((resolve) => closeFileDescriptorCallback(fd, () => resolve()));
 }
 
+async function raceWithTimeout<T, U>(promise: Promise<T>, timeoutMs: number, timeoutValue: U): Promise<T | U> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T | U>((resolve) => {
+        timer = setTimeout(() => resolve(timeoutValue), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 const SUPERVISOR_SCRIPT = `
 set +e
 set +m 2>/dev/null || true
@@ -410,11 +424,14 @@ target_status_path="$status_dir/target-status"
 target_status_writer_path="$status_dir/target-status-writer"
 completion_path="$status_dir/completed"
 target_start_path="$status_dir/target-start"
+target_authorized_path="$status_dir/target-authorized"
 target_anchor_path="$status_dir/target"
 target_pgid_path="$status_dir/target-pgid"
 target_identity_path="$status_dir/target-identity"
 target_pgid=""
 target_pid=""
+target_group_fast_path=0
+wrapper_pgid="$(run_process_probe ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' || true)"
 authorized_descendant_records=""
 authorized_descendant_count=0
 group_quiescence_required=0
@@ -424,10 +441,11 @@ if command -v setsid >/dev/null 2>&1 && [ "\${AGENT_TOOLKIT_SUPERVISOR_DISABLE_S
     anchor_path="$1"
     result_path="$2"
     start_path="$3"
-    writer_path="$4"
-    done_path="$5"
-    supervisor_no_follow="$6"
-    shift 6
+    authorized_path="$4"
+    writer_path="$5"
+    done_path="$6"
+    supervisor_no_follow="$7"
+    shift 7
     publication_path="$(dirname -- "$result_path")/status"
     write_target_marker() {
       marker_path="$1"
@@ -438,6 +456,7 @@ if command -v setsid >/dev/null 2>&1 && [ "\${AGENT_TOOLKIT_SUPERVISOR_DISABLE_S
     trap ':' HUP INT TERM
     if ! write_target_marker "$anchor_path" "$$"; then exit 125; fi
     while [ ! -e "$start_path" ]; do sleep 0.01; done
+    while [ ! -e "$authorized_path" ]; do sleep 0.01; done
     "$@" 3>&- 4>&- &
     target_pid=$!
     wait "$target_pid"
@@ -449,7 +468,7 @@ if command -v setsid >/dev/null 2>&1 && [ "\${AGENT_TOOLKIT_SUPERVISOR_DISABLE_S
     if ! write_target_marker "$done_path" complete; then exit 125; fi
     exec 3>&-
     while :; do sleep 1; done
-  ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$target_start_path" "$target_status_writer_path" "$completion_path" "$supervisor_no_follow" "$@" &
+  ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$target_start_path" "$target_authorized_path" "$target_status_writer_path" "$completion_path" "$supervisor_no_follow" "$@" &
 else
   # The external setsid utility may be absent or deliberately disabled in
   # tests, but Perl is already a supervisor prerequisite. Use POSIX::setsid
@@ -459,10 +478,11 @@ else
     anchor_path="$1"
     result_path="$2"
     start_path="$3"
-    writer_path="$4"
-    done_path="$5"
-    supervisor_no_follow="$6"
-    shift 6
+    authorized_path="$4"
+    writer_path="$5"
+    done_path="$6"
+    supervisor_no_follow="$7"
+    shift 7
     publication_path="$(dirname -- "$result_path")/status"
     write_target_marker() {
       marker_path="$1"
@@ -473,6 +493,7 @@ else
     trap ':' HUP INT TERM
     if ! write_target_marker "$anchor_path" "$$"; then exit 125; fi
     while [ ! -e "$start_path" ]; do sleep 0.01; done
+    while [ ! -e "$authorized_path" ]; do sleep 0.01; done
     "$@" 3>&- 4>&- &
     target_pid=$!
     wait "$target_pid"
@@ -484,7 +505,7 @@ else
     if ! write_target_marker "$done_path" complete; then exit 125; fi
     exec 3>&-
     while :; do sleep 1; done
-  ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$target_start_path" "$target_status_writer_path" "$completion_path" "$supervisor_no_follow" "$@" &
+  ' "agent-toolkit-target-$target_marker" "$target_anchor_path" "$target_status_path" "$target_start_path" "$target_authorized_path" "$target_status_writer_path" "$completion_path" "$supervisor_no_follow" "$@" &
 fi
 target_launcher_pid=$!
 # The shell owns this PID; the target can discover and mutate marker files but
@@ -640,6 +661,9 @@ process_identity() {
       return 0
     fi
   fi
+  # Linux exposes process identity through /proc. Do not fall back to the
+  # slower macOS ps identity format after a Linux process has disappeared.
+  [ -d /proc ] && return 1
   process_ps_identity="$(ps_identity_for_pid "$process_id" 2>/dev/null || true)"
   if [ -n "$process_ps_identity" ]; then
     printf '%s\n' "$process_ps_identity"
@@ -658,6 +682,10 @@ process_state_for_pid() {
 }
 process_liveness() {
   process_id="$1"
+  if [ -d /proc ] && [ ! -e "/proc/$process_id" ]; then
+    process_liveness_result=dead
+    return 0
+  fi
   process_state=""
   if [ -r "/proc/$process_id/stat" ]; then
     process_state="$(run_snapshot_command awk '{ sub(/.*\) /, ""); print $1 }' "/proc/$process_id/stat" 2>/dev/null || true)"
@@ -932,6 +960,16 @@ captured_group_has_live_process() {
   captured_group_probe_status=$?
   [ "$captured_group_probe_status" -eq 0 ] || return "$captured_group_probe_status"
   printf '%s' "$captured_group_members_read_data" | run_process_probe awk -F'|' '$2 !~ /^Z/ { found = 1; exit } END { exit(found ? 0 : 1) }'
+}
+send_group_signal_or_confirm_empty() {
+  signal_group="$1"
+  signal_name="$2"
+  if kill -"$signal_name" "-$signal_group" 2>/dev/null; then return 0; fi
+  captured_group_has_live_process "$signal_group"
+  case "$?" in
+    1) return 2 ;;
+    *) return 1 ;;
+  esac
 }
 captured_group_can_be_signaled() {
   captured_group_identity="$1"
@@ -1317,6 +1355,15 @@ record_descendants() {
       if authorized_record_exists "$captured_record"; then
         :
       elif ! process_is_target_descendant "$captured_pid"; then
+        # A short-lived child may exit between the process snapshot and the
+        # ancestry check. Treat a confirmed exit as absent from the ledger;
+        # keep live or uncertain processes fail-closed below.
+        process_liveness "$captured_pid"
+        case "$process_liveness_result" in
+          dead) continue ;;
+          live) ;;
+          *) cleanup_ack_enabled=0; return 1 ;;
+        esac
         authorized_group_source="$(authorized_group_record "$captured_pgid" 2>/dev/null || true)"
         if [ -n "$authorized_group_source" ]; then
           IFS='|' read -r authorized_group_pid authorized_group_identity authorized_group_pgid <<EOF
@@ -1614,49 +1661,78 @@ $captured_descendants_read_data
 EOF
   [ "$?" -eq 0 ] || cleanup_ack_enabled=0
 }
+captured_descendants_confined_to_target_group() {
+  case "$target_pgid:$wrapper_pgid" in
+    ''|*:|:*) return 1 ;;
+  esac
+  validate_captured_ledger || return 1
+  while IFS='|' read -r confined_pid confined_identity confined_pgid confined_extra; do
+    [ -n "$confined_pid$confined_identity$confined_pgid$confined_extra" ] || continue
+    [ -z "$confined_extra" ] || return 1
+    case "$confined_pgid" in
+      "$target_pgid"|"$wrapper_pgid") ;;
+      *) return 1 ;;
+    esac
+  done <<EOF
+$captured_descendants_read_data
+EOF
+  [ "$?" -eq 0 ]
+}
 signal_tree() {
   signal="$1"
   set_snapshot_deadline
+  target_group_fast_path=0
+  if [ "$target_identity_mode" = "proc" ] && [ -e "$completion_path" ] && target_identity_matches && captured_descendants_confined_to_target_group; then
+    target_group_fast_path=1
+  fi
   group_quiescence_required=0
   rm -f "$quiesced_groups_path" 2>/dev/null || cleanup_ack_enabled=0
-  if [ "$signal" = "KILL" ]; then
+  if [ "$signal" = "KILL" ] && [ "$target_group_fast_path" != "1" ]; then
     reconcile_captured_descendants || cleanup_ack_enabled=0
   fi
-  start_snapshot
+  if [ "$target_group_fast_path" = "1" ]; then
+    snapshot_ready_observed=1
+  else
+    start_snapshot
+  fi
   snapshot_ready_before_signal="$snapshot_ready_observed"
-  wrapper_pgid="$(run_process_probe ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' || true)"
+  if [ -z "$wrapper_pgid" ]; then
+    wrapper_pgid="$(run_process_probe ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ' || true)"
+  fi
   current_target_pgid=""
   group_signal_succeeded=0
   if target_identity_matches; then
     current_target_pgid="$(run_process_probe ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ' || true)"
   fi
-  if [ "$signal" = "KILL" ] && [ "$snapshot_ready_before_signal" = "1" ] && [ ! -e "$snapshot_failed_path" ]; then
+  if [ "$signal" = "KILL" ] && [ "$target_group_fast_path" != "1" ] && [ "$snapshot_ready_before_signal" = "1" ] && [ ! -e "$snapshot_failed_path" ]; then
     prepare_kill_ownership || cleanup_ack_enabled=0
   fi
   case "$current_target_pgid" in
     ''|*[!0-9]*) ;;
     *)
       if [ "$current_target_pgid" = "$target_pgid" ] && [ "$current_target_pgid" != "$wrapper_pgid" ]; then
-        if kill -"$signal" "-$current_target_pgid" 2>/dev/null; then
-          group_signal_succeeded=1
-        else
-          cleanup_ack_enabled=0
-        fi
+        send_group_signal_or_confirm_empty "$current_target_pgid" "$signal"
+        case "$?" in
+          0|2) group_signal_succeeded=1 ;;
+          *) cleanup_ack_enabled=0 ;;
+        esac
       fi
       ;;
   esac
   if [ "$group_signal_succeeded" = "0" ] && [ -z "$current_target_pgid" ]; then
     if target_group_can_be_signaled_after_anchor_loss; then
-      if kill -"$signal" "-$target_pgid" 2>/dev/null; then
-        group_signal_succeeded=1
-      else
-        cleanup_ack_enabled=0
-      fi
+      send_group_signal_or_confirm_empty "$target_pgid" "$signal"
+      case "$?" in
+        0|2) group_signal_succeeded=1 ;;
+        *) cleanup_ack_enabled=0 ;;
+      esac
     fi
   fi
   wait_for_snapshot
   if [ -e "$descendant_scan_truncated_path" ] || [ -e "$descendant_scan_failed_path" ] || [ -e "$snapshot_failed_path" ] || [ "$snapshot_ready_before_signal" != "1" ]; then cleanup_ack_enabled=0; fi
-  if [ "$signal" = "KILL" ] && [ "$snapshot_ready_before_signal" = "1" ] && [ ! -e "$snapshot_failed_path" ]; then signal_captured_descendants; fi
+  if [ "$signal" = "KILL" ] && [ "$target_group_fast_path" != "1" ] && [ "$snapshot_ready_before_signal" = "1" ] && [ ! -e "$snapshot_failed_path" ]; then
+    signal_captured_descendants
+  fi
   # If the anchor died before the group signal, retain the captured target
   # group and descendant snapshot as the cleanup roots. Returning here would
   # leave descendants alive precisely when the identity probe is unavailable.
@@ -1665,6 +1741,7 @@ signal_tree() {
   if ! descendants "$signal_descendants_path"; then cleanup_ack_enabled=0; return; fi
   signal_descendants_read_data="$(safe_read_snapshot "$signal_descendants_path" 2>/dev/null)" || { cleanup_ack_enabled=0; return; }
   while read -r pid; do
+    [ -n "$pid" ] || continue
     [ "$pid" = "$$" ] && continue
     process_liveness "$pid"
     case "$process_liveness_result" in
@@ -1724,6 +1801,10 @@ verify_captured_descendants() {
     process_liveness "$captured_pid"
     case "$process_liveness_result" in
       dead)
+        # A successful target-group signal already covered this member. The
+        # dedicated group verification below is the authoritative remaining
+        # process check, so avoid a duplicate probe for every dead member.
+        if [ "$captured_pgid" = "$target_pgid" ] && [ "$group_signal_succeeded" = "1" ]; then continue; fi
         captured_group_has_live_process "$captured_pgid"
         captured_group_live_status=$?
         case "$captured_group_live_status" in
@@ -2118,7 +2199,7 @@ exec 0<&- 1>/dev/null 2>/dev/null
 # The target exit code is the wrapper's authenticated result. Run the
 # potentially slower process-tree verification independently so short-lived
 # commands are not reported as timed out while cleanup is still in progress.
-(trap ':' HUP INT TERM; terminate_supervised_tree) </dev/null >/dev/null 2>/dev/null &
+(trap ':' HUP INT TERM; exec 3>&-; terminate_supervised_tree) </dev/null >/dev/null 2>/dev/null &
 cleanup_pid="$!"
 exit 0
 `;
@@ -2182,16 +2263,24 @@ async function readStatusPipe(fd: number, timeoutMs = SUPERVISOR_STATUS_PIPE_TIM
     while (Date.now() < deadline) {
       const remainingMs = deadline - Date.now();
       const readPromise = reader.read();
-      const result = await Promise.race([
+      const result = await raceWithTimeout(
         readPromise.then((read) => ({ kind: "data" as const, read })),
-        Bun.sleep(remainingMs).then(() => ({ kind: "timeout" as const })),
-      ]);
+        remainingMs,
+        { kind: "timeout" as const },
+      );
       if (result.kind === "timeout") {
         cancelReader();
         return undefined;
       }
       if (result.read.done) break;
       value += decoder.decode(result.read.value ?? new Uint8Array(), { stream: true });
+      const lineEnd = value.indexOf("\n");
+      if (lineEnd >= 0) {
+        const normalized = value.slice(0, lineEnd).trim();
+        if (!/^[0-9]+$/.test(normalized)) return undefined;
+        const status = Number(normalized);
+        return Number.isInteger(status) && status >= 0 && status <= 255 ? status : undefined;
+      }
     }
     value += decoder.decode();
     const normalized = value.trim();
@@ -2228,13 +2317,14 @@ const POSIX_PS = Bun.which("ps") ?? undefined;
 
 async function boundedCommandOutput(command: string[], timeoutMs = 2_000): Promise<{ exitCode: number; stdout: string } | undefined> {
   const child = Bun.spawn(command, { stdout: "pipe", stderr: "ignore" });
-  const result = await Promise.race([
+  const result = await raceWithTimeout(
     child.exited.then(async (exitCode) => ({
       exitCode,
       stdout: await new Response(child.stdout as ReadableStream<Uint8Array>).text(),
     })),
-    Bun.sleep(timeoutMs).then(() => undefined),
-  ]);
+    timeoutMs,
+    undefined,
+  );
   if (result !== undefined) return result;
   try { child.kill("SIGKILL"); } catch { /* The probe may already be gone. */ }
   await child.exited.catch(() => undefined);
@@ -2327,10 +2417,11 @@ async function readTargetReference(statusPath: string, wrapperPid: number): Prom
 async function processGroupHasLiveProcess(pgid: number): Promise<boolean | undefined> {
   if (POSIX_PS === undefined) return undefined;
   const child = Bun.spawn([POSIX_PS, "-axo", "pid=,pgid=,state="], { stdout: "pipe", stderr: "ignore" });
-  const output = await Promise.race([
+  const output = await raceWithTimeout(
     child.exited.then((exitCode) => exitCode === 0 ? new Response(child.stdout).text() : undefined),
-    Bun.sleep(2_000).then(() => undefined),
-  ]);
+    2_000,
+    undefined,
+  );
   if (output === undefined) {
     try { child.kill("SIGKILL"); } catch { /* The process probe may already be gone. */ }
     await child.exited.catch(() => undefined);
@@ -2398,10 +2489,7 @@ async function waitForReady(path: string, wrapperExited: Promise<number>): Promi
   const deadline = Date.now() + 7_500;
   while (Date.now() < deadline) {
     if ((await readRegularMarker(path))?.trim() === "ready") return true;
-    const wrapperDone = await Promise.race([
-      wrapperExited.then(() => true, () => true),
-      Bun.sleep(20).then(() => false),
-    ]);
+    const wrapperDone = await raceWithTimeout(wrapperExited.then(() => true, () => true), 20, false);
     if (wrapperDone) return false;
   }
   return false;
@@ -2416,10 +2504,7 @@ async function waitForTargetReference(
   while (Date.now() < deadline) {
     const reference = await readTargetReference(statusPath, wrapperPid);
     if (reference !== undefined) return reference;
-    const wrapperDone = await Promise.race([
-      wrapperExited.then(() => true, () => true),
-      Bun.sleep(20).then(() => false),
-    ]);
+    const wrapperDone = await raceWithTimeout(wrapperExited.then(() => true, () => true), 20, false);
     if (wrapperDone) return undefined;
   }
   return undefined;
@@ -2437,30 +2522,42 @@ async function removeSupervisorDirectory(path: string): Promise<void> {
 }
 
 async function settleSupervisorDirectory(path: string, wrapperExited: Promise<number>): Promise<void> {
-  const settled = await Promise.race([
-    wrapperExited.then(() => true, () => true),
-    Bun.sleep(SUPERVISOR_CLEANUP_ACK_SETTLE_MS).then(() => false),
-  ]);
+  const settled = await raceWithTimeout(wrapperExited.then(() => true, () => true), SUPERVISOR_CLEANUP_ACK_SETTLE_MS, false);
   if (settled) await removeSupervisorDirectory(path);
 }
 
 async function waitForCleanupAck(fd: number, cleanupStartedPath: string, wrapperExited: Promise<number>, statusDirectory: string): Promise<boolean> {
-  const wrapperResult = await Promise.race([
+  const wrapperResult = await raceWithTimeout(
     wrapperExited.then((code) => ({ done: true as const, code })),
-    Bun.sleep(20).then(() => ({ done: false as const })),
-  ]);
+    20,
+    { done: false as const },
+  );
   let timeoutMs = SUPERVISOR_CLEANUP_TIMEOUT_MS + SUPERVISOR_CLEANUP_ACK_SETTLE_MS;
   if (wrapperResult.done) {
     const cleanupStarted = await readRegularMarker(cleanupStartedPath);
     timeoutMs = wrapperResult.code === 0 && cleanupStarted === undefined
       ? SUPERVISOR_CLEANUP_ACK_SETTLE_MS
       : cleanupStarted !== undefined
-        ? SUPERVISOR_CLEANUP_ACK_SETTLE_MS
+        ? SUPERVISOR_CLEANUP_TIMEOUT_MS
         : SUPERVISOR_UNEXPECTED_EXIT_SETTLE_MS;
   }
   const acknowledgement = await readStatusPipe(fd, timeoutMs);
   await settleSupervisorDirectory(statusDirectory, wrapperExited);
   return acknowledgement === 1;
+}
+
+async function createSupervisorMarker(path: string): Promise<boolean> {
+  const noFollow = constants.O_NOFOLLOW;
+  if (typeof noFollow !== "number") return false;
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollow, 0o600);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
 }
 
 export async function spawnSupervised(args: string[]): Promise<SupervisedChild> {
@@ -2488,6 +2585,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
   }
   const statusPath = join(directory, "status");
   const readyPath = join(directory, "ready");
+  const targetAuthorizedPath = join(directory, "target-authorized");
   const cleanupStartedPath = join(directory, "cleanup-started");
   let statusFdForCleanup: number | undefined;
   let cleanupFdForParent: number | undefined;
@@ -2571,6 +2669,16 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
       await wrapperExited.catch(() => undefined);
       await supervised.exited.catch(() => undefined);
       throw new Error("supervisor_target_reference_unavailable");
+    }
+    if (!await createSupervisorMarker(targetAuthorizedPath)) {
+      try { child.kill("SIGTERM"); } catch { /* The wrapper may already be gone. */ }
+      const cleanupReady = await waitForCleanupAcknowledged();
+      if (!cleanupReady) {
+        try { child.kill("SIGKILL"); } catch { /* The wrapper may already be gone. */ }
+      }
+      await wrapperExited.catch(() => undefined);
+      await supervised.exited.catch(() => undefined);
+      throw new Error("supervisor_target_authorization_unavailable");
     }
     rememberedTargetReference = targetReference;
     return supervised;

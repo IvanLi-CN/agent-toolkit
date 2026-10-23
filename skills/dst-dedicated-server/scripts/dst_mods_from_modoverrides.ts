@@ -259,18 +259,36 @@ function killProcessTree(supervised: SupervisedChild, signal: "SIGTERM" | "SIGKI
   try { supervised.child.kill(signal); } catch { /* The supervisor may already be gone. */ }
 }
 
+async function raceWithTimeout<T, U>(promise: Promise<T>, timeoutMs: number, timeoutValue: U): Promise<T | U> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T | U>((resolve) => {
+        timer = setTimeout(() => resolve(timeoutValue), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 async function terminateAndReap(supervised: SupervisedChild): Promise<boolean> {
   const observedExit = supervised.wrapperExited;
   killProcessTree(supervised, "SIGTERM");
   const cleanupReady = await supervised.waitForCleanupAcknowledged();
-  await Promise.race([observedExit, new Promise<void>((resolve) => setTimeout(resolve, SUPERVISOR_STOP_GRACE_MS))]);
+  await raceWithTimeout(observedExit, SUPERVISOR_STOP_GRACE_MS, undefined);
   const wrapperExited = await Promise.race([observedExit.then(() => true, () => true), Bun.sleep(0).then(() => false)]);
   if (!cleanupReady || !wrapperExited) {
     if (!cleanupReady) await supervised.forceCleanup();
     killProcessTree(supervised, "SIGKILL");
   }
-  await Promise.race([observedExit, new Promise<void>((resolve) => setTimeout(resolve, SUPERVISOR_STOP_GRACE_MS))]);
+  await raceWithTimeout(observedExit, SUPERVISOR_STOP_GRACE_MS, undefined);
   await supervised.cleanup();
+  await Promise.all([
+    cancelStream(supervised.child.stdout),
+    cancelStream(supervised.child.stderr),
+  ]);
   return cleanupReady;
 }
 
@@ -335,6 +353,14 @@ async function readText(stream: ReadableStream<Uint8Array>, maxBytes = 64 * 1024
   }
 }
 
+async function cancelStream(stream: ReadableStream<Uint8Array>): Promise<void> {
+  try {
+    await stream.cancel();
+  } catch {
+    // The supervisor may already have closed the pipe.
+  }
+}
+
 export async function parseRemoteResponseStream(
   cluster: string,
   shard: "Master" | "Caves",
@@ -378,15 +404,25 @@ export async function parseRemoteResponseStream(
         throw new Error(`remote mod collection timed out after ${timeoutMs / 1000}s`);
       }
       type ReadResult = Awaited<ReturnType<typeof reader.read>>;
+      let readTimer: ReturnType<typeof setTimeout> | undefined;
+      const clearReadTimer = (): void => {
+        if (readTimer !== undefined) {
+          clearTimeout(readTimer);
+          readTimer = undefined;
+        }
+      };
       const readResult = new Promise<{ kind: "data"; value: ReadResult } | { kind: "timeout" }>((resolve, reject) => {
-        const timer = setTimeout(() => resolve({ kind: "timeout" }), remainingMs);
+        readTimer = setTimeout(() => {
+          readTimer = undefined;
+          resolve({ kind: "timeout" });
+        }, remainingMs);
         reader.read().then(
           (value) => {
-            clearTimeout(timer);
+            clearReadTimer();
             resolve({ kind: "data", value });
           },
           (error) => {
-            clearTimeout(timer);
+            clearReadTimer();
             reject(error);
           },
         );
@@ -397,10 +433,11 @@ export async function parseRemoteResponseStream(
       } else {
         const raced = await Promise.race([readResult, stopSignal]);
         if (raced.kind === "stopped") {
-          const drained = await Promise.race([
-            readResult,
-            Bun.sleep(SUPERVISOR_STREAM_DRAIN_MS).then(() => ({ kind: "drain_timeout" as const })),
-          ]);
+          // The pending read may outlive the stop signal until the stream is
+          // cancelled. Clear its deadline so a failed remote command cannot
+          // keep the Bun process alive for the full protocol timeout.
+          clearReadTimer();
+          const drained = await raceWithTimeout(readResult, SUPERVISOR_STREAM_DRAIN_MS, { kind: "drain_timeout" as const });
           if (drained.kind === "drain_timeout") {
             await cancelReader();
             if (header === "MISSING" || (header?.startsWith("PRESENT ") === true && bodyRemaining === 0)) break;
@@ -569,7 +606,9 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
         } catch (error) {
           killProcessTree(supervised, "SIGTERM");
           if (forceKillTimer === undefined) forceKillTimer = setTimeout(() => killProcessTree(supervised, "SIGKILL"), SUPERVISOR_FORCE_KILL_MS);
-          await readText(child.stdout, 64 * 1024, 1_000);
+          // parseRemoteResponseStream cancels and releases the protocol reader
+          // on every exit; reacquiring the same stream here can block forever
+          // after a short-lived remote command closes its protocol output.
           const [exitCode, stderr] = await Promise.all([exitPromise, stderrPromise]);
           const detail = redactOperationalText(stderr.trim(), [parsed.host, parsed.user]);
           if (timedOut) throw new Error(`SSH collection timed out after ${REMOTE_COMMAND_TIMEOUT_MS / 1000}s`);

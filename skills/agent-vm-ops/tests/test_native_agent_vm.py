@@ -196,6 +196,7 @@ class NativeCommands(CONTROL.CommandRunner):
                         "partition": "2",
                         "attempts": 1,
                         "capacity": {
+                            "status": "grown",
                             "requested_bytes": int(command[-1]) * GIB,
                             "disk_bytes": size,
                             "partition_bytes": size,
@@ -205,6 +206,14 @@ class NativeCommands(CONTROL.CommandRunner):
                             "source": "/dev/sda2",
                             "parent": "/dev/sda",
                             "partition": "2",
+                            "tools": {
+                                "findmnt": "/usr/bin/findmnt",
+                                "lsblk": "/usr/bin/lsblk",
+                                "blockdev": "/usr/sbin/blockdev",
+                                "growpart": "/usr/bin/growpart",
+                                "resize2fs": "/usr/sbin/resize2fs",
+                            },
+                            "attempts": [{"attempt": 1}],
                             "verified": True,
                         },
                     }).encode()
@@ -427,6 +436,7 @@ class Fixture(unittest.TestCase):
             "partition": "2",
             "attempts": attempts,
             "capacity": {
+                "status": status,
                 "requested_bytes": size,
                 "disk_bytes": size,
                 "partition_bytes": size,
@@ -436,6 +446,14 @@ class Fixture(unittest.TestCase):
                 "source": "/dev/sda2",
                 "parent": "/dev/sda",
                 "partition": "2",
+                "tools": {
+                    "findmnt": "/usr/bin/findmnt",
+                    "lsblk": "/usr/bin/lsblk",
+                    "blockdev": "/usr/sbin/blockdev",
+                    "growpart": "/usr/bin/growpart",
+                    "resize2fs": "/usr/sbin/resize2fs",
+                },
+                "attempts": [{"attempt": index + 1} for index in range(attempts)],
                 "verified": True,
             },
         }
@@ -1271,6 +1289,27 @@ class LifecycleTests(Fixture):
         self.assertTrue(result["effective_lease"])
         self.assertEqual([port["port_name"] for port in self.store.get_ports(task["task_id"])], ["ssh"])
 
+    def test_guest_growth_transport_failure_has_explicit_output_fields(self):
+        self.runner.guest_growth_results = [CONTROL.ControlError("command_timeout", "guest command timed out")]
+        self.error("guest_resize_unverified", self.acquire)
+
+        failure = json.loads(self.store.get_task(session_id="thread-a")["last_error"])
+        self.assertEqual(failure["phase"], "guest-exec")
+        self.assertEqual(failure["stdout"], "")
+        self.assertEqual(failure["stderr"], "")
+        self.assertFalse(failure["guest_capacity"]["verified"])
+
+    def test_guest_growth_report_requires_consistent_topology(self):
+        response = self.guest_growth_result()
+        payload = json.loads(response.stdout)
+        del payload["capacity"]["source"]
+        response.stdout = json.dumps(payload).encode()
+        self.runner.guest_growth_results = [response]
+        self.error("guest_resize_unverified", self.acquire)
+
+        failure = json.loads(self.store.get_task(session_id="thread-a")["last_error"])
+        self.assertEqual(failure["phase"], "guest-report")
+
     def test_already_grown_guest_root_is_an_idempotent_success(self):
         self.acquire()
         self.call("release")
@@ -1315,6 +1354,7 @@ class CommandRunnerTests(unittest.TestCase):
     def test_guest_root_growth_script_compiles_with_bounded_attempts(self):
         compile(CONTROL.GUEST_ROOT_GROWTH_SCRIPT, "<guest-root-growth>", "exec")
         self.assertIn("for attempt in (1, 2)", CONTROL.GUEST_ROOT_GROWTH_SCRIPT)
+        self.assertNotIn('"try again"', CONTROL.GUEST_ROOT_GROWTH_SCRIPT)
 
     def test_bounded_runner_discards_stdout_after_limit(self):
         code = "import sys; sys.stdout.write('x' * 1000000)"

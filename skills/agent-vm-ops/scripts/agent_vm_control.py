@@ -114,6 +114,8 @@ attempts = []
 
 
 def clip(value):
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "replace")
     return str(value or "")[-4000:]
 
 
@@ -131,7 +133,6 @@ def transient_failure(command, stdout, stderr):
         "old partition table",
         "re-read partition table",
         "reread partition table",
-        "try again",
     ))
 
 
@@ -177,7 +178,13 @@ def run(command, phase, *, check=True):
     except FileNotFoundError:
         raise GuestFailure(phase, command, cause="command_missing")
     except subprocess.TimeoutExpired as error:
-        raise GuestFailure(phase, command, cause="command_timeout") from error
+        raise GuestFailure(
+            phase,
+            command,
+            stdout=clip(error.stdout),
+            stderr=clip(error.stderr),
+            cause="command_timeout",
+        ) from error
     if check and result.returncode:
         raise GuestFailure(
             phase,
@@ -4948,6 +4955,10 @@ class Control:
         try:
             result = self.incus.exec(task["instance_name"], command, timeout=120, check=False)
         except ControlError as exc:
+            underlying = exc.as_dict()
+            transport = underlying.get("detail")
+            if not isinstance(transport, Mapping):
+                transport = {}
             raise ControlError(
                 "guest_resize_unverified",
                 "guest root filesystem growth command was not completed",
@@ -4955,8 +4966,9 @@ class Control:
                     "phase": "guest-exec",
                     "command": ["incus", "exec", task["instance_name"], "--", "python3", "-c", "guest-root-growth"],
                     "returncode": None,
-                    "stderr": "",
-                    "guest_capacity": {"verified": False, "error": exc.as_dict()},
+                    "stdout": str(transport.get("stdout") or ""),
+                    "stderr": str(transport.get("stderr") or ""),
+                    "guest_capacity": {"verified": False, "error": underlying},
                 },
             ) from exc
         stdout = result.stdout.decode("utf-8", "replace")
@@ -4996,16 +5008,69 @@ class Control:
             value = json.loads(stdout)
             if not isinstance(value, dict):
                 raise ValueError()
-            if value.get("status", "grown") not in {"grown", "grown_after_retry", "already_grown"}:
+            status = value.get("status")
+            if status not in {"grown", "grown_after_retry", "already_grown"}:
                 raise ValueError()
-            for key in ("virtual_bytes", "filesystem_bytes", "filesystem_threshold_bytes"):
+            for key in ("virtual_bytes", "partition_bytes", "filesystem_before", "filesystem_bytes",
+                        "filesystem_threshold_bytes", "attempts"):
                 if isinstance(value.get(key), bool) or not isinstance(value.get(key), int):
                     raise ValueError()
-            if value["virtual_bytes"] < disk_gib * 1024**3 or value["filesystem_bytes"] < value["filesystem_threshold_bytes"]:
+            capacity = value.get("capacity")
+            if not isinstance(capacity, Mapping) or capacity.get("verified") is not True:
                 raise ValueError()
-            if value.get("filesystem") not in {"ext4", "xfs"}:
+            required_capacity = {
+                "status", "requested_bytes", "disk_bytes", "partition_bytes", "filesystem_bytes",
+                "filesystem_threshold_bytes", "filesystem", "source", "parent", "partition", "tools",
+                "attempts",
+            }
+            if not required_capacity.issubset(capacity):
                 raise ValueError()
-            if not isinstance(value.get("capacity"), Mapping) or value["capacity"].get("verified") is not True:
+            for key in ("requested_bytes", "disk_bytes", "partition_bytes", "filesystem_bytes",
+                        "filesystem_threshold_bytes"):
+                if isinstance(capacity.get(key), bool) or not isinstance(capacity.get(key), int):
+                    raise ValueError()
+            if not isinstance(capacity.get("attempts"), list) or len(capacity["attempts"]) != value["attempts"]:
+                raise ValueError()
+            target_bytes = disk_gib * 1024**3
+            expected_threshold = capacity["disk_bytes"] * 95 // 100
+            filesystem = value.get("filesystem")
+            source = value.get("source")
+            parent = value.get("parent")
+            partition = value.get("partition")
+            direct_device = lambda item: isinstance(item, str) and item.startswith("/dev/") and item.count("/") == 2
+            tools = capacity.get("tools")
+            required_tools = {"findmnt", "lsblk", "blockdev", "growpart", "resize2fs" if filesystem == "ext4" else "xfs_growfs"}
+            if (
+                capacity["status"] != status
+                or capacity["requested_bytes"] != target_bytes
+                or value["virtual_bytes"] != capacity["disk_bytes"]
+                or value["partition_bytes"] != capacity["partition_bytes"]
+                or value["filesystem_bytes"] != capacity["filesystem_bytes"]
+                or value["filesystem_threshold_bytes"] != capacity["filesystem_threshold_bytes"]
+                or value["filesystem"] != capacity["filesystem"]
+                or value["source"] != capacity["source"]
+                or value["parent"] != capacity["parent"]
+                or value["partition"] != capacity["partition"]
+                or value["virtual_bytes"] < target_bytes
+                or value["partition_bytes"] < target_bytes * 95 // 100
+                or value["filesystem_bytes"] < value["filesystem_threshold_bytes"]
+                or capacity["disk_bytes"] < target_bytes
+                or capacity["partition_bytes"] > capacity["disk_bytes"]
+                or capacity["filesystem_bytes"] > capacity["partition_bytes"]
+                or capacity["filesystem_threshold_bytes"] != expected_threshold
+                or filesystem not in {"ext4", "xfs"}
+                or not direct_device(source)
+                or not direct_device(parent)
+                or source == parent
+                or not isinstance(partition, str)
+                or re.fullmatch(r"[0-9]+", partition) is None
+                or not isinstance(tools, Mapping)
+                or any(not isinstance(tools.get(tool), str) or not tools[tool] for tool in required_tools)
+                or value["attempts"] > 2
+                or (status == "grown" and value["attempts"] != 1)
+                or (status == "grown_after_retry" and value["attempts"] != 2)
+                or (status == "already_grown" and value["attempts"] not in {0, 1})
+            ):
                 raise ValueError()
             return value
         except (ValueError, KeyError, TypeError) as exc:

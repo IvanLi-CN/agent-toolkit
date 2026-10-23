@@ -2583,12 +2583,14 @@ async function waitForCleanupAck(fd: number, cleanupStartedPath: string, wrapper
     20,
     { done: false as const },
   );
-  let timeoutMs = wrapperResult.done
-    ? SUPERVISOR_CLEANUP_ACK_SETTLE_MS
-    : SUPERVISOR_CLEANUP_TIMEOUT_MS + SUPERVISOR_CLEANUP_ACK_SETTLE_MS;
-  if (wrapperResult.done && wrapperResult.code !== 0) {
+  let timeoutMs = SUPERVISOR_CLEANUP_TIMEOUT_MS + SUPERVISOR_CLEANUP_ACK_SETTLE_MS;
+  if (wrapperResult.done) {
     const cleanupStarted = await readRegularMarker(cleanupStartedPath);
-    timeoutMs = cleanupStarted !== undefined ? SUPERVISOR_CLEANUP_TIMEOUT_MS : SUPERVISOR_UNEXPECTED_EXIT_SETTLE_MS;
+    timeoutMs = wrapperResult.code === 0 && cleanupStarted === undefined
+      ? SUPERVISOR_CLEANUP_ACK_SETTLE_MS
+      : cleanupStarted !== undefined
+        ? SUPERVISOR_CLEANUP_TIMEOUT_MS
+        : SUPERVISOR_UNEXPECTED_EXIT_SETTLE_MS;
   }
   const acknowledgement = await readStatusPipe(fd, timeoutMs);
   await settleSupervisorDirectory(statusDirectory, acknowledgement);

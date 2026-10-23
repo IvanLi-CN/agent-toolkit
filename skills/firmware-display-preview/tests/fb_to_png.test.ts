@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, readlink, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readlink, rm, symlink, truncate, utimes, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { inflateSync } from "node:zlib";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { convertFramebuffer, encodePng, expandUser, main, parseArgs, MAX_FRAMEBUFFER_INPUT_BYTES, MAX_FRAMEBUFFER_PIXELS, MAX_FRAMEBUFFER_ROWS, type ConvertOptions } from "../scripts/fb_to_png.ts";
 
 async function captureStdout<T>(callback: () => Promise<T>): Promise<{ value: T; stdout: string[] }> {
@@ -234,6 +234,26 @@ describe("framebuffer to PNG helper", () => {
       expect(await readFile(outside, "utf8")).toBe("sentinel");
       expect([...((await readFile(output)).slice(0, 8))]).toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
       await expect(readlink(output)).rejects.toThrow();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves a stale temporary directory with unexpected contents", async () => {
+    const root = await mkdtemp(join(process.env.TMPDIR ?? "/tmp", "agent-toolkit-fb-stale-owner-"));
+    const temporaryDirectory = await mkdtemp(join(root, ".fb-to-png-tmp-"));
+    const outputName = "preview.png";
+    const staleTime = new Date(Date.now() - 60 * 60 * 1000);
+    try {
+      await writeFile(join(temporaryDirectory, ".owner"), `agent-toolkit-fb-to-png-v1\n${basename(temporaryDirectory)}\n${outputName}\n`, { mode: 0o600 });
+      await writeFile(join(temporaryDirectory, outputName), "temporary");
+      await writeFile(join(temporaryDirectory, "unrelated.txt"), "preserve");
+      await utimes(temporaryDirectory, staleTime, staleTime);
+      const input = join(root, "frame.raw");
+      const output = join(root, outputName);
+      await writeFile(input, Uint8Array.from([255]));
+      expect(await main(["--format", "gray8", "--width", "1", "--height", "1", "--in", input, "--out", output])).toBe(0);
+      expect(await readFile(join(temporaryDirectory, "unrelated.txt"), "utf8")).toBe("preserve");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

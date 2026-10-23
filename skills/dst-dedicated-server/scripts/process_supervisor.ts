@@ -429,6 +429,10 @@ target_authorized_path="$status_dir/target-authorized"
 target_anchor_path="$status_dir/target"
 target_pgid_path="$status_dir/target-pgid"
 target_identity_path="$status_dir/target-identity"
+target_marker_baseline_path="$status_dir/target-marker-baseline"
+target_marker_scan_path="$status_dir/target-marker-scan"
+target_marker_baseline_read_data=""
+target_marker_scan_requested=0
 target_pgid=""
 target_pid=""
 target_group_fast_path=0
@@ -1092,6 +1096,50 @@ EOF
   fi
   [ "$captured_group_live_count" -gt 0 ]
 }
+scan_target_marker_processes() {
+  marker_output_path="$1"
+  if [ ! -d /proc ] || [ -z "$target_marker" ] || [ "$target_marker" = "unbound" ]; then
+    rm -f "$marker_output_path" 2>/dev/null || return 1
+    create_marker_exclusive "$marker_output_path"
+    return 0
+  fi
+  safe_capture_command "$marker_output_path" perl -e '
+    use strict;
+    use warnings;
+    my ($expected) = @ARGV;
+    opendir(my $proc, "/proc") or exit 1;
+    for my $entry (readdir($proc)) {
+      next unless $entry =~ /^[0-9]+$/;
+      open(my $env, "<:raw", "/proc/$entry/environ") or next;
+      local $/;
+      my $data = <$env> // "";
+      if ($data =~ /(?:^|\\0)AGENT_TOOLKIT_TARGET_MARKER=\Q$expected\E(?:\\0|$)/) {
+        print $entry, "\\n";
+      }
+    }
+    closedir($proc);
+  ' "$target_marker"
+}
+
+marker_process_is_baseline() {
+  marker_pid="$1"
+  printf '%s' "$target_marker_baseline_read_data" | awk -v pid="$marker_pid" '$1 == pid { found = 1; exit } END { exit(found ? 0 : 1) }' >/dev/null 2>&1
+}
+
+append_marker_roots() {
+  marker_roots=""
+  target_marker_scan_read_data="$(safe_read_snapshot "$target_marker_scan_path" 2>/dev/null || true)"
+  while read -r marker_pid; do
+    case "$marker_pid" in ''|*[!0-9]*) cleanup_ack_enabled=0; continue ;; esac
+    [ "$marker_pid" = "$$" ] && continue
+    marker_process_is_baseline "$marker_pid" && continue
+    marker_roots="$marker_roots $marker_pid"
+  done <<EOF
+$target_marker_scan_read_data
+EOF
+  descendant_roots="$descendant_roots$marker_roots"
+}
+
 descendants_for_roots() {
   descendant_roots="$1"
   descendant_groups="$2"
@@ -1115,6 +1163,14 @@ descendants_for_roots() {
     cleanup_ack_enabled=0
     create_marker_exclusive "$descendant_scan_failed_path" || true
     return 1
+  fi
+  if [ "$target_marker_scan_requested" = "1" ]; then
+    if ! scan_target_marker_processes "$target_marker_scan_path"; then
+      cleanup_ack_enabled=0
+      create_marker_exclusive "$descendant_scan_failed_path" || true
+      return 1
+    fi
+    append_marker_roots
   fi
   descendant_scan_output_path="$status_dir/descendant-scan-output"
   safe_capture_command_with_input "$descendant_scan_output_path" "$descendant_scan_input_path" awk -v roots="$descendant_roots" -v groups="$descendant_groups" -v max_rows=65536 '
@@ -1692,6 +1748,7 @@ EOF
 }
 signal_tree() {
   signal="$1"
+  if [ -d /proc ]; then target_marker_scan_requested=1; fi
   set_snapshot_deadline
   target_group_fast_path=0
   if [ "$target_identity_mode" = "proc" ] && [ -e "$completion_path" ] && target_identity_matches; then
@@ -2060,16 +2117,6 @@ target_group_can_be_signaled_after_anchor_loss() {
   [ -n "$wrapper_pgid" ] && [ "$target_pgid" != "$wrapper_pgid" ] || return 1
   process_liveness "$target_pid"
   [ "$process_liveness_result" = "dead" ] || return 1
-  target_group_owner_start=""
-  target_group_owner_uid=""
-  if [ "$target_identity_mode" = "ps" ]; then
-    target_group_owner_start="$(ps_identity_start_token "$target_ps_start" 2>/dev/null || true)"
-    target_group_owner_epoch="$(ps_identity_start_epoch "$target_ps_start" 2>/dev/null || true)"
-    target_group_owner_uid="$target_ps_uid"
-    [ -n "$target_group_owner_start" ] || return 1
-    case "$target_group_owner_epoch" in ''|*[!0-9]*) return 1 ;; esac
-    case "$target_group_owner_uid" in ''|*[!0-9]*) return 1 ;; esac
-  fi
   capture_group_members "$target_pgid"
   [ "$?" -eq 0 ] || return 1
   target_group_live_count=0
@@ -2084,31 +2131,8 @@ target_group_can_be_signaled_after_anchor_loss() {
         target_group_member_identity="$(process_identity "$target_group_member_pid" 2>/dev/null || true)"
         target_group_member_identity="$(normalize_process_identity "$target_group_member_identity" 2>/dev/null || true)"
         target_group_expected_identity="$(captured_identity_for_pid "$target_group_member_pid" 2>/dev/null || true)"
-        if [ -n "$target_group_expected_identity" ]; then
-          captured_identity_matches "$target_group_expected_identity" "$target_group_member_identity" || return 1
-        else
-          case "$target_identity_mode:$target_group_member_identity" in
-            proc:proc:*)
-              target_group_member_start="\${target_group_member_identity#proc:}"
-              target_group_owner_start="\${target_starttime:-}"
-              case "$target_group_member_start" in ''|*[!0-9]*) return 1 ;; esac
-              case "$target_group_owner_start" in ''|*[!0-9]*) return 1 ;; esac
-              [ "$target_group_member_start" -gt "$target_group_owner_start" ] || return 1
-              ;;
-            ps:ps:*)
-              target_group_member_start="$(ps_identity_start_token "$target_group_member_identity" 2>/dev/null || true)"
-              target_group_member_epoch="$(ps_identity_start_epoch "$target_group_member_identity" 2>/dev/null || true)"
-              target_group_member_pgid="$(ps_identity_pgid_token "$target_group_member_identity" 2>/dev/null || true)"
-              target_group_member_uid="$(ps_owner_for_pid "$target_group_member_pid" 2>/dev/null || true)"
-              [ -n "$target_group_member_start" ] || return 1
-              case "$target_group_member_epoch" in ''|*[!0-9]*) return 1 ;; esac
-              [ "$target_group_member_epoch" -ge "$target_group_owner_epoch" ] || return 1
-              [ "$target_group_member_pgid" = "$target_pgid" ] || return 1
-              [ "$target_group_member_uid" = "$target_group_owner_uid" ] || return 1
-              ;;
-            *) return 1 ;;
-          esac
-        fi
+        [ -n "$target_group_expected_identity" ] || return 1
+        captured_identity_matches "$target_group_expected_identity" "$target_group_member_identity" || return 1
         target_group_live_count=$((target_group_live_count + 1))
         ;;
       dead) ;;
@@ -2181,6 +2205,10 @@ if ! write_marker_exclusive "$ready_path" ready; then
   terminate_supervised_tree
   exit 125
 fi
+if ! scan_target_marker_processes "$target_marker_baseline_path"; then
+  cleanup_ack_enabled=0
+fi
+target_marker_baseline_read_data="$(safe_read_snapshot "$target_marker_baseline_path" 2>/dev/null || true)"
 if ! create_marker_exclusive "$target_start_path"; then
   cleanup_ack_enabled=0
   terminate_supervised_tree
@@ -2542,9 +2570,11 @@ async function removeSupervisorDirectory(path: string): Promise<void> {
   }
 }
 
-async function settleSupervisorDirectory(path: string, wrapperExited: Promise<number>): Promise<void> {
-  const settled = await raceWithTimeout(wrapperExited.then(() => true, () => true), SUPERVISOR_CLEANUP_ACK_SETTLE_MS, false);
-  if (settled) await removeSupervisorDirectory(path);
+async function settleSupervisorDirectory(path: string, acknowledgement: number | undefined): Promise<void> {
+  // The detached cleaner owns the directory until it writes the ACK. Removing
+  // it merely because the wrapper exited can interrupt a still-running
+  // descendant verification pass.
+  if (acknowledgement !== undefined) await removeSupervisorDirectory(path);
 }
 
 async function waitForCleanupAck(fd: number, cleanupStartedPath: string, wrapperExited: Promise<number>, statusDirectory: string): Promise<boolean> {
@@ -2554,16 +2584,12 @@ async function waitForCleanupAck(fd: number, cleanupStartedPath: string, wrapper
     { done: false as const },
   );
   let timeoutMs = SUPERVISOR_CLEANUP_TIMEOUT_MS + SUPERVISOR_CLEANUP_ACK_SETTLE_MS;
-  if (wrapperResult.done) {
+  if (wrapperResult.done && wrapperResult.code !== 0) {
     const cleanupStarted = await readRegularMarker(cleanupStartedPath);
-    timeoutMs = wrapperResult.code === 0 && cleanupStarted === undefined
-      ? SUPERVISOR_CLEANUP_ACK_SETTLE_MS
-      : cleanupStarted !== undefined
-        ? SUPERVISOR_CLEANUP_TIMEOUT_MS
-        : SUPERVISOR_UNEXPECTED_EXIT_SETTLE_MS;
+    timeoutMs = cleanupStarted !== undefined ? SUPERVISOR_CLEANUP_TIMEOUT_MS : SUPERVISOR_UNEXPECTED_EXIT_SETTLE_MS;
   }
   const acknowledgement = await readStatusPipe(fd, timeoutMs);
-  await settleSupervisorDirectory(statusDirectory, wrapperExited);
+  await settleSupervisorDirectory(statusDirectory, acknowledgement);
   return acknowledgement === 1;
 }
 

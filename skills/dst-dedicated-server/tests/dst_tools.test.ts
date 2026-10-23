@@ -1213,7 +1213,7 @@ exec /bin/ps "$@"
     const child = Bun.spawn([
       process.execPath,
       "-e",
-      `import { readFile } from "node:fs/promises"; import { spawnSupervised } from ${JSON.stringify(moduleUrl)}; await spawnSupervised(["sh", "-c", "sleep 30 & printf '%s\\n' \\\"$!\\\" > \\\"${marker}\\\"; printf done > \\\"${finished}\\\"; exit 0"]); for (let attempt = 0; attempt < 40; attempt += 1) { try { if ((await readFile(${JSON.stringify(finished)}, "utf8")).trim() === "done") break; } catch {} await Bun.sleep(5); } process.exit(0);`,
+      `import { readFile } from "node:fs/promises"; import { spawnSupervised } from ${JSON.stringify(moduleUrl)}; await spawnSupervised(["sh", "-c", "sleep 30 & printf '%s\\n' \\\"$!\\\" > \\\"${marker}\\\"; printf done > \\\"${finished}\\\"; sleep 4; exit 0"]); for (let attempt = 0; attempt < 40; attempt += 1) { try { if ((await readFile(${JSON.stringify(finished)}, "utf8")).trim() === "done") break; } catch {} await Bun.sleep(5); } process.exit(0);`,
     ], { stdout: "pipe", stderr: "pipe" });
     try {
       expect(await child.exited).toBe(0);
@@ -1632,7 +1632,7 @@ exec /bin/ps "$@"
       supervised = await spawnSupervised([
         "sh",
         "-c",
-        "sleep 30 & child=$!; printf '%s\\n' \"$child\" > \"$1\"; kill -KILL \"$PPID\"; wait",
+        "sleep 30 & child=$!; printf '%s\\n' \"$child\" > \"$1\"; sleep 1; kill -KILL \"$PPID\"; wait",
         "agent-toolkit-supervised-target",
         marker,
       ]);
@@ -1799,6 +1799,57 @@ exec /bin/ps "$@"
         expect(cleanupAcknowledged).toBe(false);
         expect(detachedPid === undefined ? false : isAlive(detachedPid)).toBe(true);
       }
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (detachedPid !== undefined && isAlive(detachedPid)) {
+        try { process.kill(detachedPid, "SIGKILL"); } catch { /* The detached process may have exited. */ }
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("captures a Linux child that detaches before ancestry snapshots", { timeout: 90_000 }, async () => {
+    if (process.platform !== "linux") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-marker-detach-"));
+    const marker = join(root, "detached.pid");
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    let detachedPid: number | undefined;
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    try {
+      supervised = await spawnSupervised([
+        "sh",
+        "-c",
+        "perl -MPOSIX -e '$marker = shift; $pid = fork(); exit 125 unless defined $pid; if ($pid) { open my $fh, \">\", $marker or exit 125; print $fh \"$pid\\n\" or exit 125; close $fh or exit 125; exit 0; } POSIX::setsid() < 0 and exit 125; exec \"sleep\", \"30\" or exit 127' \"$1\"",
+        "agent-toolkit-supervised-target",
+        marker,
+      ]);
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        try {
+          detachedPid = Number((await readFile(marker, "utf8")).trim());
+          if (Number.isInteger(detachedPid) && detachedPid > 0) break;
+        } catch {
+          await Bun.sleep(25);
+        }
+      }
+      expect(Number.isInteger(detachedPid)).toBe(true);
+      expect(detachedPid === undefined ? false : isAlive(detachedPid)).toBe(true);
+      expect(await supervised.exited).toBe(0);
+      supervised.child.kill("SIGTERM");
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(true);
+      await supervised.wrapperExited;
+      for (let attempt = 0; attempt < 40 && detachedPid !== undefined && isAlive(detachedPid); attempt += 1) await Bun.sleep(25);
+      expect(detachedPid === undefined ? false : isAlive(detachedPid)).toBe(false);
     } finally {
       if (supervised !== undefined) {
         try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }

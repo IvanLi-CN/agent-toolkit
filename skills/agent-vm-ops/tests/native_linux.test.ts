@@ -338,17 +338,6 @@ test("treats an identity-matched zombie as already reaped", () => {
   expect(killed).toEqual([]);
 });
 
-test("treats a member that vanishes during cleanup as reaped", () => {
-  let existsCalls = 0;
-  const result = killProcessTree([{ pid: 4246, starttime: "vanishing-starttime" }], {
-    exists: () => ++existsCalls === 1,
-    readIdentity: () => "vanishing-starttime",
-    zombie: () => false,
-    kill: () => false,
-  });
-  expect(result).toEqual({ killed: true, error: null });
-});
-
 linuxTest("kills a TERM-ignoring descendant after the leader exits on SIGTERM", async () => {
   const runner = new CommandRunner();
   const probeRoot = root("agent-vm-term-descendant");
@@ -1041,8 +1030,7 @@ systemdTest("systemd assets validate against the Bun runtime path", async () => 
   const processHandle = Bun.spawn(["systemd-analyze", "verify", ...UNIT_PATHS], { stdout: "pipe", stderr: "pipe" });
   const result = await collect(processHandle);
   if (result.exit !== 0) throw new Error(`systemd verify failed: ${JSON.stringify(result)}`);
-  const unexpectedDiagnostics = result.stderr.split(/\r?\n/).filter(Boolean).filter((line) => !/^(?:\/usr)?\/lib\/systemd\/system\/[^:]+:\d+: Support for option CPUAccounting= has been removed and it is ignored$/.test(line));
-  if (unexpectedDiagnostics.length > 0) throw new Error(`systemd verify stderr: ${unexpectedDiagnostics.join("\n")}`);
+  if (result.stderr !== "") throw new Error(`systemd verify stderr: ${result.stderr}`);
 });
 
 linuxTest("the real Bun controller entrypoint accepts an isolated protected config override", async () => {

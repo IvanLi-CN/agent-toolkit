@@ -1418,7 +1418,6 @@ export function killProcessTree(members: readonly ProcessIdentity[], options: Pr
       if (!exists(member.pid)) continue;
       const current = readIdentity(member.pid);
       if (!current) {
-        if (!exists(member.pid)) continue;
         cleanupError ??= "process_identity_unverified";
         identityBlocked = true;
         continue;
@@ -1429,13 +1428,12 @@ export function killProcessTree(members: readonly ProcessIdentity[], options: Pr
         continue;
       }
       if (zombie(member.pid)) continue;
-      if (!kill(member.pid, 9) && exists(member.pid)) cleanupError ??= "PermissionError";
+      if (!kill(member.pid, 9)) cleanupError ??= "PermissionError";
     }
     const remaining = members.filter((member) => {
       if (!exists(member.pid)) return false;
       const current = readIdentity(member.pid);
       if (!current) {
-        if (!exists(member.pid)) return false;
         cleanupError ??= "process_identity_unverified";
         identityBlocked = true;
         return true;
@@ -1458,9 +1456,7 @@ function safeProcessSignal(pid: number, expectedIdentity: string | undefined, si
     if (!processExists(pid)) return { sent: false, error: null };
     if (!expectedIdentity) return { sent: false, error: "process_identity_unverified" };
     const current = processStartIdentity(pid);
-    if (!current) return processExists(pid)
-      ? { sent: false, error: "process_identity_unverified" }
-      : { sent: false, error: null };
+    if (!current) return { sent: false, error: "process_identity_unverified" };
     if (current !== expectedIdentity) return { sent: false, error: "process_identity_mismatch" };
     if (group) {
       if (targetPgid === undefined) return { sent: false, error: "process_group_identity_unverified" };
@@ -1676,15 +1672,10 @@ export class CommandRunner {
         addKnown(descendants.members);
         addBoundEnvironmentMembers();
         addKnown(processPipeMembers(leaderPipeTargets, pipeScope()).members);
-        let processTreeComplete = true;
-        if (leaderPgid !== undefined && leaderIdentity !== undefined) {
-          const leaderGroup = anchoredProcessGroupMembers(leaderPgid, [{ pid: processHandle.pid, starttime: leaderIdentity }]);
-          processTreeComplete &&= leaderGroup.complete;
-          addKnown(leaderGroup.members);
-        }
         const term = safeProcessSignal(processHandle.pid, leaderIdentity, 15, true, leaderPgid, leaderGroupAnchored);
         const leaderExitedAfterTerm = await Promise.race([exit.then(() => true), sleep(250).then(() => false)]);
         let processGroupCleanupError: string | null = identityMismatch ? "process_identity_mismatch" : term.error;
+        let processTreeComplete = true;
         let tree = { killed: true, error: null as string | null };
         let groupKill = { sent: false, error: null as string | null };
         let directKill = { sent: false, error: null as string | null };
@@ -1737,13 +1728,7 @@ export class CommandRunner {
           if (!remaining.length && (leaderExitedAfterTerm || !processExists(processHandle.pid))) break;
           await sleep(50);
         }
-        environmentInspectionIncomplete = false;
-        let finalEnvironment = addBoundEnvironmentMembers();
-        for (let attempt = 0; attempt < 3 && !finalEnvironment.complete; attempt += 1) {
-          await sleep(10);
-          environmentInspectionIncomplete = false;
-          finalEnvironment = addBoundEnvironmentMembers();
-        }
+        const finalEnvironment = addBoundEnvironmentMembers();
         addKnown(processPipeMembers(leaderPipeTargets, pipeScope()).members);
         const finalDescendants = processDescendantsFromRoots([...known.values()]);
         let finalInspectionComplete = finalDescendants.complete;

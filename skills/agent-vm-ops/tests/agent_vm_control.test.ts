@@ -27,10 +27,6 @@ const KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestfixture";
 const CONTROL_PATH = fileURLToPath(new URL("../scripts/agent_vm_control.ts", import.meta.url));
 setDefaultTimeout(15_000);
 
-function testTemp(prefix: string): string {
-  return mkdtempSync(join(process.cwd(), `${prefix}-`));
-}
-
 type Dict = Record<string, any>;
 type RunnerOptions = { inputData?: Uint8Array | string; timeout?: number; check?: boolean };
 type ProcessResult = { args: string[]; returncode: number; stdout: Uint8Array; stderr: Uint8Array; stdoutTruncated?: boolean };
@@ -289,7 +285,7 @@ class NativeCommands extends CommandRunner {
 }
 
 class Fixture {
-  readonly root = testTemp("agent-vm-control-test");
+  readonly root = mkdtempSync("/tmp/agent-vm-control-test-");
   readonly runner = new NativeCommands();
   readonly store: StateStore;
   readonly systemd: SystemdManager;
@@ -384,7 +380,7 @@ async function collect(child: any): Promise<{ exit: number; stdout: string; stde
 }
 
 test("loads Bun and Python 3 as managed guest prerequisites", () => {
-  const root = testTemp("agent-vm-config-test");
+  const root = mkdtempSync("/tmp/agent-vm-config-test-");
   try {
     const config = { project: "agents", profile: "agent-vm", image_alias: "image", image_fingerprint: "a".repeat(64), network: "agentsbr0", network_acl: "agent-vm-isolation", pool: "agents", host_address: "198.51.100.19", port_start: 20000, port_end: 20030, vm_ip_start: "198.51.100.20", vm_ip_end: "198.51.100.250", gateway_ip: "198.51.100.1", storage_path: root, state_db: join(root, "state.sqlite3"), timer_dir: root };
     writeFileSync(join(root, "config.json"), JSON.stringify(config));
@@ -393,7 +389,7 @@ test("loads Bun and Python 3 as managed guest prerequisites", () => {
 });
 
 test("fails closed on missing or invalid environment config before native writes", () => {
-  const root = testTemp("agent-vm-config-contract-test");
+  const root = mkdtempSync("/tmp/agent-vm-config-contract-test-");
   mkdirSync(join(root, "systemd"), { recursive: true, mode: 0o755 });
   const base: Dict = { project: "agents", profile: "agent-vm", image_alias: "image", image_fingerprint: "a".repeat(64), network: "agentsbr0", network_acl: "agent-vm-isolation", pool: "agents", host_address: "198.51.100.19", port_start: 20000, port_end: 20030, vm_ip_start: "198.51.100.20", vm_ip_end: "198.51.100.250", gateway_ip: "198.51.100.1", storage_path: root, state_db: join(root, "state.sqlite3"), timer_dir: join(root, "systemd") };
   const required = ["project", "profile", "image_alias", "image_fingerprint", "network", "network_acl", "pool", "host_address", "port_start", "port_end", "vm_ip_start", "vm_ip_end", "gateway_ip", "storage_path", "state_db", "timer_dir"];
@@ -425,7 +421,7 @@ test("fails closed on missing or invalid environment config before native writes
 });
 
 test("requires protected canonical config and timer paths", () => {
-  const root = testTemp("agent-vm-path-contract-test");
+  const root = mkdtempSync("/tmp/agent-vm-path-contract-test-");
   const timer = join(root, "systemd");
   mkdirSync(timer, { recursive: true, mode: 0o755 });
   const base: Dict = { project: "agents", profile: "agent-vm", image_alias: "image", image_fingerprint: "a".repeat(64), network: "agentsbr0", network_acl: "agent-vm-isolation", pool: "agents", host_address: "198.51.100.19", port_start: 20000, port_end: 20030, vm_ip_start: "198.51.100.20", vm_ip_end: "198.51.100.250", gateway_ip: "198.51.100.1", storage_path: root, state_db: join(root, "state.sqlite3"), timer_dir: timer };
@@ -458,7 +454,7 @@ test("requires protected canonical config and timer paths", () => {
 });
 
 test("validates systemd runtime and control script boundaries", () => {
-  const root = testTemp("agent-vm-systemd-runtime-test");
+  const root = mkdtempSync("/tmp/agent-vm-systemd-runtime-test-");
   const canonicalRoot = realpathSync(root);
   const bunPath = join(canonicalRoot, "bun");
   const controlPath = join(canonicalRoot, "agent_vm_control.ts");
@@ -472,7 +468,7 @@ test("validates systemd runtime and control script boundaries", () => {
 });
 
 test("accepts scientific ratios and preserves large integer config and request values", () => {
-  const root = testTemp("agent-vm-numeric-contract-test");
+  const root = mkdtempSync("/tmp/agent-vm-numeric-contract-test-");
   mkdirSync(join(root, "systemd"), { recursive: true, mode: 0o755 });
   const base: Dict = { project: "agents", profile: "agent-vm", image_alias: "image", image_fingerprint: "a".repeat(64), network: "agentsbr0", network_acl: "agent-vm-isolation", pool: "agents", host_address: "198.51.100.19", port_start: 20000, port_end: 20030, vm_ip_start: "198.51.100.20", vm_ip_end: "198.51.100.250", gateway_ip: "198.51.100.1", storage_path: root, state_db: join(root, "state.sqlite3"), timer_dir: join(root, "systemd"), cpu_overcommit_ratio: 1e21, create_cost_bytes: "9007199254740993" };
   const configPath = join(root, "config.json");
@@ -489,7 +485,7 @@ test("accepts scientific ratios and preserves large integer config and request v
 });
 
 test("rejects malformed timestamps and impractically large scientific ratios", () => {
-  const root = testTemp("agent-vm-input-boundary-test");
+  const root = mkdtempSync("/tmp/agent-vm-input-boundary-test-");
   mkdirSync(join(root, "systemd"), { recursive: true, mode: 0o755 });
   const base: Dict = { project: "agents", profile: "agent-vm", image_alias: "image", image_fingerprint: "a".repeat(64), network: "agentsbr0", network_acl: "agent-vm-isolation", pool: "agents", host_address: "198.51.100.19", port_start: 20000, port_end: 20030, vm_ip_start: "198.51.100.20", vm_ip_end: "198.51.100.250", gateway_ip: "198.51.100.1", storage_path: root, state_db: join(root, "state.sqlite3"), timer_dir: join(root, "systemd") };
   try {
@@ -521,7 +517,7 @@ test("rejects malformed timestamps and impractically large scientific ratios", (
 });
 
 test("rejects invalid UTF-8 at both config and request boundaries", () => {
-  const root = testTemp("agent-vm-utf8-contract-test");
+  const root = mkdtempSync("/tmp/agent-vm-utf8-contract-test-");
   const configPath = join(root, "config.json");
   try {
     writeFileSync(configPath, Uint8Array.from([0x7b, 0x22, 0x70, 0x72, 0x6f, 0x6a, 0x65, 0x63, 0x74, 0x22, 0x3a, 0xff, 0x7d]));
@@ -685,7 +681,7 @@ test("invalid write generation requests do not poison durable state", async () =
 });
 
 test("preserves JSON float semantics and Python canonical numeric digests", async () => {
-  const root = testTemp("agent-vm-numeric-boundary-test");
+  const root = mkdtempSync("/tmp/agent-vm-numeric-boundary-test-");
   mkdirSync(join(root, "systemd"), { recursive: true, mode: 0o755 });
   try {
     const base: Dict = { project: "agents", profile: "agent-vm", image_alias: "image", image_fingerprint: "a".repeat(64), network: "agentsbr0", network_acl: "agent-vm-isolation", pool: "agents", host_address: "198.51.100.19", port_start: 20000, port_end: 20030, vm_ip_start: "198.51.100.20", vm_ip_end: "198.51.100.250", gateway_ip: "198.51.100.1", storage_path: root, state_db: join(root, "state.sqlite3"), timer_dir: join(root, "systemd"), cpu_overcommit_ratio: 2e4 };
@@ -712,7 +708,7 @@ test("preserves JSON float semantics and Python canonical numeric digests", asyn
 });
 
 test("keeps SQLite integer reservations exact beyond the JS safe range", () => {
-  const root = testTemp("agent-vm-sqlite-test");
+  const root = mkdtempSync("/tmp/agent-vm-sqlite-test-");
   const store = StateStore.bootstrap(join(root, "state.sqlite3"));
   try {
     const exact = 9007199254740993n;
@@ -724,7 +720,7 @@ test("keeps SQLite integer reservations exact beyond the JS safe range", () => {
 });
 
 test("secures SQLite sidecar files when WAL is active", () => {
-  const root = testTemp("agent-vm-sqlite-sidecar-test");
+  const root = mkdtempSync("/tmp/agent-vm-sqlite-sidecar-test-");
   const path = join(root, "state.sqlite3");
   const store = StateStore.bootstrap(path);
   try {
@@ -744,7 +740,7 @@ test("secures SQLite sidecar files when WAL is active", () => {
 });
 
 test("fails closed for missing, empty, and invalid runtime state databases", () => {
-  const root = testTemp("agent-vm-state-guard-test");
+  const root = mkdtempSync("/tmp/agent-vm-state-guard-test-");
   try {
     const missing = join(root, "missing", "state.sqlite3");
     expectSyncCode(() => new StateStore(missing), "state_missing");
@@ -769,7 +765,7 @@ test("fails closed for missing, empty, and invalid runtime state databases", () 
 });
 
 test("rejects runtime state without canonical uniqueness and foreign-key contracts", () => {
-  const root = testTemp("agent-vm-state-contract-test");
+  const root = mkdtempSync("/tmp/agent-vm-state-contract-test-");
   const path = join(root, "state.sqlite3");
   const db = new Database(path);
   db.run("CREATE TABLE meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)");
@@ -785,7 +781,7 @@ test("rejects runtime state without canonical uniqueness and foreign-key contrac
 
 test("rejects runtime state with unexpected SQLite triggers and views", () => {
   for (const [suffix, ddl] of [["trigger", "CREATE TRIGGER rogue AFTER INSERT ON meta BEGIN SELECT 1; END"], ["view", "CREATE VIEW rogue AS SELECT 1"]] as const) {
-    const root = testTemp(`agent-vm-state-schema-${suffix}`);
+    const root = mkdtempSync(`/tmp/agent-vm-state-schema-${suffix}-`);
     const path = join(root, "state.sqlite3");
     const store = StateStore.bootstrap(path);
     store.db.run(ddl);
@@ -796,7 +792,7 @@ test("rejects runtime state with unexpected SQLite triggers and views", () => {
 });
 
 test("rejects canonical runtime state with invalid task identity data", () => {
-  const root = testTemp("agent-vm-state-data-test");
+  const root = mkdtempSync("/tmp/agent-vm-state-data-test-");
   const path = join(root, "state.sqlite3");
   const store = StateStore.bootstrap(path);
   store.close();
@@ -812,7 +808,7 @@ test("rejects canonical runtime state with invalid task identity data", () => {
 });
 
 test("verifies state-dependent task, port, and operation invariants at runtime", () => {
-  const root = testTemp("agent-vm-state-invariants-test");
+  const root = mkdtempSync("/tmp/agent-vm-state-invariants-test-");
   const timestamp = "2026-10-04T00:00:00+00:00";
   const task = {
     task_id: "avm-valid",
@@ -863,7 +859,7 @@ test("verifies state-dependent task, port, and operation invariants at runtime",
 });
 
 test("fails closed on unknown draining and preserves legal active resize reservations", () => {
-  const root = testTemp("agent-vm-state-runtime-contract-test");
+  const root = mkdtempSync("/tmp/agent-vm-state-runtime-contract-test-");
   const timestamp = "2026-10-04T00:00:00+00:00";
   const base = {
     task_id: "avm-resize", session_id: "resize-session", generation: 3, state: "active", instance_name: "agent-vm-avm-resize",
@@ -1126,7 +1122,7 @@ test("replays a durable response without rounding a large JSON integer", async (
 });
 
 test("replays an accepted persisted operation without changing its digest or native state", async () => {
-  const root = testTemp("agent-vm-baseline-test");
+  const root = mkdtempSync("/tmp/agent-vm-baseline-test-");
   const dbPath = join(root, "state.sqlite3");
   const digest = "c3dccc911349ced563eb9615fb6db8ffa5801d121c9542c29c5a3fc0575a768a";
   const response = {
@@ -1153,7 +1149,7 @@ test("replays an accepted persisted operation without changing its digest or nat
 });
 
 test("projects and bounds every JSON payload during legacy state migration", () => {
-  const root = testTemp("agent-vm-projected-migration-test");
+  const root = mkdtempSync("/tmp/agent-vm-projected-migration-test-");
   const dbPath = join(root, "state.sqlite3");
   const digest = "c3dccc911349ced563eb9615fb6db8ffa5801d121c9542c29c5a3fc0575a768a";
   const canary = "legacy-projection-canary";
@@ -1194,7 +1190,7 @@ test("projects and bounds every JSON payload during legacy state migration", () 
 });
 
 test("rejects unknown legacy metadata instead of copying its raw value", () => {
-  const root = testTemp("agent-vm-unknown-meta-migration-test");
+  const root = mkdtempSync("/tmp/agent-vm-unknown-meta-migration-test-");
   const dbPath = join(root, "state.sqlite3");
   writeLegacyOperation(dbPath, {
     ok: true, protocol: PROTOCOL_VERSION, server_time: "2026-10-04T00:00:00+00:00", action: "acquire", session_id: "legacy-meta",
@@ -1214,7 +1210,7 @@ test("rejects unknown legacy metadata instead of copying its raw value", () => {
 });
 
 test("fails closed and rolls back a legacy migration with invalid JSON", () => {
-  const root = testTemp("agent-vm-invalid-migration-test");
+  const root = mkdtempSync("/tmp/agent-vm-invalid-migration-test-");
   const dbPath = join(root, "state.sqlite3");
   writeLegacyOperation(dbPath, {
     ok: true, protocol: PROTOCOL_VERSION, server_time: "2026-10-04T00:00:00+00:00", action: "acquire", session_id: "legacy-invalid",
@@ -1234,7 +1230,7 @@ test("fails closed and rolls back a legacy migration with invalid JSON", () => {
 });
 
 test("rejects conflicting legacy schema migration provenance", () => {
-  const root = testTemp("agent-vm-conflicting-migration-test");
+  const root = mkdtempSync("/tmp/agent-vm-conflicting-migration-test-");
   const dbPath = join(root, "state.sqlite3");
   writeLegacyOperation(dbPath, {
     ok: true, protocol: PROTOCOL_VERSION, server_time: "2026-10-04T00:00:00+00:00", action: "acquire", session_id: "legacy-conflict",
@@ -1248,7 +1244,7 @@ test("rejects conflicting legacy schema migration provenance", () => {
 });
 
 test("rejects unknown canonical schema migration provenance", () => {
-  const root = testTemp("agent-vm-unknown-canonical-migration-test");
+  const root = mkdtempSync("/tmp/agent-vm-unknown-canonical-migration-test-");
   const dbPath = join(root, "state.sqlite3");
   const store = StateStore.bootstrap(dbPath);
   store.setMeta("schema_migration", "untrusted-provenance");
@@ -1258,7 +1254,7 @@ test("rejects unknown canonical schema migration provenance", () => {
 });
 
 test("serializes concurrent legacy-state startup and records one migration", async () => {
-  const root = testTemp("agent-vm-concurrent-migration-test");
+  const root = mkdtempSync("/tmp/agent-vm-concurrent-migration-test-");
   const dbPath = join(root, "state.sqlite3");
   writeLegacyOperation(dbPath, {
     ok: true, protocol: PROTOCOL_VERSION, server_time: "2026-10-04T00:00:00+00:00", action: "acquire", session_id: "legacy-concurrent",
@@ -1277,7 +1273,7 @@ test("serializes concurrent legacy-state startup and records one migration", asy
 });
 
 test("rejects a pending legacy operation without rewriting its journal", async () => {
-  const root = testTemp("agent-vm-pending-baseline-test");
+  const root = mkdtempSync("/tmp/agent-vm-pending-baseline-test-");
   const dbPath = join(root, "state.sqlite3");
   const digest = "c3dccc911349ced563eb9615fb6db8ffa5801d121c9542c29c5a3fc0575a768a";
   const response = { protocol: PROTOCOL_VERSION, action: "acquire", session_id: "legacy", generation: 0, operation_id: "legacy-op", outcome: "pending", _request_digest: digest };
@@ -1321,7 +1317,7 @@ test("replays an accepted operation after restart and preserves an updated renew
 
 test("executes the embedded guest growth program for ext4 and xfs", () => {
   for (const fstype of ["ext4", "xfs"] as const) {
-    const root = testTemp(`agent-vm-guest-${fstype}`);
+    const root = mkdtempSync(`/tmp/agent-vm-guest-${fstype}-`);
     try {
       const guest = createGuestFixture(root, { fstype, virtualBytes: 2 * GIB });
       const run = runGuestGrowth(guest, 1);
@@ -1335,7 +1331,7 @@ test("executes the embedded guest growth program for ext4 and xfs", () => {
 test("bounds every guest growth native command to 45 seconds with kill termination", () => {
   const boundedScript = GUEST_GROWTH_SCRIPT.replaceAll("45_000", "50");
   for (const delayCommand of ["findmnt", "growpart"] as const) {
-    const root = testTemp(`agent-vm-guest-timeout-${delayCommand}`);
+    const root = mkdtempSync(`/tmp/agent-vm-guest-timeout-${delayCommand}-`);
     try {
       const guest = createGuestFixture(root, { delayCommand, virtualBytes: 2 * GIB });
       const started = performance.now();
@@ -1347,8 +1343,8 @@ test("bounds every guest growth native command to 45 seconds with kill terminati
 });
 
 test("refuses ambiguous guest roots and missing growth commands", () => {
-  const ambiguousRoot = testTemp("agent-vm-guest-ambiguous");
-  const missingCommandRoot = testTemp("agent-vm-guest-missing-command");
+  const ambiguousRoot = mkdtempSync("/tmp/agent-vm-guest-ambiguous-");
+  const missingCommandRoot = mkdtempSync("/tmp/agent-vm-guest-missing-command-");
   try {
     const ambiguous = runGuestGrowth(createGuestFixture(ambiguousRoot, { parent: "vda/mapper", virtualBytes: 2 * GIB }), 1);
     expect(ambiguous.exitCode).not.toBe(0);
@@ -1632,7 +1628,7 @@ test("flushes a large response before a child exits", async () => {
 });
 
 test("removes an orphaned systemd timer only after native absence proof", async () => {
-  const root = testTemp("agent-vm-timer-test");
+  const root = mkdtempSync("/tmp/agent-vm-timer-test-");
   const runner = new NativeCommands();
   const systemd = new SystemdManager(runner, { timer_dir: root }, true);
   try {
@@ -1643,7 +1639,7 @@ test("removes an orphaned systemd timer only after native absence proof", async 
 });
 
 test("removes timer temporary artifacts when systemctl setup fails", async () => {
-  const root = testTemp("agent-vm-timer-failure-test");
+  const root = mkdtempSync("/tmp/agent-vm-timer-failure-test-");
   const runner = new NativeCommands();
   runner.failure = (args) => args[0] === "systemctl";
   const systemd = new SystemdManager(runner, { timer_dir: root }, true);

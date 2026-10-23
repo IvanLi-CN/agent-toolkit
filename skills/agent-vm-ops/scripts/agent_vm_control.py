@@ -311,7 +311,8 @@ def verify_partition(layout):
             "partition-verify",
             ["blockdev", "--getsize64", layout["source"]],
             0,
-            cause="partition_capacity_below_target",
+            cause="stale_partition_capacity_below_target",
+            transient=True,
         )
 
 
@@ -5078,43 +5079,49 @@ class Control:
                 "filesystem_before", "filesystem_threshold_bytes", "filesystem", "source",
                 "parent", "partition", "tools", "verified",
             }
+            max_failure_retry_depth = 2
 
             def valid_failure(error: Any) -> bool:
-                required = {"phase", "command", "returncode", "stdout", "stderr", "capacity", "transient"}
-                if not isinstance(error, Mapping) or not required.issubset(error):
-                    return False
-                failure_capacity = error["capacity"]
-                if (
-                    not isinstance(error["phase"], str)
-                    or not isinstance(error["command"], list)
-                    or not error["command"]
-                    or any(not isinstance(item, str) for item in error["command"])
-                    or (error["returncode"] is not None and (isinstance(error["returncode"], bool) or not isinstance(error["returncode"], int)))
-                    or not isinstance(error["stdout"], str)
-                    or not isinstance(error["stderr"], str)
-                    or not isinstance(failure_capacity, Mapping)
-                    or not failure_capacity_keys.issubset(failure_capacity)
-                    or failure_capacity.get("verified") is not True
-                    or not isinstance(error["transient"], bool)
-                    or ("cause" in error and not isinstance(error["cause"], str))
-                ):
-                    return False
-                for key in (
-                    "requested_bytes", "disk_bytes", "partition_bytes", "filesystem_bytes",
-                    "filesystem_before", "filesystem_threshold_bytes",
-                ):
-                    if isinstance(failure_capacity.get(key), bool) or not isinstance(failure_capacity.get(key), int):
+                pending = [(error, 0)]
+                while pending:
+                    current, depth = pending.pop()
+                    required = {"phase", "command", "returncode", "stdout", "stderr", "capacity", "transient"}
+                    if not isinstance(current, Mapping) or not required.issubset(current):
                         return False
-                if (
-                    not isinstance(failure_capacity.get("filesystem"), str)
-                    or not isinstance(failure_capacity.get("source"), str)
-                    or not isinstance(failure_capacity.get("parent"), str)
-                    or not isinstance(failure_capacity.get("partition"), str)
-                    or not isinstance(failure_capacity.get("tools"), Mapping)
-                ):
-                    return False
-                if "retry_of" in error and not valid_failure(error["retry_of"]):
-                    return False
+                    failure_capacity = current["capacity"]
+                    if (
+                        not isinstance(current["phase"], str)
+                        or not isinstance(current["command"], list)
+                        or not current["command"]
+                        or any(not isinstance(item, str) for item in current["command"])
+                        or (current["returncode"] is not None and (isinstance(current["returncode"], bool) or not isinstance(current["returncode"], int)))
+                        or not isinstance(current["stdout"], str)
+                        or not isinstance(current["stderr"], str)
+                        or not isinstance(failure_capacity, Mapping)
+                        or not failure_capacity_keys.issubset(failure_capacity)
+                        or failure_capacity.get("verified") is not True
+                        or not isinstance(current["transient"], bool)
+                        or ("cause" in current and not isinstance(current["cause"], str))
+                    ):
+                        return False
+                    for key in (
+                        "requested_bytes", "disk_bytes", "partition_bytes", "filesystem_bytes",
+                        "filesystem_before", "filesystem_threshold_bytes",
+                    ):
+                        if isinstance(failure_capacity.get(key), bool) or not isinstance(failure_capacity.get(key), int):
+                            return False
+                    if (
+                        not isinstance(failure_capacity.get("filesystem"), str)
+                        or not isinstance(failure_capacity.get("source"), str)
+                        or not isinstance(failure_capacity.get("parent"), str)
+                        or not isinstance(failure_capacity.get("partition"), str)
+                        or not isinstance(failure_capacity.get("tools"), Mapping)
+                    ):
+                        return False
+                    if "retry_of" in current:
+                        if depth >= max_failure_retry_depth or not isinstance(current["retry_of"], Mapping):
+                            return False
+                        pending.append((current["retry_of"], depth + 1))
                 return True
 
             def matches_failure(reference: Mapping[str, Any], candidate: Mapping[str, Any]) -> bool:
@@ -5211,7 +5218,7 @@ class Control:
             ):
                 raise ValueError()
             return value
-        except (ValueError, KeyError, TypeError) as exc:
+        except (RecursionError, ValueError, KeyError, TypeError) as exc:
             raise ControlError(
                 "guest_resize_unverified",
                 "guest capacity report is invalid",

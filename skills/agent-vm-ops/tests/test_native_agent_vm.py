@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import importlib.util
 import json
@@ -13,6 +14,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 from urllib.parse import urlparse, parse_qs
@@ -1355,6 +1357,22 @@ class LifecycleTests(Fixture):
         failure = json.loads(self.store.get_task(session_id="thread-a")["last_error"])
         self.assertEqual(failure["phase"], "guest-report")
 
+    def test_guest_growth_report_bounds_retry_evidence_depth(self):
+        response = self.guest_growth_result(status="grown_after_retry", attempts=2)
+        payload = json.loads(response.stdout)
+        error = payload["capacity"]["attempts"][0]["error"]
+        nested = dict(error)
+        for _ in range(4):
+            nested = {**error, "retry_of": nested}
+        payload["capacity"]["attempts"][0]["error"] = nested
+        response.stdout = json.dumps(payload).encode()
+        self.runner.guest_growth_results = [response]
+
+        self.error("guest_resize_unverified", self.acquire)
+
+        failure = json.loads(self.store.get_task(session_id="thread-a")["last_error"])
+        self.assertEqual(failure["phase"], "guest-report")
+
     def test_already_grown_guest_root_is_an_idempotent_success(self):
         self.acquire()
         self.call("release")
@@ -1421,6 +1439,118 @@ class LifecycleTests(Fixture):
         self.assertIn("guest_filesystem", completed["completed"])
         self.assertEqual(completed["guest_filesystem"]["virtual_bytes"], 40 * GIB)
         self.assertNotIn("last_error", completed)
+
+
+class GuestRootGrowthScriptTests(unittest.TestCase):
+    def execute_script(self, *, initial_partition=None, initial_filesystem=None, resize_returncode=0):
+        target = 20 * GIB
+        threshold = target * 95 // 100
+        state = {
+            "partition": initial_partition if initial_partition is not None else target // 2,
+            "filesystem": initial_filesystem if initial_filesystem is not None else target // 4,
+        }
+        marker = "/sys/class/block/sda2/partition"
+        calls = []
+
+        def completed(command, returncode=0, stdout="", stderr=""):
+            return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+
+        def run(command, **kwargs):
+            command = list(command)
+            calls.append(command)
+            if command == ["findmnt", "-n", "-o", "SOURCE", "-T", "/"]:
+                return completed(command, stdout="/dev/sda2\n")
+            if command == ["findmnt", "-n", "-o", "FSTYPE", "-T", "/"]:
+                return completed(command, stdout="ext4\n")
+            if command[:4] == ["lsblk", "-n", "-o", "PKNAME"]:
+                return completed(command, stdout="sda\n")
+            if command[:4] == ["lsblk", "-n", "-o", "TYPE"]:
+                return completed(command, stdout=("part\n" if command[-1] == "/dev/sda2" else "disk\n"))
+            if command[:2] == ["blockdev", "--getsize64"]:
+                value = target if command[-1] == "/dev/sda" else state["partition"]
+                return completed(command, stdout=f"{value}\n")
+            if command[:2] == ["blockdev", "--rereadpt"]:
+                state["partition"] = target
+                return completed(command)
+            if command[0] == "growpart":
+                return completed(command)
+            if command[0] == "resize2fs":
+                if resize_returncode:
+                    return completed(command, resize_returncode, stderr="resize2fs: Device or resource busy\n")
+                state["filesystem"] = threshold
+                return completed(command)
+            raise AssertionError(command)
+
+        def which(name):
+            return None if name == "udevadm" else f"/usr/bin/{name}"
+
+        def statvfs(path):
+            self.assertEqual(path, "/")
+            return types.SimpleNamespace(f_blocks=state["filesystem"], f_frsize=1)
+
+        real_open = open
+
+        def fake_open(path, *args, **kwargs):
+            if path == marker:
+                return io.StringIO("2\n")
+            return real_open(path, *args, **kwargs)
+
+        captured_stdout = io.StringIO()
+        captured_stderr = io.StringIO()
+        with mock.patch.object(CONTROL.subprocess, "run", side_effect=run), \
+             mock.patch.object(CONTROL.os, "statvfs", side_effect=statvfs), \
+             mock.patch.object(CONTROL.os.path, "isfile", side_effect=lambda path: path == marker), \
+             mock.patch.object(CONTROL.shutil, "which", side_effect=which), \
+             mock.patch.object(CONTROL.time, "sleep", return_value=None), \
+             mock.patch.object(CONTROL.sys, "argv", ["guest-root-growth", "20"]), \
+             mock.patch("builtins.open", side_effect=fake_open), \
+             redirect_stdout(captured_stdout), redirect_stderr(captured_stderr):
+            try:
+                exec(CONTROL.GUEST_ROOT_GROWTH_SCRIPT, {"__name__": "__main__"})
+            except SystemExit as stopped:
+                exit_code = stopped.code
+            else:
+                exit_code = 0
+        return exit_code, captured_stdout.getvalue(), captured_stderr.getvalue(), calls
+
+    def test_guest_root_growth_script_retries_stale_partition_and_grows(self):
+        exit_code, stdout, stderr, calls = self.execute_script()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        payload = json.loads(stdout)
+        self.assertEqual(payload["status"], "grown_after_retry")
+        self.assertEqual(payload["attempts"], 2)
+        first_error = payload["capacity"]["attempts"][0]["error"]
+        self.assertEqual(first_error["phase"], "partition-verify")
+        self.assertEqual(first_error["cause"], "stale_partition_capacity_below_target")
+        self.assertTrue(first_error["transient"])
+        self.assertIn(["blockdev", "--rereadpt", "/dev/sda"], calls)
+
+    def test_guest_root_growth_script_emits_retry_link_for_final_failure(self):
+        exit_code, stdout, stderr, _ = self.execute_script(resize_returncode=1)
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout, "")
+        error = json.loads(stderr)["error"]
+        self.assertEqual(error["phase"], "filesystem-grow")
+        self.assertTrue(error["transient"])
+        self.assertEqual(error["retry_of"]["phase"], "partition-verify")
+        self.assertEqual(error["retry_of"]["cause"], "stale_partition_capacity_below_target")
+        self.assertEqual(len(error["capacity"]["attempts"]), 2)
+
+    def test_guest_root_growth_script_is_idempotent_when_complete(self):
+        exit_code, stdout, stderr, calls = self.execute_script(
+            initial_partition=20 * GIB,
+            initial_filesystem=20 * GIB * 95 // 100,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        payload = json.loads(stdout)
+        self.assertEqual(payload["status"], "already_grown")
+        self.assertEqual(payload["attempts"], 0)
+        self.assertFalse(any(command[0] in {"growpart", "resize2fs"} for command in calls))
 
 
 class CommandRunnerTests(unittest.TestCase):

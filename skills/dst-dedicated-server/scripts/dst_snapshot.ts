@@ -439,7 +439,8 @@ async function syncDirectory(path: string): Promise<void> {
   }
 }
 
-const SENSITIVE_NAME = "(?:password|passwd|pass[._ -]?phrase|pwd|secret|token|credential(?:s)?|jwt|private[._ -]?key|api[._ -]?key|access[._ -]?key|signing[._ -]?key|encryption[._ -]?key|database[._ -]?url|mongo[._ -]?uri|authorization|bearer|cookie|set[._ -]?cookie|session(?:[._ -]?id)?)";
+// Match sensitive names even when remote output inserts whitespace inside a key.
+const SENSITIVE_NAME = "(?:password|passwd|pass[._ -]?phrase|pwd|secret|token|(?:credentials|credential)|jwt|private[._ -]?key|api[._ -]?key|access[._ -]?key|signing[._ -]?key|encryption[._ -]?key|database[._ -]?url|mongo[._ -]?uri|authorization|bearer|cookie|set[._ -]?cookie|session(?:[._ -]?id)?)".replaceAll("[._ -]?", "[._\\s-]*").replace(/([A-Za-z])(?=[A-Za-z])/g, "$1\\s*");
 const SENSITIVE_INDEX_SUFFIX = `(?:(?:[ \\t]*)\\[[^\\]\\r\\n]*\\])*`;
 const SENSITIVE_BARE_BASE = `[A-Za-z0-9_.-]*${SENSITIVE_NAME}[A-Za-z0-9_.-]*`;
 const SENSITIVE_BRACKET_BASE = `\\[[^\\]\\r\\n]*${SENSITIVE_NAME}[^\\]\\r\\n]*\\]`;
@@ -447,6 +448,7 @@ const SENSITIVE_QUOTED_BASE = `(?:"[^"\\r\\n]*${SENSITIVE_NAME}[^"\\r\\n]*"|'[^'
 const SENSITIVE_BARE_KEY = `(?:${SENSITIVE_BARE_BASE}${SENSITIVE_INDEX_SUFFIX})`;
 const SENSITIVE_KEY = `(?:${SENSITIVE_BARE_BASE}|${SENSITIVE_BRACKET_BASE}|${SENSITIVE_QUOTED_BASE})${SENSITIVE_INDEX_SUFFIX}`;
 const SENSITIVE_KEY_TOKEN = SENSITIVE_KEY;
+const SENSITIVE_KEY_WHITESPACE = new RegExp(`${SENSITIVE_KEY}(?=\\s*(?:[:=]|%3[dDaA]))`, "gi");
 const SENSITIVE_ASSIGNMENT = new RegExp(
   `(${SENSITIVE_BARE_KEY}\\s*[:=]\\s*)(?!\\s*\\[REDACTED\\])("(?:\\\\.|[^"\\\\])*"|'(?:\\\\.|[^'\\\\])*'|(?:Bearer|Basic)\\s+[^;\\r\\n]+?(?=[ \\t]+\\b${SENSITIVE_NAME}\\b(?:[ \\t]+|[:=])|\\r?\\n|$)|[^;\\r\\n]+?(?=[ \\t]+\\b${SENSITIVE_NAME}\\b(?:[ \\t]+|[:=])|\\r?\\n|$))`,
   "gi",
@@ -594,7 +596,9 @@ export function redactSensitiveText(text: string): string {
     .replace(UNICODE_FORMAT_CHARACTERS, " ")
     .replace(/([A-Za-z0-9])\s+([_.-])(?=[A-Za-z0-9])/g, "$1$2")
     .replace(/([_.-])\s+([A-Za-z0-9])/g, "$1$2");
-  const redacted = redactSensitiveCollections(redactSensitiveBlocks(redactSensitiveContinuations(normalized)))
+  // Canonicalize split keys before line-based continuation/block handling.
+  const canonical = normalized.replace(SENSITIVE_KEY_WHITESPACE, (key) => key.replace(/\s+/g, ""));
+  const redacted = redactSensitiveCollections(redactSensitiveBlocks(redactSensitiveContinuations(canonical)))
     .replace(SENSITIVE_MULTILINE_ASSIGNMENT, "$1[REDACTED]")
     .replace(PRIVATE_KEY_BLOCK, "[REDACTED]")
     .replace(JSON_AUTHORIZATION_ASSIGNMENT, "$1$2$1: [REDACTED]")

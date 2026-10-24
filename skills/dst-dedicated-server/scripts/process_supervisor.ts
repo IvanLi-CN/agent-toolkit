@@ -19,7 +19,7 @@ const SUPERVISOR_TARGET_REFERENCE_TIMEOUT_MS = 15_000;
 const SUPERVISOR_GROUP_MEMBER_CAPTURE_TIMEOUT_MS = 2_000;
 const SUPERVISOR_INITIAL_LEDGER_WAIT_MS = 5_000;
 const SUPERVISOR_LEDGER_AUTH_SETTLE_MS = 2_000;
-const SUPERVISOR_POST_AUTH_LEDGER_WAIT_MS = 250;
+const SUPERVISOR_POST_AUTH_LEDGER_WAIT_MS = 2_000;
 export const SUPERVISOR_UNKNOWN_TARGET_STATUS = 125;
 const MAX_SUPERVISOR_MARKER_BYTES = 256;
 const MAX_SUPERVISOR_DESCENDANT_BYTES = 1024 * 1024;
@@ -83,6 +83,8 @@ snapshot_finished_path="$status_dir/snapshot-finished"
 snapshot_failed_path="$status_dir/snapshot-failed"
 snapshot_generation=0
 ledger_generation=0
+snapshot_failure_latched=0
+ledger_notifications_enabled=1
 snapshot_ready_observed=0
 snapshot_deadline_epoch=0
 target_authorized_observed=0
@@ -102,7 +104,16 @@ case "$status_dir_identity" in
   *) exit 1 ;;
 esac
 status_dir_is_current() {
-  [ -d "." ] && [ ! -L "." ]
+  [ -d "." ] && [ ! -L "." ] && [ -d "$status_dir_path" ] && [ ! -L "$status_dir_path" ] || return 1
+  perl -e 'my ($path, $dev, $ino) = @ARGV; for my $p (".", $path) { my @s = lstat($p); exit 1 unless @s && (($s[2] & 0170000) == 0040000) && $s[0] == $dev && $s[1] == $ino; }' "$status_dir_path" "$status_dir_dev" "$status_dir_ino"
+}
+fail_snapshot() {
+  cleanup_ack_enabled=0
+  if [ "$snapshot_failure_latched" = "0" ]; then
+    snapshot_failure_latched=1
+    # Failure is terminal on the private channel, regardless of mutable markers.
+    if [ "$ledger_notifications_enabled" = "1" ]; then (trap '' PIPE; printf '%s\\n' failed >&6 2>/dev/null) || true; fi
+  fi
 }
 ledger_auth_key=""
 ledger_auth_key_read=0
@@ -199,7 +210,7 @@ safe_remove_status_directory() {
   # The parent-owned directory is private, but the target can still race its
   # old pathname. Work on the randomized tombstone and remove only the
   # supervisor's flat files plus the known cleanup-owner directories.
-  if [ -e "$status_dir_path" ] || ! perl -e '
+  if ! perl -e '
     use strict;
     use warnings;
     my ($root, $expected_dev, $expected_ino) = @ARGV;
@@ -375,14 +386,13 @@ safe_read_snapshot() {
   ' "$snapshot_input_path" "$supervisor_no_follow"
 }
 write_ledger_auth() {
-  status_dir_is_current || return 1
+  if [ "$snapshot_failure_latched" != "0" ] || [ "$cleanup_ack_enabled" != "1" ]; then fail_snapshot; return 1; fi
+  status_dir_is_current || { fail_snapshot; return 1; }
   [ -n "$supervisor_no_follow" ] || return 1
   read_ledger_auth_key || return 1
   [ -f "$captured_descendants_path" ] || return 1
   case "$snapshot_generation" in ''|*[!0-9]*) return 1 ;; esac
   ledger_generation=$((ledger_generation + 1))
-  # Publish freshness before signing; an interrupted publication must fail closed.
-  printf '%s\\n' "$ledger_generation" >&6 || return 1
   ledger_auth_nonce="$(LC_ALL=C od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d '[:space:]' || true)"
   case "$ledger_auth_nonce" in
     ''|*[!0-9a-fA-F]*) return 1 ;;
@@ -393,7 +403,7 @@ write_ledger_auth() {
     use strict;
     use warnings;
     use Fcntl qw(O_RDONLY O_WRONLY O_CREAT O_EXCL);
-    my ($input, $authentication_output, $authentication_temporary, $authenticated_output, $authenticated_temporary, $generation, $nofollow) = @ARGV;
+    my ($input, $authentication_output, $authentication_temporary, $authenticated_output, $authenticated_temporary, $generation, $nofollow, $notify, $authorized) = @ARGV;
     my $key = <STDIN> // "";
     $key =~ s/[\\r\\n]+\\z//;
     exit 1 unless defined $nofollow && $key =~ /^[0-9a-fA-F]{64}$/;
@@ -414,6 +424,15 @@ write_ledger_auth() {
       && $final[7] == $opened[7] && length($data) == $opened[7] && length($data) <= 1048576;
     close($in) or exit 1;
     my $authentication = hmac_sha256_hex($generation . "\n" . $data, pack("H*", $key));
+    if ($notify eq "1") {
+      $SIG{PIPE} = "IGNORE";
+      # Bind freshness to authenticated bytes before exposing a new disk file.
+      # The parent can verify this header against raw data even if publication
+      # is interrupted before the atomic authenticated-file rename.
+      open(my $publication, ">&", 6) or exit 1;
+      print {$publication} $generation, ":", $authentication, ":", $authorized, "\n" or exit 1;
+      close($publication) or exit 1;
+    }
     sysopen(my $authenticated, $authenticated_temporary, O_WRONLY | O_CREAT | O_EXCL | $no_follow, 0600) or exit 1;
     binmode $authenticated;
     print {$authenticated} $generation, ":", $authentication, "\n", $data or exit 1;
@@ -431,7 +450,7 @@ write_ledger_auth() {
         unlink($authentication_output) or exit 1;
       }
     }
-  ' "$captured_descendants_path" "$status_dir/descendants-auth" "$ledger_auth_temporary_path" "$authenticated_descendants_path" "$ledger_authenticated_temporary_path" "$ledger_generation" "$supervisor_no_follow"; then
+  ' "$captured_descendants_path" "$status_dir/descendants-auth" "$ledger_auth_temporary_path" "$authenticated_descendants_path" "$ledger_authenticated_temporary_path" "$ledger_generation" "$supervisor_no_follow" "$ledger_notifications_enabled" "$target_authorized_observed"; then
     rm -f -- "$ledger_auth_temporary_path" "$ledger_authenticated_temporary_path" 2>/dev/null || true
     return 1
   fi
@@ -579,6 +598,8 @@ acquire_cleanup_owner() {
   return 2
 }
 cleanup() {
+  # Parent death closes control pipes; cleanup must still remove its directory.
+  trap '' PIPE
   # The target launcher watches this private marker and can terminate its own
   # process group even when the supervisor's process probe is unavailable.
   ensure_marker "$stop_target_path" || cleanup_ack_enabled=0
@@ -1467,28 +1488,28 @@ descendants_for_roots() {
   descendant_result_path="\${3:-$descendant_result_path}"
   status_dir_is_current || return 1
   if ! rm -f "$descendant_result_path" 2>/dev/null; then
-    cleanup_ack_enabled=0
+    fail_snapshot
     create_marker_exclusive "$descendant_scan_failed_path" || true
     return 1
   fi
   if ! rm -f "$descendant_scan_status_path" "$descendant_scan_truncated_path" 2>/dev/null; then
-    cleanup_ack_enabled=0
+    fail_snapshot
     create_marker_exclusive "$descendant_scan_failed_path" || true
     return 1
   fi
   if snapshot_deadline_exceeded; then
-    cleanup_ack_enabled=0
+    fail_snapshot
     create_marker_exclusive "$descendant_scan_failed_path" || true
     return 1
   fi
   if ! safe_capture_command "$descendant_scan_input_path" ps -eo pid=,ppid=,pgid=; then
-    cleanup_ack_enabled=0
+    fail_snapshot
     create_marker_exclusive "$descendant_scan_failed_path" || true
     return 1
   fi
   if [ "$target_marker_scan_requested" = "1" ]; then
     if ! scan_target_marker_processes "$target_marker_scan_path"; then
-      cleanup_ack_enabled=0
+      fail_snapshot
       create_marker_exclusive "$descendant_scan_failed_path" || true
       return 1
     fi
@@ -1539,22 +1560,22 @@ descendants_for_roots() {
   case "$descendant_scan_status_code" in
     0)
       if ! write_marker_exclusive "$descendant_scan_status_path" ok || ! safe_copy_file "$descendant_scan_output_path" "$descendant_result_path"; then
-        cleanup_ack_enabled=0
+        fail_snapshot
         create_marker_exclusive "$descendant_scan_failed_path" || true
         return 1
       fi
       ;;
     3)
       if ! create_marker_exclusive "$descendant_scan_truncated_path" || ! write_marker_exclusive "$descendant_scan_status_path" truncated || ! safe_copy_file "$descendant_scan_output_path" "$descendant_result_path"; then
-        cleanup_ack_enabled=0
+        fail_snapshot
         create_marker_exclusive "$descendant_scan_failed_path" || true
         return 1
       fi
-      cleanup_ack_enabled=0
+      fail_snapshot
       return 0
       ;;
     *)
-      cleanup_ack_enabled=0
+      fail_snapshot
       create_marker_exclusive "$descendant_scan_failed_path" || true
       return 1
       ;;
@@ -1562,7 +1583,7 @@ descendants_for_roots() {
 }
 descendants() {
   descendant_result_path="\${1:-$descendant_result_path}"
-  if ! validate_captured_ledger; then cleanup_ack_enabled=0; return 1; fi
+  if ! validate_captured_ledger; then fail_snapshot; return 1; fi
   target_roots=""
   target_groups=""
   if target_identity_matches; then
@@ -1578,14 +1599,14 @@ descendants() {
         target_roots=""
         target_groups=""
         ;;
-      *) cleanup_ack_enabled=0; return 1 ;;
+      *) fail_snapshot; return 1 ;;
     esac
   fi
   descendants_for_roots "$target_roots" "$target_groups" "$descendant_result_path"
 }
 owned_descendants() {
   descendant_result_path="\${1:-$descendant_result_path}"
-  if ! validate_captured_ledger; then cleanup_ack_enabled=0; return 1; fi
+  if ! validate_captured_ledger; then fail_snapshot; return 1; fi
   owned_roots=""
   owned_groups=""
   if target_identity_matches; then
@@ -1593,9 +1614,9 @@ owned_descendants() {
     if target_is_alive; then
       target_group_for_scan="$(process_group_id "$target_pid" 2>/dev/null || true)"
       case "$target_group_for_scan" in
-        ''|0|*[!0-9]*) cleanup_ack_enabled=0; return 1 ;;
+        ''|0|*[!0-9]*) fail_snapshot; return 1 ;;
         *)
-          if [ "$target_group_for_scan" = "$wrapper_pgid" ]; then cleanup_ack_enabled=0; return 1; fi
+          if [ "$target_group_for_scan" = "$wrapper_pgid" ]; then fail_snapshot; return 1; fi
           owned_groups="$target_group_for_scan"
           ;;
       esac
@@ -1608,19 +1629,19 @@ owned_descendants() {
         # authorized records below are the only safe roots in this state.
         owned_groups=""
         ;;
-      *) cleanup_ack_enabled=0; return 1 ;;
+      *) fail_snapshot; return 1 ;;
     esac
   fi
   if [ "$authorized_descendant_count" -gt 0 ]; then
     while IFS='|' read -r captured_pid captured_identity captured_pgid captured_extra; do
       [ -n "$captured_pid$captured_identity$captured_pgid$captured_extra" ] || continue
-      case "$captured_pid" in ''|*[!0-9]*) cleanup_ack_enabled=0; return 1 ;; esac
-      [ -z "$captured_extra" ] || { cleanup_ack_enabled=0; return 1; }
-      identity_is_valid "$captured_identity" || { cleanup_ack_enabled=0; return 1; }
-      case "$captured_pgid" in ''|0|*[!0-9]*) cleanup_ack_enabled=0; return 1 ;; esac
+      case "$captured_pid" in ''|*[!0-9]*) fail_snapshot; return 1 ;; esac
+      [ -z "$captured_extra" ] || { fail_snapshot; return 1; }
+      identity_is_valid "$captured_identity" || { fail_snapshot; return 1; }
+      case "$captured_pgid" in ''|0|*[!0-9]*) fail_snapshot; return 1 ;; esac
       validate_authorized_record "$captured_pid" "$captured_identity" "$captured_pgid" || return 1
       owned_roots="$owned_roots $captured_pid"
-      if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
+      if snapshot_deadline_exceeded; then fail_snapshot; return 1; fi
       if [ "$captured_pgid" = "$wrapper_pgid" ] || [ "$captured_pgid" = "$target_pgid" ]; then continue; fi
       process_liveness "$captured_pid"
       case "$process_liveness_result" in
@@ -1634,54 +1655,55 @@ owned_descendants() {
               if [ "$captured_group_signal_status" -eq 0 ]; then
                 owned_groups="$owned_groups $captured_pgid"
               else
-                cleanup_ack_enabled=0
+                fail_snapshot
                 return 1
               fi
               ;;
             1) ;;
-            *) cleanup_ack_enabled=0; return 1 ;;
+            *) fail_snapshot; return 1 ;;
           esac
           continue
           ;;
         live) ;;
-        *) cleanup_ack_enabled=0; return 1 ;;
+        *) fail_snapshot; return 1 ;;
       esac
       current_captured_identity="$(process_identity "$captured_pid" 2>/dev/null || true)"
       current_captured_identity="$(normalize_process_identity "$current_captured_identity" 2>/dev/null || true)"
       current_captured_pgid="$(process_group_id "$captured_pid" 2>/dev/null || true)"
       if ! captured_identity_matches "$captured_identity" "$current_captured_identity" || [ "$current_captured_pgid" != "$captured_pgid" ]; then
-        cleanup_ack_enabled=0
+        fail_snapshot
         return 1
       fi
       if [ "$captured_pgid" != "$wrapper_pgid" ]; then owned_groups="$owned_groups $captured_pgid"; fi
     done <<EOF
 $captured_descendants_read_data
 EOF
-    [ "$?" -eq 0 ] || { cleanup_ack_enabled=0; return 1; }
+    [ "$?" -eq 0 ] || { fail_snapshot; return 1; }
   fi
   descendants_for_roots "$owned_roots" "$owned_groups" "$descendant_result_path"
 }
 snapshot_descendants() {
   status_dir_is_current || return 1
-  if ! create_marker_exclusive "$snapshot_started_path"; then cleanup_ack_enabled=0; fi
+  if ! create_marker_exclusive "$snapshot_started_path"; then fail_snapshot; fi
   if ! descendants "$pending_descendants_path" 2>/dev/null || [ "$cleanup_ack_enabled" != "1" ]; then
-    cleanup_ack_enabled=0
+    fail_snapshot
     create_marker_exclusive "$descendant_scan_failed_path" || true
     create_marker_exclusive "$status_dir/descendant-scan-failed" || true
   fi
   if [ -e "$descendant_scan_truncated_path" ] || [ -e "$descendant_scan_failed_path" ]; then
-    cleanup_ack_enabled=0
+    fail_snapshot
     create_marker_exclusive "$snapshot_failed_path" || true
     create_marker_exclusive "$status_dir/snapshot-failed" || true
   elif ! record_descendants; then
-    cleanup_ack_enabled=0
+    fail_snapshot
     create_marker_exclusive "$snapshot_failed_path" || true
     create_marker_exclusive "$status_dir/snapshot-failed" || true
   fi
-  if ! create_marker_exclusive "$snapshot_ready_path"; then cleanup_ack_enabled=0; fi
-  if ! create_marker_exclusive "$snapshot_finished_path"; then cleanup_ack_enabled=0; fi
+  if ! create_marker_exclusive "$snapshot_ready_path"; then fail_snapshot; fi
+  if ! create_marker_exclusive "$snapshot_finished_path"; then fail_snapshot; fi
 }
 start_snapshot() {
+  if [ "$snapshot_failure_latched" != "0" ] || [ "$cleanup_ack_enabled" != "1" ]; then fail_snapshot; return 1; fi
   set_snapshot_deadline
   snapshot_generation=$((snapshot_generation + 1))
   snapshot_started_path="$status_dir/snapshot-started-$snapshot_generation"
@@ -1689,21 +1711,21 @@ start_snapshot() {
   snapshot_finished_path="$status_dir/snapshot-finished-$snapshot_generation"
   snapshot_failed_path="$status_dir/snapshot-failed-$snapshot_generation"
   snapshot_ready_observed=0
-  if ! rm -f "$snapshot_started_path" "$snapshot_ready_path" "$snapshot_finished_path" "$snapshot_failed_path" 2>/dev/null; then cleanup_ack_enabled=0; fi
+  if ! rm -f "$snapshot_started_path" "$snapshot_ready_path" "$snapshot_finished_path" "$snapshot_failed_path" 2>/dev/null; then fail_snapshot; fi
   snapshot_pid=""
-  snapshot_descendants >/dev/null 2>/dev/null || cleanup_ack_enabled=0
-  if [ -e "$snapshot_failed_path" ] || [ -e "$descendant_scan_failed_path" ] || [ -e "$descendant_scan_truncated_path" ]; then
-    cleanup_ack_enabled=0
+  snapshot_descendants >/dev/null 2>/dev/null || fail_snapshot
+  if [ "$snapshot_failure_latched" != "0" ] || [ "$cleanup_ack_enabled" != "1" ] || [ -e "$snapshot_failed_path" ] || [ -e "$descendant_scan_failed_path" ] || [ -e "$descendant_scan_truncated_path" ]; then
+    fail_snapshot
     return 1
   fi
   if [ ! -e "$captured_descendants_path" ]; then
-    create_marker_exclusive "$captured_descendants_path" || cleanup_ack_enabled=0
+    create_marker_exclusive "$captured_descendants_path" || fail_snapshot
   fi
-  write_ledger_auth || cleanup_ack_enabled=0
+  write_ledger_auth || fail_snapshot
   if [ -e "$snapshot_ready_path" ] && [ ! -e "$snapshot_failed_path" ]; then
     snapshot_ready_observed=1
   else
-    cleanup_ack_enabled=0
+    fail_snapshot
     create_marker_exclusive "$snapshot_failed_path" || true
   fi
 }
@@ -1712,25 +1734,25 @@ wait_for_snapshot() {
 }
 record_descendants() {
   record_pending_path="\${1:-$pending_descendants_path}"
-  if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
-  if [ ! -e "$captured_descendants_path" ] && ! create_marker_exclusive "$captured_descendants_path"; then cleanup_ack_enabled=0; return 1; fi
-  if ! validate_captured_ledger; then cleanup_ack_enabled=0; return 1; fi
+  if snapshot_deadline_exceeded; then fail_snapshot; return 1; fi
+  if [ ! -e "$captured_descendants_path" ] && ! create_marker_exclusive "$captured_descendants_path"; then fail_snapshot; return 1; fi
+  if ! validate_captured_ledger; then fail_snapshot; return 1; fi
   captured_count="$authorized_descendant_count"
-  [ -f "$record_pending_path" ] || { cleanup_ack_enabled=0; return 1; }
-  record_pending_read_data="$(safe_read_snapshot "$record_pending_path" 2>/dev/null)" || { cleanup_ack_enabled=0; return 1; }
+  [ -f "$record_pending_path" ] || { fail_snapshot; return 1; }
+  record_pending_read_data="$(safe_read_snapshot "$record_pending_path" 2>/dev/null)" || { fail_snapshot; return 1; }
   while read -r captured_pid; do
-    if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
+    if snapshot_deadline_exceeded; then fail_snapshot; return 1; fi
     case "$captured_pid" in ''|*[!0-9]*) continue ;; esac
     [ "$captured_pid" = "$$" ] && continue
     [ "$captured_pid" = "$target_pid" ] && continue
-    [ "$captured_count" -ge 1024 ] && { cleanup_ack_enabled=0; return 1; }
+    [ "$captured_count" -ge 1024 ] && { fail_snapshot; return 1; }
     captured_identity="$(process_identity "$captured_pid" 2>/dev/null || true)"
     captured_identity="$(normalize_process_identity "$captured_identity" 2>/dev/null || true)"
     if ! identity_is_valid "$captured_identity"; then
       process_liveness "$captured_pid"
       case "$process_liveness_result" in
         dead) continue ;;
-        *) cleanup_ack_enabled=0; return 1 ;;
+        *) fail_snapshot; return 1 ;;
       esac
     fi
     captured_pgid="$(process_group_id "$captured_pid" 2>/dev/null || true)"
@@ -1738,7 +1760,7 @@ record_descendants() {
       process_liveness "$captured_pid"
       case "$process_liveness_result" in
         dead) continue ;;
-        *) cleanup_ack_enabled=0; return 1 ;;
+        *) fail_snapshot; return 1 ;;
       esac
     fi
     captured_record="$captured_pid|$captured_identity|$captured_pgid"
@@ -1753,7 +1775,7 @@ record_descendants() {
         case "$process_liveness_result" in
           dead) continue ;;
           live) ;;
-          *) cleanup_ack_enabled=0; return 1 ;;
+          *) fail_snapshot; return 1 ;;
         esac
         authorized_group_source="$(authorized_group_record "$captured_pgid" 2>/dev/null || true)"
         if [ -n "$authorized_group_source" ]; then
@@ -1761,11 +1783,11 @@ record_descendants() {
 $authorized_group_source
 EOF
           if ! captured_group_can_be_signaled "$authorized_group_identity" "$captured_pgid"; then
-            cleanup_ack_enabled=0
+            fail_snapshot
             return 1
           fi
         else
-          cleanup_ack_enabled=0
+          fail_snapshot
           return 1
         fi
       fi
@@ -1776,23 +1798,23 @@ EOF
 $authorized_group_source
 EOF
         if ! captured_group_can_be_signaled "$authorized_group_identity" "$captured_pgid"; then
-          cleanup_ack_enabled=0
+          fail_snapshot
           return 1
         fi
       elif [ "$captured_pgid" = "$target_pgid" ] && [ "$target_pgid" != "$wrapper_pgid" ]; then
         if ! target_group_can_be_signaled_after_anchor_loss; then
-          cleanup_ack_enabled=0
+          fail_snapshot
           return 1
         fi
       else
-        cleanup_ack_enabled=0
+        fail_snapshot
         return 1
       fi
     fi
     existing_captured_record="$(authorized_record_for_pid "$captured_pid" 2>/dev/null || true)"
     if [ -n "$existing_captured_record" ]; then
       if ! authorized_record_exists "$existing_captured_record"; then
-        cleanup_ack_enabled=0
+        fail_snapshot
         return 1
       fi
       existing_captured_identity="\${existing_captured_record#*|}"
@@ -1800,11 +1822,11 @@ EOF
       if captured_identity_matches "$existing_captured_identity" "$captured_identity"; then
         continue
       fi
-      cleanup_ack_enabled=0
+      fail_snapshot
       return 1
     fi
     if ! safe_append_line "$captured_descendants_path" "$captured_record"; then
-      cleanup_ack_enabled=0
+      fail_snapshot
       return 1
     fi
     authorize_descendant_record "$captured_record"
@@ -1812,40 +1834,40 @@ EOF
   done <<EOF
 $record_pending_read_data
 EOF
-  [ "$?" -eq 0 ] || { cleanup_ack_enabled=0; return 1; }
-  captured_descendants_read_data="$(safe_read_snapshot "$captured_descendants_path" 2>/dev/null)" || { cleanup_ack_enabled=0; return 1; }
-  write_ledger_auth || { cleanup_ack_enabled=0; return 1; }
+  [ "$?" -eq 0 ] || { fail_snapshot; return 1; }
+  captured_descendants_read_data="$(safe_read_snapshot "$captured_descendants_path" 2>/dev/null)" || { fail_snapshot; return 1; }
+  write_ledger_auth || { fail_snapshot; return 1; }
 }
 capture_owned_descendants() {
-  if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
+  if snapshot_deadline_exceeded; then fail_snapshot; return 1; fi
   owned_pending_path="$status_dir/owned-descendant-pids-$snapshot_generation-$ownership_round"
   if ! owned_descendants "$owned_pending_path" 2>/dev/null || [ "$cleanup_ack_enabled" != "1" ]; then
-    cleanup_ack_enabled=0
+    fail_snapshot
     return 1
   fi
   if [ -e "$descendant_scan_truncated_path" ] || [ -e "$descendant_scan_failed_path" ]; then
-    cleanup_ack_enabled=0
+    fail_snapshot
     return 1
   fi
   if ! record_descendants "$owned_pending_path"; then
-    cleanup_ack_enabled=0
+    fail_snapshot
     return 1
   fi
   if [ "$group_quiescence_required" = "1" ] && ! quiesce_captured_descendants; then return 1; fi
 }
 quiesce_captured_descendants() {
   status_dir_is_current || return 1
-  if ! validate_captured_ledger; then cleanup_ack_enabled=0; return 1; fi
+  if ! validate_captured_ledger; then fail_snapshot; return 1; fi
   [ "$authorized_descendant_count" -gt 0 ] || return 0
   while IFS='|' read -r captured_pid captured_identity captured_pgid captured_extra; do
-    if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
+    if snapshot_deadline_exceeded; then fail_snapshot; return 1; fi
     [ -n "$captured_pid$captured_identity$captured_pgid$captured_extra" ] || continue
-    case "$captured_pid" in ''|*[!0-9]*) cleanup_ack_enabled=0; return 1 ;; esac
+    case "$captured_pid" in ''|*[!0-9]*) fail_snapshot; return 1 ;; esac
     [ "$captured_pid" = "$$" ] && continue
     [ "$captured_pid" = "$target_pid" ] && continue
-    [ -z "$captured_extra" ] || { cleanup_ack_enabled=0; return 1; }
-    identity_is_valid "$captured_identity" || { cleanup_ack_enabled=0; return 1; }
-    case "$captured_pgid" in ''|0|*[!0-9]*) cleanup_ack_enabled=0; return 1 ;; esac
+    [ -z "$captured_extra" ] || { fail_snapshot; return 1; }
+    identity_is_valid "$captured_identity" || { fail_snapshot; return 1; }
+    case "$captured_pgid" in ''|0|*[!0-9]*) fail_snapshot; return 1 ;; esac
     validate_authorized_record "$captured_pid" "$captured_identity" "$captured_pgid" || return 1
     retry_process_liveness "$captured_pid"
     case "$process_liveness_result" in
@@ -1853,22 +1875,22 @@ quiesce_captured_descendants() {
         continue
         ;;
       live) ;;
-      *) cleanup_ack_enabled=0; return 1 ;;
+      *) fail_snapshot; return 1 ;;
     esac
     current_captured_identity="$(process_identity "$captured_pid" 2>/dev/null || true)"
     current_captured_identity="$(normalize_process_identity "$current_captured_identity" 2>/dev/null || true)"
-    if ! captured_identity_matches "$captured_identity" "$current_captured_identity"; then cleanup_ack_enabled=0; return 1; fi
+    if ! captured_identity_matches "$captured_identity" "$current_captured_identity"; then fail_snapshot; return 1; fi
     current_captured_pgid="$(process_group_id "$captured_pid" 2>/dev/null || true)"
-    if [ "$current_captured_pgid" != "$captured_pgid" ]; then cleanup_ack_enabled=0; return 1; fi
-    if [ "$current_captured_pgid" = "$wrapper_pgid" ]; then cleanup_ack_enabled=0; return 1; fi
+    if [ "$current_captured_pgid" != "$captured_pgid" ]; then fail_snapshot; return 1; fi
+    if [ "$current_captured_pgid" = "$wrapper_pgid" ]; then fail_snapshot; return 1; fi
     if [ -n "$target_group_for_quiesce" ] && [ "$current_captured_pgid" = "$target_group_for_quiesce" ]; then continue; fi
-    captured_process_can_be_signaled "$captured_identity" || { cleanup_ack_enabled=0; return 1; }
-    if ! kill -STOP "-$current_captured_pgid" 2>/dev/null; then cleanup_ack_enabled=0; return 1; fi
-    if ! safe_append_line "$quiesced_groups_path" "$current_captured_pgid|$captured_identity"; then cleanup_ack_enabled=0; return 1; fi
+    captured_process_can_be_signaled "$captured_identity" || { fail_snapshot; return 1; }
+    if ! kill -STOP "-$current_captured_pgid" 2>/dev/null; then fail_snapshot; return 1; fi
+    if ! safe_append_line "$quiesced_groups_path" "$current_captured_pgid|$captured_identity"; then fail_snapshot; return 1; fi
   done <<EOF
 $captured_descendants_read_data
 EOF
-  [ "$?" -eq 0 ] || { cleanup_ack_enabled=0; return 1; }
+  [ "$?" -eq 0 ] || { fail_snapshot; return 1; }
 }
 prepare_kill_ownership() {
   if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
@@ -2614,7 +2636,7 @@ exec 0<&- 1>/dev/null 2>/dev/null
 # The target exit code is the wrapper's authenticated result. Run the
 # potentially slower process-tree verification independently so short-lived
 # commands are not reported as timed out while cleanup is still in progress.
-(trap ':' HUP INT TERM; exec 3>&-; terminate_supervised_tree) </dev/null >/dev/null 2>/dev/null &
+(trap ':' HUP INT TERM; exec 3>&- 6>&-; ledger_notifications_enabled=0; terminate_supervised_tree) </dev/null >/dev/null 2>/dev/null &
 cleanup_pid="$!"
 exit 0
 `;
@@ -2628,9 +2650,24 @@ export interface SupervisedChild {
   cleanup(): Promise<void>;
 }
 
+// Trust is attached to the original root, not merely a safe-looking file in
+// whichever directory currently occupies its pathname. A mismatch is terminal.
+const supervisorDirectoryIdentities = new Map<string, SupervisorDirectoryIdentity | null>();
+
+async function supervisorDirectoryIsCurrent(path: string): Promise<boolean> {
+  const expected = supervisorDirectoryIdentities.get(path);
+  if (expected === undefined || expected === null) return false;
+  const current = await lstat(path).catch(() => undefined);
+  if (current?.isDirectory() && !current.isSymbolicLink() && current.dev === expected.dev && current.ino === expected.ino) return true;
+  supervisorDirectoryIdentities.set(path, null);
+  return false;
+}
+
 async function readRegularMarker(path: string, maxBytes = MAX_SUPERVISOR_MARKER_BYTES): Promise<string | undefined> {
   let handle: FileHandle | undefined;
   try {
+    const directory = dirname(path);
+    if (!await supervisorDirectoryIsCurrent(directory)) return undefined;
     const metadata = await lstat(path);
     if (!metadata.isFile() || metadata.isSymbolicLink()) return undefined;
     const noFollow = constants.O_NOFOLLOW;
@@ -2638,6 +2675,7 @@ async function readRegularMarker(path: string, maxBytes = MAX_SUPERVISOR_MARKER_
     const flags = constants.O_RDONLY | noFollow | (constants.O_NONBLOCK ?? 0);
     handle = await open(path, flags);
     const openedMetadata = await handle.stat();
+    if (!await supervisorDirectoryIsCurrent(directory)) return undefined;
     if (!openedMetadata.isFile() || openedMetadata.size > maxBytes || openedMetadata.dev !== metadata.dev || openedMetadata.ino !== metadata.ino) return undefined;
     const buffer = new Uint8Array(maxBytes + 1);
     let offset = 0;
@@ -2648,6 +2686,7 @@ async function readRegularMarker(path: string, maxBytes = MAX_SUPERVISOR_MARKER_
     }
     const finalMetadata = await handle.stat();
     if (offset > maxBytes || finalMetadata.size !== openedMetadata.size || finalMetadata.dev !== openedMetadata.dev || finalMetadata.ino !== openedMetadata.ino || offset !== openedMetadata.size) return undefined;
+    if (!await supervisorDirectoryIsCurrent(directory)) return undefined;
     return new TextDecoder().decode(buffer.subarray(0, offset));
   } catch {
     return undefined;
@@ -2755,14 +2794,16 @@ function parseAuthenticatedLedger(authenticatedLedger: string, key: string): Aut
 async function authenticateInitialLedger(
   statusDirectory: string,
   key: string,
+  ledgerTrusted: () => boolean,
 ): Promise<AuthenticatedLedger | undefined> {
   const deadline = Date.now() + SUPERVISOR_INITIAL_LEDGER_WAIT_MS;
   const authenticatedLedgerPath = join(statusDirectory, "descendants-authenticated");
   while (Date.now() < deadline) {
+    if (!ledgerTrusted()) return undefined;
     const published = await readRegularMarker(authenticatedLedgerPath, MAX_SUPERVISOR_AUTHENTICATED_LEDGER_BYTES);
     if (published !== undefined) {
       const authenticated = parseAuthenticatedLedger(published, key);
-      if (authenticated !== undefined) return authenticated;
+      if (authenticated !== undefined && ledgerTrusted()) return authenticated;
     }
     if (await hasSnapshotFailureMarker(statusDirectory)) return undefined;
     await Bun.sleep(25);
@@ -2781,14 +2822,16 @@ async function waitForNextAuthenticatedLedger(
   statusDirectory: string,
   key: string,
   minimumGeneration: number,
+  ledgerTrusted: () => boolean,
+  postAuthorizationReady: () => boolean,
 ): Promise<AuthenticatedLedger | undefined> {
   const deadline = Date.now() + SUPERVISOR_POST_AUTH_LEDGER_WAIT_MS;
   const authenticatedLedgerPath = join(statusDirectory, "descendants-authenticated");
   while (Date.now() < deadline) {
-    if (await hasSnapshotFailureMarker(statusDirectory)) return undefined;
+    if (!ledgerTrusted() || await hasSnapshotFailureMarker(statusDirectory)) return undefined;
     const published = await readRegularMarker(authenticatedLedgerPath, MAX_SUPERVISOR_AUTHENTICATED_LEDGER_BYTES);
     const authenticated = published === undefined ? undefined : parseAuthenticatedLedger(published, key);
-    if (authenticated !== undefined && authenticated.generation > minimumGeneration) return authenticated;
+    if (authenticated !== undefined && authenticated.generation > minimumGeneration && ledgerTrusted() && postAuthorizationReady()) return authenticated;
     await Bun.sleep(25);
   }
   return undefined;
@@ -2798,18 +2841,14 @@ async function readAuthenticatedLedger(
   statusDirectory: string,
   key: string,
   deadline: number,
+  authentication: string | undefined,
 ): Promise<AuthenticatedLedger | undefined> {
-  const authenticatedLedgerPath = join(statusDirectory, "descendants-authenticated");
+  if (authentication === undefined) return undefined;
   const ledgerPath = join(statusDirectory, "descendants");
   while (Date.now() < deadline) {
-    const published = await readRegularMarker(authenticatedLedgerPath, MAX_SUPERVISOR_AUTHENTICATED_LEDGER_BYTES);
-    if (published === undefined) {
-      await Bun.sleep(25);
-      continue;
-    }
-    const authenticated = parseAuthenticatedLedger(published, key);
     const ledger = await readRegularMarker(ledgerPath, MAX_SUPERVISOR_DESCENDANT_BYTES);
-    if (authenticated !== undefined && ledger === authenticated.data) return authenticated;
+    const authenticated = ledger === undefined ? undefined : parseAuthenticatedLedger(`${authentication}\n${ledger}`, key);
+    if (authenticated !== undefined) return authenticated;
     await Bun.sleep(25);
   }
   return undefined;
@@ -3131,12 +3170,14 @@ async function cleanupAuthorizedTargetGroup(
   allowCurrentGroupMembers = false,
   minimumLedgerGeneration = 0,
   cleanupDeadline = Date.now() + SUPERVISOR_CLEANUP_TIMEOUT_MS,
+  ledgerAuthentication?: string,
 ): Promise<boolean> {
   const withinCleanupDeadline = async <T>(promise: Promise<T>): Promise<T | undefined> => {
     const remaining = cleanupDeadline - Date.now();
     if (remaining <= 0) return undefined;
     return await raceWithTimeout(promise, remaining, undefined);
   };
+  if (statusDirectory !== undefined && !await supervisorDirectoryIsCurrent(statusDirectory)) return false;
   const authorized = new Map<number, TargetGroupMember>();
   authorized.set(reference.pid, reference);
   for (const member of rememberedMembers ?? []) {
@@ -3150,6 +3191,7 @@ async function cleanupAuthorizedTargetGroup(
       statusDirectory,
       ledgerKey,
       Math.min(cleanupDeadline, Date.now() + SUPERVISOR_LEDGER_AUTH_SETTLE_MS),
+      ledgerAuthentication,
     );
   if (statusDirectory !== undefined && authenticatedLedger === undefined) return false;
   // The private publication channel retains the newest generation even if a
@@ -3233,6 +3275,7 @@ async function cleanupAuthorizedTargetGroup(
     }
   }
   for (const member of currentMembers.values()) {
+    if (statusDirectory !== undefined && !await supervisorDirectoryIsCurrent(statusDirectory)) return false;
     const verified = await withinCleanupDeadline(readCurrentGroupMember(member.pid, member.pgid));
     const expected = authorized.get(member.pid);
     if (verified === undefined || expected === undefined || !processIdentityMatches(expected.identity, verified.identity)) return false;
@@ -3266,6 +3309,7 @@ async function cleanupOrphanedTarget(
   rememberedMembers?: readonly TargetGroupMember[],
   minimumLedgerGeneration = 0,
   cleanupDeadline = Date.now() + SUPERVISOR_CLEANUP_TIMEOUT_MS,
+  ledgerAuthentication?: string,
 ): Promise<boolean> {
   if (process.platform === "win32") return false;
   const reference = rememberedReference;
@@ -3281,17 +3325,17 @@ async function cleanupOrphanedTarget(
     return await currentProcessGroup(targetPid) === targetPgid;
   };
   if (await processIsZombie(targetPid)) {
-    return cleanupAuthorizedTargetGroup(statusDirectory, ledgerKey, reference, rememberedMembers, false, minimumLedgerGeneration, cleanupDeadline);
+    return cleanupAuthorizedTargetGroup(statusDirectory, ledgerKey, reference, rememberedMembers, false, minimumLedgerGeneration, cleanupDeadline, ledgerAuthentication);
   }
   if (!await verifyTargetReference()) {
-    return cleanupAuthorizedTargetGroup(statusDirectory, ledgerKey, reference, rememberedMembers, false, minimumLedgerGeneration, cleanupDeadline);
+    return cleanupAuthorizedTargetGroup(statusDirectory, ledgerKey, reference, rememberedMembers, false, minimumLedgerGeneration, cleanupDeadline, ledgerAuthentication);
   }
   // Re-read the authenticated identity and group immediately before the
   // negative-PGID signal so a reused PID or group cannot pass a stale check.
   if (!await verifyTargetReference()) {
-    return cleanupAuthorizedTargetGroup(statusDirectory, ledgerKey, reference, rememberedMembers, false, minimumLedgerGeneration, cleanupDeadline);
+    return cleanupAuthorizedTargetGroup(statusDirectory, ledgerKey, reference, rememberedMembers, false, minimumLedgerGeneration, cleanupDeadline, ledgerAuthentication);
   }
-  return cleanupAuthorizedTargetGroup(statusDirectory, ledgerKey, reference, rememberedMembers, true, minimumLedgerGeneration, cleanupDeadline);
+  return cleanupAuthorizedTargetGroup(statusDirectory, ledgerKey, reference, rememberedMembers, true, minimumLedgerGeneration, cleanupDeadline, ledgerAuthentication);
 }
 
 async function waitForTarget(
@@ -3303,7 +3347,7 @@ async function waitForTarget(
 ): Promise<number> {
   const wrapperCode = await wrapperExited;
   const status = statusFd === undefined ? undefined : await readStatusPipe(statusFd);
-  if (wrapperCode === 0 && status !== undefined && await readRegularMarker(parentDeadPath) === undefined) {
+  if (wrapperCode === 0 && status !== undefined && await supervisorDirectoryIsCurrent(dirname(parentDeadPath)) && await readRegularMarker(parentDeadPath) === undefined) {
     return status;
   }
   if (!forceCleanupRequested()) await cleanup();
@@ -3312,8 +3356,10 @@ async function waitForTarget(
 
 // Only the wrapper owns the write end. Target launchers close it before
 // starting commands, so filesystem replay cannot lower this in-memory floor.
-function trackLedgerGenerations(fd: number): { latest: () => number; finished: Promise<void> } {
+function trackLedgerGenerations(fd: number): { latest: () => number; authentication: () => string | undefined; authorized: () => boolean; finished: Promise<void> } {
   let latest = 0;
+  let authentication: string | undefined;
+  let authorized = false;
   const finished = (async () => {
     const reader = Bun.file(fd).stream().getReader();
     let pending = "";
@@ -3326,14 +3372,17 @@ function trackLedgerGenerations(fd: number): { latest: () => number; finished: P
         while ((newline = pending.indexOf("\n")) >= 0) {
           const line = pending.slice(0, newline);
           pending = pending.slice(newline + 1);
-          const generation = Number(line);
-          if (!/^[1-9][0-9]*$/.test(line) || !Number.isSafeInteger(generation) || generation <= latest) {
+          const frame = /^([1-9][0-9]*):([0-9a-f]{64}):([01])$/.exec(line);
+          const generation = frame === null ? NaN : Number(frame[1]);
+          if (!Number.isSafeInteger(generation) || generation <= latest) {
             latest = Infinity;
             return;
           }
           latest = generation;
+          authentication = `${frame![1]}:${frame![2]}`;
+          authorized ||= frame![3] === "1";
         }
-        if (pending.length > 32) { latest = Infinity; return; }
+        if (pending.length > 100) { latest = Infinity; return; }
       }
       if (pending.length > 0) latest = Infinity;
     } catch {
@@ -3344,7 +3393,7 @@ function trackLedgerGenerations(fd: number): { latest: () => number; finished: P
       await closeFileDescriptor(fd);
     }
   })();
-  return { latest: () => latest, finished };
+  return { latest: () => latest, authentication: () => authentication, authorized: () => authorized, finished };
 }
 
 async function waitForReady(path: string, wrapperExited: Promise<number>): Promise<boolean> {
@@ -3469,6 +3518,7 @@ async function removeSupervisorDirectoryOnce(path: string, expectedIdentity?: Su
     const beforeRemoval = await lstat(tombstone);
     if (!beforeRemoval.isDirectory() || beforeRemoval.isSymbolicLink() || beforeRemoval.dev !== identity.dev || beforeRemoval.ino !== identity.ino) throw new Error("supervisor directory changed");
     await rmdir(tombstone);
+    supervisorDirectoryIdentities.delete(path);
   } catch {
     await restoreSupervisorDirectory(path, tombstone, identity);
   }
@@ -3536,8 +3586,9 @@ async function waitForCleanupAck(
         : SUPERVISOR_UNEXPECTED_EXIT_SETTLE_MS;
   }
   const acknowledgement = await readStatusPipe(fd, timeoutMs);
+  const directoryCurrent = await supervisorDirectoryIsCurrent(statusDirectory);
   await settleSupervisorDirectory(statusDirectory, acknowledgement, directoryIdentity);
-  return acknowledgement === 1;
+  return acknowledgement === 1 && directoryCurrent;
 }
 
 async function createSupervisorMarker(path: string): Promise<boolean> {
@@ -3545,8 +3596,9 @@ async function createSupervisorMarker(path: string): Promise<boolean> {
   if (typeof noFollow !== "number") return false;
   let handle: FileHandle | undefined;
   try {
+    if (!await supervisorDirectoryIsCurrent(dirname(path))) return false;
     handle = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollow, 0o600);
-    return true;
+    return await supervisorDirectoryIsCurrent(dirname(path));
   } catch {
     return false;
   } finally {
@@ -3557,7 +3609,7 @@ async function createSupervisorMarker(path: string): Promise<boolean> {
 export async function spawnSupervised(args: string[]): Promise<SupervisedChild> {
   if (process.platform === "win32") throw new Error("supervisor_unsupported_platform");
 
-  for (const command of ["sh", "perl", "ps", "awk", "cksum", "date", "od", "tr", "rm", "sleep"]) {
+  for (const command of ["sh", "perl", "ps", "awk", "cksum", "date", "od", "tr", "rm", "sleep", "dirname", "mktemp", "rmdir", "mv"]) {
     if (Bun.which(command) === null) throw new Error(`supervisor_requires_${command}`);
   }
   const perlModules = Bun.spawn(["perl", "-MFcntl", "-MPOSIX", "-MDigest::SHA", "-e", ""], { stdout: "ignore", stderr: "ignore" });
@@ -3576,6 +3628,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
     throw new Error("supervisor_directory_unavailable");
   }
   const directoryIdentity: SupervisorDirectoryIdentity = { dev: directoryMetadata.dev, ino: directoryMetadata.ino };
+  supervisorDirectoryIdentities.set(directory, directoryIdentity);
   const statusPath = join(directory, "status");
   const readyPath = join(directory, "ready");
   const targetAuthorizedPath = join(directory, "target-authorized");
@@ -3637,6 +3690,14 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
     const cleanupTarget = (): Promise<boolean> => {
       if (targetCleanupComplete) return Promise.resolve(true);
       targetCleanupPromise ??= (async () => {
+        if (await wrapperExited === 0) {
+          // The detached cleaner closes the generation channel before work.
+          // Its private ACK owns that cleanup result; disk markers cannot
+          // override a failed ACK or resurrect the pre-cleanup snapshot.
+          const cleaned = await waitForCleanupAcknowledged();
+          if (cleaned) targetCleanupComplete = true;
+          return cleaned;
+        }
         // Drain the private channel after wrapper exit before accepting any
         // disk snapshot. Never race automatic cleanup against forced cleanup.
         const drained = await raceWithTimeout(generations.finished.then(() => true), SUPERVISOR_STATUS_PIPE_TIMEOUT_MS, false);
@@ -3645,7 +3706,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
         const cleanupDeadline = Date.now() + SUPERVISOR_CLEANUP_TIMEOUT_MS;
         const floor = Math.max(minimumLedgerGeneration, generations.latest());
         for (let attempt = 0; attempt < 2 && Date.now() < cleanupDeadline; attempt += 1) {
-          if (await cleanupOrphanedTarget(reference, directory, ledgerKey, rememberedTargetGroupMembers, floor, cleanupDeadline)) {
+          if (await cleanupOrphanedTarget(reference, directory, ledgerKey, rememberedTargetGroupMembers, floor, cleanupDeadline, generations.authentication())) {
             targetCleanupComplete = true;
             return true;
           }
@@ -3668,11 +3729,12 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
           try { child.kill("SIGKILL"); } catch { /* The wrapper may already be gone. */ }
           await wrapperExited.catch(() => undefined);
           await targetExitPromise.catch(() => undefined);
-          if (cleanupFdForParent !== undefined) {
-            await closeFileDescriptor(cleanupFdForParent);
-            cleanupFdForParent = undefined;
-          }
           const cleaned = await cleanupTarget();
+          if (cleanupFdForParent !== undefined) {
+            const fd = cleanupFdForParent;
+            cleanupFdForParent = undefined;
+            await closeFileDescriptor(fd);
+          }
           if (cleaned) await removeSupervisorDirectory(directory, directoryIdentity);
           return cleaned;
         })().then((cleaned) => {
@@ -3730,7 +3792,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
     // the supervisor during this handshake and leave the parent without a
     // trustworthy initial state.
     rememberedTargetReference = targetReference;
-    const initialLedger = await authenticateInitialLedger(directory, ledgerKey);
+    const initialLedger = await authenticateInitialLedger(directory, ledgerKey, () => Number.isFinite(generations.latest()));
     if (initialLedger === undefined) {
       try { child.kill("SIGTERM"); } catch { /* The supervisor may already be gone. */ }
       const cleanupReady = await waitForCleanupAcknowledged();
@@ -3754,7 +3816,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
       await supervised.exited.catch(() => undefined);
       throw new Error("supervisor_target_authorization_unavailable");
     }
-    const authorizedLedger = await waitForNextAuthenticatedLedger(directory, ledgerKey, minimumLedgerGeneration);
+    const authorizedLedger = await waitForNextAuthenticatedLedger(directory, ledgerKey, minimumLedgerGeneration, () => Number.isFinite(generations.latest()), generations.authorized);
     // A target may be intentionally short-lived. Treat the post-authorization
     // refresh as opportunistic; when it exists, retain that generation as the
     // freshness floor for parent-side force cleanup.

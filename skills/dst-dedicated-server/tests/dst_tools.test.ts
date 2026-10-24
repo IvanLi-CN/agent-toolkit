@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -19,6 +19,21 @@ async function runTool(script: string, args: string[], env: Record<string, strin
   const child = Bun.spawn([process.execPath, script, ...args], { env, stdout: "pipe", stderr: "pipe" });
   const [status, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
   return { status, stdout, stderr };
+}
+
+async function supervisorStatusDirectory(before: ReadonlySet<string>, wrapperPid: number): Promise<string> {
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    for (const entry of await readdir(tmpdir())) {
+      if (before.has(entry) || !entry.startsWith(".agent-toolkit-dst-supervisor-") || entry.includes("ack-")) continue;
+      const candidate = join(tmpdir(), entry);
+      const pid = Number((await readFile(join(candidate, "target"), "utf8").catch(() => "")).trim());
+      if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+      const parent = Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(pid)], { stdout: "pipe", stderr: "ignore" });
+      if (Number(new TextDecoder().decode(parent.stdout).trim()) === wrapperPid) return candidate;
+    }
+    await Bun.sleep(25);
+  }
+  throw new Error("supervisor fixture directory unavailable");
 }
 
 function byteStream(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
@@ -75,6 +90,11 @@ describe.serial("DST local Bun tooling", () => {
     expect(redactSensitiveText("api_key=\u001b[31mfixture-secret")).not.toContain("fixture-secret");
     expect(redactSensitiveText("api\tkey=tab-separated-secret")).not.toContain("tab-separated-secret");
     expect(redactSensitiveText("pass\u0000word=nul-separated-secret")).not.toContain("nul-separated-secret");
+    for (const whitespace of [" ", "\t", "\n", "\r\n", "\u2028"]) {
+      for (const key of ["password", "passphrase", "token", "credentials", "authorization"]) {
+        expect(redactSensitiveText(`${key.split("").join(whitespace)}: split-key-value\nsplit-key-value`)).not.toContain("split-key-value");
+      }
+    }
     expect(redactSensitiveText("token\u200B=UNICODE_SECRET")).not.toContain("UNICODE_SECRET");
     expect(redactSensitiveText("to\u200Bken=UNICODE_KEY_SECRET")).not.toContain("UNICODE_KEY_SECRET");
     expect(redactSensitiveText("token=\u0000NUL_SECRET")).not.toContain("NUL_SECRET");
@@ -829,7 +849,7 @@ esac
       await writeFile(fakeSsh, `#!/bin/sh
 case "$*" in
   *"echo ok"*) exit 0 ;;
-  *) printf '### Remote fixture\\napi_key=fixture-secret\\n' ;;
+  *) printf '### Remote fixture\\napi_key=fixture-secret\\npass\\nword: multiline-fixture-value\\ncreden\\ntials=credential-fixture-value\\n' ;;
 esac
 `);
       await chmod(fakeSsh, 0o755);
@@ -843,6 +863,7 @@ esac
       const report = await readFile(output, "utf8");
       expect(report).toContain("api_key=[REDACTED]");
       expect(report).not.toContain("fixture-secret");
+      expect(report).not.toMatch(/multiline-fixture-value|credential-fixture-value/);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -1236,6 +1257,32 @@ exec /bin/ps "$@"
       expect(results.map((result) => result.status).sort()).toEqual([0, 0]);
       expect(await readFile(output, "utf8")).toContain("# DST snapshot");
       expect((await readdir(root)).filter((entry) => entry.startsWith(".dst-snapshot-tmp-")).length).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preflights every filesystem tool required by the supervisor", async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-preflight-"));
+    const required = ["sh", "perl", "ps", "awk", "cksum", "date", "od", "tr", "rm", "sleep", "dirname", "mktemp", "rmdir", "mv"];
+    const moduleUrl = pathToFileURL(join(import.meta.dir, "..", "scripts", "process_supervisor.ts")).href;
+    try {
+      for (const missing of ["dirname", "mktemp", "rmdir", "mv"]) {
+        const bin = join(root, missing);
+        await mkdir(bin);
+        for (const tool of required) {
+          if (tool === missing) continue;
+          const executable = Bun.which(tool);
+          expect(executable).not.toBeNull();
+          await symlink(executable!, join(bin, tool));
+        }
+        const child = Bun.spawn([process.execPath, "-e", `import { spawnSupervised } from ${JSON.stringify(moduleUrl)}; try { await spawnSupervised(["sh", "-c", "exit 0"]); process.exit(1); } catch (error) { console.log(error.message); }`], {
+          env: { ...process.env, PATH: bin }, stdout: "pipe", stderr: "pipe",
+        });
+        expect(await child.exited).toBe(0);
+        expect((await new Response(child.stdout).text()).trim()).toBe(`supervisor_requires_${missing}`);
+      }
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -1943,7 +1990,11 @@ try {
         let pid: number | undefined;
         try {
           supervised = await spawnSupervised(["sh", "-c", "sleep 30 & printf '%s\\n' \"$!\" > \"$1\"; wait", "race-target", marker]);
-          pid = Number((await readFile(marker, "utf8")).trim());
+          for (let attempt = 0; attempt < 80; attempt += 1) {
+            pid = Number((await readFile(marker, "utf8").catch(() => "")).trim());
+            if (Number.isSafeInteger(pid) && pid > 0) break;
+            await Bun.sleep(25);
+          }
           expect(pid).toBeGreaterThan(0);
           supervised.child.kill("SIGKILL");
           await Bun.sleep(delay);
@@ -1963,6 +2014,78 @@ try {
         }
       }
     } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("retains snapshot failure after the target deletes every failure marker", { timeout: 30_000 }, async () => {
+    if (process.platform === "win32") return;
+    const before = new Set(await readdir(tmpdir()));
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    let directory: string | undefined;
+    let anchor: number | undefined;
+    try {
+      supervised = await spawnSupervised(["sh", "-c", "sleep 30"]);
+      directory = await supervisorStatusDirectory(before, supervised.child.pid);
+      anchor = Number((await readFile(join(directory, "target"), "utf8")).trim());
+      await writeFile(join(directory, "descendant-scan-failed"), "failure");
+      let observed = false;
+      for (let attempt = 0; attempt < 160; attempt += 1) {
+        if ((await lstat(join(directory, "snapshot-failed")).catch(() => undefined))?.isFile()) { observed = true; break; }
+        await Bun.sleep(25);
+      }
+      expect(observed).toBe(true);
+      const authenticated = await readFile(join(directory, "descendants-authenticated"), "utf8");
+      for (const entry of await readdir(directory)) {
+        if (entry.startsWith("snapshot-failed") || entry === "descendant-scan-failed" || entry === "descendant-scan-truncated") {
+          await rm(join(directory, entry));
+        }
+      }
+      await Bun.sleep(250);
+      expect(await readFile(join(directory, "descendants-authenticated"), "utf8")).toBe(authenticated);
+      expect(await supervised.forceCleanup()).toBe(false);
+      expect((await lstat(directory)).isDirectory()).toBe(true);
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch {}
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (anchor !== undefined) { try { process.kill(-anchor, "SIGKILL"); } catch {} }
+      if (directory !== undefined) await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a replaced state directory even with copied valid signed files", { timeout: 30_000 }, async () => {
+    if (process.platform === "win32") return;
+    const before = new Set(await readdir(tmpdir()));
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-replacement-"));
+    const moved = join(root, "original");
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    let directory: string | undefined;
+    let anchor: number | undefined;
+    try {
+      supervised = await spawnSupervised(["sh", "-c", "sleep 30"]);
+      directory = await supervisorStatusDirectory(before, supervised.child.pid);
+      anchor = Number((await readFile(join(directory, "target"), "utf8")).trim());
+      supervised.child.kill("SIGSTOP");
+      await Bun.sleep(100);
+      await rename(directory, moved);
+      await cp(moved, directory, { recursive: true });
+      expect(await supervised.forceCleanup()).toBe(false);
+      expect((await lstat(directory)).isDirectory()).toBe(true);
+      // Restoring the pathname cannot erase an observed identity violation.
+      await rm(directory, { recursive: true, force: true });
+      await rename(moved, directory);
+      expect(await supervised.forceCleanup()).toBe(false);
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch {}
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (anchor !== undefined) { try { process.kill(-anchor, "SIGKILL"); } catch {} }
+      if (directory !== undefined) await rm(directory, { recursive: true, force: true });
       await rm(root, { recursive: true, force: true });
     }
   });

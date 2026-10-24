@@ -385,6 +385,8 @@ class Fixture(unittest.TestCase):
         self.resources.cpu_pressure.return_value = {
             "scope": "ct-cpu-pressure",
             "sources": ["cgroupfs"],
+            "mountpoint": "/sys/fs/cgroup",
+            "filesystem": "cgroup2",
             "some": {"avg10": 0.0, "avg60": 0.0, "avg300": 0.0, "total": 0.0},
             "full": {"avg10": 0.0, "avg60": 0.0, "avg300": 0.0, "total": 0.0},
         }

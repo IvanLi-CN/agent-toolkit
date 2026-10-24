@@ -463,7 +463,7 @@ def _write_local_operation(path: Path, request: Mapping[str, Any], result: Mappi
         )
 
 
-def _parse_remote_error(raw: bytes | None) -> dict[str, Any] | None:
+def _parse_remote_error(raw: bytes | None, *, request: Mapping[str, Any]) -> dict[str, Any] | None:
     if not raw:
         return None
     try:
@@ -475,7 +475,16 @@ def _parse_remote_error(raw: bytes | None) -> dict[str, Any] | None:
             payload = json.loads(line)
         except (TypeError, ValueError):
             continue
-        error = payload.get("error") if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("ok") is not False or payload.get("protocol") != PROTOCOL_VERSION:
+            continue
+        # A write journal may be finalized only from an error envelope emitted
+        # for this exact request.  SSH/wrapper diagnostics are not outcomes.
+        identity = ("action", "session_id", "generation", "operation_id")
+        if any(key not in payload or payload[key] != request[key] for key in identity if key in request):
+            continue
+        error = payload.get("error")
         if not isinstance(error, dict):
             continue
         code = error.get("code")
@@ -489,6 +498,7 @@ _DETERMINISTIC_REMOTE_ERROR_CODES = frozenset({
     "cache_ineligible",
     "config_invalid",
     "config_missing",
+    "capacity_insufficient",
     "draining",
     "generation_mismatch",
     "invalid_request",
@@ -497,13 +507,15 @@ _DETERMINISTIC_REMOTE_ERROR_CODES = frozenset({
     "resource_insufficient",
     "resource_pressure",
     "resource_budget_invalid",
+    "resource_unverified",
+    "lease_window_short",
     "task_missing",
     "task_not_active",
     "unknown_action",
 })
 
 
-def _remote_error_outcome_uncertain(error: Mapping[str, Any]) -> bool:
+def _remote_error_outcome_uncertain(error: Mapping[str, Any], *, action: str | None = None) -> bool:
     code = error.get("code")
     if code == "sqlite_unavailable":
         detail = error.get("detail")
@@ -515,6 +527,9 @@ def _remote_error_outcome_uncertain(error: Mapping[str, Any]) -> bool:
         "native-generation", "native-init", "native-config", "native-stop", "native-start",
         "guest-readiness", "guest-post-check", "access-exposure",
     } for key in ("phase", "operation_phase")):
+        return True
+    if action == "port-add" and code in {"generation_mismatch", "task_not_active"}:
+        # port-add can have created a native proxy before its final state check.
         return True
     if code in _DETERMINISTIC_REMOTE_ERROR_CODES:
         return False
@@ -571,9 +586,9 @@ def control_request(action: str, *, session: str | None, generation: int | None 
         sys.stderr.buffer.write(process.stderr)
         sys.stderr.flush()
     if process.returncode:
-        remote_error = _parse_remote_error(process.stderr)
+        remote_error = _parse_remote_error(process.stderr, request=request)
         if remote_error is not None:
-            if op_path is not None and not _remote_error_outcome_uncertain(remote_error):
+            if op_path is not None and not _remote_error_outcome_uncertain(remote_error, action=action):
                 _finalize_local_error(op_path, request, remote_error)
             fail(
                 str(remote_error["code"]),

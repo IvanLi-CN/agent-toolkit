@@ -251,6 +251,11 @@ class SessionContractTests(unittest.TestCase):
     def test_structured_remote_failure_preserves_control_error(self):
         error = {
             "ok": False,
+            "protocol": CLI.PROTOCOL_VERSION,
+            "action": "acquire",
+            "session_id": "thread",
+            "generation": 0,
+            "operation_id": "pressure",
             "error": {
                 "code": "resource_pressure",
                 "message": "CPU scheduler pressure blocks VM startup",
@@ -278,6 +283,11 @@ class SessionContractTests(unittest.TestCase):
     def test_unknown_structured_remote_failure_keeps_journal_pending(self):
         error = {
             "ok": False,
+            "protocol": CLI.PROTOCOL_VERSION,
+            "action": "acquire",
+            "session_id": "thread",
+            "generation": 0,
+            "operation_id": "unknown",
             "error": {
                 "code": "internal_error",
                 "message": "control process failed unexpectedly",
@@ -294,6 +304,35 @@ class SessionContractTests(unittest.TestCase):
             self.assertEqual(failure.exception.code, "internal_error")
             journal = Path(directory) / "operations" / (hashlib.sha256(b"unknown").hexdigest() + ".json")
             self.assertEqual(json.loads(journal.read_text(encoding="utf-8"))["outcome"], "pending")
+
+    def test_unrelated_stderr_json_cannot_finalize_write_journal(self):
+        error = {
+            "ok": False,
+            "protocol": CLI.PROTOCOL_VERSION,
+            "action": "acquire",
+            "session_id": "other-thread",
+            "generation": 0,
+            "operation_id": "other-operation",
+            "error": {"code": "resource_pressure", "message": "wrong request"},
+        }
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(CLI, "local_session_dir", return_value=Path(directory)), \
+             mock.patch.object(CLI.subprocess, "run", return_value=subprocess.CompletedProcess(
+                 [], 2, b"", (json.dumps(error) + "\n").encode()
+             )):
+            with self.assertRaises(CLI.CliError) as failure:
+                CLI.control_request("acquire", session="thread", generation=0, write=True, operation_id="local")
+            self.assertEqual(failure.exception.code, "remote_failed")
+            journal = Path(directory) / "operations" / (hashlib.sha256(b"local").hexdigest() + ".json")
+            self.assertEqual(json.loads(journal.read_text(encoding="utf-8"))["outcome"], "pending")
+
+    def test_pre_native_errors_are_deterministic_but_port_add_generation_is_uncertain(self):
+        for code in ("resource_unverified", "capacity_insufficient", "lease_window_short"):
+            with self.subTest(code=code):
+                self.assertFalse(CLI._remote_error_outcome_uncertain({"code": code}, action="acquire"))
+        self.assertFalse(CLI._remote_error_outcome_uncertain({"code": "generation_mismatch"}, action="acquire"))
+        self.assertTrue(CLI._remote_error_outcome_uncertain({"code": "generation_mismatch"}, action="port-add"))
+        self.assertTrue(CLI._remote_error_outcome_uncertain({"code": "task_not_active"}, action="port-add"))
 
     def test_incompatible_remote_response_is_rejected_before_return(self):
         response = {

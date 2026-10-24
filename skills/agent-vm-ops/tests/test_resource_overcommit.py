@@ -98,6 +98,7 @@ class SQLiteStateTests(unittest.TestCase):
 
 class CTObservationTests(unittest.TestCase):
     mount = "12 1 0:9 /meminfo /proc/meminfo rw - fuse.lxcfs lxcfs rw\n"
+    cgroup_mount = "42 35 0:28 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n"
 
     def observe(self, values):
         reads = []
@@ -200,27 +201,36 @@ class CTObservationTests(unittest.TestCase):
 
     def test_cpu_pressure_requires_verified_some_and_full_psi(self):
         raw = "some avg10=12.34 avg60=5.00 avg300=1.00 total=100\nfull avg10=7.89 avg60=3.00 avg300=0.50 total=50\n"
-        with mock.patch.object(CONTROL.CTResources, "_read", return_value=raw) as read:
+        def read(path):
+            return self.cgroup_mount if path == "/proc/self/mountinfo" else raw
+        with mock.patch.object(CONTROL.CTResources, "_read", side_effect=read) as read:
             result = CONTROL.CTResources().cpu_pressure()
         self.assertEqual(result["scope"], "ct-cpu-pressure")
         self.assertEqual(result["sources"], ["cgroupfs"])
+        self.assertEqual(result["mountpoint"], "/sys/fs/cgroup")
+        self.assertEqual(result["filesystem"], "cgroup2")
         self.assertEqual(result["full"]["avg10"], 7.89)
         self.assertEqual(result["some"]["avg10"], 12.34)
-        read.assert_called_once_with("/sys/fs/cgroup/cpu.pressure")
+        self.assertEqual(read.call_args_list, [mock.call("/proc/self/mountinfo"), mock.call("/sys/fs/cgroup/cpu.pressure")])
 
-        with mock.patch.object(CONTROL.CTResources, "_read", return_value="some avg10=1\n"):
+        with mock.patch.object(CONTROL.CTResources, "_read", side_effect=lambda path: self.cgroup_mount if path == "/proc/self/mountinfo" else "some avg10=1\n"):
             with self.assertRaises(CONTROL.ControlError) as failure:
                 CONTROL.CTResources().cpu_pressure()
         self.assertEqual(failure.exception.code, "resource_unverified")
 
         contradictory = "some avg10=1 avg60=1 avg300=1 total=1\nfull avg10=2 avg60=1 avg300=1 total=1\n"
-        with mock.patch.object(CONTROL.CTResources, "_read", return_value=contradictory):
+        with mock.patch.object(CONTROL.CTResources, "_read", side_effect=lambda path: self.cgroup_mount if path == "/proc/self/mountinfo" else contradictory):
             with self.assertRaises(CONTROL.ControlError) as failure:
                 CONTROL.CTResources().cpu_pressure()
         self.assertEqual(failure.exception.code, "resource_unverified")
 
         contaminated = raw + "unexpected avg10=0 avg60=0 avg300=0 total=0\n"
-        with mock.patch.object(CONTROL.CTResources, "_read", return_value=contaminated):
+        with mock.patch.object(CONTROL.CTResources, "_read", side_effect=lambda path: self.cgroup_mount if path == "/proc/self/mountinfo" else contaminated):
+            with self.assertRaises(CONTROL.ControlError) as failure:
+                CONTROL.CTResources().cpu_pressure()
+        self.assertEqual(failure.exception.code, "resource_unverified")
+
+        with mock.patch.object(CONTROL.CTResources, "_read", return_value=""):
             with self.assertRaises(CONTROL.ControlError) as failure:
                 CONTROL.CTResources().cpu_pressure()
         self.assertEqual(failure.exception.code, "resource_unverified")
@@ -282,6 +292,8 @@ class AdmissionTests(Fixture):
         self.resources.cpu_pressure.return_value = {
             "scope": "ct-cpu-pressure",
             "sources": ["cgroupfs"],
+            "mountpoint": "/sys/fs/cgroup",
+            "filesystem": "cgroup2",
             "some": {"avg10": 55.12, "avg60": 49.12, "avg300": 49.51, "total": 100.0},
             "full": {"avg10": 45.67, "avg60": 39.88, "avg300": 37.85, "total": 50.0},
         }

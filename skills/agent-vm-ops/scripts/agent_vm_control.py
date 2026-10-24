@@ -847,13 +847,34 @@ class CTResources:
             capacity = min(capacity, self._unsigned(fields[0], "cpu.max quota", positive=True) // period)
         return capacity
 
+    def _verify_cgroup2_mount(self) -> None:
+        matches = []
+        for line in self._read("/proc/self/mountinfo").splitlines():
+            before, separator, after = line.partition(" - ")
+            left, right = before.split(), after.split()
+            if separator and len(left) >= 5 and right and left[4] == "/sys/fs/cgroup":
+                matches.append(right[0])
+        if matches != ["cgroup2"]:
+            raise ControlError(
+                "resource_unverified",
+                "CT cgroup v2 mount cannot be verified",
+                {"metric": "/proc/self/mountinfo", "mountpoint": "/sys/fs/cgroup"},
+            )
+
     def cpu_pressure(self) -> dict[str, Any]:
+        self._verify_cgroup2_mount()
         try:
             values = parse_cpu_psi(self._read("/sys/fs/cgroup/cpu.pressure"))
         except ValueError as exc:
             raise ControlError("resource_unverified", "CT CPU pressure metric is invalid",
                                {"metric": "/sys/fs/cgroup/cpu.pressure"}) from exc
-        return {"scope": "ct-cpu-pressure", "sources": ["cgroupfs"], **values}
+        return {
+            "scope": "ct-cpu-pressure",
+            "sources": ["cgroupfs"],
+            "mountpoint": "/sys/fs/cgroup",
+            "filesystem": "cgroup2",
+            **values,
+        }
 
     def _lxcfs_meminfo(self) -> dict[str, int] | None:
         # Verify the mount before reading meminfo: an unvirtualized proc view
@@ -3562,8 +3583,9 @@ class Control:
             }}
         sources = observation.get("sources")
         if (observation.get("scope") != "ct-cpu-pressure"
-                or not isinstance(sources, list)
-                or "cgroupfs" not in sources):
+                or sources != ["cgroupfs"]
+                or observation.get("mountpoint") != "/sys/fs/cgroup"
+                or observation.get("filesystem") != "cgroup2"):
             return {"verified": False, "error": {
                 "code": "resource_unverified",
                 "message": "CT CPU pressure observation is not CT-local",
@@ -6494,6 +6516,7 @@ def parse_timer_args(argv: Sequence[str]) -> dict[str, Any] | None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     argv = list(argv if argv is not None else sys.argv[1:])
+    request: dict[str, Any] | None = None
     try:
         config = load_config()
         request = parse_timer_args(argv)
@@ -6506,16 +6529,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stdout.write(json.dumps(response, sort_keys=True) + "\n")
         return 0
     except ControlError as exc:
-        sys.stderr.write(json.dumps({"ok": False, "error": exc.as_dict()}, sort_keys=True) + "\n")
+        envelope: dict[str, Any] = {"ok": False, "protocol": PROTOCOL_VERSION}
+        if request is not None:
+            for key in ("action", "session_id", "generation", "operation_id"):
+                if key in request:
+                    envelope[key] = request[key]
+        envelope["error"] = exc.as_dict()
+        sys.stderr.write(json.dumps(envelope, sort_keys=True) + "\n")
         return 2
     except Exception as exc:
-        sys.stderr.write(
-            json.dumps(
-                {"ok": False, "error": {"code": "internal_error", "message": type(exc).__name__}},
-                sort_keys=True,
-            )
-            + "\n"
-        )
+        envelope = {"ok": False, "protocol": PROTOCOL_VERSION}
+        if request is not None:
+            for key in ("action", "session_id", "generation", "operation_id"):
+                if key in request:
+                    envelope[key] = request[key]
+        envelope["error"] = {"code": "internal_error", "message": type(exc).__name__}
+        sys.stderr.write(json.dumps(envelope, sort_keys=True) + "\n")
         return 3
 
 

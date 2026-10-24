@@ -200,13 +200,21 @@ class CTObservationTests(unittest.TestCase):
 
     def test_cpu_pressure_requires_verified_some_and_full_psi(self):
         raw = "some avg10=12.34 avg60=5.00 avg300=1.00 total=100\nfull avg10=7.89 avg60=3.00 avg300=0.50 total=50\n"
-        with mock.patch.object(CONTROL.CTResources, "_read", return_value=raw):
+        with mock.patch.object(CONTROL.CTResources, "_read", return_value=raw) as read:
             result = CONTROL.CTResources().cpu_pressure()
         self.assertEqual(result["scope"], "ct-cpu-pressure")
+        self.assertEqual(result["sources"], ["cgroupfs"])
         self.assertEqual(result["full"]["avg10"], 7.89)
         self.assertEqual(result["some"]["avg10"], 12.34)
+        read.assert_called_once_with("/sys/fs/cgroup/cpu.pressure")
 
         with mock.patch.object(CONTROL.CTResources, "_read", return_value="some avg10=1\n"):
+            with self.assertRaises(CONTROL.ControlError) as failure:
+                CONTROL.CTResources().cpu_pressure()
+        self.assertEqual(failure.exception.code, "resource_unverified")
+
+        contradictory = "some avg10=1 avg60=1 avg300=1 total=1\nfull avg10=2 avg60=1 avg300=1 total=1\n"
+        with mock.patch.object(CONTROL.CTResources, "_read", return_value=contradictory):
             with self.assertRaises(CONTROL.ControlError) as failure:
                 CONTROL.CTResources().cpu_pressure()
         self.assertEqual(failure.exception.code, "resource_unverified")
@@ -267,9 +275,9 @@ class AdmissionTests(Fixture):
         self.config.update(cpu_budget=15, cpu_overcommit_ratio=4)
         self.resources.cpu_pressure.return_value = {
             "scope": "ct-cpu-pressure",
-            "sources": ["procfs"],
-            "some": {"avg10": 55.12, "avg60": 49.12, "avg300": 49.51},
-            "full": {"avg10": 45.67, "avg60": 39.88, "avg300": 37.85},
+            "sources": ["cgroupfs"],
+            "some": {"avg10": 55.12, "avg60": 49.12, "avg300": 49.51, "total": 100.0},
+            "full": {"avg10": 45.67, "avg60": 39.88, "avg300": 37.85, "total": 50.0},
         }
         base = self.call("acquire", "base", public_key=KEY, cpu=16)
         with self.assertRaises(CONTROL.ControlError) as failure:
@@ -284,10 +292,33 @@ class AdmissionTests(Fixture):
         admitted = self.call("acquire", "after", public_key=KEY, cpu=2)
         self.assertEqual(admitted["resources"]["cpu"], 2)
 
+    def test_unverified_cpu_pressure_blocks_new_startup(self):
+        self.resources.cpu_pressure.return_value = {
+            "scope": "host-cpu-pressure",
+            "sources": ["procfs"],
+            "some": {"avg10": 0.0, "avg60": 0.0, "avg300": 0.0, "total": 0.0},
+            "full": {"avg10": 0.0, "avg60": 0.0, "avg300": 0.0, "total": 0.0},
+        }
+        self.error("resource_unverified", self.acquire, "unverified")
+        self.assertEqual(self.runner.instances, {})
+
+    def test_restart_resize_uses_target_cpu_for_startup_projection(self):
+        self.config.update(cpu_budget=15, cpu_overcommit_ratio=2)
+        base = self.call("acquire", "base", public_key=KEY, cpu=16)
+        self.call("acquire", "other", public_key=KEY, cpu=14)
+        self.resources.cpu_pressure.return_value["some"]["avg10"] = 55.12
+        self.resources.cpu_pressure.return_value["full"]["avg10"] = 45.67
+
+        result = self.call("resize", "base", cpu=2, allow_restart=True)
+
+        self.assertEqual(result["resources"]["cpu"], 2)
+        self.assertEqual(self.runner.instances[base["instance_name"]]["config"]["limits.cpu"], "2")
+
     def test_cpu_startup_pressure_checks_restart_before_stopping_guest(self):
         self.config.update(cpu_budget=15, cpu_overcommit_ratio=4)
         base = self.call("acquire", "base", public_key=KEY, cpu=16)
         self.call("acquire", "other", public_key=KEY, cpu=2)
+        self.resources.cpu_pressure.return_value["some"]["avg10"] = 55.12
         self.resources.cpu_pressure.return_value["full"]["avg10"] = 45.67
         stop_calls = sum(args[3:4] == ["stop"] for args, _, _ in self.runner.calls)
         with self.assertRaises(CONTROL.ControlError) as failure:

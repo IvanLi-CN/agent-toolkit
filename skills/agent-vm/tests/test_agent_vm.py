@@ -268,8 +268,12 @@ class SessionContractTests(unittest.TestCase):
              ):
             with self.assertRaises(CLI.CliError) as failure:
                 CLI.control_request("acquire", session="thread", generation=0, write=True, operation_id="pressure")
-        self.assertEqual(failure.exception.code, "resource_pressure")
-        self.assertEqual(failure.exception.detail["projected_cpu"], 18)
+            self.assertEqual(failure.exception.code, "resource_pressure")
+            self.assertEqual(failure.exception.detail["projected_cpu"], 18)
+            journal = Path(directory) / "operations" / (hashlib.sha256(b"pressure").hexdigest() + ".json")
+            saved = json.loads(journal.read_text(encoding="utf-8"))
+            self.assertEqual(saved["outcome"], "error")
+            self.assertEqual(saved["error"]["code"], "resource_pressure")
 
     def test_incompatible_remote_response_is_rejected_before_return(self):
         response = {

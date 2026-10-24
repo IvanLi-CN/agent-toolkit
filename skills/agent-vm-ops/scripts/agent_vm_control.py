@@ -805,6 +805,11 @@ def parse_cpu_psi(raw: str) -> dict[str, dict[str, float]]:
         result[fields[0]] = values
     if set(result) != {"some", "full"}:
         raise ValueError("CPU PSI data is missing")
+    required = {"avg10", "avg60", "avg300", "total"}
+    if any(set(values) != required for values in result.values()):
+        raise ValueError("CPU PSI fields are incomplete")
+    if any(result["full"][name] > result["some"][name] for name in required):
+        raise ValueError("CPU PSI full pressure exceeds some pressure")
     return result
 
 
@@ -842,11 +847,11 @@ class CTResources:
 
     def cpu_pressure(self) -> dict[str, Any]:
         try:
-            values = parse_cpu_psi(self._read("/proc/pressure/cpu"))
+            values = parse_cpu_psi(self._read("/sys/fs/cgroup/cpu.pressure"))
         except ValueError as exc:
             raise ControlError("resource_unverified", "CT CPU pressure metric is invalid",
-                               {"metric": "/proc/pressure/cpu"}) from exc
-        return {"scope": "ct-cpu-pressure", "sources": ["procfs"], **values}
+                               {"metric": "/sys/fs/cgroup/cpu.pressure"}) from exc
+        return {"scope": "ct-cpu-pressure", "sources": ["cgroupfs"], **values}
 
     def _lxcfs_meminfo(self) -> dict[str, int] | None:
         # Verify the mount before reading meminfo: an unvirtualized proc view
@@ -3553,6 +3558,14 @@ class Control:
                 "code": "resource_unverified",
                 "message": "CT CPU pressure observation is not an object",
             }}
+        sources = observation.get("sources")
+        if (observation.get("scope") != "ct-cpu-pressure"
+                or not isinstance(sources, list)
+                or "cgroupfs" not in sources):
+            return {"verified": False, "error": {
+                "code": "resource_unverified",
+                "message": "CT CPU pressure observation is not CT-local",
+            }}
         return {"verified": True, **dict(observation), "observed_at": iso_time(self.now())}
 
     def _cpu_startup_pressure_diagnostics(
@@ -3586,10 +3599,14 @@ class Control:
         try:
             full = observation["full"]
             some = observation["some"]
-            full_avg10 = float(full["avg10"])
-            some_avg10 = float(some["avg10"])
-            if not math.isfinite(full_avg10) or not math.isfinite(some_avg10):
-                raise ValueError()
+            values = {}
+            for name in ("avg10", "avg60", "avg300", "total"):
+                full_value = float(full[name])
+                some_value = float(some[name])
+                if (not math.isfinite(full_value) or not math.isfinite(some_value)
+                        or full_value > some_value):
+                    raise ValueError()
+                values[name] = (full_value, some_value)
         except (KeyError, TypeError, ValueError) as exc:
             detail.update({
                 "verified": False,
@@ -3601,10 +3618,10 @@ class Control:
             return detail
         detail.update({
             "verified": True,
-            "full_avg10_percent": full_avg10,
-            "some_avg10_percent": some_avg10,
+            "full_avg10_percent": values["avg10"][0],
+            "some_avg10_percent": values["avg10"][1],
         })
-        detail["startup_blocked"] = detail["physically_oversubscribed"] and full_avg10 >= threshold
+        detail["startup_blocked"] = detail["physically_oversubscribed"] and values["avg10"][0] >= threshold
         return detail
 
     def _enforce_cpu_startup_pressure(
@@ -3619,6 +3636,12 @@ class Control:
             requested_cpu=requested_cpu,
             capacity_cpu=capacity_cpu,
         )
+        if not detail["verified"]:
+            raise ControlError(
+                "resource_unverified",
+                "CT CPU pressure observation is not verified",
+                detail,
+            )
         if detail["startup_blocked"]:
             raise ControlError(
                 "resource_pressure",
@@ -3895,7 +3918,9 @@ class Control:
                 reasons.append({"code": "resource_pressure", "message": "CPU scheduler pressure blocks VM startup",
                                 "detail": cpu_startup_pressure})
             elif not cpu_startup_pressure["verified"]:
-                warnings.append({"code": "cpu_pressure_unavailable", "detail": cpu_startup_pressure.get("error")})
+                reasons.append({"code": "resource_unverified",
+                                "message": "CT CPU pressure observation is not verified",
+                                "detail": cpu_startup_pressure})
         if not instances.get("verified"):
             reasons.append(instances["error"])
         elif not instances["policy_compliant"] and not any(reason["code"] == "project_instance_limits_conflict" for reason in reasons):
@@ -3918,6 +3943,7 @@ class Control:
     def _reserve_resources(self, task: Mapping[str, Any], resources: Mapping[str, int],
                            *, memory_reduction: bool = False,
                            startup_required: bool = True,
+                           startup_cpu: int | None = None,
                            admission_epoch: str | None = None) -> dict[str, Any]:
         # Only a verified, memory-only reduction may bypass new-demand gates.
         # Its old allocation stays reserved until native completion is verified.
@@ -3956,7 +3982,7 @@ class Control:
             if policy and startup_required:
                 self._enforce_cpu_startup_pressure(
                     allocated_cpu=totals["cpu"],
-                    requested_cpu=resources["cpu"],
+                    requested_cpu=resources["cpu"] if startup_cpu is None else startup_cpu,
                     capacity_cpu=policy["ct_capacity"]["cpu"],
                 )
             record = dict(task, resource_reservation_json=json.dumps(dict(resources), sort_keys=True))
@@ -4437,7 +4463,7 @@ class Control:
         except Exception as error:
             errors.append({"source": "native_status", **self._diagnostic_error(error)})
         try:
-            payload["cpu_psi"] = self._parse_cpu_psi(Path("/proc/pressure/cpu").read_text())
+            payload["cpu_psi"] = self._parse_cpu_psi(Path("/sys/fs/cgroup/cpu.pressure").read_text())
         except Exception as error:
             errors.append({"source": "cpu_psi", **self._diagnostic_error(error)})
         try:
@@ -5273,7 +5299,7 @@ class Control:
         reclaimed = []
         if needs_restart:
             reserved = {key: max(old[key], target[key], previous_reservation.get(key, 0)) for key in old}
-            self._reserve_resources(task, reserved)
+            self._reserve_resources(task, reserved, startup_cpu=target["cpu"])
             try:
                 reclaimed = self._reclaim_capacity(cost, task["task_id"])
                 self._reserve_native(task, cost)
@@ -5413,7 +5439,7 @@ class Control:
                 if (self._durable_resources(current, "resource_reservation_json", allow_empty=True) != reserved
                         or self._native_resources(task) != old or self._guest_boot_id(task) != before):
                     raise ControlError("resize_unverified", "native rollback or guest continuity is unverified after balloon timeout")
-                self._reserve_resources(task, reserved, memory_reduction=target["memory_mib"] < old["memory_mib"])
+                self._reserve_resources(task, reserved, memory_reduction=target["memory_mib"] < old["memory_mib"], startup_required=False)
                 # Large balloons keep converging after Incus's five-second
                 # check. One bounded settle interval precedes the only retry.
                 # Expiry can still preempt this object and withdraw access.

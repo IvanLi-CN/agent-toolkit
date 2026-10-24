@@ -384,9 +384,9 @@ class Fixture(unittest.TestCase):
                                               "available_bytes": 24*GIB, "threshold_bytes": (32*GIB+9)//10}
         self.resources.cpu_pressure.return_value = {
             "scope": "ct-cpu-pressure",
-            "sources": ["procfs"],
-            "some": {"avg10": 0.0, "avg60": 0.0, "avg300": 0.0},
-            "full": {"avg10": 0.0, "avg60": 0.0, "avg300": 0.0},
+            "sources": ["cgroupfs"],
+            "some": {"avg10": 0.0, "avg60": 0.0, "avg300": 0.0, "total": 0.0},
+            "full": {"avg10": 0.0, "avg60": 0.0, "avg300": 0.0, "total": 0.0},
         }
         self.control = CONTROL.Control(self.config, runner=self.runner, store=self.store, systemd=self.systemd,
                                        resources=self.resources, clock=lambda: self.now)

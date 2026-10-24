@@ -428,10 +428,18 @@ def _append_warning(warnings: list[dict[str, Any]], item: dict[str, Any]) -> Non
 
 
 def _finalize_local_operation(path: Path, request: Mapping[str, Any], response: Mapping[str, Any]) -> None:
+    _write_local_operation(path, request, {"outcome": "success", "response": dict(response)})
+
+
+def _finalize_local_error(path: Path, request: Mapping[str, Any], error: Mapping[str, Any]) -> None:
+    _write_local_operation(path, request, {"outcome": "error", "error": dict(error)})
+
+
+def _write_local_operation(path: Path, request: Mapping[str, Any], result: Mapping[str, Any]) -> None:
     temporary = path.with_name("." + path.name + ".tmp")
     try:
         with temporary.open("w", encoding="utf-8") as handle:
-            json.dump({"request": dict(request), "outcome": "success", "response": dict(response)}, handle, sort_keys=True)
+            json.dump({"request": dict(request), **dict(result)}, handle, sort_keys=True)
             handle.write("\n")
             handle.flush()
             os.fchmod(handle.fileno(), 0o600)
@@ -450,7 +458,7 @@ def _finalize_local_operation(path: Path, request: Mapping[str, Any], response: 
             pass
         fail(
             "local_journal_update_failed",
-            "remote operation succeeded but the local operation journal could not be finalized",
+            "remote operation outcome is known but the local operation journal could not be finalized",
             {"operation_id": request.get("operation_id")},
         )
 
@@ -475,6 +483,22 @@ def _parse_remote_error(raw: bytes | None) -> dict[str, Any] | None:
         if isinstance(code, str) and code and isinstance(message, str) and message:
             return error
     return None
+
+
+def _remote_error_outcome_uncertain(error: Mapping[str, Any]) -> bool:
+    code = error.get("code")
+    if code == "sqlite_unavailable":
+        detail = error.get("detail")
+        return not isinstance(detail, Mapping) or detail.get("state_committed") is not False
+    if code in {"acquire_partial", "resize_partial", "restart_partial", "cleanup_incomplete", "operation_unverified"}:
+        return True
+    detail = error.get("detail")
+    if not isinstance(detail, Mapping):
+        return False
+    return any(detail.get(key) in {
+        "native-generation", "native-init", "native-config", "native-stop", "native-start",
+        "guest-readiness", "guest-post-check", "access-exposure",
+    } for key in ("phase", "operation_phase"))
 
 
 def control_request(action: str, *, session: str | None, generation: int | None = None,
@@ -529,6 +553,8 @@ def control_request(action: str, *, session: str | None, generation: int | None 
     if process.returncode:
         remote_error = _parse_remote_error(process.stderr)
         if remote_error is not None:
+            if op_path is not None and not _remote_error_outcome_uncertain(remote_error):
+                _finalize_local_error(op_path, request, remote_error)
             fail(
                 str(remote_error["code"]),
                 str(remote_error["message"]),

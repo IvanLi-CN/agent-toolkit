@@ -382,6 +382,17 @@ class Fixture(unittest.TestCase):
         self.resources.cpu.return_value = 16
         self.resources.memory.return_value = {"scope": "ct-memory", "sources": ["lxcfs"], "limit_bytes": 32*GIB,
                                               "available_bytes": 24*GIB, "threshold_bytes": (32*GIB+9)//10}
+        self.resources.cpu_pressure.return_value = {
+            "scope": "ct-cpu-pressure",
+            "sources": ["cgroupfs"],
+            "mountpoint": "/sys/fs/cgroup",
+            "mount_root": "/",
+            "filesystem": "cgroup2",
+            "cgroup_path": "/",
+            "metric": "/sys/fs/cgroup/cpu.pressure",
+            "some": {"avg10": 0.0, "avg60": 0.0, "avg300": 0.0, "total": 0.0},
+            "full": {"avg10": 0.0, "avg60": 0.0, "avg300": 0.0, "total": 0.0},
+        }
         self.control = CONTROL.Control(self.config, runner=self.runner, store=self.store, systemd=self.systemd,
                                        resources=self.resources, clock=lambda: self.now)
         self.config = self.control.config
@@ -841,8 +852,22 @@ class LifecycleTests(Fixture):
                 self.call("port-add", name="web", vm_port=8080)
 
         self.assertEqual(failure.exception.code, "task_not_active")
+        self.assertEqual(failure.exception.detail["operation_phase"], "port-add")
+        self.assertTrue(failure.exception.detail["outcome_verified"])
         task = self.store.get_task(session_id="thread-a")
         self.assertIsNone(self.store.get_port(task["task_id"], "web", "tcp"))
+
+    def test_port_remove_failure_keeps_closing_state_and_marks_outcome_uncertain(self):
+        self.acquire()
+        self.call("port-add", name="web", vm_port=8080)
+        task = self.store.get_task(session_id="thread-a")
+        failure = CONTROL.ControlError("conntrack_unverified", "matching flows remain")
+        with mock.patch.object(self.control, "_conntrack_delete", side_effect=failure):
+            with self.assertRaises(CONTROL.ControlError) as raised:
+                self.call("port-remove", name="web")
+        self.assertEqual(raised.exception.detail["operation_phase"], "port-remove")
+        self.assertFalse(raised.exception.detail["outcome_verified"])
+        self.assertEqual(self.store.get_port(task["task_id"], "web", "tcp")["state"], "closing")
 
     def test_existing_port_retry_cannot_reopen_mapping_after_expiry_preemption(self):
         self.acquire()
@@ -859,6 +884,7 @@ class LifecycleTests(Fixture):
                 self.call("port-add", name="web", vm_port=8080)
 
         self.assertEqual(failure.exception.code, "task_not_active")
+        self.assertTrue(failure.exception.detail["outcome_verified"])
         self.assertIsNone(self.store.get_port(task["task_id"], "web", "tcp"))
         self.assertNotIn("agent-vm-" + task["task_id"] + "-web-tcp", self.runner.instances[task["instance_name"]]["devices"])
 
@@ -1754,6 +1780,30 @@ class LifecycleTests(Fixture):
         self.assertEqual(completed["guest_filesystem"]["virtual_bytes"], 40 * GIB)
         self.assertNotIn("last_error", completed)
 
+    def test_slow_start_diagnostic_uses_verified_current_cgroup_pressure_path(self):
+        self.acquire()
+        task = self.store.get_task(session_id="thread-a")
+        observation = dict(self.resources.cpu_pressure.return_value)
+        observation.update({
+            "cgroup_path": "/system.slice/agent-vm",
+            "metric": "/sys/fs/cgroup/system.slice/agent-vm/cpu.pressure",
+        })
+        with mock.patch.object(self.resources, "cpu_pressure", return_value=observation), \
+             mock.patch.object(self.control.incus, "instance_info", return_value={"status": "Running", "pid": 1}), \
+             mock.patch.object(self.control.incus, "instance_log", return_value=""):
+            diagnostic = self.control._emit_slow_start_diagnostic(
+                task,
+                phase="agent",
+                started_monotonic=0.0,
+                readiness={},
+            )
+
+        self.assertEqual(diagnostic["cpu_psi"]["cgroup_path"], "/system.slice/agent-vm")
+        self.assertEqual(
+            diagnostic["cpu_psi"]["metric"],
+            "/sys/fs/cgroup/system.slice/agent-vm/cpu.pressure",
+        )
+
 
 class GuestRootGrowthScriptTests(unittest.TestCase):
     def execute_script(
@@ -1773,6 +1823,8 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         timeout_command=None,
         command_timeout=None,
         killpg_error=False,
+        escaped_child_pid_path=None,
+        root_exits_before_timeout=False,
         source_output="/dev/sda2\n",
         partition_marker_exists=True,
         udevadm_available=False,
@@ -1876,10 +1928,23 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
                 "sys.stdout.flush(); sys.stderr.flush(); sys.exit(" + str(returncode) + ")"
             )
             if timeout:
-                helper = helper.replace("import sys;", "import sys, time;").replace(
-                    "; sys.exit(" + str(returncode),
-                    "; time.sleep(10); sys.exit(" + str(returncode),
-                )
+                if escaped_child_pid_path is None:
+                    helper = helper.replace("import sys;", "import sys, time;").replace(
+                        "; sys.exit(" + str(returncode),
+                        "; time.sleep(10); sys.exit(" + str(returncode),
+                    )
+                else:
+                    helper = (
+                        "import os, subprocess, sys, time; "
+                        "child=subprocess.Popen([sys.executable, '-c', "
+                        "'import os,time; os.setsid(); time.sleep(10)'], close_fds=False); "
+                        "open(" + repr(escaped_child_pid_path) + ", 'w').write(str(child.pid)); "
+                        "sys.stdout.buffer.write(" + repr(output) + "); "
+                        "sys.stderr.buffer.write(" + repr(error) + "); "
+                        "sys.stdout.flush(); sys.stderr.flush(); "
+                        + ("time.sleep(0.15); sys.exit(" if root_exits_before_timeout else "time.sleep(10); sys.exit(")
+                        + str(returncode) + ")"
+                    )
             process = real_popen(
                 [os.sys.executable, "-c", helper],
                 stdout=kwargs.get("stdout"),
@@ -2144,6 +2209,73 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         self.assertTrue(error["process_group_cleanup_error"].startswith("PermissionError"))
         self.assertEqual(error["process_group_killed"], Path("/proc").is_dir())
 
+    @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
+    def test_guest_root_growth_script_kills_setsid_descendant_outside_process_group(self):
+        command = ["findmnt", "-n", "-o", "SOURCE", "-T", "/"]
+        with tempfile.TemporaryDirectory() as directory:
+            pid_path = Path(directory) / "child.pid"
+            exit_code, stdout, stderr, _ = self.execute_script(
+                timeout_command=command,
+                command_timeout=0.05,
+                escaped_child_pid_path=str(pid_path),
+            )
+
+            self.assertEqual(exit_code, 1)
+            error = json.loads(stderr)["error"]
+            self.assertEqual(error["cause"], "command_timeout")
+            for _ in range(20):
+                if pid_path.exists():
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("guest growth setsid child did not publish its pid")
+            child_pid = int(pid_path.read_text())
+            for _ in range(40):
+                try:
+                    state = (Path("/proc") / str(child_pid) / "stat").read_text()
+                    close_paren = state.rfind(")")
+                    if state[close_paren + 2 :].split()[0] == "Z":
+                        break
+                except FileNotFoundError:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("guest growth setsid descendant remained alive after timeout")
+
+    @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
+    def test_guest_root_growth_script_kills_setsid_descendant_after_leader_exit(self):
+        command = ["findmnt", "-n", "-o", "SOURCE", "-T", "/"]
+        with tempfile.TemporaryDirectory() as directory:
+            pid_path = Path(directory) / "child.pid"
+            exit_code, _, stderr, _ = self.execute_script(
+                timeout_command=command,
+                command_timeout=0.3,
+                escaped_child_pid_path=str(pid_path),
+                root_exits_before_timeout=True,
+            )
+
+            self.assertEqual(exit_code, 1)
+            error = json.loads(stderr)["error"]
+            self.assertEqual(error["cause"], "command_timeout")
+            for _ in range(20):
+                if pid_path.exists():
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("guest growth setsid child did not publish its pid")
+            child_pid = int(pid_path.read_text())
+            for _ in range(40):
+                try:
+                    state = (Path("/proc") / str(child_pid) / "stat").read_text()
+                    close_paren = state.rfind(")")
+                    if state[close_paren + 2 :].split()[0] == "Z":
+                        break
+                except FileNotFoundError:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("guest growth setsid descendant remained alive after leader exit")
+
     def test_guest_root_growth_script_bounds_command_output(self):
         exit_code, stdout, stderr, _ = self.execute_script(source_output="/dev/sda2\n" + "x" * 20000 + "\n")
 
@@ -2204,6 +2336,19 @@ class CommandRunnerTests(unittest.TestCase):
         )
         self.assertEqual(len(result.stdout), 128)
         self.assertTrue(result.stdout_truncated)
+
+    def test_bounded_runner_nonzero_preserves_output_truncation(self):
+        code = (
+            "import sys; sys.stdout.write('o' * 1000000); "
+            "sys.stderr.write('e' * 1000000); sys.exit(3)"
+        )
+        with self.assertRaises(CONTROL.ControlError) as failure:
+            CONTROL.CommandRunner().run_bounded(
+                [os.sys.executable, "-c", code], timeout=5, stdout_limit=128, stderr_limit=128
+            )
+        self.assertEqual(failure.exception.code, "command_failed")
+        self.assertTrue(failure.exception.detail["stdout_truncated"])
+        self.assertTrue(failure.exception.detail["stderr_truncated"])
 
     def test_bounded_runner_limits_stderr_and_kills_on_timeout(self):
         flood = "import sys; sys.stderr.write('e' * 1000000)"
@@ -2287,6 +2432,75 @@ class CommandRunnerTests(unittest.TestCase):
                 time.sleep(0.01)
             else:
                 self.fail("diagnostic descendant remained alive after timeout")
+
+    @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
+    def test_bounded_runner_kills_setsid_descendant_outside_process_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pid_path = Path(directory) / "child.pid"
+            code = (
+                "import os,subprocess,sys,time; "
+                "child=subprocess.Popen([sys.executable, '-c', "
+                "'import os,time; os.setsid(); time.sleep(10)'], close_fds=False); "
+                "open(sys.argv[1], 'w').write(str(child.pid)); "
+                "time.sleep(10)"
+            )
+            with self.assertRaises(CONTROL.ControlError):
+                CONTROL.CommandRunner().run_bounded(
+                    [os.sys.executable, "-c", code, str(pid_path)], timeout=0.2
+                )
+            for _ in range(20):
+                if pid_path.exists():
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("setsid diagnostic child did not publish its pid")
+            child_pid = int(pid_path.read_text())
+            for _ in range(40):
+                try:
+                    state = (Path("/proc") / str(child_pid) / "stat").read_text()
+                    close_paren = state.rfind(")")
+                    if state[close_paren + 2 :].split()[0] == "Z":
+                        break
+                except FileNotFoundError:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("setsid diagnostic descendant remained alive after timeout")
+
+    @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
+    def test_bounded_runner_kills_setsid_descendant_after_leader_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pid_path = Path(directory) / "child.pid"
+            code = (
+                "import os,subprocess,sys,time; "
+                "child=subprocess.Popen([sys.executable, '-c', "
+                "'import os,time; os.setsid(); time.sleep(10)'], close_fds=False); "
+                "open(sys.argv[1], 'w').write(str(child.pid)); "
+                "sys.stdout.flush(); sys.stderr.flush(); time.sleep(0.15); sys.exit(0)"
+            )
+            with self.assertRaises(CONTROL.ControlError) as failure:
+                CONTROL.CommandRunner().run_bounded(
+                    [os.sys.executable, "-c", code, str(pid_path)], timeout=0.3
+                )
+            self.assertEqual(failure.exception.code, "command_timeout")
+            for _ in range(20):
+                if pid_path.exists():
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("setsid diagnostic child did not publish its pid")
+            child_pid = int(pid_path.read_text())
+            for _ in range(40):
+                try:
+                    state = (Path("/proc") / str(child_pid) / "stat").read_text()
+                    close_paren = state.rfind(")")
+                    if state[close_paren + 2 :].split()[0] == "Z":
+                        break
+                except FileNotFoundError:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("setsid diagnostic descendant remained alive after leader exit")
 
     @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
     def test_bounded_runner_fallback_kills_descendants_when_group_signal_fails(self):
@@ -2418,6 +2632,22 @@ class IncusWaitTests(unittest.TestCase):
 
 
 class ReclaimTests(Fixture):
+    def test_failed_native_reclaim_delete_keeps_acquire_operation_pending(self):
+        cached = self.acquire("cached")
+        self.call("release", "cached")
+        self.runner.free = 10 * GIB
+        self.runner.failure = lambda args: args[3:4] == ["delete"]
+        request = self.request("acquire", "new", operation="reclaim-delete-uncertain", public_key=KEY)
+
+        with self.assertRaises(CONTROL.ControlError) as failure:
+            self.control.dispatch(request)
+
+        self.assertEqual(failure.exception.code, "reclaim_failed")
+        self.assertEqual(failure.exception.detail["detail"]["operation_phase"], "cache-delete")
+        self.assertFalse(failure.exception.detail["outcome_verified"])
+        self.assertEqual(self.store.operation(request["operation_id"])["outcome"], "pending")
+        self.assertEqual(self.store.get_task(task_id=cached["task_id"])["state"], "deleting")
+
     def test_manual_gc_previews_and_deletes_all_eligible_caches(self):
         old = self.acquire("old")
         self.call("release", "old")
@@ -2554,12 +2784,16 @@ class NativeCliTests(unittest.TestCase):
             ("status", {}, 240),
         ):
             response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": action,
-                        "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "result": {}}
+                        "session_id": "thread", "outcome": "success",
+                        "server_time": "2026-10-04T00:00:00+00:00", "result": {}}
             process = subprocess.CompletedProcess([], 0, json.dumps(response).encode(), b"")
             with self.subTest(action=action, fields=fields), mock.patch.object(CLI.subprocess, "run", return_value=process) as run:
                 CLI.control_request(action, session="thread", fields=fields)
                 self.assertEqual(run.call_args.kwargs["timeout"], expected)
-                self.assertIsNone(run.call_args.kwargs["stderr"])
+                self.assertNotEqual(run.call_args.kwargs["stdout"], subprocess.PIPE)
+                self.assertNotEqual(run.call_args.kwargs["stderr"], subprocess.PIPE)
+                self.assertTrue(hasattr(run.call_args.kwargs["stdout"], "fileno"))
+                self.assertTrue(hasattr(run.call_args.kwargs["stderr"], "fileno"))
 
     def test_exec_argv_and_online_tar_are_safely_quoted(self):
         parser = CLI.build_parser()

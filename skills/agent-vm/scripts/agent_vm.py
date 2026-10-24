@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shlex
 import subprocess
 import sys
@@ -547,11 +548,17 @@ def _remote_error_outcome_uncertain(error: Mapping[str, Any], *, action: str | N
     return True
 
 
-def _drain_bounded_stream(fd: int, limit: int, output: list[bytes], truncated: list[bool]) -> None:
+def _drain_bounded_stream(fd: int, limit: int, output: list[bytes], truncated: list[bool],
+                          stop_event: threading.Event | None = None) -> None:
     retained = bytearray()
     try:
         try:
             while True:
+                if stop_event is not None and stop_event.is_set():
+                    break
+                ready, _, _ = select.select([fd], [], [], 0.1)
+                if not ready:
+                    continue
                 chunk = os.read(fd, 65536)
                 if not chunk:
                     break
@@ -561,7 +568,8 @@ def _drain_bounded_stream(fd: int, limit: int, output: list[bytes], truncated: l
                 if len(retained) > limit:
                     truncated[0] = True
         except OSError:
-            # A timeout closes the read end to release a descendant-held pipe.
+            # The reader owns the descriptor; cancellation is handled by the
+            # bounded select loop so a late reader cannot close a reused fd.
             pass
     finally:
         try:
@@ -623,14 +631,15 @@ def control_request(action: str, *, session: str | None, generation: int | None 
         stderr_output: list[bytes] = []
         stdout_truncated_flag = [False]
         stderr_truncated_flag = [False]
+        stream_stop = threading.Event()
         stdout_reader = threading.Thread(
             target=_drain_bounded_stream,
-            args=(stdout_read, REMOTE_STDOUT_LIMIT_BYTES, stdout_output, stdout_truncated_flag),
+            args=(stdout_read, REMOTE_STDOUT_LIMIT_BYTES, stdout_output, stdout_truncated_flag, stream_stop),
             daemon=True,
         )
         stderr_reader = threading.Thread(
             target=_drain_bounded_stream,
-            args=(stderr_read, REMOTE_STDERR_LIMIT_BYTES, stderr_output, stderr_truncated_flag),
+            args=(stderr_read, REMOTE_STDERR_LIMIT_BYTES, stderr_output, stderr_truncated_flag, stream_stop),
             daemon=True,
         )
         stdout_reader.start()
@@ -654,11 +663,7 @@ def control_request(action: str, *, session: str | None, generation: int | None 
             stdout_sink.close()
             stderr_sink.close()
             if remote_timeout:
-                for fd in (stdout_read, stderr_read):
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
+                stream_stop.set()
                 stdout_reader.join(timeout=1)
                 stderr_reader.join(timeout=1)
                 if stdout_reader.is_alive() or stderr_reader.is_alive():
@@ -666,14 +671,11 @@ def control_request(action: str, *, session: str | None, generation: int | None 
                     stream_cleanup_error = "reader_join_timeout"
             else:
                 reader_deadline = request_started + request_timeout
-                for reader, fd in ((stdout_reader, stdout_read), (stderr_reader, stderr_read)):
+                for reader in (stdout_reader, stderr_reader):
                     reader.join(timeout=max(0.0, reader_deadline - time.monotonic()))
                     if reader.is_alive():
-                        try:
-                            os.close(fd)
-                        except OSError:
-                            pass
-                        reader.join(timeout=max(0.0, reader_deadline - time.monotonic()))
+                        stream_stop.set()
+                        reader.join(timeout=0.2)
                     if reader.is_alive():
                         stream_cleanup_verified = False
                         stream_cleanup_error = "reader_join_timeout"
@@ -711,7 +713,8 @@ def control_request(action: str, *, session: str | None, generation: int | None 
         }
         if stream_cleanup_error is not None:
             detail["stream_cleanup_error"] = stream_cleanup_error
-        fail("remote_failed", "control response stream cleanup is not verified", detail, process.returncode)
+        exit_code = process.returncode if process is not None and process.returncode else 1
+        fail("remote_failed", "control response stream cleanup is not verified", detail, exit_code)
     if process.returncode:
         if stdout_truncated or stderr_truncated or not stream_cleanup_verified:
             detail = {

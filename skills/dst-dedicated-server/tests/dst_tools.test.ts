@@ -1736,7 +1736,12 @@ try {
       const ledger = await readFile(ledgerPath, "utf8");
       expect(ledger.trim().length).toBeGreaterThan(0);
       await writeFile(ledgerPath, `${ledger}999999|proc:forged|999999\n`, "utf8");
-      expect(await supervised.forceCleanup()).toBe(false);
+      const rejected = supervised.forceCleanup();
+      expect(await rejected).toBe(false);
+      // A failed force attempt must not suppress future cleanup attempts.
+      const retry = supervised.forceCleanup();
+      expect(retry).not.toBe(rejected);
+      expect(await retry).toBe(false);
     } finally {
       killTarget("SIGKILL");
       if (supervised !== undefined) {
@@ -1857,6 +1862,107 @@ try {
       if (descendantPid !== undefined && isAlive(descendantPid)) {
         try { process.kill(descendantPid, "SIGKILL"); } catch { /* The descendant may have exited. */ }
       }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  for (const replayRaw of [false, true]) {
+    test(`rejects an older signed ledger after anchor loss (raw replay: ${replayRaw})`, { timeout: 30_000 }, async () => {
+      if (process.platform === "win32") return;
+      const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-replay-"));
+      const trigger = join(root, "start");
+      const detachedMarker = join(root, "detached.pid");
+      let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+      let statusDirectory: string | undefined;
+      let anchorPid: number | undefined;
+      let detachedPid: number | undefined;
+      const before = new Set(await readdir(tmpdir()));
+      try {
+        supervised = await spawnSupervised([
+          "sh", "-c",
+          "while [ ! -e \"$1\" ]; do sleep 0.02; done; perl -MPOSIX -e 'POSIX::setsid() < 0 and exit 125; open my $f, \">\", $ARGV[0] or exit 1; print $f \"$$\\n\"; close $f; $SIG{HUP}=\"IGNORE\"; $SIG{TERM}=\"IGNORE\"; sleep 30' \"$2\" & wait",
+          "replay-target", trigger, detachedMarker,
+        ]);
+        for (const entry of await readdir(tmpdir())) {
+          if (!before.has(entry) && entry.startsWith(".agent-toolkit-dst-supervisor-") && !entry.includes("ack-")) {
+            const candidate = join(tmpdir(), entry);
+            if ((await lstat(join(candidate, "target")).catch(() => undefined))?.isFile()) statusDirectory = candidate;
+          }
+        }
+        expect(statusDirectory).toBeDefined();
+        anchorPid = Number((await readFile(join(statusDirectory!, "target"), "utf8")).trim());
+        const authenticatedPath = join(statusDirectory!, "descendants-authenticated");
+        const rawPath = join(statusDirectory!, "descendants");
+        const oldAuthenticated = await readFile(authenticatedPath, "utf8");
+        const oldRaw = oldAuthenticated.slice(oldAuthenticated.indexOf("\n") + 1);
+        await writeFile(trigger, "start");
+        for (let attempt = 0; attempt < 160; attempt += 1) {
+          detachedPid = Number((await readFile(detachedMarker, "utf8").catch(() => "")).trim());
+          const current = await readFile(authenticatedPath, "utf8");
+          if (detachedPid > 0 && current.includes(`${detachedPid}|`)) break;
+          await Bun.sleep(25);
+        }
+        expect(detachedPid).toBeGreaterThan(0);
+        expect(await readFile(authenticatedPath, "utf8")).toContain(`${detachedPid}|`);
+        // Freeze publication, then restore a valid historical signature. The
+        // second case also restores raw bytes to defeat consistency-only checks.
+        supervised.child.kill("SIGSTOP");
+        await Bun.sleep(50);
+        await writeFile(authenticatedPath, oldAuthenticated);
+        if (replayRaw) await writeFile(rawPath, oldRaw);
+        process.kill(anchorPid, "SIGKILL");
+        expect(await supervised.forceCleanup()).toBe(false);
+        expect(await supervised.exited).toBe(SUPERVISOR_UNKNOWN_TARGET_STATUS);
+        // A rejected proof must retain its directory for diagnosis.
+        expect((await lstat(statusDirectory!)).isDirectory()).toBe(true);
+      } finally {
+        if (supervised !== undefined) {
+          try { supervised.child.kill("SIGKILL"); } catch {}
+          await supervised.wrapperExited.catch(() => undefined);
+          await supervised.cleanup();
+        }
+        for (const pid of [anchorPid, detachedPid]) {
+          if (pid !== undefined && pid > 0) {
+            try { process.kill(-pid, "SIGKILL"); } catch {}
+            try { process.kill(pid, "SIGKILL"); } catch {}
+          }
+        }
+        if (statusDirectory !== undefined) await rm(statusDirectory, { recursive: true, force: true });
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test("serializes automatic and forced cleanup after wrapper SIGKILL", { timeout: 90_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-cleanup-race-"));
+    try {
+      for (const delay of [0, 25, 250, 2_100, 2_250, 2_500]) {
+        const marker = join(root, `child-${delay}.pid`);
+        let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+        let pid: number | undefined;
+        try {
+          supervised = await spawnSupervised(["sh", "-c", "sleep 30 & printf '%s\\n' \"$!\" > \"$1\"; wait", "race-target", marker]);
+          pid = Number((await readFile(marker, "utf8")).trim());
+          expect(pid).toBeGreaterThan(0);
+          supervised.child.kill("SIGKILL");
+          await Bun.sleep(delay);
+          const first = supervised.forceCleanup();
+          expect(supervised.forceCleanup()).toBe(first);
+          expect(await first).toBe(true);
+          expect(await supervised.exited).toBe(SUPERVISOR_UNKNOWN_TARGET_STATUS);
+          const state = Bun.spawnSync(["ps", "-o", "state=", "-p", String(pid)], { stdout: "pipe", stderr: "ignore" });
+          expect(new TextDecoder().decode(state.stdout).trim().replace(/^Z.*$/, "")).toBe("");
+        } finally {
+          if (supervised !== undefined) {
+            try { supervised.child.kill("SIGKILL"); } catch {}
+            await supervised.wrapperExited.catch(() => undefined);
+            await supervised.cleanup();
+          }
+          if (pid !== undefined) { try { process.kill(pid, "SIGKILL"); } catch {} }
+        }
+      }
+    } finally {
       await rm(root, { recursive: true, force: true });
     }
   });

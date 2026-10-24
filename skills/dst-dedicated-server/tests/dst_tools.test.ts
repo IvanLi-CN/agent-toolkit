@@ -1920,6 +1920,84 @@ try {
     }
   });
 
+  for (const snapshotFailure of [false, true]) {
+    test(`handles a natural exit with cleanup ACK zero (snapshot failure: ${snapshotFailure})`, { timeout: 45_000 }, async () => {
+      if (process.platform === "win32") return;
+      const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-natural-ack-zero-"));
+      const marker = join(root, "descendant.pid");
+      const trigger = join(root, "exit-and-fail-cleaner");
+      const failScan = join(root, "fail-cleaner-snapshot");
+      const previousPath = process.env.PATH;
+      const realMktemp = Bun.which("mktemp");
+      const realPs = Bun.which("ps");
+      const before = new Set(await readdir(tmpdir()));
+      let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+      let directory: string | undefined;
+      let pid: number | undefined;
+      const alive = (target: number): boolean => {
+        const state = Bun.spawnSync(["ps", "-o", "state=", "-p", String(target)], { stdout: "pipe", stderr: "ignore" });
+        return new TextDecoder().decode(state.stdout).trim().replace(/^Z.*$/, "") !== "";
+      };
+      try {
+        await writeFile(join(root, "mktemp"), `#!/bin/sh
+case "$*" in
+  *.cleanup-owner-candidate.*) if [ -e "${trigger}" ]; then ${snapshotFailure ? `printf failure > "${failScan}"` : "exit 1"}; fi ;;
+esac
+exec "${realMktemp}" "$@"
+`);
+        await chmod(join(root, "mktemp"), 0o755);
+        await writeFile(join(root, "ps"), `#!/bin/sh
+if [ "$*" = "-eo pid=,ppid=,pgid=" ] && [ -e "${failScan}" ]; then printf 'malformed process row\\n'; exit 0; fi
+exec "${realPs}" "$@"
+`);
+        await chmod(join(root, "ps"), 0o755);
+        process.env.PATH = `${root}:${previousPath ?? ""}`;
+        supervised = await spawnSupervised([
+          "sh", "-c",
+          "perl -e '$SIG{HUP}=\"IGNORE\"; $SIG{TERM}=\"IGNORE\"; open my $f, \">\", $ARGV[0] or exit 1; print $f \"$$\\n\"; close $f; sleep 30' \"$1\" & while [ ! -e \"$2\" ]; do sleep 0.02; done; exit 0",
+          "natural-exit-target", marker, trigger,
+        ]);
+        process.env.PATH = previousPath;
+        directory = await supervisorStatusDirectory(before, supervised.child.pid);
+        for (let attempt = 0; attempt < 160; attempt += 1) {
+          pid = Number((await readFile(marker, "utf8").catch(() => "")).trim());
+          const ledger = await readFile(join(directory, "descendants-authenticated"), "utf8");
+          if (pid > 0 && ledger.includes(`${pid}|`)) break;
+          await Bun.sleep(25);
+        }
+        expect(pid).toBeGreaterThan(0);
+        expect(await readFile(join(directory, "descendants-authenticated"), "utf8")).toContain(`${pid}|`);
+        await writeFile(trigger, "exit");
+        expect(await supervised.wrapperExited).toBe(0);
+        expect(await supervised.exited).toBe(0);
+        expect(await supervised.waitForCleanupAcknowledged()).toBe(false);
+        if (snapshotFailure) {
+          // The failure happened in the detached cleaner, after FD6 was closed.
+          // Erasing its disk markers cannot clear the private ACK-channel latch.
+          expect((await readdir(directory)).some((entry) => entry.startsWith("snapshot-failed"))).toBe(true);
+          for (const entry of await readdir(directory)) {
+            if (entry.startsWith("snapshot-failed") || entry === "descendant-scan-failed" || entry === "descendant-scan-truncated") await rm(join(directory, entry));
+          }
+          expect(await supervised.forceCleanup()).toBe(false);
+        } else {
+          expect(alive(pid!)).toBe(true);
+          expect(await supervised.forceCleanup()).toBe(true);
+          expect(alive(pid!)).toBe(false);
+        }
+      } finally {
+        process.env.PATH = previousPath;
+        if (supervised !== undefined) {
+          try { supervised.child.kill("SIGKILL"); } catch {}
+          await supervised.wrapperExited.catch(() => undefined);
+          await supervised.cleanup();
+        }
+        if (pid !== undefined && pid > 0) { try { process.kill(pid, "SIGKILL"); } catch {} }
+        if (directory !== undefined) await rm(directory, { recursive: true, force: true });
+        await rm(root, { recursive: true, force: true });
+      }
+  });
+  }
+
   for (const replayRaw of [false, true]) {
     test(`rejects an older signed ledger after anchor loss (raw replay: ${replayRaw})`, { timeout: 30_000 }, async () => {
       if (process.platform === "win32") return;

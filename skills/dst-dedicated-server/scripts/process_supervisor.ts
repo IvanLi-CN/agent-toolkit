@@ -112,7 +112,11 @@ fail_snapshot() {
   if [ "$snapshot_failure_latched" = "0" ]; then
     snapshot_failure_latched=1
     # Failure is terminal on the private channel, regardless of mutable markers.
-    if [ "$ledger_notifications_enabled" = "1" ]; then (trap '' PIPE; printf '%s\\n' failed >&6 2>/dev/null) || true; fi
+    if [ "$ledger_notifications_enabled" = "1" ]; then
+      (trap '' PIPE; printf '%s\\n' failed >&6 2>/dev/null) || true
+    else
+      (trap '' PIPE; printf '%s\\n' failed >&4 2>/dev/null) || true
+    fi
   fi
 }
 ledger_auth_key=""
@@ -424,12 +428,13 @@ write_ledger_auth() {
       && $final[7] == $opened[7] && length($data) == $opened[7] && length($data) <= 1048576;
     close($in) or exit 1;
     my $authentication = hmac_sha256_hex($generation . "\n" . $data, pack("H*", $key));
-    if ($notify eq "1") {
+    {
       $SIG{PIPE} = "IGNORE";
       # Bind freshness to authenticated bytes before exposing a new disk file.
       # The parent can verify this header against raw data even if publication
       # is interrupted before the atomic authenticated-file rename.
-      open(my $publication, ">&", 6) or exit 1;
+      my $publication_fd = $notify eq "1" ? 6 : 4;
+      open(my $publication, ">&", $publication_fd) or exit 1;
       print {$publication} $generation, ":", $authentication, ":", $authorized, "\n" or exit 1;
       close($publication) or exit 1;
     }
@@ -2705,7 +2710,7 @@ async function readNumericMarker(path: string): Promise<number | undefined> {
   return /^[1-9][0-9]*$/.test(value) ? Number(value) : undefined;
 }
 
-async function readStatusPipe(fd: number, timeoutMs = SUPERVISOR_STATUS_PIPE_TIMEOUT_MS): Promise<number | undefined> {
+async function readStatusPipe(fd: number, timeoutMs = SUPERVISOR_STATUS_PIPE_TIMEOUT_MS, onFrame?: (frame: string) => void): Promise<number | undefined> {
   const reader = Bun.file(fd).stream().getReader();
   const decoder = new TextDecoder();
   let value = "";
@@ -2731,13 +2736,19 @@ async function readStatusPipe(fd: number, timeoutMs = SUPERVISOR_STATUS_PIPE_TIM
       }
       if (result.read.done) break;
       value += decoder.decode(result.read.value ?? new Uint8Array(), { stream: true });
-      const lineEnd = value.indexOf("\n");
-      if (lineEnd >= 0) {
+      let lineEnd: number;
+      while ((lineEnd = value.indexOf("\n")) >= 0) {
         const normalized = value.slice(0, lineEnd).trim();
-        if (!/^[0-9]+$/.test(normalized)) return undefined;
+        value = value.slice(lineEnd + 1);
+        if (!/^[0-9]+$/.test(normalized)) {
+          if (onFrame === undefined) return undefined;
+          onFrame(normalized);
+          continue;
+        }
         const status = Number(normalized);
         return Number.isInteger(status) && status >= 0 && status <= 255 ? status : undefined;
       }
+      if (value.length > 128) { onFrame?.("failed"); return undefined; }
     }
     value += decoder.decode();
     const normalized = value.trim();
@@ -3356,10 +3367,22 @@ async function waitForTarget(
 
 // Only the wrapper owns the write end. Target launchers close it before
 // starting commands, so filesystem replay cannot lower this in-memory floor.
-function trackLedgerGenerations(fd: number): { latest: () => number; authentication: () => string | undefined; authorized: () => boolean; finished: Promise<void> } {
+function trackLedgerGenerations(fd: number): { latest: () => number; authentication: () => string | undefined; authorized: () => boolean; acceptFrame: (frame: string) => void; finished: Promise<void> } {
   let latest = 0;
   let authentication: string | undefined;
   let authorized = false;
+  const acceptFrame = (line: string): void => {
+    if (!Number.isFinite(latest)) return;
+    const frame = /^([1-9][0-9]*):([0-9a-f]{64}):([01])$/.exec(line);
+    const generation = frame === null ? NaN : Number(frame[1]);
+    if (!Number.isSafeInteger(generation) || generation <= latest) {
+      latest = Infinity;
+      return;
+    }
+    latest = generation;
+    authentication = `${frame![1]}:${frame![2]}`;
+    authorized ||= frame![3] === "1";
+  };
   const finished = (async () => {
     const reader = Bun.file(fd).stream().getReader();
     let pending = "";
@@ -3372,15 +3395,8 @@ function trackLedgerGenerations(fd: number): { latest: () => number; authenticat
         while ((newline = pending.indexOf("\n")) >= 0) {
           const line = pending.slice(0, newline);
           pending = pending.slice(newline + 1);
-          const frame = /^([1-9][0-9]*):([0-9a-f]{64}):([01])$/.exec(line);
-          const generation = frame === null ? NaN : Number(frame[1]);
-          if (!Number.isSafeInteger(generation) || generation <= latest) {
-            latest = Infinity;
-            return;
-          }
-          latest = generation;
-          authentication = `${frame![1]}:${frame![2]}`;
-          authorized ||= frame![3] === "1";
+          acceptFrame(line);
+          if (!Number.isFinite(latest)) return;
         }
         if (pending.length > 100) { latest = Infinity; return; }
       }
@@ -3393,7 +3409,7 @@ function trackLedgerGenerations(fd: number): { latest: () => number; authenticat
       await closeFileDescriptor(fd);
     }
   })();
-  return { latest: () => latest, authentication: () => authentication, authorized: () => authorized, finished };
+  return { latest: () => latest, authentication: () => authentication, authorized: () => authorized, acceptFrame, finished };
 }
 
 async function waitForReady(path: string, wrapperExited: Promise<number>): Promise<boolean> {
@@ -3570,7 +3586,8 @@ async function waitForCleanupAck(
   wrapperExited: Promise<number>,
   statusDirectory: string,
   directoryIdentity: SupervisorDirectoryIdentity,
-): Promise<boolean> {
+  onFrame: (frame: string) => void,
+): Promise<{ acknowledged: boolean; allowFallback: boolean }> {
   const wrapperResult = await raceWithTimeout(
     wrapperExited.then((code) => ({ done: true as const, code })),
     20,
@@ -3585,10 +3602,10 @@ async function waitForCleanupAck(
         ? SUPERVISOR_CLEANUP_TIMEOUT_MS
         : SUPERVISOR_UNEXPECTED_EXIT_SETTLE_MS;
   }
-  const acknowledgement = await readStatusPipe(fd, timeoutMs);
+  const acknowledgement = await readStatusPipe(fd, timeoutMs, onFrame);
   const directoryCurrent = await supervisorDirectoryIsCurrent(statusDirectory);
   await settleSupervisorDirectory(statusDirectory, acknowledgement, directoryIdentity);
-  return acknowledgement === 1 && directoryCurrent;
+  return { acknowledged: acknowledgement === 1 && directoryCurrent, allowFallback: acknowledgement === 0 && directoryCurrent };
 }
 
 async function createSupervisorMarker(path: string): Promise<boolean> {
@@ -3681,8 +3698,19 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
     let targetCleanupComplete = false;
     let forceCleanupPromise: Promise<boolean> | undefined;
     let cleanupAckPromise: Promise<boolean> | undefined;
+    let cleanupFallbackReady = false;
     const waitForCleanupAcknowledged = (): Promise<boolean> => {
-      cleanupAckPromise ??= waitForCleanupAck(cleanupFd, cleanupStartedPath, wrapperExited, directory, directoryIdentity).finally(() => {
+      cleanupAckPromise ??= (async () => {
+        const frames: string[] = [];
+        const result = await waitForCleanupAck(cleanupFd, cleanupStartedPath, wrapperExited, directory, directoryIdentity, (frame) => frames.push(frame));
+        // The two private pipes may be scheduled independently. Apply cleaner
+        // frames only after the wrapper's earlier generation stream is drained.
+        const drained = await raceWithTimeout(generations.finished.then(() => true), SUPERVISOR_STATUS_PIPE_TIMEOUT_MS, false);
+        if (!drained) { generations.acceptFrame("failed"); return false; }
+        for (const frame of frames) generations.acceptFrame(frame);
+        cleanupFallbackReady = result.allowFallback && Number.isFinite(generations.latest());
+        return result.acknowledged && Number.isFinite(generations.latest());
+      })().finally(() => {
         cleanupFdForParent = undefined;
       });
       return cleanupAckPromise;
@@ -3692,11 +3720,11 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
       targetCleanupPromise ??= (async () => {
         if (await wrapperExited === 0) {
           // The detached cleaner closes the generation channel before work.
-          // Its private ACK owns that cleanup result; disk markers cannot
-          // override a failed ACK or resurrect the pre-cleanup snapshot.
+          // Its private ACK channel carries subsequent freshness/failure
+          // frames. Drain it before attempting authenticated parent recovery.
           const cleaned = await waitForCleanupAcknowledged();
-          if (cleaned) targetCleanupComplete = true;
-          return cleaned;
+          if (cleaned) { targetCleanupComplete = true; return true; }
+          if (!cleanupFallbackReady) return false;
         }
         // Drain the private channel after wrapper exit before accepting any
         // disk snapshot. Never race automatic cleanup against forced cleanup.

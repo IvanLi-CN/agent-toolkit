@@ -386,7 +386,10 @@ class Fixture(unittest.TestCase):
             "scope": "ct-cpu-pressure",
             "sources": ["cgroupfs"],
             "mountpoint": "/sys/fs/cgroup",
+            "mount_root": "/",
             "filesystem": "cgroup2",
+            "cgroup_path": "/",
+            "metric": "/sys/fs/cgroup/cpu.pressure",
             "some": {"avg10": 0.0, "avg60": 0.0, "avg300": 0.0, "total": 0.0},
             "full": {"avg10": 0.0, "avg60": 0.0, "avg300": 0.0, "total": 0.0},
         }
@@ -849,6 +852,7 @@ class LifecycleTests(Fixture):
                 self.call("port-add", name="web", vm_port=8080)
 
         self.assertEqual(failure.exception.code, "task_not_active")
+        self.assertEqual(failure.exception.detail["operation_phase"], "port-add")
         task = self.store.get_task(session_id="thread-a")
         self.assertIsNone(self.store.get_port(task["task_id"], "web", "tcp"))
 
@@ -2562,12 +2566,13 @@ class NativeCliTests(unittest.TestCase):
             ("status", {}, 240),
         ):
             response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": action,
-                        "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "result": {}}
+                        "session_id": "thread", "outcome": "success",
+                        "server_time": "2026-10-04T00:00:00+00:00", "result": {}}
             process = subprocess.CompletedProcess([], 0, json.dumps(response).encode(), b"")
             with self.subTest(action=action, fields=fields), mock.patch.object(CLI.subprocess, "run", return_value=process) as run:
                 CLI.control_request(action, session="thread", fields=fields)
                 self.assertEqual(run.call_args.kwargs["timeout"], expected)
-                self.assertEqual(run.call_args.kwargs["stderr"], subprocess.PIPE)
+                self.assertIsInstance(run.call_args.kwargs["stderr"], tempfile.SpooledTemporaryFile)
 
     def test_exec_argv_and_online_tar_are_safely_quoted(self):
         parser = CLI.build_parser()

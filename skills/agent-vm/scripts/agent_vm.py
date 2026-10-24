@@ -28,6 +28,7 @@ VERSION = "0.4.0-native"
 REMOTE_CONTROL = "/opt/agent-vm-native/agent_vm_control.py"
 DEFAULT_CONTROL_TIMEOUT_SECONDS = 240
 LONG_CONTROL_TIMEOUT_SECONDS = 600
+REMOTE_STDERR_LIMIT_BYTES = 64 * 1024
 SESSION_ENV = "AGENT_VM_SESSION_ID"
 CONTROL_HOST_ENV = "AGENT_VM_CONTROL_HOST"
 REMOTE_CONTROL_ENV = "AGENT_VM_REMOTE_CONTROL"
@@ -463,6 +464,10 @@ def _write_local_operation(path: Path, request: Mapping[str, Any], result: Mappi
         )
 
 
+def _json_value_matches(actual: Any, expected: Any) -> bool:
+    return type(actual) is type(expected) and actual == expected
+
+
 def _parse_remote_error(raw: bytes | None, *, request: Mapping[str, Any]) -> dict[str, Any] | None:
     if not raw:
         return None
@@ -470,19 +475,20 @@ def _parse_remote_error(raw: bytes | None, *, request: Mapping[str, Any]) -> dic
         lines = raw.decode("utf-8", "replace").splitlines()
     except Exception:
         return None
-    for line in reversed(lines):
+    matches: list[dict[str, Any]] = []
+    for line in lines:
         try:
             payload = json.loads(line)
         except (TypeError, ValueError):
             continue
         if not isinstance(payload, dict):
             continue
-        if payload.get("ok") is not False or payload.get("protocol") != PROTOCOL_VERSION:
+        if payload.get("ok") is not False or not _json_value_matches(payload.get("protocol"), PROTOCOL_VERSION):
             continue
         # A write journal may be finalized only from an error envelope emitted
         # for this exact request.  SSH/wrapper diagnostics are not outcomes.
         identity = ("action", "session_id", "generation", "operation_id")
-        if any(key not in payload or payload[key] != request[key] for key in identity if key in request):
+        if any(key not in payload or not _json_value_matches(payload[key], request[key]) for key in identity if key in request):
             continue
         error = payload.get("error")
         if not isinstance(error, dict):
@@ -490,8 +496,8 @@ def _parse_remote_error(raw: bytes | None, *, request: Mapping[str, Any]) -> dic
         code = error.get("code")
         message = error.get("message")
         if isinstance(code, str) and code and isinstance(message, str) and message:
-            return error
-    return None
+            matches.append(error)
+    return matches[0] if len(matches) == 1 else None
 
 
 _DETERMINISTIC_REMOTE_ERROR_CODES = frozenset({
@@ -525,12 +531,11 @@ def _remote_error_outcome_uncertain(error: Mapping[str, Any], *, action: str | N
     detail = error.get("detail")
     if isinstance(detail, Mapping) and any(detail.get(key) in {
         "native-generation", "native-init", "native-config", "native-stop", "native-start",
-        "guest-readiness", "guest-post-check", "access-exposure",
+        "guest-readiness", "guest-post-check", "access-exposure", "port-add",
     } for key in ("phase", "operation_phase")):
         return True
-    if action == "port-add" and code in {"generation_mismatch", "task_not_active"}:
-        # port-add can have created a native proxy before its final state check.
-        return True
+    if isinstance(detail, Mapping) and isinstance(detail.get("outcome_verified"), bool):
+        return not detail["outcome_verified"]
     if code in _DETERMINISTIC_REMOTE_ERROR_CODES:
         return False
     return True
@@ -574,19 +579,32 @@ def control_request(action: str, *, session: str | None, generation: int | None 
     try:
         control_host = os.environ.get(CONTROL_HOST_ENV, DEFAULT_CONTROL_HOST)
         remote_control = os.environ.get(REMOTE_CONTROL_ENV, DEFAULT_REMOTE_CONTROL)
-        process = subprocess.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", control_host,
-                                  shlex.join(["python3", remote_control])],
-                                 input=json.dumps(request, sort_keys=True).encode(), stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE, check=False, timeout=control_timeout(action, fields))
+        with tempfile.SpooledTemporaryFile(max_size=REMOTE_STDERR_LIMIT_BYTES, mode="w+b") as stderr_sink:
+            process = subprocess.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", control_host,
+                                      shlex.join(["python3", remote_control])],
+                                     input=json.dumps(request, sort_keys=True).encode(), stdout=subprocess.PIPE,
+                                     stderr=stderr_sink, check=False, timeout=control_timeout(action, fields))
+            stderr = process.stderr
+            if stderr is None:
+                stderr_sink.seek(0)
+                stderr = stderr_sink.read(REMOTE_STDERR_LIMIT_BYTES + 1)
     except FileNotFoundError: fail("command_missing", "ssh is not installed")
     except subprocess.TimeoutExpired:
         fail("remote_timeout", "control outcome is uncertain; retry the same operation ID",
              {"operation_id": request.get("operation_id")})
-    if process.stderr:
-        sys.stderr.buffer.write(process.stderr)
+    if not isinstance(stderr, bytes):
+        stderr = b""
+    stderr_truncated = len(stderr) > REMOTE_STDERR_LIMIT_BYTES
+    stderr = stderr[:REMOTE_STDERR_LIMIT_BYTES]
+    if stderr:
+        sys.stderr.buffer.write(stderr)
         sys.stderr.flush()
     if process.returncode:
-        remote_error = _parse_remote_error(process.stderr, request=request)
+        if stderr_truncated:
+            fail("remote_failed", "remote request failed; bounded stderr was truncated and control outcome is not verified",
+                 {"operation_id": request.get("operation_id"), "stderr_truncated": True,
+                  "stderr_limit_bytes": REMOTE_STDERR_LIMIT_BYTES}, process.returncode)
+        remote_error = _parse_remote_error(stderr, request=request)
         if remote_error is not None:
             if op_path is not None and not _remote_error_outcome_uncertain(remote_error, action=action):
                 _finalize_local_error(op_path, request, remote_error)
@@ -602,7 +620,11 @@ def control_request(action: str, *, session: str | None, generation: int | None 
     except (ValueError, UnicodeDecodeError): fail("invalid_remote_response", "control did not return JSON")
     if not isinstance(response, dict) or response.get("protocol") != PROTOCOL_VERSION or response.get("action") != action or response.get("session_id") != session:
         fail("protocol_mismatch", "response protocol or request identity differs")
-    if not response.get("ok") or not isinstance(response.get("result"), dict) or not isinstance(response.get("server_time"), str):
+    if "generation" in request and not _json_value_matches(response.get("generation"), request["generation"]):
+        fail("protocol_mismatch", "response generation differs")
+    if response.get("outcome") not in {"success", "replayed"}:
+        fail("invalid_remote_response", "control response outcome is missing or invalid")
+    if response.get("ok") is not True or not isinstance(response.get("result"), dict) or not isinstance(response.get("server_time"), str):
         fail("invalid_remote_response", "invalid control response envelope")
     if write and response.get("operation_id") != request["operation_id"]:
         fail("protocol_mismatch", "operation identity differs")

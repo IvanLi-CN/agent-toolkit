@@ -795,6 +795,8 @@ def parse_cpu_psi(raw: str) -> dict[str, dict[str, float]]:
             name, separator, value = field.partition("=")
             if not separator or name in values:
                 raise ValueError("invalid CPU PSI field")
+            if name == "total" and re.fullmatch(r"[0-9]+", value) is None:
+                raise ValueError("invalid CPU PSI total")
             try:
                 number = float(value)
             except ValueError as exc:
@@ -851,28 +853,53 @@ class CTResources:
         matches = []
         for line in self._read("/proc/self/mountinfo").splitlines():
             before, separator, after = line.partition(" - ")
+            if not separator:
+                continue
             left, right = before.split(), after.split()
-            if separator and len(left) >= 5 and right and left[4] == "/sys/fs/cgroup":
-                matches.append(right[0])
-        if matches != ["cgroup2"]:
+            if len(left) >= 5 and right and left[3] == "/" and left[4] == "/sys/fs/cgroup":
+                matches.append((right[0], left[3]))
+        if matches != [("cgroup2", "/")]:
             raise ControlError(
                 "resource_unverified",
                 "CT cgroup v2 mount cannot be verified",
                 {"metric": "/proc/self/mountinfo", "mountpoint": "/sys/fs/cgroup"},
             )
 
+    def current_cgroup_path(self) -> str:
+        lines = [line for line in self._read("/proc/self/cgroup").splitlines() if line.strip()]
+        if len(lines) != 1:
+            raise ControlError("resource_unverified", "CT cgroup path cannot be verified",
+                               {"metric": "/proc/self/cgroup"})
+        fields = lines[0].split(":", 2)
+        if len(fields) != 3 or fields[0] != "0" or fields[1] != "":
+            raise ControlError("resource_unverified", "CT cgroup path is not unified",
+                               {"metric": "/proc/self/cgroup"})
+        path = fields[2]
+        if path != "/" and (
+            re.fullmatch(r"/[^\x00/]+(?:/[^\x00/]+)*", path) is None
+            or any(part in {".", ".."} for part in path.split("/"))
+        ):
+            raise ControlError("resource_unverified", "CT cgroup path is invalid",
+                               {"metric": "/proc/self/cgroup"})
+        return path
+
     def cpu_pressure(self) -> dict[str, Any]:
         self._verify_cgroup2_mount()
+        cgroup_path = self.current_cgroup_path()
+        pressure_path = "/sys/fs/cgroup" + ("" if cgroup_path == "/" else cgroup_path) + "/cpu.pressure"
         try:
-            values = parse_cpu_psi(self._read("/sys/fs/cgroup/cpu.pressure"))
+            values = parse_cpu_psi(self._read(pressure_path))
         except ValueError as exc:
             raise ControlError("resource_unverified", "CT CPU pressure metric is invalid",
-                               {"metric": "/sys/fs/cgroup/cpu.pressure"}) from exc
+                               {"metric": pressure_path}) from exc
         return {
             "scope": "ct-cpu-pressure",
             "sources": ["cgroupfs"],
             "mountpoint": "/sys/fs/cgroup",
+            "mount_root": "/",
             "filesystem": "cgroup2",
+            "cgroup_path": cgroup_path,
+            "metric": pressure_path,
             **values,
         }
 
@@ -2578,7 +2605,7 @@ class Control:
         phases = {str(detail.get(key)) for key in ("phase", "operation_phase") if detail.get(key) is not None}
         native_phases = {
             "native-generation", "native-init", "native-config", "native-stop", "native-start",
-            "guest-readiness", "guest-post-check", "access-exposure",
+            "guest-readiness", "guest-post-check", "access-exposure", "port-add",
         }
         return bool(phases & native_phases)
 
@@ -3141,6 +3168,10 @@ class Control:
             result = self._dispatch_action(action, dict(request), session_id, compatibility_warnings)
         except ControlError as exc:
             try:
+                outcome_uncertain = self._operation_outcome_uncertain(action, exc)
+                detail = dict(exc.detail) if isinstance(exc.detail, Mapping) else {}
+                detail.setdefault("outcome_verified", not outcome_uncertain)
+                exc = ControlError(exc.code, exc.message, detail)
                 if operation_id and is_write:
                     # A committed renew must remain replayable even if rearming its
                     # native timer failed after the atomic deadline/journal commit.
@@ -3161,7 +3192,7 @@ class Control:
                     )
             except ControlError as state_error:
                 raise self._annotate_state_error(state_error, action=action, operation_id=operation_id) from state_error
-            raise
+            raise exc
         response = {
             "ok": True,
             "protocol": PROTOCOL_VERSION,
@@ -3576,6 +3607,11 @@ class Control:
             observation = self.resources.cpu_pressure()
         except ControlError as exc:
             return {"verified": False, "error": exc.as_dict()}
+        except AttributeError:
+            return {"verified": False, "error": {
+                "code": "resource_unverified",
+                "message": "CT CPU pressure observation is unavailable",
+            }}
         if not isinstance(observation, Mapping):
             return {"verified": False, "error": {
                 "code": "resource_unverified",
@@ -3585,10 +3621,27 @@ class Control:
         if (observation.get("scope") != "ct-cpu-pressure"
                 or sources != ["cgroupfs"]
                 or observation.get("mountpoint") != "/sys/fs/cgroup"
+                or observation.get("mount_root") != "/"
                 or observation.get("filesystem") != "cgroup2"):
             return {"verified": False, "error": {
                 "code": "resource_unverified",
                 "message": "CT CPU pressure observation is not CT-local",
+            }}
+        cgroup_path = observation.get("cgroup_path")
+        if (not isinstance(cgroup_path, str)
+                or (cgroup_path != "/" and (
+                    re.fullmatch(r"/[^\x00/]+(?:/[^\x00/]+)*", cgroup_path) is None
+                    or any(part in {".", ".."} for part in cgroup_path.split("/"))
+                ))):
+            return {"verified": False, "error": {
+                "code": "resource_unverified",
+                "message": "CT CPU pressure cgroup path is invalid",
+            }}
+        expected_metric = "/sys/fs/cgroup" + ("" if cgroup_path == "/" else cgroup_path) + "/cpu.pressure"
+        if observation.get("metric") != expected_metric:
+            return {"verified": False, "error": {
+                "code": "resource_unverified",
+                "message": "CT CPU pressure metric path is not current-cgroup local",
             }}
         return {"verified": True, **dict(observation), "observed_at": iso_time(self.now())}
 
@@ -6032,7 +6085,7 @@ class Control:
                     self._check_generation(current, request)
                     self._require_active(current)
                 return self.store.get_port(task["task_id"], name, protocol)
-            except ControlError:
+            except ControlError as exc:
                 current = self.store.get_task(task_id=task["task_id"])
                 same_generation = bool(
                     current
@@ -6063,7 +6116,9 @@ class Control:
                         current_port = self.store.get_port(task["task_id"], name, protocol)
                         if current_port and int(current_port["generation"]) == int(existing["generation"]):
                             self.store.update_port(task["task_id"], name, protocol, state="closing")
-                raise
+                detail = dict(exc.detail) if isinstance(exc.detail, Mapping) else {}
+                detail.setdefault("operation_phase", "port-add")
+                raise ControlError(exc.code, exc.message, detail) from exc
         inventory = self._port_inventory()
         with self._global_lock(), self.store.transaction():
             self._require_active(self.store.get_task(task_id=task["task_id"]))
@@ -6078,7 +6133,7 @@ class Control:
                 self._require_active(current)
                 self.store.update_port(task["task_id"], name, protocol, state="active")
             return self.store.get_port(task["task_id"], name, protocol)
-        except ControlError:
+        except ControlError as exc:
             try:
                 with self._native_lock(task):
                     current = self.store.get_task(task_id=task["task_id"])
@@ -6092,7 +6147,9 @@ class Control:
                 current_port = self.store.get_port(task["task_id"], name, protocol)
                 if current_port and int(current_port["generation"]) == int(port["generation"]):
                     self.store.update_port(task["task_id"], name, protocol, state="closing")
-            raise
+            detail = dict(exc.detail) if isinstance(exc.detail, Mapping) else {}
+            detail.setdefault("operation_phase", "port-add")
+            raise ControlError(exc.code, exc.message, detail) from exc
 
 
     def port_list(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:
@@ -6518,12 +6575,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     argv = list(argv if argv is not None else sys.argv[1:])
     request: dict[str, Any] | None = None
     try:
-        config = load_config()
         request = parse_timer_args(argv)
         if request is None:
             if argv:
                 raise ControlError("invalid_request", "unknown command-line arguments")
             request = request_from_stdin()
+        config = load_config()
         control = Control(config)
         response = control.dispatch(request)
         sys.stdout.write(json.dumps(response, sort_keys=True) + "\n")

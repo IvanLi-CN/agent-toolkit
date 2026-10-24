@@ -380,11 +380,35 @@ class SessionContractTests(unittest.TestCase):
             journal = Path(directory) / "operations" / (hashlib.sha256(b"oversized").hexdigest() + ".json")
             self.assertEqual(json.loads(journal.read_text(encoding="utf-8"))["outcome"], "pending")
 
+    def test_oversized_remote_stdout_is_rejected_without_parsing(self):
+        response = b"{" + b"x" * CLI.REMOTE_STDOUT_LIMIT_BYTES
+        with mock.patch.object(CLI.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, response, b"")):
+            with self.assertRaises(CLI.CliError) as failure:
+                CLI.control_request("status", session="thread")
+        self.assertEqual(failure.exception.code, "invalid_remote_response")
+        self.assertTrue(failure.exception.detail["stdout_truncated"])
+
+    def test_remote_streams_are_drained_and_hard_capped(self):
+        def run(*_args, **kwargs):
+            kwargs["stdout"].write(b"x" * (CLI.REMOTE_STDOUT_LIMIT_BYTES + 1))
+            kwargs["stderr"].write(b"y" * (CLI.REMOTE_STDERR_LIMIT_BYTES + 1))
+            return subprocess.CompletedProcess([], 255, None, None)
+
+        with mock.patch.object(CLI.subprocess, "run", side_effect=run):
+            with self.assertRaises(CLI.CliError) as failure:
+                CLI.control_request("status", session="thread")
+        self.assertEqual(failure.exception.code, "remote_failed")
+        self.assertTrue(failure.exception.detail["stdout_truncated"])
+        self.assertTrue(failure.exception.detail["stderr_truncated"])
+
     def test_pre_native_errors_are_deterministic_but_port_add_generation_is_uncertain(self):
         for code in ("resource_unverified", "capacity_insufficient", "lease_window_short"):
             with self.subTest(code=code):
                 self.assertFalse(CLI._remote_error_outcome_uncertain({"code": code}, action="acquire"))
-        self.assertFalse(CLI._remote_error_outcome_uncertain({"code": "generation_mismatch"}, action="port-add"))
+        self.assertTrue(CLI._remote_error_outcome_uncertain({"code": "generation_mismatch"}, action="port-add"))
+        self.assertFalse(CLI._remote_error_outcome_uncertain(
+            {"code": "generation_mismatch", "detail": {"outcome_verified": True}}, action="port-add"
+        ))
         self.assertTrue(CLI._remote_error_outcome_uncertain(
             {"code": "generation_mismatch", "detail": {"operation_phase": "port-add"}},
             action="port-add",
@@ -394,6 +418,10 @@ class SessionContractTests(unittest.TestCase):
         ))
         self.assertFalse(CLI._remote_error_outcome_uncertain(
             {"code": "image_unavailable", "detail": {"outcome_verified": True}}, action="acquire"
+        ))
+        self.assertFalse(CLI._remote_error_outcome_uncertain(
+            {"code": "acquire_partial", "detail": {"phase": "guest-readiness", "outcome_verified": True}},
+            action="acquire",
         ))
 
     def test_success_response_must_match_request_generation(self):

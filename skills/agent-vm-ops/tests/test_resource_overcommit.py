@@ -837,6 +837,20 @@ class AdmissionTests(Fixture):
         self.assertEqual(record["outcome"], "pending")
         self.assertFalse(raised.exception.detail["outcome_verified"])
 
+    def test_verified_outcome_overrides_native_phase_for_terminal_journal(self):
+        request = self.request("acquire", operation="verified-native-cleanup", public_key=KEY)
+        failure = CONTROL.ControlError(
+            "command_failed",
+            "native action failed after confirmed cleanup",
+            {"phase": "guest-readiness", "outcome_verified": True},
+        )
+        with mock.patch.object(self.control, "_dispatch_action", side_effect=failure):
+            with self.assertRaises(CONTROL.ControlError):
+                self.control.dispatch(request)
+        record = self.store.operation(request["operation_id"])
+        self.assertEqual(record["outcome"], "error")
+        self.assertTrue(record["error"]["detail"]["outcome_verified"])
+
     def test_unknown_state_commit_preserves_pending_operation(self):
         request = {
             "protocol": CONTROL.PROTOCOL_VERSION,

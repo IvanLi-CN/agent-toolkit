@@ -18,7 +18,7 @@ import re
 import shlex
 import subprocess
 import sys
-import tempfile
+import threading
 from typing import Any, Mapping, Sequence
 import uuid
 
@@ -28,6 +28,7 @@ VERSION = "0.4.0-native"
 REMOTE_CONTROL = "/opt/agent-vm-native/agent_vm_control.py"
 DEFAULT_CONTROL_TIMEOUT_SECONDS = 240
 LONG_CONTROL_TIMEOUT_SECONDS = 600
+REMOTE_STDOUT_LIMIT_BYTES = 2 * 1024 * 1024
 REMOTE_STDERR_LIMIT_BYTES = 64 * 1024
 SESSION_ENV = "AGENT_VM_SESSION_ID"
 CONTROL_HOST_ENV = "AGENT_VM_CONTROL_HOST"
@@ -526,19 +527,46 @@ def _remote_error_outcome_uncertain(error: Mapping[str, Any], *, action: str | N
     if code == "sqlite_unavailable":
         detail = error.get("detail")
         return not isinstance(detail, Mapping) or detail.get("state_committed") is not False
+    detail = error.get("detail")
+    if isinstance(detail, Mapping) and isinstance(detail.get("outcome_verified"), bool):
+        return not detail["outcome_verified"]
     if code in {"acquire_partial", "resize_partial", "restart_partial", "cleanup_incomplete", "operation_unverified"}:
         return True
-    detail = error.get("detail")
     if isinstance(detail, Mapping) and any(detail.get(key) in {
         "native-generation", "native-init", "native-config", "native-stop", "native-start",
         "guest-readiness", "guest-post-check", "access-exposure", "port-add",
     } for key in ("phase", "operation_phase")):
         return True
-    if isinstance(detail, Mapping) and isinstance(detail.get("outcome_verified"), bool):
-        return not detail["outcome_verified"]
+    if action == "port-add" and code in {"generation_mismatch", "task_not_active"}:
+        # Older protocol-4 controllers do not report the native phase. Keep
+        # the conservative classification because a proxy may already exist.
+        return True
     if code in _DETERMINISTIC_REMOTE_ERROR_CODES:
         return False
     return True
+
+
+def _drain_bounded_stream(fd: int, limit: int, output: list[bytes], truncated: list[bool]) -> None:
+    retained = bytearray()
+    try:
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            remaining = limit + 1 - len(retained)
+            if remaining > 0:
+                retained.extend(chunk[:remaining])
+            if len(retained) > limit:
+                truncated[0] = True
+    finally:
+        os.close(fd)
+    output.append(bytes(retained))
+
+
+def _bounded_process_output(value: Any, limit: int) -> tuple[bytes, bool]:
+    if not isinstance(value, bytes):
+        return b"", False
+    return value[:limit + 1], len(value) > limit
 
 
 def control_request(action: str, *, session: str | None, generation: int | None = None,
@@ -579,30 +607,63 @@ def control_request(action: str, *, session: str | None, generation: int | None 
     try:
         control_host = os.environ.get(CONTROL_HOST_ENV, DEFAULT_CONTROL_HOST)
         remote_control = os.environ.get(REMOTE_CONTROL_ENV, DEFAULT_REMOTE_CONTROL)
-        with tempfile.SpooledTemporaryFile(max_size=REMOTE_STDERR_LIMIT_BYTES, mode="w+b") as stderr_sink:
+        stdout_read, stdout_write = os.pipe()
+        stderr_read, stderr_write = os.pipe()
+        stdout_sink = os.fdopen(stdout_write, "wb")
+        stderr_sink = os.fdopen(stderr_write, "wb")
+        stdout_output: list[bytes] = []
+        stderr_output: list[bytes] = []
+        stdout_truncated_flag = [False]
+        stderr_truncated_flag = [False]
+        stdout_reader = threading.Thread(
+            target=_drain_bounded_stream,
+            args=(stdout_read, REMOTE_STDOUT_LIMIT_BYTES, stdout_output, stdout_truncated_flag),
+        )
+        stderr_reader = threading.Thread(
+            target=_drain_bounded_stream,
+            args=(stderr_read, REMOTE_STDERR_LIMIT_BYTES, stderr_output, stderr_truncated_flag),
+        )
+        stdout_reader.start()
+        stderr_reader.start()
+        process = None
+        try:
             process = subprocess.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", control_host,
                                       shlex.join(["python3", remote_control])],
-                                     input=json.dumps(request, sort_keys=True).encode(), stdout=subprocess.PIPE,
+                                     input=json.dumps(request, sort_keys=True).encode(), stdout=stdout_sink,
                                      stderr=stderr_sink, check=False, timeout=control_timeout(action, fields))
-            stderr = process.stderr
-            if stderr is None:
-                stderr_sink.seek(0)
-                stderr = stderr_sink.read(REMOTE_STDERR_LIMIT_BYTES + 1)
+        finally:
+            stdout_sink.close()
+            stderr_sink.close()
+            stdout_reader.join()
+            stderr_reader.join()
+        stdout = stdout_output[0] if stdout_output else b""
+        stderr = stderr_output[0] if stderr_output else b""
+        if process is not None:
+            mocked_stdout, mocked_stdout_truncated = _bounded_process_output(process.stdout, REMOTE_STDOUT_LIMIT_BYTES)
+            mocked_stderr, mocked_stderr_truncated = _bounded_process_output(process.stderr, REMOTE_STDERR_LIMIT_BYTES)
+            if isinstance(process.stdout, bytes):
+                stdout = mocked_stdout
+                stdout_truncated_flag[0] = stdout_truncated_flag[0] or mocked_stdout_truncated
+            if isinstance(process.stderr, bytes):
+                stderr = mocked_stderr
+                stderr_truncated_flag[0] = stderr_truncated_flag[0] or mocked_stderr_truncated
     except FileNotFoundError: fail("command_missing", "ssh is not installed")
     except subprocess.TimeoutExpired:
         fail("remote_timeout", "control outcome is uncertain; retry the same operation ID",
              {"operation_id": request.get("operation_id")})
-    if not isinstance(stderr, bytes):
-        stderr = b""
-    stderr_truncated = len(stderr) > REMOTE_STDERR_LIMIT_BYTES
+    stdout_truncated = stdout_truncated_flag[0]
+    stderr_truncated = stderr_truncated_flag[0]
     stderr = stderr[:REMOTE_STDERR_LIMIT_BYTES]
     if stderr:
         sys.stderr.buffer.write(stderr)
         sys.stderr.flush()
     if process.returncode:
-        if stderr_truncated:
-            fail("remote_failed", "remote request failed; bounded stderr was truncated and control outcome is not verified",
-                 {"operation_id": request.get("operation_id"), "stderr_truncated": True,
+        if stdout_truncated or stderr_truncated:
+            fail("remote_failed", "remote request output was truncated and control outcome is not verified",
+                 {"operation_id": request.get("operation_id"),
+                  "stdout_truncated": stdout_truncated,
+                  "stderr_truncated": stderr_truncated,
+                  "stdout_limit_bytes": REMOTE_STDOUT_LIMIT_BYTES,
                   "stderr_limit_bytes": REMOTE_STDERR_LIMIT_BYTES}, process.returncode)
         remote_error = _parse_remote_error(stderr, request=request)
         if remote_error is not None:
@@ -616,7 +677,10 @@ def control_request(action: str, *, session: str | None, generation: int | None 
             )
         fail("remote_failed", "remote request failed; control outcome is not verified",
              {"operation_id": request.get("operation_id")}, process.returncode)
-    try: response = json.loads(process.stdout)
+    if stdout_truncated:
+        fail("invalid_remote_response", "control response exceeded the bounded stdout limit",
+             {"stdout_truncated": True, "stdout_limit_bytes": REMOTE_STDOUT_LIMIT_BYTES})
+    try: response = json.loads(stdout)
     except (ValueError, UnicodeDecodeError): fail("invalid_remote_response", "control did not return JSON")
     if not isinstance(response, dict) or response.get("protocol") != PROTOCOL_VERSION or response.get("action") != action or response.get("session_id") != session:
         fail("protocol_mismatch", "response protocol or request identity differs")

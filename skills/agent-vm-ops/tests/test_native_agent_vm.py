@@ -853,6 +853,7 @@ class LifecycleTests(Fixture):
 
         self.assertEqual(failure.exception.code, "task_not_active")
         self.assertEqual(failure.exception.detail["operation_phase"], "port-add")
+        self.assertTrue(failure.exception.detail["outcome_verified"])
         task = self.store.get_task(session_id="thread-a")
         self.assertIsNone(self.store.get_port(task["task_id"], "web", "tcp"))
 
@@ -871,6 +872,7 @@ class LifecycleTests(Fixture):
                 self.call("port-add", name="web", vm_port=8080)
 
         self.assertEqual(failure.exception.code, "task_not_active")
+        self.assertTrue(failure.exception.detail["outcome_verified"])
         self.assertIsNone(self.store.get_port(task["task_id"], "web", "tcp"))
         self.assertNotIn("agent-vm-" + task["task_id"] + "-web-tcp", self.runner.instances[task["instance_name"]]["devices"])
 
@@ -1766,6 +1768,30 @@ class LifecycleTests(Fixture):
         self.assertEqual(completed["guest_filesystem"]["virtual_bytes"], 40 * GIB)
         self.assertNotIn("last_error", completed)
 
+    def test_slow_start_diagnostic_uses_verified_current_cgroup_pressure_path(self):
+        self.acquire()
+        task = self.store.get_task(session_id="thread-a")
+        observation = dict(self.resources.cpu_pressure.return_value)
+        observation.update({
+            "cgroup_path": "/system.slice/agent-vm",
+            "metric": "/sys/fs/cgroup/system.slice/agent-vm/cpu.pressure",
+        })
+        with mock.patch.object(self.resources, "cpu_pressure", return_value=observation), \
+             mock.patch.object(self.control.incus, "instance_info", return_value={"status": "Running", "pid": 1}), \
+             mock.patch.object(self.control.incus, "instance_log", return_value=""):
+            diagnostic = self.control._emit_slow_start_diagnostic(
+                task,
+                phase="agent",
+                started_monotonic=0.0,
+                readiness={},
+            )
+
+        self.assertEqual(diagnostic["cpu_psi"]["cgroup_path"], "/system.slice/agent-vm")
+        self.assertEqual(
+            diagnostic["cpu_psi"]["metric"],
+            "/sys/fs/cgroup/system.slice/agent-vm/cpu.pressure",
+        )
+
 
 class GuestRootGrowthScriptTests(unittest.TestCase):
     def execute_script(
@@ -2572,7 +2598,10 @@ class NativeCliTests(unittest.TestCase):
             with self.subTest(action=action, fields=fields), mock.patch.object(CLI.subprocess, "run", return_value=process) as run:
                 CLI.control_request(action, session="thread", fields=fields)
                 self.assertEqual(run.call_args.kwargs["timeout"], expected)
-                self.assertIsInstance(run.call_args.kwargs["stderr"], tempfile.SpooledTemporaryFile)
+                self.assertNotEqual(run.call_args.kwargs["stdout"], subprocess.PIPE)
+                self.assertNotEqual(run.call_args.kwargs["stderr"], subprocess.PIPE)
+                self.assertTrue(hasattr(run.call_args.kwargs["stdout"], "fileno"))
+                self.assertTrue(hasattr(run.call_args.kwargs["stderr"], "fileno"))
 
     def test_exec_argv_and_online_tar_are_safely_quoted(self):
         parser = CLI.build_parser()

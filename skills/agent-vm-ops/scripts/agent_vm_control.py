@@ -2594,6 +2594,8 @@ class Control:
         detail = error.detail if isinstance(error.detail, Mapping) else {}
         if error.code == "sqlite_unavailable" and detail.get("state_committed") is not False:
             return True
+        if isinstance(detail.get("outcome_verified"), bool):
+            return not detail["outcome_verified"]
         cleanup = detail.get("cleanup")
         cleanup_result = cleanup.get("result") if isinstance(cleanup, Mapping) else None
         if (isinstance(cleanup, Mapping) and cleanup.get("ok")
@@ -4546,7 +4548,19 @@ class Control:
         except Exception as error:
             errors.append({"source": "native_status", **self._diagnostic_error(error)})
         try:
-            payload["cpu_psi"] = self._parse_cpu_psi(Path("/sys/fs/cgroup/cpu.pressure").read_text())
+            observation = self._cpu_pressure_observation()
+            if observation.get("verified"):
+                payload["cpu_psi"] = observation
+            else:
+                error = observation.get("error")
+                if isinstance(error, Mapping):
+                    errors.append({
+                        "source": "cpu_psi",
+                        "type": "ControlError",
+                        "code": error.get("code", "resource_unverified"),
+                    })
+                else:
+                    errors.append({"source": "cpu_psi", "type": "ResourceObservationError"})
         except Exception as error:
             errors.append({"source": "cpu_psi", **self._diagnostic_error(error)})
         try:
@@ -6086,6 +6100,7 @@ class Control:
                     self._require_active(current)
                 return self.store.get_port(task["task_id"], name, protocol)
             except ControlError as exc:
+                cleanup_verified = False
                 current = self.store.get_task(task_id=task["task_id"])
                 same_generation = bool(
                     current
@@ -6112,12 +6127,14 @@ class Control:
                                     self._conntrack_delete(cleanup_port, task)
                                     if current_port:
                                         self.store.remove_port(task["task_id"], name, protocol)
+                                    cleanup_verified = True
                     except ControlError:
                         current_port = self.store.get_port(task["task_id"], name, protocol)
                         if current_port and int(current_port["generation"]) == int(existing["generation"]):
                             self.store.update_port(task["task_id"], name, protocol, state="closing")
                 detail = dict(exc.detail) if isinstance(exc.detail, Mapping) else {}
                 detail.setdefault("operation_phase", "port-add")
+                detail["outcome_verified"] = cleanup_verified
                 raise ControlError(exc.code, exc.message, detail) from exc
         inventory = self._port_inventory()
         with self._global_lock(), self.store.transaction():
@@ -6134,6 +6151,7 @@ class Control:
                 self.store.update_port(task["task_id"], name, protocol, state="active")
             return self.store.get_port(task["task_id"], name, protocol)
         except ControlError as exc:
+            cleanup_verified = False
             try:
                 with self._native_lock(task):
                     current = self.store.get_task(task_id=task["task_id"])
@@ -6143,12 +6161,14 @@ class Control:
                         current_port = self.store.get_port(task["task_id"], name, protocol)
                         if current_port and int(current_port["generation"]) == int(port["generation"]):
                             self.store.remove_port(task["task_id"], name, protocol)
+                        cleanup_verified = True
             except ControlError:
                 current_port = self.store.get_port(task["task_id"], name, protocol)
                 if current_port and int(current_port["generation"]) == int(port["generation"]):
                     self.store.update_port(task["task_id"], name, protocol, state="closing")
             detail = dict(exc.detail) if isinstance(exc.detail, Mapping) else {}
             detail.setdefault("operation_phase", "port-add")
+            detail["outcome_verified"] = cleanup_verified
             raise ControlError(exc.code, exc.message, detail) from exc
 
 

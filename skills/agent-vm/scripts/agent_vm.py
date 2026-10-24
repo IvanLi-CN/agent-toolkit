@@ -19,6 +19,7 @@ import shlex
 import subprocess
 import sys
 import threading
+import time
 from typing import Any, Mapping, Sequence
 import uuid
 
@@ -638,12 +639,14 @@ def control_request(action: str, *, session: str | None, generation: int | None 
         remote_timeout = False
         stream_cleanup_verified = True
         stream_cleanup_error = None
+        request_timeout = control_timeout(action, fields)
+        request_started = time.monotonic()
         try:
             try:
                 process = subprocess.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", control_host,
                                           shlex.join(["python3", remote_control])],
                                          input=json.dumps(request, sort_keys=True).encode(), stdout=stdout_sink,
-                                         stderr=stderr_sink, check=False, timeout=control_timeout(action, fields))
+                                         stderr=stderr_sink, check=False, timeout=request_timeout)
             except subprocess.TimeoutExpired:
                 remote_timeout = True
                 raise
@@ -662,8 +665,18 @@ def control_request(action: str, *, session: str | None, generation: int | None 
                     stream_cleanup_verified = False
                     stream_cleanup_error = "reader_join_timeout"
             else:
-                stdout_reader.join()
-                stderr_reader.join()
+                reader_deadline = request_started + request_timeout
+                for reader, fd in ((stdout_reader, stdout_read), (stderr_reader, stderr_read)):
+                    reader.join(timeout=max(0.0, reader_deadline - time.monotonic()))
+                    if reader.is_alive():
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+                        reader.join(timeout=max(0.0, reader_deadline - time.monotonic()))
+                    if reader.is_alive():
+                        stream_cleanup_verified = False
+                        stream_cleanup_error = "reader_join_timeout"
         stdout = stdout_output[0] if stdout_output else b""
         stderr = stderr_output[0] if stderr_output else b""
         if process is not None:
@@ -691,14 +704,28 @@ def control_request(action: str, *, session: str | None, generation: int | None 
     if stderr:
         sys.stderr.buffer.write(stderr)
         sys.stderr.flush()
+    if not stream_cleanup_verified:
+        detail = {
+            "operation_id": request.get("operation_id"),
+            "stream_cleanup_verified": False,
+        }
+        if stream_cleanup_error is not None:
+            detail["stream_cleanup_error"] = stream_cleanup_error
+        fail("remote_failed", "control response stream cleanup is not verified", detail, process.returncode)
     if process.returncode:
-        if stdout_truncated or stderr_truncated:
-            fail("remote_failed", "remote request output was truncated and control outcome is not verified",
-                 {"operation_id": request.get("operation_id"),
-                  "stdout_truncated": stdout_truncated,
-                  "stderr_truncated": stderr_truncated,
-                  "stdout_limit_bytes": REMOTE_STDOUT_LIMIT_BYTES,
-                  "stderr_limit_bytes": REMOTE_STDERR_LIMIT_BYTES}, process.returncode)
+        if stdout_truncated or stderr_truncated or not stream_cleanup_verified:
+            detail = {
+                "operation_id": request.get("operation_id"),
+                "stdout_truncated": stdout_truncated,
+                "stderr_truncated": stderr_truncated,
+                "stdout_limit_bytes": REMOTE_STDOUT_LIMIT_BYTES,
+                "stderr_limit_bytes": REMOTE_STDERR_LIMIT_BYTES,
+                "stream_cleanup_verified": stream_cleanup_verified,
+            }
+            if stream_cleanup_error is not None:
+                detail["stream_cleanup_error"] = stream_cleanup_error
+            fail("remote_failed", "remote request output was truncated or stream cleanup is not verified",
+                 detail, process.returncode)
         remote_error = _parse_remote_error(stderr, request=request)
         if remote_error is not None:
             if op_path is not None and not _remote_error_outcome_uncertain(remote_error, action=action):
@@ -715,7 +742,11 @@ def control_request(action: str, *, session: str | None, generation: int | None 
         fail("invalid_remote_response", "control response exceeded the bounded stdout limit",
              {"stdout_truncated": True, "stdout_limit_bytes": REMOTE_STDOUT_LIMIT_BYTES})
     try: response = json.loads(stdout)
-    except (ValueError, UnicodeDecodeError): fail("invalid_remote_response", "control did not return JSON")
+    except (ValueError, UnicodeDecodeError):
+        detail = {"stream_cleanup_verified": stream_cleanup_verified}
+        if stream_cleanup_error is not None:
+            detail["stream_cleanup_error"] = stream_cleanup_error
+        fail("invalid_remote_response", "control did not return JSON", detail)
     if not isinstance(response, dict) or response.get("protocol") != PROTOCOL_VERSION or response.get("action") != action or response.get("session_id") != session:
         fail("protocol_mismatch", "response protocol or request identity differs")
     if "generation" in request and not _json_value_matches(response.get("generation"), request["generation"]):

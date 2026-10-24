@@ -221,11 +221,35 @@ class CTObservationTests(unittest.TestCase):
                 return nested
             if path == "/sys/fs/cgroup/system.slice/agent-vm/cpu.max":
                 return "500000 100000"
+            if path == "/sys/fs/cgroup/system.slice/cpu.max":
+                return "max 100000"
+            if path == "/sys/fs/cgroup/cpu.max":
+                return "max 100000"
             raise AssertionError(path)
 
         with mock.patch.object(CONTROL.os, "sched_getaffinity", return_value=set(range(16)), create=True), \
              mock.patch.object(CONTROL.CTResources, "_read", side_effect=read):
             self.assertEqual(CONTROL.CTResources().cpu(), 5)
+
+    def test_cpu_capacity_includes_finite_ancestor_when_child_is_unlimited(self):
+        nested = "0::/system.slice/agent-vm\n"
+
+        def read(path):
+            if path == "/proc/self/mountinfo":
+                return self.cgroup_mount
+            if path == "/proc/self/cgroup":
+                return nested
+            if path == "/sys/fs/cgroup/system.slice/agent-vm/cpu.max":
+                return "max 100000"
+            if path == "/sys/fs/cgroup/system.slice/cpu.max":
+                return "1200000 100000"
+            if path == "/sys/fs/cgroup/cpu.max":
+                return "max 100000"
+            raise AssertionError(path)
+
+        with mock.patch.object(CONTROL.os, "sched_getaffinity", return_value=set(range(16)), create=True), \
+             mock.patch.object(CONTROL.CTResources, "_read", side_effect=read):
+            self.assertEqual(CONTROL.CTResources().cpu(), 12)
 
     def test_cpu_pressure_requires_verified_some_and_full_psi(self):
         raw = "some avg10=12.34 avg60=5.00 avg300=1.00 total=100\nfull avg10=7.89 avg60=3.00 avg300=0.50 total=50\n"
@@ -872,6 +896,18 @@ class AdmissionTests(Fixture):
         record = self.store.operation(request["operation_id"])
         self.assertEqual(record["outcome"], "pending")
         self.assertFalse(raised.exception.detail["outcome_verified"])
+
+    def test_release_finalize_failure_keeps_pending_journal_while_task_is_closing(self):
+        self.acquire()
+        task = self.store.get_task(session_id="thread-a")
+        self.store.update_task(task["task_id"], state="closing")
+        request = self.request("release", operation="release-finalize-failure")
+        failure = CONTROL.ControlError("command_failed", "expiry finalization failed")
+        with mock.patch.object(self.control, "_dispatch_action", side_effect=failure):
+            with self.assertRaises(CONTROL.ControlError) as raised:
+                self.control.dispatch(request)
+        self.assertFalse(raised.exception.detail["outcome_verified"])
+        self.assertEqual(self.store.operation(request["operation_id"])["outcome"], "pending")
 
     def test_verified_outcome_overrides_native_phase_for_terminal_journal(self):
         request = self.request("acquire", operation="verified-native-cleanup", public_key=KEY)

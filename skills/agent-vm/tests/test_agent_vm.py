@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -401,6 +402,44 @@ class SessionContractTests(unittest.TestCase):
         self.assertEqual(failure.exception.code, "remote_failed")
         self.assertTrue(failure.exception.detail["stdout_truncated"])
         self.assertTrue(failure.exception.detail["stderr_truncated"])
+
+    def test_normal_completion_bounds_inherited_stream_reader_cleanup(self):
+        response = {
+            "ok": True,
+            "protocol": CLI.PROTOCOL_VERSION,
+            "action": "status",
+            "session_id": "thread",
+            "outcome": "success",
+            "server_time": "2026-10-22T00:00:00+00:00",
+            "result": {},
+        }
+        holders = []
+
+        def run(*_args, **kwargs):
+            duplicated = CLI.os.dup(kwargs["stdout"].fileno())
+            holders.append(
+                subprocess.Popen(
+                    [CLI.sys.executable, "-c", "import time; time.sleep(10)"],
+                    close_fds=True,
+                    pass_fds=(duplicated,),
+                )
+            )
+            CLI.os.close(duplicated)
+            kwargs["stdout"].write(json.dumps(response).encode())
+            return subprocess.CompletedProcess([], 0, None, None)
+
+        try:
+            with mock.patch.object(CLI, "control_timeout", return_value=0.1), \
+                 mock.patch.object(CLI.subprocess, "run", side_effect=run):
+                started = time.monotonic()
+                result = CLI.control_request("status", session="thread")
+                elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 1.0)
+            self.assertEqual(result["action"], "status")
+        finally:
+            for holder in holders:
+                holder.kill()
+                holder.wait()
 
     def test_remote_timeout_bounds_stream_reader_cleanup(self):
         with mock.patch.object(

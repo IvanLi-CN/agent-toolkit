@@ -274,12 +274,14 @@ def run(command, phase, *, check=True):
             else:
                 retain_stderr(chunk)
 
-    def drain_until(selector, deadline):
+    def drain_until(selector, deadline, track_process_tree=None):
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
-            read_ready(selector, selector.select(min(0.25, remaining)))
+            if track_process_tree is not None:
+                track_process_tree()
+            read_ready(selector, selector.select(min(0.1, remaining)))
         return True
 
     def process_group_members(pgid):
@@ -394,7 +396,7 @@ def run(command, phase, *, check=True):
                 return False, "process_tree_inspection_failed"
             if not members:
                 return True, cleanup_error
-            for pid in members:
+            for pid, _ in members:
                 try:
                     os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError:
@@ -419,11 +421,30 @@ def run(command, phase, *, check=True):
             )
         except FileNotFoundError:
             raise GuestFailure(phase, command, cause="command_missing")
+        tracked_tree_members = {}
+        tracked_tree_valid = False
+
+        def track_process_tree():
+            nonlocal tracked_tree_valid
+            if not os.path.isdir("/proc"):
+                return
+            members, complete = process_tree_members(process.pid)
+            if not complete or not members:
+                return
+            for pid, starttime in members:
+                previous = tracked_tree_members.get(pid)
+                if previous is not None and previous != starttime:
+                    tracked_tree_valid = False
+                    return
+                tracked_tree_members[pid] = starttime
+            tracked_tree_valid = True
+
+        track_process_tree()
         for stream, name in ((process.stdout, "stdout"), (process.stderr, "stderr")):
             if stream is not None:
                 selector.register(stream, selectors.EVENT_READ, name)
         deadline = time.monotonic() + COMMAND_TIMEOUT
-        if not drain_until(selector, deadline):
+        if not drain_until(selector, deadline, track_process_tree):
             raise subprocess.TimeoutExpired(command, COMMAND_TIMEOUT)
         remaining = max(0, deadline - time.monotonic())
         try:
@@ -437,6 +458,18 @@ def run(command, phase, *, check=True):
         tree_complete = True
         if os.path.isdir("/proc"):
             tree_members, tree_complete = process_tree_members(process.pid)
+        current_tree_members = tree_members
+        if tracked_tree_members and tracked_tree_valid:
+            merged = dict(tracked_tree_members)
+            for pid, starttime in current_tree_members:
+                previous = merged.get(pid)
+                if previous is not None and previous != starttime:
+                    tree_complete = False
+                    continue
+                merged[pid] = starttime
+            tree_members = sorted(merged.items())
+            if not current_tree_members:
+                tree_complete = True
         root_identity = next((identity for identity in tree_members if identity[0] == process.pid), None)
         root_live = []
         root_verified = not os.path.isdir("/proc")
@@ -955,13 +988,14 @@ class CTResources:
 
     def cpu(self) -> int:
         capacity = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 0)
-        _cgroup_path, cpu_max_path = self._cgroup_metric_path("cpu.max")
-        fields = self._read(cpu_max_path).split()
-        if len(fields) != 2:
-            raise ControlError("resource_unverified", "invalid CT CPU quota")
-        period = self._unsigned(fields[1], "cpu.max period", positive=True)
-        if fields[0] != "max":
-            capacity = min(capacity, self._unsigned(fields[0], "cpu.max quota", positive=True) // period)
+        _cgroup_path, cgroup_paths = self._cgroup_metric_paths("cpu.max")
+        for cpu_max_path in cgroup_paths:
+            fields = self._read(cpu_max_path).split()
+            if len(fields) != 2:
+                raise ControlError("resource_unverified", "invalid CT CPU quota")
+            period = self._unsigned(fields[1], "cpu.max period", positive=True)
+            if fields[0] != "max":
+                capacity = min(capacity, self._unsigned(fields[0], "cpu.max quota", positive=True) // period)
         return capacity
 
     def _verify_cgroup2_mount(self) -> None:
@@ -999,9 +1033,18 @@ class CTResources:
         return path
 
     def _cgroup_metric_path(self, metric: str) -> tuple[str, str]:
+        cgroup_path, paths = self._cgroup_metric_paths(metric)
+        return cgroup_path, paths[0]
+
+    def _cgroup_metric_paths(self, metric: str) -> tuple[str, list[str]]:
         self._verify_cgroup2_mount()
         cgroup_path = self.current_cgroup_path()
-        return cgroup_path, "/sys/fs/cgroup" + ("" if cgroup_path == "/" else cgroup_path) + "/" + metric
+        components = [] if cgroup_path == "/" else cgroup_path.strip("/").split("/")
+        paths = []
+        for depth in range(len(components), -1, -1):
+            ancestor = "/" + "/".join(components[:depth]) if depth else ""
+            paths.append("/sys/fs/cgroup" + ancestor + "/" + metric)
+        return cgroup_path, paths
 
     def cpu_pressure(self) -> dict[str, Any]:
         cgroup_path, pressure_path = self._cgroup_metric_path("cpu.pressure")
@@ -1437,6 +1480,26 @@ class CommandRunner:
             if stream is not None:
                 selector.register(stream, selectors.EVENT_READ, name)
 
+        tracked_tree_members: dict[int, int] = {}
+        tracked_tree_valid = False
+
+        def track_process_tree() -> None:
+            nonlocal tracked_tree_valid
+            if not Path("/proc").is_dir():
+                return
+            members, complete = self._process_tree_members(process.pid)
+            if not complete or not members:
+                return
+            for pid, starttime in members:
+                previous = tracked_tree_members.get(pid)
+                if previous is not None and previous != starttime:
+                    tracked_tree_valid = False
+                    return
+                tracked_tree_members[pid] = starttime
+            tracked_tree_valid = True
+
+        track_process_tree()
+
         def retain_stdout(chunk: bytes) -> None:
             nonlocal stdout_truncated
             available = max(0, stdout_limit - len(stdout))
@@ -1473,7 +1536,8 @@ class CommandRunner:
                 remaining = timeout - (time.monotonic() - started)
                 if remaining <= 0:
                     raise subprocess.TimeoutExpired(argv[0], timeout)
-                events = selector.select(remaining)
+                track_process_tree()
+                events = selector.select(min(0.1, remaining))
                 if not events:
                     continue
                 read_ready(events)
@@ -1485,10 +1549,22 @@ class CommandRunner:
             reaped = False
             process_group_killed = False
             process_group_cleanup_error = None
-            tree_members: list[int] = []
+            tree_members: list[tuple[int, int]] = []
             tree_complete = True
             if Path("/proc").is_dir():
                 tree_members, tree_complete = self._process_tree_members(process.pid)
+            current_tree_members = tree_members
+            if tracked_tree_members and tracked_tree_valid:
+                merged = dict(tracked_tree_members)
+                for pid, starttime in current_tree_members:
+                    previous = merged.get(pid)
+                    if previous is not None and previous != starttime:
+                        tree_complete = False
+                        continue
+                    merged[pid] = starttime
+                tree_members = sorted(merged.items())
+                if not current_tree_members:
+                    tree_complete = True
             root_identity = next((identity for identity in tree_members if identity[0] == process.pid), None)
             root_live: list[tuple[int, int]] = []
             root_verified = not Path("/proc").is_dir()
@@ -3404,6 +3480,15 @@ class Control:
         except ControlError as exc:
             try:
                 outcome_uncertain = self._operation_outcome_uncertain(action, exc)
+                if not outcome_uncertain and action in {"release", "destroy"} and session_id is not None:
+                    try:
+                        current_task = self.store.get_task(session_id=session_id)
+                    except ControlError:
+                        outcome_uncertain = True
+                    else:
+                        outcome_uncertain = bool(
+                            current_task and current_task.get("state") in {"closing", "deleting"}
+                        )
                 detail = dict(exc.detail) if isinstance(exc.detail, Mapping) else {}
                 detail.setdefault("outcome_verified", not outcome_uncertain)
                 exc = ControlError(exc.code, exc.message, detail)

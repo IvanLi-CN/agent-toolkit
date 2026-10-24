@@ -1824,6 +1824,7 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         command_timeout=None,
         killpg_error=False,
         escaped_child_pid_path=None,
+        root_exits_before_timeout=False,
         source_output="/dev/sda2\n",
         partition_marker_exists=True,
         udevadm_available=False,
@@ -1940,8 +1941,9 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
                         "open(" + repr(escaped_child_pid_path) + ", 'w').write(str(child.pid)); "
                         "sys.stdout.buffer.write(" + repr(output) + "); "
                         "sys.stderr.buffer.write(" + repr(error) + "); "
-                        "sys.stdout.flush(); sys.stderr.flush(); time.sleep(10); "
-                        "sys.exit(" + str(returncode) + ")"
+                        "sys.stdout.flush(); sys.stderr.flush(); "
+                        + ("time.sleep(0.15); sys.exit(" if root_exits_before_timeout else "time.sleep(10); sys.exit(")
+                        + str(returncode) + ")"
                     )
             process = real_popen(
                 [os.sys.executable, "-c", helper],
@@ -2240,6 +2242,40 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
             else:
                 self.fail("guest growth setsid descendant remained alive after timeout")
 
+    @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
+    def test_guest_root_growth_script_kills_setsid_descendant_after_leader_exit(self):
+        command = ["findmnt", "-n", "-o", "SOURCE", "-T", "/"]
+        with tempfile.TemporaryDirectory() as directory:
+            pid_path = Path(directory) / "child.pid"
+            exit_code, _, stderr, _ = self.execute_script(
+                timeout_command=command,
+                command_timeout=0.3,
+                escaped_child_pid_path=str(pid_path),
+                root_exits_before_timeout=True,
+            )
+
+            self.assertEqual(exit_code, 1)
+            error = json.loads(stderr)["error"]
+            self.assertEqual(error["cause"], "command_timeout")
+            for _ in range(20):
+                if pid_path.exists():
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("guest growth setsid child did not publish its pid")
+            child_pid = int(pid_path.read_text())
+            for _ in range(40):
+                try:
+                    state = (Path("/proc") / str(child_pid) / "stat").read_text()
+                    close_paren = state.rfind(")")
+                    if state[close_paren + 2 :].split()[0] == "Z":
+                        break
+                except FileNotFoundError:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("guest growth setsid descendant remained alive after leader exit")
+
     def test_guest_root_growth_script_bounds_command_output(self):
         exit_code, stdout, stderr, _ = self.execute_script(source_output="/dev/sda2\n" + "x" * 20000 + "\n")
 
@@ -2430,6 +2466,41 @@ class CommandRunnerTests(unittest.TestCase):
                 time.sleep(0.01)
             else:
                 self.fail("setsid diagnostic descendant remained alive after timeout")
+
+    @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
+    def test_bounded_runner_kills_setsid_descendant_after_leader_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pid_path = Path(directory) / "child.pid"
+            code = (
+                "import os,subprocess,sys,time; "
+                "child=subprocess.Popen([sys.executable, '-c', "
+                "'import os,time; os.setsid(); time.sleep(10)'], close_fds=False); "
+                "open(sys.argv[1], 'w').write(str(child.pid)); "
+                "sys.stdout.flush(); sys.stderr.flush(); time.sleep(0.15); sys.exit(0)"
+            )
+            with self.assertRaises(CONTROL.ControlError) as failure:
+                CONTROL.CommandRunner().run_bounded(
+                    [os.sys.executable, "-c", code, str(pid_path)], timeout=0.3
+                )
+            self.assertEqual(failure.exception.code, "command_timeout")
+            for _ in range(20):
+                if pid_path.exists():
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("setsid diagnostic child did not publish its pid")
+            child_pid = int(pid_path.read_text())
+            for _ in range(40):
+                try:
+                    state = (Path("/proc") / str(child_pid) / "stat").read_text()
+                    close_paren = state.rfind(")")
+                    if state[close_paren + 2 :].split()[0] == "Z":
+                        break
+                except FileNotFoundError:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("setsid diagnostic descendant remained alive after leader exit")
 
     @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
     def test_bounded_runner_fallback_kills_descendants_when_group_signal_fails(self):

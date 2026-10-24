@@ -173,15 +173,27 @@ export async function createSnapshotOwnerMarker(scope: string, ownerPid = proces
 
 async function snapshotOwnerPid(value: string, expectedScope: string): Promise<number | undefined> {
   const lines = value.split("\n");
-  if (lines.length !== 5 || lines[0] !== SNAPSHOT_OWNER_MARKER_VERSION || lines[2] !== createHash("sha256").update(expectedScope).digest("hex")) return undefined;
+  if (lines.length !== 5 || lines[0] !== SNAPSHOT_OWNER_MARKER_VERSION) return undefined;
   const ownerPid = lines[3] ?? "";
   if (!SNAPSHOT_OWNER_PID_PATTERN.test(ownerPid)) return undefined;
   const match = SNAPSHOT_OWNER_RECORD_PATTERN.exec(lines[1] ?? "");
   if (match === null) return undefined;
   try {
     const key = await readSnapshotOwnerKey();
-    const expected = createHmac("sha256", key).update(`${expectedScope}\n${ownerPid}\n${match[1]}`).digest("hex");
-    return expected === match[2]!.toLowerCase() ? Number(ownerPid) : undefined;
+    const scopePrefix = expectedScope.slice(0, expectedScope.indexOf(":"));
+    const scopePath = expectedScope.slice(expectedScope.indexOf(":") + 1);
+    const scopes = new Set([expectedScope]);
+    try {
+      scopes.add(`${scopePrefix}:${await realpath(scopePath)}`);
+    } catch {
+      // The lexical scope may be the only path still available during cleanup.
+    }
+    for (const scope of scopes) {
+      if (createHash("sha256").update(scope).digest("hex") !== lines[2]) continue;
+      const expected = createHmac("sha256", key).update(`${scope}\n${ownerPid}\n${match[1]}`).digest("hex");
+      if (expected === match[2]!.toLowerCase()) return Number(ownerPid);
+    }
+    return undefined;
   } catch {
     return undefined;
   }
@@ -569,8 +581,11 @@ export function redactSensitiveText(text: string): string {
   // be concatenated into a token that bypasses the assignment patterns. The
   // punctuation cleanup keeps split names such as `api_\u001b[31mkey` intact.
   const normalized = text
+    // Remove control and formatting characters before matching keys so an
+    // untrusted diagnostic cannot split `password`, `api_key`, or `token`.
     .replace(ANSI_ESCAPE, " ")
-    .replace(CONTROL_CHARACTERS, " ")
+    .replace(CONTROL_CHARACTERS, "")
+    .replace(/\t/g, " ")
     .replace(/(?<=[A-Za-z0-9_.-])\p{Cf}+(?=[A-Za-z0-9_.-])/gu, "")
     .replace(UNICODE_FORMAT_CHARACTERS, " ")
     .replace(/([A-Za-z0-9])\s+([_.-])(?=[A-Za-z0-9])/g, "$1$2")
@@ -816,7 +831,7 @@ async function renderKnownLogListing(localDir: string, entries: Dirent[], redact
   return output;
 }
 
-async function ensureSnapshotTemporaryRoot(parent: string): Promise<string> {
+async function ensureSnapshotTemporaryRoot(parent: string, scopeParent = parent): Promise<string> {
   await realpath(parent);
   const parentMetadata = await lstat(parent);
   if (!parentMetadata.isDirectory() || parentMetadata.isSymbolicLink()) throw new Error("snapshot output parent must be a real directory");
@@ -840,7 +855,7 @@ async function ensureSnapshotTemporaryRoot(parent: string): Promise<string> {
   if (!metadata.isDirectory() || metadata.isSymbolicLink() || (metadata.mode & 0o077) !== 0) throw new Error("snapshot temporary root must be a private directory");
   if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) throw new Error("snapshot temporary root is not owned by the current user");
   const marker = join(root, ".owner");
-  const rootScope = `root:${root}`;
+  const rootScope = `root:${join(scopeParent, SNAPSHOT_TEMP_ROOT_NAME)}`;
   const readMarker = async (path = marker): Promise<boolean | undefined> => {
     let markerMetadata;
     try {
@@ -957,7 +972,7 @@ async function ensureSnapshotTemporaryRoot(parent: string): Promise<string> {
   return root;
 }
 
-async function cleanupSnapshotTemporaryDirectories(root: string, requestedPath?: string): Promise<void> {
+async function cleanupSnapshotTemporaryDirectories(root: string, requestedPath?: string, scopeParent?: string): Promise<void> {
   const removeDirectoryContents = async (path: string, expectedIdentity: { dev: number; ino: number }): Promise<boolean> => {
     try {
       const moved = await lstat(path);
@@ -1006,6 +1021,7 @@ async function cleanupSnapshotTemporaryDirectories(root: string, requestedPath?:
     }
   };
   let directory;
+  const scopeRoot = scopeParent === undefined ? root : join(scopeParent, SNAPSHOT_TEMP_ROOT_NAME);
   try {
     directory = await opendir(root);
   } catch (error) {
@@ -1025,7 +1041,7 @@ async function cleanupSnapshotTemporaryDirectories(root: string, requestedPath?:
         const metadata = await lstat(path);
         if (!metadata.isDirectory() || metadata.isSymbolicLink()) continue;
         const originalName = isTombstone ? tombstoneMatch![1]! : entry.name;
-        const originalPath = join(root, originalName);
+        const originalPath = join(scopeRoot, originalName);
         if (!isTombstone && requestedPath !== path && Date.now() - metadata.mtimeMs < SNAPSHOT_TEMP_STALE_MS) continue;
         if (await readMarkerForCleanup(join(path, ".owner"), `temp:${originalPath}`) !== true) continue;
         const initialIdentity = { dev: metadata.dev, ino: metadata.ino };
@@ -1406,13 +1422,21 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
   }
   try {
     const parent = dirname(outputPath);
-    const tempRoot = await ensureSnapshotTemporaryRoot(parent);
-    await cleanupSnapshotTemporaryDirectories(tempRoot);
-    const parentMetadata = await lstat(parent);
-    if (!parentMetadata.isDirectory() || parentMetadata.isSymbolicLink()) throw new Error("snapshot output parent must be a real directory");
-    const parentIdentity = { dev: parentMetadata.dev, ino: parentMetadata.ino };
+    const canonicalParent = await realpath(parent);
+    const requestedParentMetadata = await lstat(parent);
+    const canonicalParentMetadata = await lstat(canonicalParent);
+    if (!requestedParentMetadata.isDirectory() || requestedParentMetadata.isSymbolicLink()
+      || !canonicalParentMetadata.isDirectory() || canonicalParentMetadata.isSymbolicLink()
+      || requestedParentMetadata.dev !== canonicalParentMetadata.dev
+      || requestedParentMetadata.ino !== canonicalParentMetadata.ino) {
+      throw new Error("snapshot output parent must be a real directory");
+    }
+    const publicationPath = join(canonicalParent, basename(outputPath));
+    const tempRoot = await ensureSnapshotTemporaryRoot(canonicalParent, parent);
+    await cleanupSnapshotTemporaryDirectories(tempRoot, undefined, parent);
+    const parentIdentity = { dev: canonicalParentMetadata.dev, ino: canonicalParentMetadata.ino };
     const assertParentStable = async (): Promise<void> => {
-      const current = await lstat(parent);
+      const current = await lstat(canonicalParent);
       if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== parentIdentity.dev || current.ino !== parentIdentity.ino) {
         throw new Error("snapshot output parent changed during publication");
       }
@@ -1423,7 +1447,7 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     try {
       const owner = await open(join(tempDir, ".owner"), "wx", 0o600);
       try {
-          await owner.writeFile(await createSnapshotOwnerMarker(`temp:${tempDir}`));
+        await owner.writeFile(await createSnapshotOwnerMarker(`temp:${join(parent, basename(tempDir))}`));
         await owner.sync();
       } finally {
         await owner.close();
@@ -1436,13 +1460,13 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
         await handle.close();
       }
       await assertParentStable();
-      await rename(tempPath, outputPath);
+      await rename(tempPath, publicationPath);
       await assertParentStable();
     } finally {
       await unlink(tempPath).catch(() => undefined);
-      await cleanupSnapshotTemporaryDirectories(tempRoot, tempDir);
+      await cleanupSnapshotTemporaryDirectories(tempRoot, tempDir, parent);
     }
-    await syncDirectory(parent);
+    await syncDirectory(canonicalParent);
   } catch (error) {
     const detail = redactOperationalText(error instanceof Error ? error.message : String(error), [outputPath, dirname(outputPath)]);
     console.error(`error: cannot publish snapshot at <configured-output>: ${detail || "publication failed"}`);

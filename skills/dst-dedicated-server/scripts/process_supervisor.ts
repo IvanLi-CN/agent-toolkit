@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { close as closeFileDescriptorCallback, constants } from "node:fs";
 import { lstat, mkdir, mkdtemp, open, opendir, readFile, rename, rmdir, unlink, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -16,6 +16,8 @@ const SUPERVISOR_STATUS_PIPE_TIMEOUT_MS = 2_000;
 // enough time to complete the probe sequence.
 const SUPERVISOR_TARGET_REFERENCE_TIMEOUT_MS = 15_000;
 const SUPERVISOR_GROUP_MEMBER_CAPTURE_TIMEOUT_MS = 2_000;
+const SUPERVISOR_INITIAL_LEDGER_WAIT_MS = 5_000;
+const SUPERVISOR_LEDGER_AUTH_SETTLE_MS = 2_000;
 export const SUPERVISOR_UNKNOWN_TARGET_STATUS = 125;
 const MAX_SUPERVISOR_MARKER_BYTES = 256;
 const MAX_SUPERVISOR_DESCENDANT_BYTES = 1024 * 1024;
@@ -91,6 +93,11 @@ fi
 status_dir_is_current() {
   [ -d "." ] && [ ! -L "." ]
 }
+ledger_auth_key="\${AGENT_TOOLKIT_SUPERVISOR_LEDGER_KEY:-}"
+case "$ledger_auth_key" in
+  ''|*[!0-9a-fA-F]*) ledger_auth_key="" ;;
+esac
+[ "\${#ledger_auth_key}" -eq 64 ] || ledger_auth_key=""
 read_regular_marker() {
   marker_path="$1"
   if ! command -v perl >/dev/null 2>&1; then return 1; fi
@@ -342,6 +349,49 @@ safe_read_snapshot() {
     binmode STDOUT;
     print $data;
   ' "$snapshot_input_path" "$supervisor_no_follow"
+}
+write_ledger_auth() {
+  status_dir_is_current || return 1
+  [ -n "$supervisor_no_follow" ] || return 1
+  [ -n "$ledger_auth_key" ] || return 1
+  [ -f "$captured_descendants_path" ] || return 0
+  ledger_auth_nonce="$(LC_ALL=C od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d '[:space:]' || true)"
+  case "$ledger_auth_nonce" in
+    ''|*[!0-9a-fA-F]*) return 1 ;;
+  esac
+  ledger_auth_temporary_path="$status_dir/.descendants-auth-$ledger_auth_nonce.tmp"
+  if ! perl -MDigest::SHA=hmac_sha256_hex -e '
+    use strict;
+    use warnings;
+    use Fcntl qw(O_RDONLY O_WRONLY O_CREAT O_EXCL);
+    my ($input, $output, $temporary, $key, $nofollow) = @ARGV;
+    exit 1 unless defined $nofollow && $key =~ /^[0-9a-fA-F]{64}$/;
+    my @path_stat = lstat($input);
+    exit 1 unless @path_stat && (($path_stat[2] & 0170000) == 0100000) && $path_stat[7] <= 1048576;
+    my $no_follow = eval { Fcntl::O_NOFOLLOW() };
+    exit 1 unless defined $no_follow;
+    sysopen(my $in, $input, O_RDONLY | $no_follow) or exit 1;
+    my @opened = stat($in);
+    exit 1 unless @opened && (($opened[2] & 0170000) == 0100000)
+      && $opened[0] == $path_stat[0] && $opened[1] == $path_stat[1]
+      && $opened[7] == $path_stat[7] && $opened[7] <= 1048576;
+    binmode $in;
+    local $/;
+    my $data = <$in> // "";
+    my @final = stat($in);
+    exit 1 unless @final && $final[0] == $opened[0] && $final[1] == $opened[1]
+      && $final[7] == $opened[7] && length($data) == $opened[7] && length($data) <= 1048576;
+    close($in) or exit 1;
+    my $authentication = hmac_sha256_hex($data, pack("H*", $key));
+    sysopen(my $out, $temporary, O_WRONLY | O_CREAT | O_EXCL | $no_follow, 0600) or exit 1;
+    print {$out} $authentication, "\n" or exit 1;
+    close($out) or exit 1;
+    rename($temporary, $output) or exit 1;
+  ' "$captured_descendants_path" "$status_dir/descendants-auth" "$ledger_auth_temporary_path" "$ledger_auth_key" "$supervisor_no_follow"; then
+    rm -f -- "$ledger_auth_temporary_path" 2>/dev/null || true
+    return 1
+  fi
+  return 0
 }
 validate_captured_ledger() {
   [ -n "$supervisor_no_follow" ] || return 1
@@ -623,6 +673,7 @@ if command -v setsid >/dev/null 2>&1 && [ "\${AGENT_TOOLKIT_SUPERVISOR_DISABLE_S
     supervisor_no_follow="$7"
     stop_path="$8"
     shift 8
+    unset AGENT_TOOLKIT_SUPERVISOR_LEDGER_KEY
     publication_path="$(dirname -- "$result_path")/status"
     write_target_marker() {
       marker_path="$1"
@@ -665,6 +716,7 @@ else
     supervisor_no_follow="$7"
     stop_path="$8"
     shift 8
+    unset AGENT_TOOLKIT_SUPERVISOR_LEDGER_KEY
     publication_path="$(dirname -- "$result_path")/status"
     write_target_marker() {
       marker_path="$1"
@@ -1705,6 +1757,7 @@ $record_pending_read_data
 EOF
   [ "$?" -eq 0 ] || { cleanup_ack_enabled=0; return 1; }
   captured_descendants_read_data="$(safe_read_snapshot "$captured_descendants_path" 2>/dev/null)" || { cleanup_ack_enabled=0; return 1; }
+  write_ledger_auth || { cleanup_ack_enabled=0; return 1; }
 }
 capture_owned_descendants() {
   if snapshot_deadline_exceeded; then cleanup_ack_enabled=0; return 1; fi
@@ -2553,8 +2606,11 @@ async function readStatusPipe(fd: number, timeoutMs = SUPERVISOR_STATUS_PIPE_TIM
   const reader = Bun.file(fd).stream().getReader();
   const decoder = new TextDecoder();
   let value = "";
-  const cancelReader = (): void => {
-    try { void reader.cancel().catch(() => undefined); } catch { /* The pipe may already be closed. */ }
+  let readerClosed = false;
+  const cancelReader = async (): Promise<void> => {
+    if (readerClosed) return;
+    readerClosed = true;
+    try { await reader.cancel(); } catch { /* The pipe may already be closed. */ }
   };
   try {
     const deadline = Date.now() + timeoutMs;
@@ -2567,7 +2623,7 @@ async function readStatusPipe(fd: number, timeoutMs = SUPERVISOR_STATUS_PIPE_TIM
         { kind: "timeout" as const },
       );
       if (result.kind === "timeout") {
-        cancelReader();
+        await cancelReader();
         return undefined;
       }
       if (result.read.done) break;
@@ -2588,7 +2644,7 @@ async function readStatusPipe(fd: number, timeoutMs = SUPERVISOR_STATUS_PIPE_TIM
   } catch {
     return undefined;
   } finally {
-    cancelReader();
+    await cancelReader();
     try { reader.releaseLock(); } catch { /* The pipe may still be closing. */ }
     await closeFileDescriptor(fd);
   }
@@ -2606,6 +2662,55 @@ interface TargetGroupMember {
   identity: string;
 }
 
+interface SupervisorDirectoryIdentity {
+  dev: number;
+  ino: number;
+}
+
+function ledgerAuthenticationMatches(ledger: string, authentication: string, key: string): boolean {
+  if (!/^[0-9a-fA-F]{64}$/.test(key) || !/^[0-9a-fA-F]{64}$/.test(authentication)) return false;
+  const expected = createHmac("sha256", Buffer.from(key, "hex")).update(ledger).digest();
+  const actual = Buffer.from(authentication, "hex");
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+async function authenticateInitialLedger(
+  statusDirectory: string,
+  key: string,
+): Promise<boolean> {
+  const deadline = Date.now() + SUPERVISOR_INITIAL_LEDGER_WAIT_MS;
+  const snapshotFinishedPath = join(statusDirectory, "snapshot-finished-1");
+  while (Date.now() < deadline) {
+    const ledger = await readRegularMarker(join(statusDirectory, "descendants"), MAX_SUPERVISOR_DESCENDANT_BYTES);
+    const snapshotFinished = await readRegularMarker(snapshotFinishedPath);
+    if (ledger !== undefined && ledger.trim().length > 0) {
+      const authentication = await readRegularMarker(join(statusDirectory, "descendants-auth"), MAX_SUPERVISOR_MARKER_BYTES);
+      if (authentication !== undefined && ledgerAuthenticationMatches(ledger, authentication.trim(), key)) return true;
+    } else if (snapshotFinished !== undefined) {
+      return true;
+    }
+    await Bun.sleep(25);
+  }
+  return false;
+}
+
+async function readAuthenticatedLedger(statusDirectory: string, key: string, deadline: number): Promise<string | undefined> {
+  const ledgerPath = join(statusDirectory, "descendants");
+  const authenticationPath = join(statusDirectory, "descendants-auth");
+  while (Date.now() < deadline) {
+    const ledger = await readRegularMarker(ledgerPath, MAX_SUPERVISOR_DESCENDANT_BYTES);
+    if (ledger === undefined) {
+      await Bun.sleep(25);
+      continue;
+    }
+    if (ledger.trim().length === 0) return ledger;
+    const authentication = await readRegularMarker(authenticationPath, MAX_SUPERVISOR_MARKER_BYTES);
+    if (authentication !== undefined && ledgerAuthenticationMatches(ledger, authentication.trim(), key)) return ledger;
+    await Bun.sleep(25);
+  }
+  return undefined;
+}
+
 async function processStartTime(pid: number): Promise<string | undefined> {
   try {
     const stat = await readFile(`/proc/${pid}/stat`, "utf8");
@@ -2619,8 +2724,7 @@ async function processStartTime(pid: number): Promise<string | undefined> {
 
 const POSIX_PS = Bun.which("ps") ?? undefined;
 
-async function readProcessProbeOutput(stream: ReadableStream<Uint8Array>, maxBytes = MAX_SUPERVISOR_PROBE_BYTES): Promise<string | undefined> {
-  const reader = stream.getReader();
+async function readProcessProbeOutput(reader: ReadableStreamDefaultReader<Uint8Array>, maxBytes = MAX_SUPERVISOR_PROBE_BYTES): Promise<string | undefined> {
   const chunks: Uint8Array[] = [];
   let total = 0;
   try {
@@ -2647,7 +2751,8 @@ async function readProcessProbeOutput(stream: ReadableStream<Uint8Array>, maxByt
 
 async function boundedCommandOutput(command: string[], timeoutMs = 2_000): Promise<{ exitCode: number; stdout: string } | undefined> {
   const child = Bun.spawn(command, { stdout: "pipe", stderr: "ignore" });
-  const stdoutPromise = readProcessProbeOutput(child.stdout as ReadableStream<Uint8Array>);
+  const reader = (child.stdout as ReadableStream<Uint8Array>).getReader();
+  const stdoutPromise = readProcessProbeOutput(reader);
   const result = await raceWithTimeout(
     Promise.all([child.exited, stdoutPromise]).then(([exitCode, stdout]) => {
       return stdout === undefined ? undefined : { exitCode, stdout };
@@ -2656,6 +2761,8 @@ async function boundedCommandOutput(command: string[], timeoutMs = 2_000): Promi
     undefined,
   );
   if (result !== undefined && result !== null) return result;
+  try { await reader.cancel(); } catch { /* The probe stream may already be closed. */ }
+  await stdoutPromise.catch(() => undefined);
   try { child.kill("SIGKILL"); } catch { /* The probe may already be gone. */ }
   await child.exited.catch(() => undefined);
   return undefined;
@@ -2766,13 +2873,16 @@ async function readTargetReference(statusPath: string, wrapperPid: number): Prom
 async function processGroupHasLiveProcess(pgid: number): Promise<boolean | undefined> {
   if (POSIX_PS === undefined) return undefined;
   const child = Bun.spawn([POSIX_PS, "-axo", "pid=,pgid=,state="], { stdout: "pipe", stderr: "ignore" });
-  const stdoutPromise = readProcessProbeOutput(child.stdout);
+  const reader = (child.stdout as ReadableStream<Uint8Array>).getReader();
+  const stdoutPromise = readProcessProbeOutput(reader);
   const output = await raceWithTimeout(
     Promise.all([child.exited, stdoutPromise]).then(([exitCode, stdout]) => exitCode === 0 ? stdout : undefined),
     2_000,
     undefined,
   );
   if (output === undefined || output === null) {
+    try { await reader.cancel(); } catch { /* The probe stream may already be closed. */ }
+    await stdoutPromise.catch(() => undefined);
     try { child.kill("SIGKILL"); } catch { /* The process probe may already be gone. */ }
     await child.exited.catch(() => undefined);
     return undefined;
@@ -2834,7 +2944,8 @@ async function probeAuthorizedMember(expected: TargetGroupMember): Promise<Autho
 async function captureTargetGroupMembers(reference: TargetReference, wrapperExited: Promise<number>): Promise<TargetGroupMember[] | undefined> {
   const deadline = Date.now() + SUPERVISOR_GROUP_MEMBER_CAPTURE_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    const result = POSIX_PS === undefined ? undefined : await boundedCommandOutput([POSIX_PS, "-axo", "pid=,pgid=,state="]);
+    const remainingMs = deadline - Date.now();
+    const result = POSIX_PS === undefined ? undefined : await boundedCommandOutput([POSIX_PS, "-axo", "pid=,pgid=,state="], Math.min(2_000, remainingMs));
     if (result !== undefined && result.exitCode === 0) {
       const members: TargetGroupMember[] = [];
       let malformed = false;
@@ -2848,7 +2959,12 @@ async function captureTargetGroupMembers(reference: TargetReference, wrapperExit
         const pid = Number(match[1]);
         const pgid = Number(match[2]);
         if (!Number.isInteger(pid) || !Number.isInteger(pgid) || pgid !== reference.pgid || match[3]!.startsWith("Z")) continue;
-        const identity = await currentProcessIdentity(pid);
+        const memberRemainingMs = deadline - Date.now();
+        if (memberRemainingMs <= 0) {
+          malformed = true;
+          break;
+        }
+        const identity = await raceWithTimeout(currentProcessIdentity(pid), memberRemainingMs, undefined);
         if (identity === undefined) {
           if (processIsAlive(pid)) {
             malformed = true;
@@ -2856,7 +2972,16 @@ async function captureTargetGroupMembers(reference: TargetReference, wrapperExit
           }
           continue;
         }
-        const currentPgid = await currentProcessGroup(pid);
+        const groupRemainingMs = deadline - Date.now();
+        if (groupRemainingMs <= 0) {
+          malformed = true;
+          break;
+        }
+        const currentPgid = await raceWithTimeout(currentProcessGroup(pid), groupRemainingMs, undefined);
+        if (currentPgid === undefined) {
+          malformed = true;
+          break;
+        }
         if (currentPgid !== reference.pgid) {
           malformed = true;
           break;
@@ -2879,6 +3004,7 @@ async function captureTargetGroupMembers(reference: TargetReference, wrapperExit
 
 async function cleanupAuthorizedTargetGroup(
   statusDirectory: string | undefined,
+  ledgerKey: string,
   reference: TargetReference,
   rememberedMembers?: readonly TargetGroupMember[],
   allowCurrentGroupMembers = false,
@@ -2896,8 +3022,12 @@ async function cleanupAuthorizedTargetGroup(
     if (previous !== undefined && (previous.identity !== member.identity || previous.pgid !== member.pgid)) return false;
     authorized.set(member.pid, member);
   }
-  const ledger = statusDirectory === undefined ? undefined : await readRegularMarker(join(statusDirectory, "descendants"), MAX_SUPERVISOR_DESCENDANT_BYTES);
-  if (ledger !== undefined) {
+  const ledger = statusDirectory === undefined
+    ? undefined
+    : await readAuthenticatedLedger(statusDirectory, ledgerKey, Math.min(cleanupDeadline, Date.now() + SUPERVISOR_LEDGER_AUTH_SETTLE_MS));
+  if (statusDirectory !== undefined && ledger === undefined
+    && await lstat(join(statusDirectory, "descendants")).then(() => true, () => false)) return false;
+  if (ledger !== undefined && ledger.trim().length > 0) {
     let ledgerRecords = 0;
     for (const line of ledger.split(/\r?\n/)) {
       if (line.trim().length === 0) continue;
@@ -2979,6 +3109,7 @@ async function waitForProcessGroupGone(pgid: number, cleanupDeadline = Date.now(
 async function cleanupOrphanedTarget(
   rememberedReference?: TargetReference,
   statusDirectory?: string,
+  ledgerKey = "",
   rememberedMembers?: readonly TargetGroupMember[],
   cleanupDeadline = Date.now() + SUPERVISOR_CLEANUP_TIMEOUT_MS,
 ): Promise<boolean> {
@@ -2996,14 +3127,14 @@ async function cleanupOrphanedTarget(
     return await currentProcessGroup(targetPid) === targetPgid;
   };
   if (!await verifyTargetReference()) {
-    return cleanupAuthorizedTargetGroup(statusDirectory, reference, rememberedMembers, false, cleanupDeadline);
+    return cleanupAuthorizedTargetGroup(statusDirectory, ledgerKey, reference, rememberedMembers, false, cleanupDeadline);
   }
   // Re-read the authenticated identity and group immediately before the
   // negative-PGID signal so a reused PID or group cannot pass a stale check.
   if (!await verifyTargetReference()) {
-    return cleanupAuthorizedTargetGroup(statusDirectory, reference, rememberedMembers, false, cleanupDeadline);
+    return cleanupAuthorizedTargetGroup(statusDirectory, ledgerKey, reference, rememberedMembers, false, cleanupDeadline);
   }
-  return cleanupAuthorizedTargetGroup(statusDirectory, reference, rememberedMembers, true, cleanupDeadline);
+  return cleanupAuthorizedTargetGroup(statusDirectory, ledgerKey, reference, rememberedMembers, true, cleanupDeadline);
 }
 
 async function waitForTarget(
@@ -3012,13 +3143,14 @@ async function waitForTarget(
   wrapperExited: Promise<number>,
   rememberedReference?: () => TargetReference | undefined,
   rememberedMembers?: () => readonly TargetGroupMember[] | undefined,
+  ledgerKey = "",
 ): Promise<number> {
   const wrapperCode = await wrapperExited;
   const status = statusFd === undefined ? undefined : await readStatusPipe(statusFd);
   if (wrapperCode === 0 && status !== undefined && await readRegularMarker(parentDeadPath) === undefined) {
     return status;
   }
-  await cleanupOrphanedTarget(rememberedReference?.(), dirname(parentDeadPath), rememberedMembers?.());
+  await cleanupOrphanedTarget(rememberedReference?.(), dirname(parentDeadPath), ledgerKey, rememberedMembers?.());
   return SUPERVISOR_UNKNOWN_TARGET_STATUS;
 }
 
@@ -3063,7 +3195,7 @@ async function restoreSupervisorDirectory(original: string, tombstone: string, i
   }
 }
 
-async function removeSupervisorDirectory(path: string): Promise<void> {
+async function removeSupervisorDirectory(path: string, expectedIdentity?: SupervisorDirectoryIdentity): Promise<void> {
   let metadata;
   try {
     metadata = await lstat(path);
@@ -3072,6 +3204,7 @@ async function removeSupervisorDirectory(path: string): Promise<void> {
     return;
   }
   if (!metadata.isDirectory() || metadata.isSymbolicLink()) return;
+  if (expectedIdentity !== undefined && (metadata.dev !== expectedIdentity.dev || metadata.ino !== expectedIdentity.ino)) return;
   const identity = { dev: metadata.dev, ino: metadata.ino };
   const tombstone = join(dirname(path), `.agent-toolkit-dst-supervisor-delete-${randomUUID()}`);
   try {
@@ -3148,35 +3281,41 @@ async function removeSupervisorDirectory(path: string): Promise<void> {
   }
 }
 
-async function removeSupervisorDirectoryAfterAcknowledgement(path: string, acknowledgement: number | undefined): Promise<void> {
+async function removeSupervisorDirectoryAfterAcknowledgement(path: string, acknowledgement: number | undefined, expectedIdentity: SupervisorDirectoryIdentity): Promise<void> {
   if (acknowledgement !== 0 && acknowledgement !== 1) return;
   // ACK=0 means the detached cleaner could not prove cleanup. Preserve the
   // ledger until the parent-side authenticated fallback has had a chance to
   // recover descendants.
   if (acknowledgement === 0) return;
-  await removeSupervisorDirectory(path);
+  await removeSupervisorDirectory(path, expectedIdentity);
 }
 
-async function settleSupervisorDirectory(path: string, acknowledgement: number | undefined): Promise<void> {
+async function settleSupervisorDirectory(path: string, acknowledgement: number | undefined, expectedIdentity: SupervisorDirectoryIdentity): Promise<void> {
   // The detached cleaner owns the directory until it writes the ACK. Removing
   // it merely because the wrapper exited can interrupt a still-running
   // descendant verification pass.
   if (acknowledgement === 0) {
-    await removeSupervisorDirectoryAfterAcknowledgement(path, acknowledgement);
+    await removeSupervisorDirectoryAfterAcknowledgement(path, acknowledgement, expectedIdentity);
     return;
   }
   if (acknowledgement !== 1) return;
   const deadline = Date.now() + SUPERVISOR_CLEANUP_MARKER_SETTLE_MS;
   while (Date.now() < deadline) {
     if ((await readRegularMarker(join(path, "cleanup-complete")))?.trim() === "complete") {
-      await removeSupervisorDirectory(path);
+      await removeSupervisorDirectory(path, expectedIdentity);
       return;
     }
     await Bun.sleep(Math.min(25, Math.max(1, deadline - Date.now())));
   }
 }
 
-async function waitForCleanupAck(fd: number, cleanupStartedPath: string, wrapperExited: Promise<number>, statusDirectory: string): Promise<boolean> {
+async function waitForCleanupAck(
+  fd: number,
+  cleanupStartedPath: string,
+  wrapperExited: Promise<number>,
+  statusDirectory: string,
+  directoryIdentity: SupervisorDirectoryIdentity,
+): Promise<boolean> {
   const wrapperResult = await raceWithTimeout(
     wrapperExited.then((code) => ({ done: true as const, code })),
     20,
@@ -3192,7 +3331,7 @@ async function waitForCleanupAck(fd: number, cleanupStartedPath: string, wrapper
         : SUPERVISOR_UNEXPECTED_EXIT_SETTLE_MS;
   }
   const acknowledgement = await readStatusPipe(fd, timeoutMs);
-  await settleSupervisorDirectory(statusDirectory, acknowledgement);
+  await settleSupervisorDirectory(statusDirectory, acknowledgement, directoryIdentity);
   return acknowledgement === 1;
 }
 
@@ -3217,12 +3356,18 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
   if (Bun.which("ps") === null) throw new Error("supervisor_requires_ps");
 
   const targetMarker = randomUUID();
+  const ledgerKey = randomBytes(32).toString("hex");
   let directory: string;
   try {
     directory = await mkdtemp(join(tmpdir(), ".agent-toolkit-dst-supervisor-"));
   } catch (error) {
     throw error;
   }
+  const directoryMetadata = await lstat(directory);
+  if (!directoryMetadata.isDirectory() || directoryMetadata.isSymbolicLink()) {
+    throw new Error("supervisor_directory_unavailable");
+  }
+  const directoryIdentity: SupervisorDirectoryIdentity = { dev: directoryMetadata.dev, ino: directoryMetadata.ino };
   const statusPath = join(directory, "status");
   const readyPath = join(directory, "ready");
   const targetAuthorizedPath = join(directory, "target-authorized");
@@ -3239,6 +3384,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
           ...process.env,
           AGENT_TOOLKIT_SUPERVISOR_PARENT_PID: String(process.pid),
           AGENT_TOOLKIT_TARGET_MARKER: targetMarker,
+          AGENT_TOOLKIT_SUPERVISOR_LEDGER_KEY: ledgerKey,
         },
       },
     ) as Bun.Subprocess<"pipe", "pipe", "pipe"> & { stdio: [null, null, null, number | null, number | null] };
@@ -3256,7 +3402,7 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
     let rememberedTargetGroupMembers: TargetGroupMember[] | undefined;
     let cleanupAckPromise: Promise<boolean> | undefined;
     const waitForCleanupAcknowledged = (): Promise<boolean> => {
-      cleanupAckPromise ??= waitForCleanupAck(cleanupFd, cleanupStartedPath, wrapperExited, directory).finally(() => {
+      cleanupAckPromise ??= waitForCleanupAck(cleanupFd, cleanupStartedPath, wrapperExited, directory, directoryIdentity).finally(() => {
         cleanupFdForParent = undefined;
       });
       return cleanupAckPromise;
@@ -3269,13 +3415,14 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
         wrapperExited,
         () => rememberedTargetReference,
         () => rememberedTargetGroupMembers,
+        ledgerKey,
       ),
       wrapperExited,
       waitForCleanupAcknowledged,
       forceCleanup: async () => {
         const reference = rememberedTargetReference ?? await readTargetReference(statusPath, child.pid);
         const cleanupDeadline = Date.now() + SUPERVISOR_CLEANUP_TIMEOUT_MS;
-        const targetCleanup = cleanupOrphanedTarget(reference, directory, rememberedTargetGroupMembers, cleanupDeadline);
+        const targetCleanup = cleanupOrphanedTarget(reference, directory, ledgerKey, rememberedTargetGroupMembers, cleanupDeadline);
         try { child.kill("SIGKILL"); } catch { /* The wrapper may already be gone. */ }
         await wrapperExited.catch(() => undefined);
         if (cleanupFdForParent !== undefined) {
@@ -3283,17 +3430,17 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
           cleanupFdForParent = undefined;
         }
         if (await targetCleanup) {
-          await removeSupervisorDirectory(directory);
+          await removeSupervisorDirectory(directory, directoryIdentity);
           return true;
         }
-        const retry = await cleanupOrphanedTarget(reference, directory, rememberedTargetGroupMembers, cleanupDeadline);
-        if (retry) await removeSupervisorDirectory(directory);
+        const retry = await cleanupOrphanedTarget(reference, directory, ledgerKey, rememberedTargetGroupMembers, cleanupDeadline);
+        if (retry) await removeSupervisorDirectory(directory, directoryIdentity);
         return retry;
       },
       cleanup: async () => {
-        await cleanupOrphanedTarget(rememberedTargetReference, directory, rememberedTargetGroupMembers);
+        await cleanupOrphanedTarget(rememberedTargetReference, directory, ledgerKey, rememberedTargetGroupMembers);
         if ((await readRegularMarker(cleanupCompletePath))?.trim() === "complete") {
-          await removeSupervisorDirectory(directory);
+          await removeSupervisorDirectory(directory, directoryIdentity);
         }
         if (cleanupFdForParent !== undefined) {
           await closeFileDescriptor(cleanupFdForParent);
@@ -3344,12 +3491,13 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
     }
     rememberedTargetReference = targetReference;
     rememberedTargetGroupMembers = await captureTargetGroupMembers(targetReference, wrapperExited);
+    await authenticateInitialLedger(directory, ledgerKey);
     return supervised;
   } catch (error) {
     if (statusFdForCleanup !== undefined) await closeFileDescriptor(statusFdForCleanup);
     if (cleanupFdForParent !== undefined) await closeFileDescriptor(cleanupFdForParent);
     if (statusFdForCleanup === undefined || (await readRegularMarker(cleanupCompletePath))?.trim() === "complete") {
-      await removeSupervisorDirectory(directory);
+      await removeSupervisorDirectory(directory, directoryIdentity);
     }
     throw error;
   }

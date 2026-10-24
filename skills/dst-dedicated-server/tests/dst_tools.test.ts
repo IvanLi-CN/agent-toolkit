@@ -73,6 +73,8 @@ describe.serial("DST local Bun tooling", () => {
     expect(redactSensitiveText("token\u001b[31mANSI_SECRET")).not.toContain("ANSI_SECRET");
     expect(redactSensitiveText("api_key\u001b[31m=fixture-secret")).not.toContain("fixture-secret");
     expect(redactSensitiveText("api_key=\u001b[31mfixture-secret")).not.toContain("fixture-secret");
+    expect(redactSensitiveText("api\tkey=tab-separated-secret")).not.toContain("tab-separated-secret");
+    expect(redactSensitiveText("pass\u0000word=nul-separated-secret")).not.toContain("nul-separated-secret");
     expect(redactSensitiveText("token\u200B=UNICODE_SECRET")).not.toContain("UNICODE_SECRET");
     expect(redactSensitiveText("to\u200Bken=UNICODE_KEY_SECRET")).not.toContain("UNICODE_KEY_SECRET");
     expect(redactSensitiveText("token=\u0000NUL_SECRET")).not.toContain("NUL_SECRET");
@@ -1691,6 +1693,58 @@ try {
       expect(result.stdout.trim()).toBe("true");
     } finally {
       await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a forged descendant ledger during fallback cleanup", { timeout: 30_000 }, async () => {
+    if (process.platform === "win32") return;
+    const before = new Set((await readdir(tmpdir())).filter((entry) => entry.startsWith(".agent-toolkit-dst-supervisor-") && !entry.includes("ack-")));
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    let statusDirectory: string | undefined;
+    let targetPid: number | undefined;
+    let targetPgid: number | undefined;
+    const killTarget = (signal: "SIGKILL" | "SIGTERM"): void => {
+      if (targetPgid !== undefined && targetPgid > 0) {
+        try { process.kill(-targetPgid, signal); } catch { /* The group may already have exited. */ }
+      }
+      if (targetPid !== undefined) {
+        try { process.kill(targetPid, signal); } catch { /* The target may already have exited. */ }
+      }
+    };
+    try {
+      supervised = await spawnSupervised(["sh", "-c", "sleep 30"]);
+      for (let attempt = 0; attempt < 40 && statusDirectory === undefined; attempt += 1) {
+        for (const entry of await readdir(tmpdir())) {
+          if (before.has(entry) || !entry.startsWith(".agent-toolkit-dst-supervisor-") || entry.includes("ack-")) continue;
+          if ((await lstat(join(tmpdir(), entry, "target")).catch(() => undefined))?.isFile() === true) {
+            statusDirectory = join(tmpdir(), entry);
+            break;
+          }
+        }
+        if (statusDirectory === undefined) await Bun.sleep(25);
+      }
+      expect(statusDirectory).toBeString();
+      targetPid = Number((await readFile(join(statusDirectory!, "target"), "utf8")).trim());
+      targetPgid = Number((await readFile(join(statusDirectory!, "target-pgid"), "utf8")).trim());
+      const ledgerPath = join(statusDirectory!, "descendants");
+      const authPath = join(statusDirectory!, "descendants-auth");
+      for (let attempt = 0; attempt < 80; attempt += 1) {
+        if ((await lstat(ledgerPath).catch(() => undefined))?.isFile() === true
+          && (await lstat(authPath).catch(() => undefined))?.isFile() === true) break;
+        await Bun.sleep(25);
+      }
+      const ledger = await readFile(ledgerPath, "utf8");
+      expect(ledger.trim().length).toBeGreaterThan(0);
+      await writeFile(ledgerPath, `${ledger}999999|proc:forged|999999\n`, "utf8");
+      expect(await supervised.forceCleanup()).toBe(false);
+    } finally {
+      killTarget("SIGKILL");
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (statusDirectory !== undefined) await rm(statusDirectory, { recursive: true, force: true });
     }
   });
 

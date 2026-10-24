@@ -647,19 +647,26 @@ async function cleanupStaleTemporaryDirectories(parent: string): Promise<void> {
 async function writePngAtomically(outputPath: string, data: Uint8Array): Promise<void> {
   if (basename(outputPath) === ".owner") throw new Error("--out cannot use .owner as the output filename");
   const parent = dirname(outputPath);
-  await realpath(parent);
-  const parentMetadata = await lstat(parent);
-  if (!parentMetadata.isDirectory() || parentMetadata.isSymbolicLink()) throw new Error("framebuffer output parent must be a real directory");
-  const parentIdentity = { dev: parentMetadata.dev, ino: parentMetadata.ino };
+  const canonicalParent = await realpath(parent);
+  const requestedParentMetadata = await lstat(parent);
+  const canonicalParentMetadata = await lstat(canonicalParent);
+  if (!requestedParentMetadata.isDirectory() || requestedParentMetadata.isSymbolicLink()
+    || !canonicalParentMetadata.isDirectory() || canonicalParentMetadata.isSymbolicLink()
+    || requestedParentMetadata.dev !== canonicalParentMetadata.dev
+    || requestedParentMetadata.ino !== canonicalParentMetadata.ino) {
+    throw new Error("framebuffer output parent must be a real directory");
+  }
+  const publicationPath = join(canonicalParent, basename(outputPath));
+  const parentIdentity = { dev: canonicalParentMetadata.dev, ino: canonicalParentMetadata.ino };
   const assertParentStable = async (): Promise<void> => {
-    const current = await lstat(parent);
+    const current = await lstat(canonicalParent);
     if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== parentIdentity.dev || current.ino !== parentIdentity.ino) {
       throw new Error("framebuffer output parent changed during publication");
     }
   };
-  await cleanupStaleTemporaryDirectories(parent);
+  await cleanupStaleTemporaryDirectories(canonicalParent);
   await assertParentStable();
-  const temporaryDirectory = await mkdtemp(join(parent, TEMP_DIRECTORY_PREFIX));
+  const temporaryDirectory = await mkdtemp(join(canonicalParent, TEMP_DIRECTORY_PREFIX));
   const temporaryPath = join(temporaryDirectory, basename(outputPath));
   try {
     const owner = await open(join(temporaryDirectory, ".owner"), "wx", 0o600);
@@ -677,10 +684,10 @@ async function writePngAtomically(outputPath: string, data: Uint8Array): Promise
       await handle.close();
     }
     await assertParentStable();
-    await rename(temporaryPath, outputPath);
+    await rename(temporaryPath, publicationPath);
     await assertParentStable();
     try {
-      const directoryHandle = await open(parent, "r");
+      const directoryHandle = await open(canonicalParent, "r");
       try {
         await directoryHandle.sync();
       } finally {

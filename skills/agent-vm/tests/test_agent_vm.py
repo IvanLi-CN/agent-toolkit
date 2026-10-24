@@ -248,6 +248,29 @@ class SessionContractTests(unittest.TestCase):
                 CLI.control_request("status", session="thread")
         self.assertEqual(failure.exception.code, "invalid_remote_response")
 
+    def test_structured_remote_failure_preserves_control_error(self):
+        error = {
+            "ok": False,
+            "error": {
+                "code": "resource_pressure",
+                "message": "CPU scheduler pressure blocks VM startup",
+                "detail": {"projected_cpu": 18, "ct_capacity_cpu": 16},
+            },
+        }
+        stderr = mock.Mock()
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(CLI, "local_session_dir", return_value=Path(directory)), \
+             mock.patch.object(CLI.sys, "stderr", stderr), \
+             mock.patch.object(
+                 CLI.subprocess,
+                 "run",
+                 return_value=subprocess.CompletedProcess([], 2, b"", (json.dumps(error) + "\n").encode()),
+             ):
+            with self.assertRaises(CLI.CliError) as failure:
+                CLI.control_request("acquire", session="thread", generation=0, write=True, operation_id="pressure")
+        self.assertEqual(failure.exception.code, "resource_pressure")
+        self.assertEqual(failure.exception.detail["projected_cpu"], 18)
+
     def test_incompatible_remote_response_is_rejected_before_return(self):
         response = {
             "ok": True,

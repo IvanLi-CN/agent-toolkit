@@ -15,6 +15,7 @@ from decimal import Decimal
 import fcntl
 import hashlib
 import json
+import math
 import os
 import ipaddress
 from pathlib import Path, PurePosixPath
@@ -65,6 +66,7 @@ PROTOCOL_VERSION = 4
 SCHEMA_VERSION = 1
 SEMANTIC_REVISION = 1
 MEMORY_SETTLE_SECONDS = 45
+CPU_STARTUP_PRESSURE_FULL_AVG10_PERCENT = 20.0
 TRANSITIONAL_ADMISSION_WAIT_SECONDS = 30
 TRANSITIONAL_ADMISSION_POLL_SECONDS = 0.25
 TRANSITIONAL_ADMISSION_ERROR_MESSAGE = "transitional native instance blocks admission"
@@ -766,6 +768,46 @@ def overcommit_ratio(value: Any, name: str) -> Decimal:
     return ratio
 
 
+def percentage(value: Any, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ControlError("config_invalid", f"{name} must be a finite percentage between zero and 100")
+    try:
+        number = Decimal(str(value))
+        if not number.is_finite() or number < 0 or number > 100:
+            raise ValueError()
+    except (ValueError, ArithmeticError) as exc:
+        raise ControlError("config_invalid", f"{name} must be a finite percentage between zero and 100") from exc
+    return float(number)
+
+
+def parse_cpu_psi(raw: str) -> dict[str, dict[str, float]]:
+    result: dict[str, dict[str, float]] = {}
+    for line in raw.splitlines():
+        fields = line.split()
+        if not fields or fields[0] not in {"some", "full"}:
+            continue
+        if fields[0] in result:
+            raise ValueError("duplicate CPU PSI line")
+        values: dict[str, float] = {}
+        for field in fields[1:]:
+            name, separator, value = field.partition("=")
+            if not separator or name in values:
+                raise ValueError("invalid CPU PSI field")
+            try:
+                number = float(value)
+            except ValueError as exc:
+                raise ValueError("invalid CPU PSI value") from exc
+            if not math.isfinite(number) or number < 0 or (name.startswith("avg") and number > 100):
+                raise ValueError("CPU PSI value is out of range")
+            values[name] = number
+        if "avg10" not in values:
+            raise ValueError("CPU PSI avg10 is missing")
+        result[fields[0]] = values
+    if set(result) != {"some", "full"}:
+        raise ValueError("CPU PSI data is missing")
+    return result
+
+
 class CTResources:
     """Read only the container's visible boundary, never ancestor host data."""
 
@@ -797,6 +839,14 @@ class CTResources:
         if fields[0] != "max":
             capacity = min(capacity, self._unsigned(fields[0], "cpu.max quota", positive=True) // period)
         return capacity
+
+    def cpu_pressure(self) -> dict[str, Any]:
+        try:
+            values = parse_cpu_psi(self._read("/proc/pressure/cpu"))
+        except ValueError as exc:
+            raise ControlError("resource_unverified", "CT CPU pressure metric is invalid",
+                               {"metric": "/proc/pressure/cpu"}) from exc
+        return {"scope": "ct-cpu-pressure", "sources": ["procfs"], **values}
 
     def _lxcfs_meminfo(self) -> dict[str, int] | None:
         # Verify the mount before reading meminfo: an unvirtualized proc view
@@ -952,6 +1002,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
         "memory_budget_mib": 0,
         "cpu_overcommit_ratio": 4,
         "memory_overcommit_ratio": 4,
+        "cpu_startup_pressure_full_avg10_percent": CPU_STARTUP_PRESSURE_FULL_AVG10_PERCENT,
         "create_cost_bytes": 4 * 1024**3,
         "resume_cost_bytes": 1024**3,
         "resize_cost_bytes": 1024**3,
@@ -979,6 +1030,10 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
         config[field] = require_int(config[field], field, 0)
     for field in ("cpu_overcommit_ratio", "memory_overcommit_ratio"):
         overcommit_ratio(config[field], field)
+    config["cpu_startup_pressure_full_avg10_percent"] = percentage(
+        config["cpu_startup_pressure_full_avg10_percent"],
+        "cpu_startup_pressure_full_avg10_percent",
+    )
     config["host_address"] = require_nonempty_string(config["host_address"], "host_address")
     config["vm_ip_start"] = require_nonempty_string(config["vm_ip_start"], "vm_ip_start")
     config["vm_ip_end"] = require_nonempty_string(config["vm_ip_end"], "vm_ip_end")
@@ -3488,6 +3543,90 @@ class Control:
                 "limits": {key: int(Decimal(base[key]) * ratios[key]) for key in base},
                 "ct_capacity": capacity, "memory": {**memory, "observed_at": iso_time(self.now())}}
 
+    def _cpu_pressure_observation(self) -> dict[str, Any]:
+        try:
+            observation = self.resources.cpu_pressure()
+        except ControlError as exc:
+            return {"verified": False, "error": exc.as_dict()}
+        if not isinstance(observation, Mapping):
+            return {"verified": False, "error": {
+                "code": "resource_unverified",
+                "message": "CT CPU pressure observation is not an object",
+            }}
+        return {"verified": True, **dict(observation), "observed_at": iso_time(self.now())}
+
+    def _cpu_startup_pressure_diagnostics(
+        self,
+        *,
+        allocated_cpu: int,
+        requested_cpu: int,
+        capacity_cpu: int,
+        observation: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        observation = observation if observation is not None else self._cpu_pressure_observation()
+        threshold = percentage(
+            self.config.get(
+                "cpu_startup_pressure_full_avg10_percent",
+                CPU_STARTUP_PRESSURE_FULL_AVG10_PERCENT,
+            ),
+            "cpu_startup_pressure_full_avg10_percent",
+        )
+        detail: dict[str, Any] = {
+            "threshold_full_avg10_percent": threshold,
+            "allocated_cpu": allocated_cpu,
+            "requested_cpu": requested_cpu,
+            "projected_cpu": allocated_cpu + requested_cpu,
+            "ct_capacity_cpu": capacity_cpu,
+            "physically_oversubscribed": allocated_cpu + requested_cpu > capacity_cpu,
+            "startup_blocked": False,
+        }
+        if not observation.get("verified"):
+            detail.update({"verified": False, "error": observation.get("error")})
+            return detail
+        try:
+            full = observation["full"]
+            some = observation["some"]
+            full_avg10 = float(full["avg10"])
+            some_avg10 = float(some["avg10"])
+            if not math.isfinite(full_avg10) or not math.isfinite(some_avg10):
+                raise ValueError()
+        except (KeyError, TypeError, ValueError) as exc:
+            detail.update({
+                "verified": False,
+                "error": {
+                    "code": "resource_unverified",
+                    "message": "CT CPU pressure observation is incomplete",
+                },
+            })
+            return detail
+        detail.update({
+            "verified": True,
+            "full_avg10_percent": full_avg10,
+            "some_avg10_percent": some_avg10,
+        })
+        detail["startup_blocked"] = detail["physically_oversubscribed"] and full_avg10 >= threshold
+        return detail
+
+    def _enforce_cpu_startup_pressure(
+        self,
+        *,
+        allocated_cpu: int,
+        requested_cpu: int,
+        capacity_cpu: int,
+    ) -> dict[str, Any]:
+        detail = self._cpu_startup_pressure_diagnostics(
+            allocated_cpu=allocated_cpu,
+            requested_cpu=requested_cpu,
+            capacity_cpu=capacity_cpu,
+        )
+        if detail["startup_blocked"]:
+            raise ControlError(
+                "resource_pressure",
+                "CPU scheduler pressure blocks VM startup",
+                detail,
+            )
+        return detail
+
     def _allocation_breakdown(self, exclude_task_id: str | None = None) -> dict[str, dict[str, int]]:
         totals = {key: {name: 0 for name in ("allocated", "reserved", "allocated_and_reserved")}
                   for key in ("cpu", "memory_mib")}
@@ -3587,6 +3726,7 @@ class Control:
             memory = self.resources.memory()
         except ControlError as exc:
             memory_error = exc
+        cpu_pressure = self._cpu_pressure_observation()
         policy = None
         try:
             if memory_error is not None:
@@ -3614,6 +3754,7 @@ class Control:
                     "allocated_and_reserved": allocated_and_reserved,
                     "remaining": {key: policy["limits"][key] - allocated_and_reserved[key] for key in allocated_and_reserved},
                     "memory_pressure": policy["memory"]["available_bytes"] < policy["memory"]["threshold_bytes"],
+                    "cpu_pressure": cpu_pressure,
                     "disk_admission": disk}
         except ControlError as exc:
             result = {
@@ -3625,6 +3766,7 @@ class Control:
                 "ct_capacity": None,
                 "memory": None if memory is None else {**memory, "observed_at": iso_time(self.now())},
                 "memory_pressure": None,
+                "cpu_pressure": cpu_pressure,
                 "allocated": None,
                 "reserved": None,
                 "allocated_and_reserved": None,
@@ -3741,6 +3883,19 @@ class Control:
         warnings = []
         if resources.get("memory_pressure"):
             warnings.append({"code": "memory_pressure", "memory": resources.get("memory")})
+        cpu_startup_pressure = None
+        if resources.get("verified"):
+            cpu_startup_pressure = self._cpu_startup_pressure_diagnostics(
+                allocated_cpu=resources["allocated_and_reserved"]["cpu"],
+                requested_cpu=requested["cpu"],
+                capacity_cpu=resources["ct_capacity"]["cpu"],
+                observation=resources.get("cpu_pressure"),
+            )
+            if cpu_startup_pressure["startup_blocked"]:
+                reasons.append({"code": "resource_pressure", "message": "CPU scheduler pressure blocks VM startup",
+                                "detail": cpu_startup_pressure})
+            elif not cpu_startup_pressure["verified"]:
+                warnings.append({"code": "cpu_pressure_unavailable", "detail": cpu_startup_pressure.get("error")})
         if not instances.get("verified"):
             reasons.append(instances["error"])
         elif not instances["policy_compliant"] and not any(reason["code"] == "project_instance_limits_conflict" for reason in reasons):
@@ -3756,11 +3911,13 @@ class Control:
                 reasons.append({"code": "disk_reclaim_required", "message": "default creation needs capacity reclamation"})
         return {"requested": requested, "request_cost_bytes": self.config["create_cost_bytes"],
                 "ready": not reasons, "reasons": reasons, "reclaim_required": reclaim_required,
-                "observations": {"memory_pressure": resources.get("memory_pressure")},
+                "observations": {"memory_pressure": resources.get("memory_pressure"),
+                                 "cpu_startup_pressure": cpu_startup_pressure},
                 "warnings": warnings}
 
     def _reserve_resources(self, task: Mapping[str, Any], resources: Mapping[str, int],
                            *, memory_reduction: bool = False,
+                           startup_required: bool = True,
                            admission_epoch: str | None = None) -> dict[str, Any]:
         # Only a verified, memory-only reduction may bypass new-demand gates.
         # Its old allocation stays reserved until native completion is verified.
@@ -3796,6 +3953,12 @@ class Control:
                 raise ControlError("resource_insufficient", "allocation ceiling exceeded: " + ", ".join(exceeded),
                                    {"dimensions": exceeded, "requested": dict(resources), "other_allocated": totals,
                                     "projected": projected, "base": policy["base"], "limits": policy["limits"]})
+            if policy and startup_required:
+                self._enforce_cpu_startup_pressure(
+                    allocated_cpu=totals["cpu"],
+                    requested_cpu=resources["cpu"],
+                    capacity_cpu=policy["ct_capacity"]["cpu"],
+                )
             record = dict(task, resource_reservation_json=json.dumps(dict(resources), sort_keys=True))
             if not record.get("resources_json"):
                 record["resources_json"] = json.dumps(dict(resources), sort_keys=True)
@@ -4162,24 +4325,7 @@ class Control:
 
     @staticmethod
     def _parse_cpu_psi(raw: str) -> dict[str, dict[str, float]]:
-        result: dict[str, dict[str, float]] = {}
-        for line in raw.splitlines():
-            fields = line.split()
-            if not fields or fields[0] not in {"some", "full"}:
-                continue
-            values: dict[str, float] = {}
-            for field in fields[1:]:
-                name, separator, value = field.partition("=")
-                if separator:
-                    try:
-                        values[name] = float(value)
-                    except ValueError:
-                        continue
-            if values:
-                result[fields[0]] = values
-        if not result:
-            raise ValueError("CPU PSI data is missing")
-        return result
+        return parse_cpu_psi(raw)
 
     @staticmethod
     def _redact_startup_log(raw: str) -> dict[str, Any]:
@@ -5041,6 +5187,11 @@ class Control:
                     raise ControlError("draining", "restart work is refused while draining")
                 self._ownership(task)
                 self._verify_native_allocation(task)
+                self._enforce_cpu_startup_pressure(
+                    allocated_cpu=self._allocation_totals()["cpu"],
+                    requested_cpu=0,
+                    capacity_cpu=self.resources.cpu(),
+                )
                 self._network_guard()
                 self._verify_network_device(task)
                 self._require_window(task)
@@ -5214,7 +5365,12 @@ class Control:
         if target == old:
             return {"applied": False, "mode": "live-memory", "plan": "unchanged", **self._state_summary(task)}
         reserved = {key: max(old[key], target[key]) for key in old}
-        self._reserve_resources(task, reserved, memory_reduction=target["memory_mib"] < old["memory_mib"])
+        self._reserve_resources(
+            task,
+            reserved,
+            memory_reduction=target["memory_mib"] < old["memory_mib"],
+            startup_required=False,
+        )
         completed = []
         try:
             # Recheck expiry's lock-independent fence immediately before the native
@@ -5269,7 +5425,7 @@ class Control:
                 if (self._durable_resources(current, "resource_reservation_json", allow_empty=True) != reserved
                         or self._native_resources(task) != old or self._guest_boot_id(task) != before):
                     raise ControlError("resize_unverified", "native rollback, reservation or guest continuity changed during balloon settlement")
-                self._reserve_resources(task, reserved, memory_reduction=True)
+                self._reserve_resources(task, reserved, memory_reduction=True, startup_required=False)
                 apply_memory()
             completed.append("native_memory_update")
             if self._native_resources(task) != target:
@@ -5931,6 +6087,14 @@ class Control:
                 "resources": resources,
                 "capacity": doctor.get("capacity"),
                 "disk_admission": disk_admission,
+                "ct_cpu": {
+                    "capacity_vcpu": (resources.get("ct_capacity") or {}).get("cpu")
+                    if isinstance(resources, Mapping) else None,
+                    "pressure": resources.get("cpu_pressure") if isinstance(resources, Mapping) else None,
+                    "startup_pressure": doctor.get("default_admission", {}).get("observations", {}).get(
+                        "cpu_startup_pressure"
+                    ),
+                },
                 "ct_memory": {
                     "capacity_bytes": memory.get("limit_bytes"),
                     "current_bytes": memory.get("current_bytes"),

@@ -382,6 +382,12 @@ class Fixture(unittest.TestCase):
         self.resources.cpu.return_value = 16
         self.resources.memory.return_value = {"scope": "ct-memory", "sources": ["lxcfs"], "limit_bytes": 32*GIB,
                                               "available_bytes": 24*GIB, "threshold_bytes": (32*GIB+9)//10}
+        self.resources.cpu_pressure.return_value = {
+            "scope": "ct-cpu-pressure",
+            "sources": ["procfs"],
+            "some": {"avg10": 0.0, "avg60": 0.0, "avg300": 0.0},
+            "full": {"avg10": 0.0, "avg60": 0.0, "avg300": 0.0},
+        }
         self.control = CONTROL.Control(self.config, runner=self.runner, store=self.store, systemd=self.systemd,
                                        resources=self.resources, clock=lambda: self.now)
         self.config = self.control.config
@@ -2559,7 +2565,7 @@ class NativeCliTests(unittest.TestCase):
             with self.subTest(action=action, fields=fields), mock.patch.object(CLI.subprocess, "run", return_value=process) as run:
                 CLI.control_request(action, session="thread", fields=fields)
                 self.assertEqual(run.call_args.kwargs["timeout"], expected)
-                self.assertIsNone(run.call_args.kwargs["stderr"])
+                self.assertEqual(run.call_args.kwargs["stderr"], subprocess.PIPE)
 
     def test_exec_argv_and_online_tar_are_safely_quoted(self):
         parser = CLI.build_parser()

@@ -198,6 +198,19 @@ class CTObservationTests(unittest.TestCase):
             self.assertEqual(CONTROL.CTResources().cpu(), 7)
             read.assert_called_once_with("/sys/fs/cgroup/cpu.max")
 
+    def test_cpu_pressure_requires_verified_some_and_full_psi(self):
+        raw = "some avg10=12.34 avg60=5.00 avg300=1.00 total=100\nfull avg10=7.89 avg60=3.00 avg300=0.50 total=50\n"
+        with mock.patch.object(CONTROL.CTResources, "_read", return_value=raw):
+            result = CONTROL.CTResources().cpu_pressure()
+        self.assertEqual(result["scope"], "ct-cpu-pressure")
+        self.assertEqual(result["full"]["avg10"], 7.89)
+        self.assertEqual(result["some"]["avg10"], 12.34)
+
+        with mock.patch.object(CONTROL.CTResources, "_read", return_value="some avg10=1\n"):
+            with self.assertRaises(CONTROL.ControlError) as failure:
+                CONTROL.CTResources().cpu_pressure()
+        self.assertEqual(failure.exception.code, "resource_unverified")
+
 
 class AdmissionTests(Fixture):
     def test_default_ceilings_and_fractional_floor(self):
@@ -250,6 +263,39 @@ class AdmissionTests(Fixture):
         self.assertEqual(result["state"], "active")
         self.assertEqual(self.control._resource_diagnostics()["remaining"]["memory_mib"], 61440)
 
+    def test_cpu_startup_pressure_blocks_only_new_boot_when_physically_overcommitted(self):
+        self.config.update(cpu_budget=15, cpu_overcommit_ratio=4)
+        self.resources.cpu_pressure.return_value = {
+            "scope": "ct-cpu-pressure",
+            "sources": ["procfs"],
+            "some": {"avg10": 55.12, "avg60": 49.12, "avg300": 49.51},
+            "full": {"avg10": 45.67, "avg60": 39.88, "avg300": 37.85},
+        }
+        base = self.call("acquire", "base", public_key=KEY, cpu=16)
+        with self.assertRaises(CONTROL.ControlError) as failure:
+            self.call("acquire", "blocked", public_key=KEY, cpu=2)
+        self.assertEqual(failure.exception.code, "resource_pressure")
+        self.assertEqual(failure.exception.detail["projected_cpu"], 18)
+        self.assertTrue(failure.exception.detail["physically_oversubscribed"])
+        self.assertEqual(self.runner.instances[base["instance_name"]]["status"], "Running")
+        self.assertEqual(len(self.runner.instances), 1)
+
+        self.resources.cpu_pressure.return_value["full"]["avg10"] = 0.0
+        admitted = self.call("acquire", "after", public_key=KEY, cpu=2)
+        self.assertEqual(admitted["resources"]["cpu"], 2)
+
+    def test_cpu_startup_pressure_checks_restart_before_stopping_guest(self):
+        self.config.update(cpu_budget=15, cpu_overcommit_ratio=4)
+        base = self.call("acquire", "base", public_key=KEY, cpu=16)
+        self.call("acquire", "other", public_key=KEY, cpu=2)
+        self.resources.cpu_pressure.return_value["full"]["avg10"] = 45.67
+        stop_calls = sum(args[3:4] == ["stop"] for args, _, _ in self.runner.calls)
+        with self.assertRaises(CONTROL.ControlError) as failure:
+            self.call("restart", "base")
+        self.assertEqual(failure.exception.code, "resource_pressure")
+        self.assertEqual(sum(args[3:4] == ["stop"] for args, _, _ in self.runner.calls), stop_calls)
+        self.assertEqual(self.runner.instances[base["instance_name"]]["status"], "Running")
+
     def test_pressure_and_failed_observation_do_not_block_existing_lease_operations(self):
         active = self.acquire()
         self.resources.memory.return_value["available_bytes"] = 0
@@ -296,7 +342,7 @@ class AdmissionTests(Fixture):
         self.assertEqual(CONTROL.parse_time(result["observed_at"]), self.now)
         self.assertTrue({
             "observed_at", "up", "draining", "admission_ready", "reclaim_required", "resources",
-            "capacity", "disk_admission", "ct_memory", "instances", "task_states", "operations",
+            "capacity", "disk_admission", "ct_cpu", "ct_memory", "instances", "task_states", "operations",
             "pending_operations", "image_unpack_failures", "warnings", "warning_counts", "doctor",
         }.issubset(result))
         self.assertTrue(result["up"])
@@ -307,6 +353,8 @@ class AdmissionTests(Fixture):
         self.assertIn("available_bytes", result["ct_memory"])
         self.assertIn("pressure_threshold_bytes", result["ct_memory"])
         self.assertIn("oom_events", result["ct_memory"])
+        self.assertEqual(result["ct_cpu"]["capacity_vcpu"], 16)
+        self.assertEqual(result["ct_cpu"]["pressure"]["full"]["avg10"], 0.0)
         self.assertEqual(result["resources"]["allocated"]["memory_mib"], 4096)
         self.assertEqual(result["resources"]["reserved"]["memory_mib"], 0)
         self.assertEqual(result["resources"]["allocated_and_reserved"]["memory_mib"], 4096)

@@ -455,6 +455,28 @@ def _finalize_local_operation(path: Path, request: Mapping[str, Any], response: 
         )
 
 
+def _parse_remote_error(raw: bytes | None) -> dict[str, Any] | None:
+    if not raw:
+        return None
+    try:
+        lines = raw.decode("utf-8", "replace").splitlines()
+    except Exception:
+        return None
+    for line in reversed(lines):
+        try:
+            payload = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        error = payload.get("error") if isinstance(payload, dict) else None
+        if not isinstance(error, dict):
+            continue
+        code = error.get("code")
+        message = error.get("message")
+        if isinstance(code, str) and code and isinstance(message, str) and message:
+            return error
+    return None
+
+
 def control_request(action: str, *, session: str | None, generation: int | None = None,
                     write: bool = False, operation_id: str | None = None,
                     fields: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -496,7 +518,7 @@ def control_request(action: str, *, session: str | None, generation: int | None 
         process = subprocess.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", control_host,
                                   shlex.join(["python3", remote_control])],
                                  input=json.dumps(request, sort_keys=True).encode(), stdout=subprocess.PIPE,
-                                 stderr=None, check=False, timeout=control_timeout(action, fields))
+                                 stderr=subprocess.PIPE, check=False, timeout=control_timeout(action, fields))
     except FileNotFoundError: fail("command_missing", "ssh is not installed")
     except subprocess.TimeoutExpired:
         fail("remote_timeout", "control outcome is uncertain; retry the same operation ID",
@@ -505,7 +527,15 @@ def control_request(action: str, *, session: str | None, generation: int | None 
         sys.stderr.buffer.write(process.stderr)
         sys.stderr.flush()
     if process.returncode:
-        fail("remote_failed", "remote request failed; retry only with its original operation ID",
+        remote_error = _parse_remote_error(process.stderr)
+        if remote_error is not None:
+            fail(
+                str(remote_error["code"]),
+                str(remote_error["message"]),
+                remote_error.get("detail"),
+                process.returncode,
+            )
+        fail("remote_failed", "remote request failed; control outcome is not verified",
              {"operation_id": request.get("operation_id")}, process.returncode)
     try: response = json.loads(process.stdout)
     except (ValueError, UnicodeDecodeError): fail("invalid_remote_response", "control did not return JSON")

@@ -2784,6 +2784,7 @@ interface SupervisorDirectoryIdentity {
 interface AuthenticatedLedger {
   data: string;
   generation: number;
+  uncommittedAppend?: string;
 }
 
 function parseAuthenticatedLedger(authenticatedLedger: string, key: string): AuthenticatedLedger | undefined {
@@ -2853,6 +2854,7 @@ async function readAuthenticatedLedger(
   key: string,
   deadline: number,
   authentication: string | undefined,
+  allowUncommittedAppend = false,
 ): Promise<AuthenticatedLedger | undefined> {
   if (authentication === undefined) return undefined;
   const ledgerPath = join(statusDirectory, "descendants");
@@ -2860,6 +2862,13 @@ async function readAuthenticatedLedger(
     const ledger = await readRegularMarker(ledgerPath, MAX_SUPERVISOR_DESCENDANT_BYTES);
     const authenticated = ledger === undefined ? undefined : parseAuthenticatedLedger(`${authentication}\n${ledger}`, key);
     if (authenticated !== undefined) return authenticated;
+    if (allowUncommittedAppend && ledger !== undefined && ledger.endsWith("\n")) {
+      const published = await readRegularMarker(join(statusDirectory, "descendants-authenticated"), MAX_SUPERVISOR_AUTHENTICATED_LEDGER_BYTES);
+      const previous = published?.startsWith(`${authentication}\n`) ? parseAuthenticatedLedger(published, key) : undefined;
+      if (previous !== undefined && (previous.data === "" || previous.data.endsWith("\n")) && ledger.startsWith(previous.data) && ledger.length > previous.data.length) {
+        return { ...previous, uncommittedAppend: ledger.slice(previous.data.length) };
+      }
+    }
     await Bun.sleep(25);
   }
   return undefined;
@@ -3203,6 +3212,7 @@ async function cleanupAuthorizedTargetGroup(
       ledgerKey,
       Math.min(cleanupDeadline, Date.now() + SUPERVISOR_LEDGER_AUTH_SETTLE_MS),
       ledgerAuthentication,
+      allowCurrentGroupMembers,
     );
   if (statusDirectory !== undefined && authenticatedLedger === undefined) return false;
   // The private publication channel retains the newest generation even if a
@@ -3235,6 +3245,30 @@ async function cleanupAuthorizedTargetGroup(
           && !(rememberedMembers ?? []).some((remembered) => remembered.pgid === member.pgid)) return false;
       }
       authorized.set(pid, member);
+    }
+  }
+  // A wrapper can die after appending raw records but before signing them.
+  // The private header still pins the last signed prefix. Only a live anchor
+  // permits recovery of the suffix, and every added process needs fresh
+  // identity, group and ancestry proof; unsigned bytes grant no authority.
+  if (authenticatedLedger?.uncommittedAppend !== undefined) {
+    if (!allowCurrentGroupMembers) return false;
+    const anchor = await withinCleanupDeadline(readCurrentGroupMember(reference.pid, reference.pgid));
+    if (anchor === undefined || !processIdentityMatches(reference.identity, anchor.identity)) return false;
+    const records = authenticatedLedger.uncommittedAppend.trimEnd().split(/\r?\n/);
+    if (records.length + authorized.size > MAX_SUPERVISOR_DESCENDANT_RECORDS) return false;
+    for (const line of records) {
+      const fields = line.split("|");
+      if (fields.length !== 3 || !/^[1-9][0-9]*$/.test(fields[0]!) || !/^[1-9][0-9]*$/.test(fields[2]!)) return false;
+      const member = { pid: Number(fields[0]), identity: fields[1]!, pgid: Number(fields[2]) };
+      if (!Number.isSafeInteger(member.pid) || !Number.isSafeInteger(member.pgid) || member.identity.length === 0) return false;
+      const probe = await withinCleanupDeadline(probeAuthorizedMember(member));
+      if (probe === undefined || probe.kind !== "live") return false;
+      if (probe.member.pgid !== member.pgid) return false;
+      if (await withinCleanupDeadline(processDescendsFrom(member.pid, reference.pid)) !== true) return false;
+      const previous = authorized.get(member.pid);
+      if (previous !== undefined && (previous.identity !== member.identity || previous.pgid !== member.pgid)) return false;
+      authorized.set(member.pid, member);
     }
   }
   const currentPgid = await withinCleanupDeadline(currentProcessGroup(process.pid));

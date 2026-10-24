@@ -2070,6 +2070,65 @@ exec "${realPs}" "$@"
     });
   }
 
+  test("recovers a live target when SIGKILL interrupts raw ledger append publication", { timeout: 45_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-append-publication-"));
+    const childMarker = join(root, "child.pid");
+    const trigger = join(root, "spawn-child");
+    const paused = join(root, "append-paused");
+    const realPerl = Bun.which("perl");
+    const previousPath = process.env.PATH;
+    const before = new Set(await readdir(tmpdir()));
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    let directory: string | undefined;
+    let pid: number | undefined;
+    try {
+      await writeFile(join(root, "perl"), `#!/bin/sh
+case "$2" in *O_APPEND*) ;; *) exec "${realPerl}" "$@" ;; esac
+"${realPerl}" "$@"
+result=$?
+if [ "$result" = 0 ] && [ "$3" = ./descendants ] && [ -f "${childMarker}" ]; then
+  expected=$(cat "${childMarker}")
+  case "$4" in "$expected|"*) printf '%s\\n' "$PPID" > "${paused}"; kill -STOP "$PPID" ;; esac
+fi
+exit "$result"
+`);
+      await chmod(join(root, "perl"), 0o755);
+      process.env.PATH = `${root}:${previousPath ?? ""}`;
+      supervised = await spawnSupervised([
+        "perl", "-e", "while (!-e $ARGV[0]) { select undef, undef, undef, 0.02; } my $pid = fork(); defined $pid or exit 1; if ($pid == 0) { open my $f, \">\", $ARGV[1] or exit 1; print $f \"$$\\n\"; close $f; sleep 30; exit 0; } waitpid($pid, 0);",
+        trigger, childMarker,
+      ]);
+      process.env.PATH = previousPath;
+      directory = await supervisorStatusDirectory(before, supervised.child.pid);
+      await writeFile(trigger, "spawn");
+      let pausedWrapper = 0;
+      for (let attempt = 0; attempt < 480; attempt += 1) {
+        pausedWrapper = Number((await readFile(paused, "utf8").catch(() => "")).trim());
+        if (pausedWrapper > 0) break;
+        await Bun.sleep(25);
+      }
+      expect(pausedWrapper).toBe(supervised.child.pid);
+      pid = Number((await readFile(childMarker, "utf8")).trim());
+      expect(await readFile(join(directory, "descendants"), "utf8")).toContain(`${pid}|`);
+      expect(await readFile(join(directory, "descendants-authenticated"), "utf8")).not.toContain(`${pid}|`);
+      supervised.child.kill("SIGKILL");
+      expect(await supervised.forceCleanup()).toBe(true);
+      const state = Bun.spawnSync(["ps", "-o", "state=", "-p", String(pid)], { stdout: "pipe", stderr: "ignore" });
+      expect(new TextDecoder().decode(state.stdout).trim().replace(/^Z.*$/, "")).toBe("");
+    } finally {
+      process.env.PATH = previousPath;
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch {}
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (pid !== undefined && pid > 0) { try { process.kill(pid, "SIGKILL"); } catch {} }
+      if (directory !== undefined) await rm(directory, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("serializes automatic and forced cleanup after wrapper SIGKILL", { timeout: 90_000 }, async () => {
     if (process.platform === "win32") return;
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-cleanup-race-"));

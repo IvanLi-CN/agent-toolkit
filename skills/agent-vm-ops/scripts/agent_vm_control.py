@@ -193,7 +193,8 @@ class GuestFailure(Exception):
     def __init__(self, phase, command=None, returncode=None, stdout="", stderr="",
                  *, cause=None, transient=False, retry_of=None,
                  stdout_truncated=False, stderr_truncated=False,
-                 process_group_killed=None, process_group_cleanup_error=None):
+                 process_group_killed=None, process_group_cleanup_error=None,
+                 reaped=None, pipes_drained=None):
         super().__init__(phase)
         self.phase = phase
         self.command = list(command or [])
@@ -207,6 +208,8 @@ class GuestFailure(Exception):
         self.stderr_truncated = stderr_truncated
         self.process_group_killed = process_group_killed
         self.process_group_cleanup_error = process_group_cleanup_error
+        self.reaped = reaped
+        self.pipes_drained = pipes_drained
 
     def as_dict(self, *, report=False, stdout_limit=None, stderr_limit=None):
         value = {
@@ -227,6 +230,10 @@ class GuestFailure(Exception):
         if self.process_group_killed is not None:
             value["process_group_killed"] = self.process_group_killed
             value["process_group_cleanup_error"] = self.process_group_cleanup_error
+        if self.reaped is not None:
+            value["reaped"] = self.reaped
+        if self.pipes_drained is not None:
+            value["pipes_drained"] = self.pipes_drained
         if not report:
             return value
         return compact_failure(
@@ -391,21 +398,75 @@ def run(command, phase, *, check=True):
                 complete = False
         return live, complete
 
-    def kill_process_group_members(pgid):
+    def open_verified_pidfd(identity):
+        opener = getattr(os, "pidfd_open", None)
+        if opener is None:
+            return None, "pidfd_unavailable"
+        pid, _ = identity
+        try:
+            pidfd = opener(pid)
+        except ProcessLookupError:
+            return None, None
+        except OSError as error:
+            return None, type(error).__name__
+        current, complete = live_processes([identity])
+        if not complete:
+            os.close(pidfd)
+            return None, "process_identity_unverified"
+        if not current:
+            os.close(pidfd)
+            return None, None
+        return pidfd, None
+
+    def kill_process_identities(identities):
+        sender = getattr(signal, "pidfd_send_signal", None)
+        if sender is None:
+            return False, "pidfd_signal_unavailable"
         cleanup_error = None
-        for _ in range(3):
-            members, complete, inspection_error = process_group_members(pgid)
+        deadline = time.monotonic() + 0.25
+        while True:
+            members, complete = live_processes(identities)
             if not complete:
-                return False, inspection_error or "process_group_inspection_failed"
+                return False, "process_identity_unverified"
             if not members:
                 return True, cleanup_error
-            for pid in members:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
+            for identity in members:
+                pidfd, open_error = open_verified_pidfd(identity)
+                if pidfd is None:
+                    if open_error is not None:
+                        return False, open_error
                     continue
+                try:
+                    sender(pidfd, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 except OSError as error:
                     cleanup_error = type(error).__name__
+                finally:
+                    os.close(pidfd)
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+        members, complete = live_processes(identities)
+        if complete and not members:
+            return True, cleanup_error
+        return False, cleanup_error or "process_members_remain"
+
+    def kill_process_group_members(pgid, *, required_identity=None):
+        if not os.path.isdir("/proc"):
+            return False, "process_group_identity_unavailable"
+        cleanup_error = None
+        for attempt in range(3):
+            identities, complete, inspection_error = process_group_identities(pgid)
+            if not complete:
+                return False, inspection_error or "process_group_inspection_failed"
+            if not identities:
+                return True, cleanup_error
+            if attempt == 0 and required_identity is not None and required_identity not in identities:
+                return False, "process_group_identity_unverified"
+            killed, cleanup_error = kill_process_identities(identities)
+            if not killed:
+                return False, cleanup_error
         members, complete, inspection_error = process_group_members(pgid)
         if complete and not members:
             return True, cleanup_error
@@ -419,14 +480,9 @@ def run(command, phase, *, check=True):
                 return False, "process_tree_inspection_failed"
             if not members:
                 return True, cleanup_error
-            for pid, _ in members:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    continue
-                except OSError as error:
-                    cleanup_error = type(error).__name__
-            time.sleep(0.01)
+            killed, cleanup_error = kill_process_identities(identities)
+            if not killed:
+                return False, cleanup_error
         members, complete = live_processes(identities)
         if complete and not members:
             return True, cleanup_error
@@ -448,23 +504,32 @@ def run(command, phase, *, check=True):
         tracked_tree_valid = False
         tracked_group_members = {}
         tracked_group_valid = False
+        leader_identity = None
+        if os.path.isdir("/proc"):
+            group_members, group_complete, _ = process_group_identities(process.pid)
+            if group_complete:
+                leader_identity = next(
+                    (identity for identity in group_members if identity[0] == process.pid),
+                    None,
+                )
 
         def track_process_tree():
             nonlocal tracked_tree_valid, tracked_group_valid
             if not os.path.isdir("/proc"):
                 return
             members, complete = process_tree_members(process.pid)
-            if not complete or not members:
-                return
-            for pid, starttime in members:
-                previous = tracked_tree_members.get(pid)
-                if previous is not None and previous != starttime:
-                    tracked_tree_valid = False
-                    return
-                tracked_tree_members[pid] = starttime
-            tracked_tree_valid = True
+            if complete and members:
+                for pid, starttime in members:
+                    previous = tracked_tree_members.get(pid)
+                    if previous is not None and previous != starttime:
+                        tracked_tree_valid = False
+                        return
+                    tracked_tree_members[pid] = starttime
+                tracked_tree_valid = True
             group_members, group_complete, _ = process_group_identities(process.pid)
             if not group_complete or not group_members:
+                return
+            if leader_identity is None:
                 return
             for pid, starttime in group_members:
                 previous = tracked_group_members.get(pid)
@@ -503,32 +568,53 @@ def run(command, phase, *, check=True):
                     continue
                 merged[pid] = starttime
             tree_members = sorted(merged.items())
-        root_identity = next((identity for identity in tree_members if identity[0] == process.pid), None)
+        if os.path.isdir("/proc") and leader_identity is None:
+            tree_members = []
+            tree_complete = False
+        root_identity = (
+            leader_identity
+            if os.path.isdir("/proc")
+            else next((identity for identity in tree_members if identity[0] == process.pid), None)
+        )
         root_live = []
         root_verified = not os.path.isdir("/proc")
-        root_identity_missing = False
+        root_identity_missing = leader_identity is not None and os.path.isdir("/proc")
         if root_identity is not None:
             root_live, root_identity_complete = live_processes([root_identity])
             if not root_identity_complete:
                 tree_complete = False
             root_verified = bool(root_live)
             root_identity_missing = root_identity_complete and not root_live
+        elif leader_identity is not None and os.path.isdir("/proc"):
+            root_live, root_identity_complete = live_processes([leader_identity])
+            if not root_identity_complete:
+                tree_complete = False
+            root_identity_missing = root_identity_complete and not root_live
         if root_verified:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-                process_group_killed, fallback_error = kill_process_group_members(process.pid)
+                if os.path.isdir("/proc"):
+                    os.killpg(process.pid, 0)
+                else:
+                    os.killpg(process.pid, signal.SIGKILL)
+                process_group_killed, fallback_error = kill_process_group_members(
+                    process.pid, required_identity=leader_identity
+                )
                 if fallback_error:
                     process_group_cleanup_error = fallback_error
             except ProcessLookupError:
-                process_group_killed, fallback_error = kill_process_group_members(process.pid)
+                process_group_killed, fallback_error = kill_process_group_members(
+                    process.pid, required_identity=leader_identity
+                )
                 if fallback_error:
                     process_group_cleanup_error = fallback_error
             except (AttributeError, PermissionError, OSError) as group_error:
                 process_group_cleanup_error = type(group_error).__name__
-                process_group_killed, fallback_error = kill_process_group_members(process.pid)
+                process_group_killed, fallback_error = kill_process_group_members(
+                    process.pid, required_identity=leader_identity
+                )
                 if fallback_error:
                     process_group_cleanup_error += ":" + fallback_error
-                if process is not None:
+                if not os.path.isdir("/proc"):
                     try:
                         process.kill()
                     except ProcessLookupError:
@@ -553,11 +639,13 @@ def run(command, phase, *, check=True):
                 process_group_cleanup_error + ":" + tree_error
                 if process_group_cleanup_error else tree_error
             )
+        reaped = False
         try:
             process.wait(timeout=2)
+            reaped = True
         except (subprocess.TimeoutExpired, ChildProcessError):
             pass
-        drain_until(selector, time.monotonic() + 1)
+        pipes_drained = drain_until(selector, time.monotonic() + 1)
         raise GuestFailure(
             phase,
             command,
@@ -568,6 +656,8 @@ def run(command, phase, *, check=True):
             stderr_truncated=stderr_truncated,
             process_group_killed=process_group_killed,
             process_group_cleanup_error=process_group_cleanup_error,
+            reaped=reaped,
+            pipes_drained=pipes_drained,
         ) from error
     except FileNotFoundError:
         raise GuestFailure(phase, command, cause="command_missing")
@@ -1448,21 +1538,84 @@ class CommandRunner:
         return live, complete
 
     @classmethod
-    def _kill_process_group_members(cls, pgid: int) -> tuple[bool, str | None]:
+    def _open_verified_pidfd(cls, identity: tuple[int, int]) -> tuple[int | None, str | None]:
+        opener = getattr(os, "pidfd_open", None)
+        if opener is None:
+            return None, "pidfd_unavailable"
+        pid, _ = identity
+        try:
+            pidfd = opener(pid)
+        except ProcessLookupError:
+            return None, None
+        except OSError as error:
+            return None, type(error).__name__
+        current, complete = cls._live_processes([identity])
+        if not complete:
+            os.close(pidfd)
+            return None, "process_identity_unverified"
+        if not current:
+            os.close(pidfd)
+            return None, None
+        return pidfd, None
+
+    @classmethod
+    def _kill_process_identities(
+        cls, identities: Sequence[tuple[int, int]]
+    ) -> tuple[bool, str | None]:
+        sender = getattr(signal, "pidfd_send_signal", None)
+        if sender is None:
+            return False, "pidfd_signal_unavailable"
         cleanup_error = None
-        for _ in range(3):
-            members, complete = cls._process_group_members(pgid)
+        deadline = time.monotonic() + 0.25
+        while True:
+            members, complete = cls._live_processes(identities)
             if not complete:
-                return False, "process_group_inspection_failed"
+                return False, "process_identity_unverified"
             if not members:
                 return True, cleanup_error
-            for pid in members:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
+            for identity in members:
+                pidfd, open_error = cls._open_verified_pidfd(identity)
+                if pidfd is None:
+                    if open_error is not None:
+                        return False, open_error
                     continue
+                try:
+                    sender(pidfd, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 except OSError as error:
                     cleanup_error = type(error).__name__
+                finally:
+                    os.close(pidfd)
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+        members, complete = cls._live_processes(identities)
+        if complete and not members:
+            return True, cleanup_error
+        return False, cleanup_error or "process_members_remain"
+
+    @classmethod
+    def _kill_process_group_members(
+        cls,
+        pgid: int,
+        *,
+        required_identity: tuple[int, int] | None = None,
+    ) -> tuple[bool, str | None]:
+        if not Path("/proc").is_dir():
+            return False, "process_group_identity_unavailable"
+        cleanup_error = None
+        for attempt in range(3):
+            identities, complete = cls._process_group_identities(pgid)
+            if not complete:
+                return False, "process_group_inspection_failed"
+            if not identities:
+                return True, cleanup_error
+            if attempt == 0 and required_identity is not None and required_identity not in identities:
+                return False, "process_group_identity_unverified"
+            killed, cleanup_error = cls._kill_process_identities(identities)
+            if not killed:
+                return False, cleanup_error
         members, complete = cls._process_group_members(pgid)
         if complete and not members:
             return True, cleanup_error
@@ -1499,14 +1652,9 @@ class CommandRunner:
                 return False, "process_tree_inspection_failed"
             if not members:
                 return True, cleanup_error
-            for pid, _ in members:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    continue
-                except OSError as error:
-                    cleanup_error = type(error).__name__
-            time.sleep(0.01)
+            killed, cleanup_error = cls._kill_process_identities(members)
+            if not killed:
+                return False, cleanup_error
         members, complete = cls._live_processes(identities)
         if complete and not members:
             return True, cleanup_error
@@ -1546,23 +1694,32 @@ class CommandRunner:
         tracked_tree_valid = False
         tracked_group_members: dict[int, int] = {}
         tracked_group_valid = False
+        leader_identity: tuple[int, int] | None = None
+        if Path("/proc").is_dir():
+            group_members, group_complete = self._process_group_identities(process.pid)
+            if group_complete:
+                leader_identity = next(
+                    (identity for identity in group_members if identity[0] == process.pid),
+                    None,
+                )
 
         def track_process_tree() -> None:
             nonlocal tracked_tree_valid, tracked_group_valid
             if not Path("/proc").is_dir():
                 return
             members, complete = self._process_tree_members(process.pid)
-            if not complete or not members:
-                return
-            for pid, starttime in members:
-                previous = tracked_tree_members.get(pid)
-                if previous is not None and previous != starttime:
-                    tracked_tree_valid = False
-                    return
-                tracked_tree_members[pid] = starttime
-            tracked_tree_valid = True
+            if complete and members:
+                for pid, starttime in members:
+                    previous = tracked_tree_members.get(pid)
+                    if previous is not None and previous != starttime:
+                        tracked_tree_valid = False
+                        return
+                    tracked_tree_members[pid] = starttime
+                tracked_tree_valid = True
             group_members, group_complete = self._process_group_identities(process.pid)
             if not group_complete or not group_members:
+                return
+            if leader_identity is None:
                 return
             for pid, starttime in group_members:
                 previous = tracked_group_members.get(pid)
@@ -1637,35 +1794,57 @@ class CommandRunner:
                         continue
                     merged[pid] = starttime
                 tree_members = sorted(merged.items())
-            root_identity = next((identity for identity in tree_members if identity[0] == process.pid), None)
+            if Path("/proc").is_dir() and leader_identity is None:
+                tree_members = []
+                tree_complete = False
+            root_identity = (
+                leader_identity
+                if Path("/proc").is_dir()
+                else next((identity for identity in tree_members if identity[0] == process.pid), None)
+            )
             root_live: list[tuple[int, int]] = []
             root_verified = not Path("/proc").is_dir()
-            root_identity_missing = False
+            root_identity_missing = leader_identity is not None and Path("/proc").is_dir()
             if root_identity is not None:
                 root_live, root_identity_complete = self._live_processes([root_identity])
                 if not root_identity_complete:
                     tree_complete = False
                 root_verified = bool(root_live)
                 root_identity_missing = root_identity_complete and not root_live
+            elif leader_identity is not None and Path("/proc").is_dir():
+                root_live, root_identity_complete = self._live_processes([leader_identity])
+                if not root_identity_complete:
+                    tree_complete = False
+                root_identity_missing = root_identity_complete and not root_live
             if root_verified:
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process_group_killed, fallback_error = self._kill_process_group_members(process.pid)
+                    if Path("/proc").is_dir():
+                        os.killpg(process.pid, 0)
+                    else:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    process_group_killed, fallback_error = self._kill_process_group_members(
+                        process.pid, required_identity=leader_identity
+                    )
                     if fallback_error:
                         process_group_cleanup_error = fallback_error
                 except ProcessLookupError:
-                    process_group_killed, fallback_error = self._kill_process_group_members(process.pid)
+                    process_group_killed, fallback_error = self._kill_process_group_members(
+                        process.pid, required_identity=leader_identity
+                    )
                     if fallback_error:
                         process_group_cleanup_error = fallback_error
                 except OSError as group_error:
                     process_group_cleanup_error = type(group_error).__name__
-                    process_group_killed, fallback_error = self._kill_process_group_members(process.pid)
+                    process_group_killed, fallback_error = self._kill_process_group_members(
+                        process.pid, required_identity=leader_identity
+                    )
                     if fallback_error:
                         process_group_cleanup_error += ":" + fallback_error
-                    try:
-                        process.kill()
-                    except ProcessLookupError:
-                        pass
+                    if not Path("/proc").is_dir():
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            pass
             elif root_identity_missing and tracked_group_valid:
                 process_group_killed, process_group_cleanup_error = self._kill_verified_process_group_members(
                     process.pid, tracked_group_members
@@ -1686,10 +1865,11 @@ class CommandRunner:
                     f"{process_group_cleanup_error}:{tree_error}"
                     if process_group_cleanup_error else tree_error
                 )
+            pipes_drained = False
             try:
                 process.wait(timeout=1)
                 reaped = True
-            except subprocess.TimeoutExpired:
+            except (subprocess.TimeoutExpired, ChildProcessError):
                 pass
             drain_deadline = time.monotonic() + 1
             while selector.get_map() and time.monotonic() < drain_deadline:
@@ -1697,6 +1877,7 @@ class CommandRunner:
                 if not events:
                     break
                 read_ready(events)
+            pipes_drained = not selector.get_map()
             raise ControlError(
                 "command_timeout",
                 f"command timed out: {argv[0]}",
@@ -1706,6 +1887,7 @@ class CommandRunner:
                     "stdout_truncated": stdout_truncated,
                     "stderr_truncated": stderr_truncated,
                     "reaped": reaped,
+                    "pipes_drained": pipes_drained,
                     "process_group_killed": process_group_killed,
                     "process_group_cleanup_error": process_group_cleanup_error,
                 },
@@ -2977,9 +3159,11 @@ class Control:
         detail = error.detail if isinstance(error.detail, Mapping) else {}
         if error.code == "sqlite_unavailable" and detail.get("state_committed") is not False:
             return True
+        cleanup = detail.get("cleanup")
+        if isinstance(cleanup, Mapping) and cleanup.get("ok") is False:
+            return True
         if isinstance(detail.get("outcome_verified"), bool):
             return not detail["outcome_verified"]
-        cleanup = detail.get("cleanup")
         cleanup_result = cleanup.get("result") if isinstance(cleanup, Mapping) else None
         if (isinstance(cleanup, Mapping) and cleanup.get("ok")
                 and isinstance(cleanup_result, Mapping)
@@ -4819,7 +5003,7 @@ class Control:
         if isinstance(error, ControlError):
             detail["code"] = error.code
             if error.code == "command_timeout" and isinstance(error.detail, Mapping):
-                for key in ("reaped", "process_group_killed", "process_group_cleanup_error"):
+                for key in ("reaped", "pipes_drained", "process_group_killed", "process_group_cleanup_error"):
                     if key in error.detail:
                         detail[key] = error.detail[key]
         return detail
@@ -6061,6 +6245,8 @@ class Control:
                     or not isinstance(current["transient"], bool)
                     or not isinstance(current["stdout_truncated"], bool)
                     or not isinstance(current["stderr_truncated"], bool)
+                    or ("reaped" in current and not isinstance(current["reaped"], bool))
+                    or ("pipes_drained" in current and not isinstance(current["pipes_drained"], bool))
                     or ("process_group_killed" in current and not isinstance(current["process_group_killed"], bool))
                     or (
                         "process_group_cleanup_error" in current
@@ -6071,7 +6257,9 @@ class Control:
                     or (
                         current.get("cause") == "command_timeout"
                         and (
-                            not isinstance(current.get("process_group_killed"), bool)
+                            not isinstance(current.get("reaped"), bool)
+                            or not isinstance(current.get("pipes_drained"), bool)
+                            or not isinstance(current.get("process_group_killed"), bool)
                             or "process_group_cleanup_error" not in current
                         )
                     )
@@ -6103,13 +6291,15 @@ class Control:
         def matches_guest_failure(reference: Mapping[str, Any], candidate: Mapping[str, Any]) -> bool:
             return all(candidate.get(key) == reference.get(key) for key in (
                 "phase", "command", "returncode", "stdout", "stderr", "capacity", "transient", "cause",
-                "stdout_truncated", "stderr_truncated", "process_group_killed", "process_group_cleanup_error",
+                "stdout_truncated", "stderr_truncated", "reaped", "pipes_drained",
+                "process_group_killed", "process_group_cleanup_error",
             ))
 
         def same_guest_failure(reference: Mapping[str, Any], candidate: Mapping[str, Any]) -> bool:
             return all(candidate.get(key) == reference.get(key) for key in (
                 "phase", "command", "returncode", "stdout", "stderr", "transient", "cause", "retry_of",
-                "stdout_truncated", "stderr_truncated", "process_group_killed", "process_group_cleanup_error",
+                "stdout_truncated", "stderr_truncated", "reaped", "pipes_drained",
+                "process_group_killed", "process_group_cleanup_error",
             ))
 
         def valid_guest_attempts(attempts: Any) -> bool:
@@ -6204,7 +6394,7 @@ class Control:
             }
             for key in (
                 "transient", "retry_of", "cause", "stdout_truncated", "stderr_truncated",
-                "process_group_killed", "process_group_cleanup_error",
+                "reaped", "pipes_drained", "process_group_killed", "process_group_cleanup_error",
             ):
                 if key in guest_error:
                     detail[key] = guest_error[key]
@@ -6290,6 +6480,8 @@ class Control:
                         or not isinstance(current["transient"], bool)
                         or not isinstance(current["stdout_truncated"], bool)
                         or not isinstance(current["stderr_truncated"], bool)
+                        or ("reaped" in current and not isinstance(current["reaped"], bool))
+                        or ("pipes_drained" in current and not isinstance(current["pipes_drained"], bool))
                         or ("process_group_killed" in current and not isinstance(current["process_group_killed"], bool))
                         or (
                             "process_group_cleanup_error" in current
@@ -6300,7 +6492,9 @@ class Control:
                         or (
                             current.get("cause") == "command_timeout"
                             and (
-                                not isinstance(current.get("process_group_killed"), bool)
+                                not isinstance(current.get("reaped"), bool)
+                                or not isinstance(current.get("pipes_drained"), bool)
+                                or not isinstance(current.get("process_group_killed"), bool)
                                 or "process_group_cleanup_error" not in current
                             )
                         )
@@ -6330,7 +6524,7 @@ class Control:
             def matches_failure(reference: Mapping[str, Any], candidate: Mapping[str, Any]) -> bool:
                 return all(candidate.get(key) == reference.get(key) for key in (
                     "phase", "command", "returncode", "stdout", "stderr", "capacity", "transient", "cause",
-                    "stdout_truncated", "stderr_truncated",
+                    "stdout_truncated", "stderr_truncated", "reaped", "pipes_drained",
                 ))
 
             attempt_records = capacity["attempts"]

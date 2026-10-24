@@ -549,7 +549,8 @@ def _remote_error_outcome_uncertain(error: Mapping[str, Any], *, action: str | N
 
 
 def _drain_bounded_stream(fd: int, limit: int, output: list[bytes], truncated: list[bool],
-                          stop_event: threading.Event | None = None) -> None:
+                          stop_event: threading.Event | None = None,
+                          eof: list[bool] | None = None) -> None:
     retained = bytearray()
     try:
         try:
@@ -561,6 +562,8 @@ def _drain_bounded_stream(fd: int, limit: int, output: list[bytes], truncated: l
                     continue
                 chunk = os.read(fd, 65536)
                 if not chunk:
+                    if eof is not None:
+                        eof[0] = True
                     break
                 remaining = limit + 1 - len(retained)
                 if remaining > 0:
@@ -631,15 +634,17 @@ def control_request(action: str, *, session: str | None, generation: int | None 
         stderr_output: list[bytes] = []
         stdout_truncated_flag = [False]
         stderr_truncated_flag = [False]
+        stdout_eof = [False]
+        stderr_eof = [False]
         stream_stop = threading.Event()
         stdout_reader = threading.Thread(
             target=_drain_bounded_stream,
-            args=(stdout_read, REMOTE_STDOUT_LIMIT_BYTES, stdout_output, stdout_truncated_flag, stream_stop),
+            args=(stdout_read, REMOTE_STDOUT_LIMIT_BYTES, stdout_output, stdout_truncated_flag, stream_stop, stdout_eof),
             daemon=True,
         )
         stderr_reader = threading.Thread(
             target=_drain_bounded_stream,
-            args=(stderr_read, REMOTE_STDERR_LIMIT_BYTES, stderr_output, stderr_truncated_flag, stream_stop),
+            args=(stderr_read, REMOTE_STDERR_LIMIT_BYTES, stderr_output, stderr_truncated_flag, stream_stop, stderr_eof),
             daemon=True,
         )
         stdout_reader.start()
@@ -669,6 +674,9 @@ def control_request(action: str, *, session: str | None, generation: int | None 
                 if stdout_reader.is_alive() or stderr_reader.is_alive():
                     stream_cleanup_verified = False
                     stream_cleanup_error = "reader_join_timeout"
+                elif not stdout_eof[0] or not stderr_eof[0]:
+                    stream_cleanup_verified = False
+                    stream_cleanup_error = "reader_cancelled_before_eof"
             else:
                 reader_deadline = request_started + request_timeout
                 for reader in (stdout_reader, stderr_reader):
@@ -679,6 +687,9 @@ def control_request(action: str, *, session: str | None, generation: int | None 
                     if reader.is_alive():
                         stream_cleanup_verified = False
                         stream_cleanup_error = "reader_join_timeout"
+                if not stdout_eof[0] or not stderr_eof[0]:
+                    stream_cleanup_verified = False
+                    stream_cleanup_error = stream_cleanup_error or "reader_cancelled_before_eof"
         stdout = stdout_output[0] if stdout_output else b""
         stderr = stderr_output[0] if stderr_output else b""
         if process is not None:

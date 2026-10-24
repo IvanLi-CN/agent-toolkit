@@ -1,5 +1,5 @@
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { close as closeFileDescriptorCallback, constants } from "node:fs";
+import { close as closeFileDescriptorCallback, constants, writeSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, open, opendir, readFile, rename, rmdir, unlink, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -21,6 +21,7 @@ const SUPERVISOR_LEDGER_AUTH_SETTLE_MS = 2_000;
 export const SUPERVISOR_UNKNOWN_TARGET_STATUS = 125;
 const MAX_SUPERVISOR_MARKER_BYTES = 256;
 const MAX_SUPERVISOR_DESCENDANT_BYTES = 1024 * 1024;
+const MAX_SUPERVISOR_AUTHENTICATED_LEDGER_BYTES = MAX_SUPERVISOR_DESCENDANT_BYTES + MAX_SUPERVISOR_MARKER_BYTES;
 const MAX_SUPERVISOR_DESCENDANT_RECORDS = 1024;
 const MAX_SUPERVISOR_PROBE_BYTES = 256 * 1024;
 
@@ -72,6 +73,7 @@ quiesced_groups_read_data=""
 cleanup_ack_result=1
 cleanup_ack_sent=0
 captured_descendants_path="$status_dir/descendants"
+authenticated_descendants_path="$status_dir/descendants-authenticated"
 pending_descendants_path="$status_dir/descendant-pids"
 snapshot_started_path="$status_dir/snapshot-started"
 snapshot_ready_path="$status_dir/snapshot-ready"
@@ -80,6 +82,7 @@ snapshot_failed_path="$status_dir/snapshot-failed"
 snapshot_generation=0
 snapshot_ready_observed=0
 snapshot_deadline_epoch=0
+target_authorized_observed=0
 descendant_scan_truncated_path="$status_dir/descendant-scan-truncated"
 descendant_scan_failed_path="$status_dir/descendant-scan-failed"
 descendant_scan_input_path="$status_dir/descendant-scan-input"
@@ -90,14 +93,31 @@ supervisor_no_follow=""
 if command -v perl >/dev/null 2>&1; then
   supervisor_no_follow="$(perl -MFcntl -e 'print eval { Fcntl::O_NOFOLLOW() } // ""' 2>/dev/null || true)"
 fi
+status_dir_identity="$(perl -e 'my @s = lstat($ARGV[0]); print "$s[0]:$s[1]" if @s && (($s[2] & 0170000) == 0040000)' "$status_dir_path" 2>/dev/null || true)"
+case "$status_dir_identity" in
+  [0-9]*:[0-9]*) status_dir_dev="\${status_dir_identity%%:*}"; status_dir_ino="\${status_dir_identity#*:}" ;;
+  *) exit 1 ;;
+esac
 status_dir_is_current() {
   [ -d "." ] && [ ! -L "." ]
 }
-ledger_auth_key="\${AGENT_TOOLKIT_SUPERVISOR_LEDGER_KEY:-}"
-case "$ledger_auth_key" in
-  ''|*[!0-9a-fA-F]*) ledger_auth_key="" ;;
-esac
-[ "\${#ledger_auth_key}" -eq 64 ] || ledger_auth_key=""
+ledger_auth_key=""
+ledger_auth_key_read=0
+read_ledger_auth_key() {
+  if [ "$ledger_auth_key_read" = "1" ]; then
+    [ -n "$ledger_auth_key" ]
+    return $?
+  fi
+  ledger_auth_key_read=1
+  IFS= read -r ledger_auth_key <&5 || ledger_auth_key=""
+  case "$ledger_auth_key" in
+    ''|*[!0-9a-fA-F]*) ledger_auth_key="" ;;
+  esac
+  if [ "\${#ledger_auth_key}" -eq 64 ]; then
+    return 0
+  fi
+  return 1
+}
 read_regular_marker() {
   marker_path="$1"
   if ! command -v perl >/dev/null 2>&1; then return 1; fi
@@ -179,7 +199,7 @@ safe_remove_status_directory() {
   if [ -e "$status_dir_path" ] || ! perl -e '
     use strict;
     use warnings;
-    my ($root) = @ARGV;
+    my ($root, $expected_dev, $expected_ino) = @ARGV;
     sub identity {
       my @stat = lstat($_[0]);
       return unless @stat;
@@ -190,7 +210,8 @@ safe_remove_status_directory() {
       return defined($left) && defined($right) && $left->[0] == $right->[0] && $left->[1] == $right->[1] && $left->[2] == $right->[2];
     }
     my $root_identity = identity($root);
-    exit 1 unless defined($root_identity) && $root_identity->[2] == 0040000;
+    exit 1 unless defined($root_identity) && $root_identity->[2] == 0040000
+      && $root_identity->[0] eq $expected_dev && $root_identity->[1] eq $expected_ino;
     opendir(my $directory, $root) or exit 1;
     my @entries;
     while (defined(my $name = readdir($directory))) {
@@ -237,7 +258,7 @@ safe_remove_status_directory() {
     }
     exit 1 unless same_identity(identity($root), $root_identity);
     rmdir($root) or exit 1;
-  ' "$cleanup_tombstone"; then
+  ' "$cleanup_tombstone" "$status_dir_dev" "$status_dir_ino"; then
     return 1
   fi
 }
@@ -353,18 +374,22 @@ safe_read_snapshot() {
 write_ledger_auth() {
   status_dir_is_current || return 1
   [ -n "$supervisor_no_follow" ] || return 1
-  [ -n "$ledger_auth_key" ] || return 1
-  [ -f "$captured_descendants_path" ] || return 0
+  read_ledger_auth_key || return 1
+  [ -f "$captured_descendants_path" ] || return 1
+  case "$snapshot_generation" in ''|*[!0-9]*) return 1 ;; esac
   ledger_auth_nonce="$(LC_ALL=C od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d '[:space:]' || true)"
   case "$ledger_auth_nonce" in
     ''|*[!0-9a-fA-F]*) return 1 ;;
   esac
   ledger_auth_temporary_path="$status_dir/.descendants-auth-$ledger_auth_nonce.tmp"
-  if ! perl -MDigest::SHA=hmac_sha256_hex -e '
+  ledger_authenticated_temporary_path="$status_dir/.descendants-authenticated-$ledger_auth_nonce.tmp"
+  if ! printf '%s\n' "$ledger_auth_key" | perl -MDigest::SHA=hmac_sha256_hex -e '
     use strict;
     use warnings;
     use Fcntl qw(O_RDONLY O_WRONLY O_CREAT O_EXCL);
-    my ($input, $output, $temporary, $key, $nofollow) = @ARGV;
+    my ($input, $authentication_output, $authentication_temporary, $authenticated_output, $authenticated_temporary, $generation, $nofollow) = @ARGV;
+    my $key = <STDIN> // "";
+    $key =~ s/[\\r\\n]+\\z//;
     exit 1 unless defined $nofollow && $key =~ /^[0-9a-fA-F]{64}$/;
     my @path_stat = lstat($input);
     exit 1 unless @path_stat && (($path_stat[2] & 0170000) == 0100000) && $path_stat[7] <= 1048576;
@@ -382,13 +407,26 @@ write_ledger_auth() {
     exit 1 unless @final && $final[0] == $opened[0] && $final[1] == $opened[1]
       && $final[7] == $opened[7] && length($data) == $opened[7] && length($data) <= 1048576;
     close($in) or exit 1;
-    my $authentication = hmac_sha256_hex($data, pack("H*", $key));
-    sysopen(my $out, $temporary, O_WRONLY | O_CREAT | O_EXCL | $no_follow, 0600) or exit 1;
-    print {$out} $authentication, "\n" or exit 1;
-    close($out) or exit 1;
-    rename($temporary, $output) or exit 1;
-  ' "$captured_descendants_path" "$status_dir/descendants-auth" "$ledger_auth_temporary_path" "$ledger_auth_key" "$supervisor_no_follow"; then
-    rm -f -- "$ledger_auth_temporary_path" 2>/dev/null || true
+    my $authentication = hmac_sha256_hex($generation . "\n" . $data, pack("H*", $key));
+    sysopen(my $authenticated, $authenticated_temporary, O_WRONLY | O_CREAT | O_EXCL | $no_follow, 0600) or exit 1;
+    binmode $authenticated;
+    print {$authenticated} $generation, ":", $authentication, "\n", $data or exit 1;
+    close($authenticated) or exit 1;
+    rename($authenticated_temporary, $authenticated_output) or exit 1;
+    if (length($data) > 0) {
+      sysopen(my $out, $authentication_temporary, O_WRONLY | O_CREAT | O_EXCL | $no_follow, 0600) or exit 1;
+      print {$out} $generation, ":", $authentication, "\n" or exit 1;
+      close($out) or exit 1;
+      rename($authentication_temporary, $authentication_output) or exit 1;
+    } else {
+      my @legacy = lstat($authentication_output);
+      if (@legacy) {
+        exit 1 unless (($legacy[2] & 0170000) == 0100000);
+        unlink($authentication_output) or exit 1;
+      }
+    }
+  ' "$captured_descendants_path" "$status_dir/descendants-auth" "$ledger_auth_temporary_path" "$authenticated_descendants_path" "$ledger_authenticated_temporary_path" "$snapshot_generation" "$supervisor_no_follow"; then
+    rm -f -- "$ledger_auth_temporary_path" "$ledger_authenticated_temporary_path" 2>/dev/null || true
     return 1
   fi
   return 0
@@ -685,7 +723,7 @@ if command -v setsid >/dev/null 2>&1 && [ "\${AGENT_TOOLKIT_SUPERVISOR_DISABLE_S
     if ! write_target_marker "$anchor_path" "$$"; then exit 125; fi
     while [ ! -e "$start_path" ]; do sleep 0.01; done
     while [ ! -e "$authorized_path" ]; do sleep 0.01; done
-    (cd "$AGENT_TOOLKIT_TARGET_CWD" && "$@") 3>&- 4>&- &
+    (cd "$AGENT_TOOLKIT_TARGET_CWD" && "$@") 3>&- 4>&- 5>&- &
     target_pid=$!
     (trap ':' HUP INT TERM; while [ ! -e "$stop_path" ]; do sleep 0.02; done; kill -TERM "-$$" 2>/dev/null || true; sleep 0.25; kill -KILL "-$$" 2>/dev/null || true) &
     stop_watcher_pid=$!
@@ -728,7 +766,7 @@ else
     if ! write_target_marker "$anchor_path" "$$"; then exit 125; fi
     while [ ! -e "$start_path" ]; do sleep 0.01; done
     while [ ! -e "$authorized_path" ]; do sleep 0.01; done
-    (cd "$AGENT_TOOLKIT_TARGET_CWD" && "$@") 3>&- 4>&- &
+    (cd "$AGENT_TOOLKIT_TARGET_CWD" && "$@") 3>&- 4>&- 5>&- &
     target_pid=$!
     (trap ':' HUP INT TERM; while [ ! -e "$stop_path" ]; do sleep 0.02; done; kill -TERM "-$$" 2>/dev/null || true; sleep 0.25; kill -KILL "-$$" 2>/dev/null || true) &
     stop_watcher_pid=$!
@@ -1621,13 +1659,16 @@ snapshot_descendants() {
   if ! descendants "$pending_descendants_path" 2>/dev/null || [ "$cleanup_ack_enabled" != "1" ]; then
     cleanup_ack_enabled=0
     create_marker_exclusive "$descendant_scan_failed_path" || true
+    create_marker_exclusive "$status_dir/descendant-scan-failed" || true
   fi
   if [ -e "$descendant_scan_truncated_path" ] || [ -e "$descendant_scan_failed_path" ]; then
     cleanup_ack_enabled=0
     create_marker_exclusive "$snapshot_failed_path" || true
+    create_marker_exclusive "$status_dir/snapshot-failed" || true
   elif ! record_descendants; then
     cleanup_ack_enabled=0
     create_marker_exclusive "$snapshot_failed_path" || true
+    create_marker_exclusive "$status_dir/snapshot-failed" || true
   fi
   if ! create_marker_exclusive "$snapshot_ready_path"; then cleanup_ack_enabled=0; fi
   if ! create_marker_exclusive "$snapshot_finished_path"; then cleanup_ack_enabled=0; fi
@@ -1643,6 +1684,10 @@ start_snapshot() {
   if ! rm -f "$snapshot_started_path" "$snapshot_ready_path" "$snapshot_finished_path" "$snapshot_failed_path" 2>/dev/null; then cleanup_ack_enabled=0; fi
   snapshot_pid=""
   snapshot_descendants >/dev/null 2>/dev/null || cleanup_ack_enabled=0
+  if [ ! -e "$captured_descendants_path" ]; then
+    create_marker_exclusive "$captured_descendants_path" || cleanup_ack_enabled=0
+  fi
+  write_ledger_auth || cleanup_ack_enabled=0
   if [ -e "$snapshot_ready_path" ] && [ ! -e "$snapshot_failed_path" ]; then
     snapshot_ready_observed=1
   else
@@ -2525,10 +2570,16 @@ while [ ! -e "$completion_path" ]; do
     terminate_supervised_tree
     exit 143
   fi
-  snapshot_probe_count=$((snapshot_probe_count + 1))
-  if [ "$snapshot_probe_count" -ge 5 ]; then
+  if [ "$target_authorized_observed" = "0" ] && [ -e "$target_authorized_path" ]; then
+    target_authorized_observed=1
     start_snapshot || true
-    snapshot_probe_count=0
+  fi
+  if [ "$target_authorized_observed" = "1" ]; then
+    snapshot_probe_count=$((snapshot_probe_count + 1))
+    if [ "$snapshot_probe_count" -ge 5 ]; then
+      start_snapshot || true
+      snapshot_probe_count=0
+    fi
   fi
   if [ "$termination_requested" = "1" ]; then
     terminate_supervised_tree
@@ -2667,45 +2718,61 @@ interface SupervisorDirectoryIdentity {
   ino: number;
 }
 
-function ledgerAuthenticationMatches(ledger: string, authentication: string, key: string): boolean {
-  if (!/^[0-9a-fA-F]{64}$/.test(key) || !/^[0-9a-fA-F]{64}$/.test(authentication)) return false;
-  const expected = createHmac("sha256", Buffer.from(key, "hex")).update(ledger).digest();
-  const actual = Buffer.from(authentication, "hex");
-  return actual.length === expected.length && timingSafeEqual(actual, expected);
+interface AuthenticatedLedger {
+  data: string;
+  generation: number;
+}
+
+function parseAuthenticatedLedger(authenticatedLedger: string, key: string): AuthenticatedLedger | undefined {
+  if (!/^[0-9a-fA-F]{64}$/.test(key)) return undefined;
+  const separator = authenticatedLedger.indexOf("\n");
+  if (separator < 0) return undefined;
+  const authentication = authenticatedLedger.slice(0, separator);
+  const ledger = authenticatedLedger.slice(separator + 1);
+  const match = /^(0|[1-9][0-9]*):([0-9a-fA-F]{64})$/.exec(authentication.trim());
+  if (match === null) return undefined;
+  const generation = Number(match[1]);
+  if (!Number.isSafeInteger(generation) || generation < 1) return undefined;
+  const expected = createHmac("sha256", Buffer.from(key, "hex")).update(`${generation}\n${ledger}`).digest();
+  const actual = Buffer.from(match[2]!, "hex");
+  if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return undefined;
+  return { data: ledger, generation };
 }
 
 async function authenticateInitialLedger(
   statusDirectory: string,
   key: string,
-): Promise<boolean> {
+): Promise<AuthenticatedLedger | undefined> {
   const deadline = Date.now() + SUPERVISOR_INITIAL_LEDGER_WAIT_MS;
-  const snapshotFinishedPath = join(statusDirectory, "snapshot-finished-1");
+  const authenticatedLedgerPath = join(statusDirectory, "descendants-authenticated");
   while (Date.now() < deadline) {
-    const ledger = await readRegularMarker(join(statusDirectory, "descendants"), MAX_SUPERVISOR_DESCENDANT_BYTES);
-    const snapshotFinished = await readRegularMarker(snapshotFinishedPath);
-    if (ledger !== undefined && ledger.trim().length > 0) {
-      const authentication = await readRegularMarker(join(statusDirectory, "descendants-auth"), MAX_SUPERVISOR_MARKER_BYTES);
-      if (authentication !== undefined && ledgerAuthenticationMatches(ledger, authentication.trim(), key)) return true;
-    } else if (snapshotFinished !== undefined) {
-      return true;
+    const published = await readRegularMarker(authenticatedLedgerPath, MAX_SUPERVISOR_AUTHENTICATED_LEDGER_BYTES);
+    if (published !== undefined) {
+      const authenticated = parseAuthenticatedLedger(published, key);
+      if (authenticated !== undefined) return authenticated;
     }
     await Bun.sleep(25);
   }
-  return false;
+  return undefined;
 }
 
-async function readAuthenticatedLedger(statusDirectory: string, key: string, deadline: number): Promise<string | undefined> {
+async function readAuthenticatedLedger(
+  statusDirectory: string,
+  key: string,
+  deadline: number,
+  acceptStaleLedger = false,
+): Promise<AuthenticatedLedger | undefined> {
+  const authenticatedLedgerPath = join(statusDirectory, "descendants-authenticated");
   const ledgerPath = join(statusDirectory, "descendants");
-  const authenticationPath = join(statusDirectory, "descendants-auth");
   while (Date.now() < deadline) {
-    const ledger = await readRegularMarker(ledgerPath, MAX_SUPERVISOR_DESCENDANT_BYTES);
-    if (ledger === undefined) {
+    const published = await readRegularMarker(authenticatedLedgerPath, MAX_SUPERVISOR_AUTHENTICATED_LEDGER_BYTES);
+    if (published === undefined) {
       await Bun.sleep(25);
       continue;
     }
-    if (ledger.trim().length === 0) return ledger;
-    const authentication = await readRegularMarker(authenticationPath, MAX_SUPERVISOR_MARKER_BYTES);
-    if (authentication !== undefined && ledgerAuthenticationMatches(ledger, authentication.trim(), key)) return ledger;
+    const authenticated = parseAuthenticatedLedger(published, key);
+    const ledger = await readRegularMarker(ledgerPath, MAX_SUPERVISOR_DESCENDANT_BYTES);
+    if (authenticated !== undefined && (acceptStaleLedger || ledger === authenticated.data)) return authenticated;
     await Bun.sleep(25);
   }
   return undefined;
@@ -2833,6 +2900,23 @@ async function currentProcessParent(pid: number): Promise<number | undefined> {
   if (result === undefined || result.exitCode !== 0) return undefined;
   const value = result.stdout.trim();
   return /^[1-9][0-9]*$/.test(value) ? Number(value) : undefined;
+}
+
+async function processDescendsFrom(pid: number, ancestorPid: number): Promise<boolean | undefined> {
+  if (pid === ancestorPid) return true;
+  const seen = new Set<number>();
+  let current = pid;
+  for (let depth = 0; depth < MAX_SUPERVISOR_DESCENDANT_RECORDS; depth += 1) {
+    if (current === ancestorPid) return true;
+    if (seen.has(current)) return false;
+    seen.add(current);
+    const parent = await currentProcessParent(current);
+    if (parent === undefined) return undefined;
+    if (parent === ancestorPid) return true;
+    if (parent <= 1) return false;
+    current = parent;
+  }
+  return false;
 }
 
 function processIsAlive(pid: number): boolean {
@@ -3008,6 +3092,7 @@ async function cleanupAuthorizedTargetGroup(
   reference: TargetReference,
   rememberedMembers?: readonly TargetGroupMember[],
   allowCurrentGroupMembers = false,
+  minimumLedgerGeneration = 0,
   cleanupDeadline = Date.now() + SUPERVISOR_CLEANUP_TIMEOUT_MS,
 ): Promise<boolean> {
   const withinCleanupDeadline = async <T>(promise: Promise<T>): Promise<T | undefined> => {
@@ -3022,11 +3107,22 @@ async function cleanupAuthorizedTargetGroup(
     if (previous !== undefined && (previous.identity !== member.identity || previous.pgid !== member.pgid)) return false;
     authorized.set(member.pid, member);
   }
-  const ledger = statusDirectory === undefined
+  const authenticatedLedger = statusDirectory === undefined
     ? undefined
-    : await readAuthenticatedLedger(statusDirectory, ledgerKey, Math.min(cleanupDeadline, Date.now() + SUPERVISOR_LEDGER_AUTH_SETTLE_MS));
-  if (statusDirectory !== undefined && ledger === undefined
-    && await lstat(join(statusDirectory, "descendants")).then(() => true, () => false)) return false;
+    : await readAuthenticatedLedger(
+      statusDirectory,
+      ledgerKey,
+      Math.min(cleanupDeadline, Date.now() + SUPERVISOR_LEDGER_AUTH_SETTLE_MS),
+      !allowCurrentGroupMembers,
+    );
+  if (statusDirectory !== undefined && authenticatedLedger === undefined) return false;
+  if (authenticatedLedger !== undefined && authenticatedLedger.generation <= minimumLedgerGeneration) return false;
+  if (statusDirectory !== undefined) {
+    for (const failureMarker of ["snapshot-failed", "descendant-scan-failed", "descendant-scan-truncated"]) {
+      if (await readRegularMarker(join(statusDirectory, failureMarker)) !== undefined) return false;
+    }
+  }
+  const ledger = authenticatedLedger?.data;
   if (ledger !== undefined && ledger.trim().length > 0) {
     let ledgerRecords = 0;
     for (const line of ledger.split(/\r?\n/)) {
@@ -3041,6 +3137,12 @@ async function cleanupAuthorizedTargetGroup(
       const member = { pid, pgid, identity: fields[1]! };
       const previous = authorized.get(pid);
       if (previous !== undefined && (previous.identity !== member.identity || previous.pgid !== member.pgid)) return false;
+      if (previous === undefined) {
+        const descendant = await processDescendsFrom(pid, reference.pid);
+        if (descendant !== true
+          && member.pgid !== reference.pgid
+          && !(rememberedMembers ?? []).some((remembered) => remembered.pgid === member.pgid)) return false;
+      }
       authorized.set(pid, member);
     }
   }
@@ -3065,9 +3167,22 @@ async function cleanupAuthorizedTargetGroup(
     for (const member of members) {
       const expected = authorized.get(member.pid);
       if (expected === undefined) {
-        if (pgid !== reference.pgid || !allowCurrentGroupMembers) return false;
-        const targetStillOwnsGroup = await withinCleanupDeadline(readCurrentGroupMember(reference.pid, reference.pgid));
-        if (targetStillOwnsGroup === undefined || !processIdentityMatches(reference.identity, targetStillOwnsGroup.identity)) return false;
+        if (pgid !== reference.pgid) return false;
+        if (allowCurrentGroupMembers) {
+          const targetStillOwnsGroup = await withinCleanupDeadline(readCurrentGroupMember(reference.pid, reference.pgid));
+          if (targetStillOwnsGroup === undefined || !processIdentityMatches(reference.identity, targetStillOwnsGroup.identity)) return false;
+        } else {
+          let descendedFromAuthorizedMember = false;
+          for (const ancestor of authorized.values()) {
+            if (ancestor.pid === member.pid) continue;
+            const relation = await withinCleanupDeadline(processDescendsFrom(member.pid, ancestor.pid));
+            if (relation === true) {
+              descendedFromAuthorizedMember = true;
+              break;
+            }
+          }
+          if (!descendedFromAuthorizedMember) return false;
+        }
         authorized.set(member.pid, member);
       } else if (!processIdentityMatches(expected.identity, member.identity)) {
         return false;
@@ -3111,7 +3226,9 @@ async function cleanupOrphanedTarget(
   statusDirectory?: string,
   ledgerKey = "",
   rememberedMembers?: readonly TargetGroupMember[],
+  minimumLedgerGeneration = 0,
   cleanupDeadline = Date.now() + SUPERVISOR_CLEANUP_TIMEOUT_MS,
+  allowStaleForDeadRemembered = false,
 ): Promise<boolean> {
   if (process.platform === "win32") return false;
   const reference = rememberedReference;
@@ -3126,15 +3243,27 @@ async function cleanupOrphanedTarget(
     if (reference.identity.length === 0 || currentIdentity === undefined || !processIdentityMatches(reference.identity, currentIdentity)) return false;
     return await currentProcessGroup(targetPid) === targetPgid;
   };
+  if (await processIsZombie(targetPid)) {
+    return cleanupAuthorizedTargetGroup(statusDirectory, ledgerKey, reference, rememberedMembers, false, minimumLedgerGeneration, cleanupDeadline);
+  }
+  if (allowStaleForDeadRemembered) {
+    for (const member of rememberedMembers ?? []) {
+      if (member.pid === reference.pid) continue;
+      const probe = await probeAuthorizedMember(member);
+      if (probe.kind === "dead" || await processIsZombie(member.pid)) {
+        return cleanupAuthorizedTargetGroup(statusDirectory, ledgerKey, reference, rememberedMembers, false, minimumLedgerGeneration, cleanupDeadline);
+      }
+    }
+  }
   if (!await verifyTargetReference()) {
-    return cleanupAuthorizedTargetGroup(statusDirectory, ledgerKey, reference, rememberedMembers, false, cleanupDeadline);
+    return cleanupAuthorizedTargetGroup(statusDirectory, ledgerKey, reference, rememberedMembers, false, minimumLedgerGeneration, cleanupDeadline);
   }
   // Re-read the authenticated identity and group immediately before the
   // negative-PGID signal so a reused PID or group cannot pass a stale check.
   if (!await verifyTargetReference()) {
-    return cleanupAuthorizedTargetGroup(statusDirectory, ledgerKey, reference, rememberedMembers, false, cleanupDeadline);
+    return cleanupAuthorizedTargetGroup(statusDirectory, ledgerKey, reference, rememberedMembers, false, minimumLedgerGeneration, cleanupDeadline);
   }
-  return cleanupAuthorizedTargetGroup(statusDirectory, ledgerKey, reference, rememberedMembers, true, cleanupDeadline);
+  return cleanupAuthorizedTargetGroup(statusDirectory, ledgerKey, reference, rememberedMembers, true, minimumLedgerGeneration, cleanupDeadline);
 }
 
 async function waitForTarget(
@@ -3144,13 +3273,15 @@ async function waitForTarget(
   rememberedReference?: () => TargetReference | undefined,
   rememberedMembers?: () => readonly TargetGroupMember[] | undefined,
   ledgerKey = "",
+  minimumLedgerGeneration?: () => number,
 ): Promise<number> {
   const wrapperCode = await wrapperExited;
   const status = statusFd === undefined ? undefined : await readStatusPipe(statusFd);
   if (wrapperCode === 0 && status !== undefined && await readRegularMarker(parentDeadPath) === undefined) {
     return status;
   }
-  await cleanupOrphanedTarget(rememberedReference?.(), dirname(parentDeadPath), ledgerKey, rememberedMembers?.());
+  const requiredGeneration = wrapperCode === 0 ? (minimumLedgerGeneration?.() ?? 0) : 0;
+  await cleanupOrphanedTarget(rememberedReference?.(), dirname(parentDeadPath), ledgerKey, rememberedMembers?.(), requiredGeneration);
   return SUPERVISOR_UNKNOWN_TARGET_STATUS;
 }
 
@@ -3195,7 +3326,7 @@ async function restoreSupervisorDirectory(original: string, tombstone: string, i
   }
 }
 
-async function removeSupervisorDirectory(path: string, expectedIdentity?: SupervisorDirectoryIdentity): Promise<void> {
+async function removeSupervisorDirectoryOnce(path: string, expectedIdentity?: SupervisorDirectoryIdentity): Promise<void> {
   let metadata;
   try {
     metadata = await lstat(path);
@@ -3281,6 +3412,17 @@ async function removeSupervisorDirectory(path: string, expectedIdentity?: Superv
   }
 }
 
+async function removeSupervisorDirectory(path: string, expectedIdentity?: SupervisorDirectoryIdentity): Promise<void> {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    await removeSupervisorDirectoryOnce(path, expectedIdentity);
+    const remaining = await lstat(path).catch(() => undefined);
+    if (remaining === undefined) return;
+    if (!remaining.isDirectory() || remaining.isSymbolicLink()) return;
+    if (expectedIdentity !== undefined && (remaining.dev !== expectedIdentity.dev || remaining.ino !== expectedIdentity.ino)) return;
+    if (attempt < 3) await Bun.sleep(25 * (attempt + 1));
+  }
+}
+
 async function removeSupervisorDirectoryAfterAcknowledgement(path: string, acknowledgement: number | undefined, expectedIdentity: SupervisorDirectoryIdentity): Promise<void> {
   if (acknowledgement !== 0 && acknowledgement !== 1) return;
   // ACK=0 means the detached cleaner could not prove cleanup. Preserve the
@@ -3352,8 +3494,11 @@ async function createSupervisorMarker(path: string): Promise<boolean> {
 export async function spawnSupervised(args: string[]): Promise<SupervisedChild> {
   if (process.platform === "win32") throw new Error("supervisor_unsupported_platform");
 
-  if (Bun.which("perl") === null) throw new Error("supervisor_requires_perl");
-  if (Bun.which("ps") === null) throw new Error("supervisor_requires_ps");
+  for (const command of ["sh", "perl", "ps", "awk", "cksum", "date", "od", "tr", "rm", "sleep"]) {
+    if (Bun.which(command) === null) throw new Error(`supervisor_requires_${command}`);
+  }
+  const perlModules = Bun.spawn(["perl", "-MFcntl", "-MPOSIX", "-MDigest::SHA", "-e", ""], { stdout: "ignore", stderr: "ignore" });
+  if (await perlModules.exited !== 0) throw new Error("supervisor_requires_perl_modules");
 
   const targetMarker = randomUUID();
   const ledgerKey = randomBytes(32).toString("hex");
@@ -3375,31 +3520,42 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
   const cleanupCompletePath = join(directory, "cleanup-complete");
   let statusFdForCleanup: number | undefined;
   let cleanupFdForParent: number | undefined;
+  let ledgerKeyFdForChild: number | undefined;
   try {
+    const supervisorEnv = { ...process.env };
+    delete supervisorEnv.AGENT_TOOLKIT_SUPERVISOR_LEDGER_KEY;
     const child = Bun.spawn(
       ["sh", "-c", SUPERVISOR_SCRIPT, "agent-toolkit-supervisor", statusPath, ...args],
       {
-        stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"],
+        stdio: ["pipe", "pipe", "pipe", "pipe", "pipe", "pipe"],
         env: {
-          ...process.env,
+          ...supervisorEnv,
           AGENT_TOOLKIT_SUPERVISOR_PARENT_PID: String(process.pid),
           AGENT_TOOLKIT_TARGET_MARKER: targetMarker,
-          AGENT_TOOLKIT_SUPERVISOR_LEDGER_KEY: ledgerKey,
         },
       },
-    ) as Bun.Subprocess<"pipe", "pipe", "pipe"> & { stdio: [null, null, null, number | null, number | null] };
+    ) as Bun.Subprocess<"pipe", "pipe", "pipe"> & { stdio: [null, null, null, number | null, number | null, number | null] };
     statusFdForCleanup = typeof child.stdio[3] === "number" ? child.stdio[3] : undefined;
     cleanupFdForParent = typeof child.stdio[4] === "number" ? child.stdio[4] : undefined;
-    if (statusFdForCleanup === undefined || cleanupFdForParent === undefined) {
+    ledgerKeyFdForChild = typeof child.stdio[5] === "number" ? child.stdio[5] : undefined;
+    if (statusFdForCleanup === undefined || cleanupFdForParent === undefined || ledgerKeyFdForChild === undefined) {
       try { child.kill("SIGKILL"); } catch { /* The wrapper may already be gone. */ }
       await child.exited.catch(() => undefined);
       throw new Error("supervisor_control_pipe_unavailable");
     }
+    // The supervisor performs an initial snapshot before it can expose the
+    // target authorization marker, so provide the ledger key as soon as the
+    // private control channel is established. Keeping it on FD5 avoids
+    // exposing the secret through the supervisor environment or argv.
+    writeSync(ledgerKeyFdForChild, Buffer.from(`${ledgerKey}\n`, "ascii"));
+    await closeFileDescriptor(ledgerKeyFdForChild);
+    ledgerKeyFdForChild = undefined;
     const statusFd = statusFdForCleanup;
     const cleanupFd = cleanupFdForParent;
     const wrapperExited = child.exited;
     let rememberedTargetReference: TargetReference | undefined;
     let rememberedTargetGroupMembers: TargetGroupMember[] | undefined;
+    let lastLedgerGeneration = 0;
     let cleanupAckPromise: Promise<boolean> | undefined;
     const waitForCleanupAcknowledged = (): Promise<boolean> => {
       cleanupAckPromise ??= waitForCleanupAck(cleanupFd, cleanupStartedPath, wrapperExited, directory, directoryIdentity).finally(() => {
@@ -3407,38 +3563,40 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
       });
       return cleanupAckPromise;
     };
+    const targetExitPromise = waitForTarget(
+      join(directory, "parent-dead"),
+      statusFd,
+      wrapperExited,
+      () => rememberedTargetReference,
+      () => rememberedTargetGroupMembers,
+      ledgerKey,
+      () => lastLedgerGeneration,
+    );
     const supervised: SupervisedChild = {
       child,
-      exited: waitForTarget(
-        join(directory, "parent-dead"),
-        statusFd,
-        wrapperExited,
-        () => rememberedTargetReference,
-        () => rememberedTargetGroupMembers,
-        ledgerKey,
-      ),
+      exited: targetExitPromise,
       wrapperExited,
       waitForCleanupAcknowledged,
       forceCleanup: async () => {
         const reference = rememberedTargetReference ?? await readTargetReference(statusPath, child.pid);
-        const cleanupDeadline = Date.now() + SUPERVISOR_CLEANUP_TIMEOUT_MS;
-        const targetCleanup = cleanupOrphanedTarget(reference, directory, ledgerKey, rememberedTargetGroupMembers, cleanupDeadline);
         try { child.kill("SIGKILL"); } catch { /* The wrapper may already be gone. */ }
         await wrapperExited.catch(() => undefined);
+        await targetExitPromise.catch(() => undefined);
         if (cleanupFdForParent !== undefined) {
           await closeFileDescriptor(cleanupFdForParent);
           cleanupFdForParent = undefined;
         }
-        if (await targetCleanup) {
+        const cleanupDeadline = Date.now() + SUPERVISOR_CLEANUP_TIMEOUT_MS;
+        if (await cleanupOrphanedTarget(reference, directory, ledgerKey, rememberedTargetGroupMembers, 0, cleanupDeadline, true)) {
           await removeSupervisorDirectory(directory, directoryIdentity);
           return true;
         }
-        const retry = await cleanupOrphanedTarget(reference, directory, ledgerKey, rememberedTargetGroupMembers, cleanupDeadline);
+        const retry = await cleanupOrphanedTarget(reference, directory, ledgerKey, rememberedTargetGroupMembers, 0, cleanupDeadline, true);
         if (retry) await removeSupervisorDirectory(directory, directoryIdentity);
         return retry;
       },
       cleanup: async () => {
-        await cleanupOrphanedTarget(rememberedTargetReference, directory, ledgerKey, rememberedTargetGroupMembers);
+        await cleanupOrphanedTarget(rememberedTargetReference, directory, ledgerKey, rememberedTargetGroupMembers, lastLedgerGeneration);
         if ((await readRegularMarker(cleanupCompletePath))?.trim() === "complete") {
           await removeSupervisorDirectory(directory, directoryIdentity);
         }
@@ -3478,6 +3636,24 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
       await supervised.exited.catch(() => undefined);
       throw new Error("supervisor_target_reference_unavailable");
     }
+    // Keep the target launcher waiting while the parent authenticates the
+    // first signed descendant ledger. A target must not be able to terminate
+    // the supervisor during this handshake and leave the parent without a
+    // trustworthy initial state.
+    rememberedTargetReference = targetReference;
+    const initialLedger = await authenticateInitialLedger(directory, ledgerKey);
+    if (initialLedger === undefined) {
+      try { child.kill("SIGTERM"); } catch { /* The supervisor may already be gone. */ }
+      const cleanupReady = await waitForCleanupAcknowledged();
+      if (!cleanupReady) {
+        try { child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.forceCleanup();
+      }
+      await wrapperExited.catch(() => undefined);
+      await supervised.exited.catch(() => undefined);
+      throw new Error("supervisor_ledger_authentication_failed");
+    }
+    lastLedgerGeneration = initialLedger.generation;
     if (!await createSupervisorMarker(targetAuthorizedPath)) {
       try { child.kill("SIGTERM"); } catch { /* The wrapper may already be gone. */ }
       const cleanupReady = await waitForCleanupAcknowledged();
@@ -3489,13 +3665,12 @@ export async function spawnSupervised(args: string[]): Promise<SupervisedChild> 
       await supervised.exited.catch(() => undefined);
       throw new Error("supervisor_target_authorization_unavailable");
     }
-    rememberedTargetReference = targetReference;
     rememberedTargetGroupMembers = await captureTargetGroupMembers(targetReference, wrapperExited);
-    await authenticateInitialLedger(directory, ledgerKey);
     return supervised;
   } catch (error) {
     if (statusFdForCleanup !== undefined) await closeFileDescriptor(statusFdForCleanup);
     if (cleanupFdForParent !== undefined) await closeFileDescriptor(cleanupFdForParent);
+    if (ledgerKeyFdForChild !== undefined) await closeFileDescriptor(ledgerKeyFdForChild);
     if (statusFdForCleanup === undefined || (await readRegularMarker(cleanupCompletePath))?.trim() === "complete") {
       await removeSupervisorDirectory(directory, directoryIdentity);
     }

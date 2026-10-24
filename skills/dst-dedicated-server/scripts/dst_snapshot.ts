@@ -3,7 +3,7 @@
 import { constants, type Dirent } from "node:fs";
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { lstat, link, mkdir, mkdtemp, open, opendir, realpath, rename, rmdir, unlink, type FileHandle } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawnSupervised, SUPERVISOR_UNKNOWN_TARGET_STATUS, type SupervisedChild } from "./process_supervisor.ts";
 
@@ -395,7 +395,7 @@ async function runWithStdin(
       clearTimeout(forceKillTimer);
       forceKillTimer = undefined;
     }
-    await supervised.cleanup();
+    if (!cleanupReady) await supervised.cleanup();
     await Promise.all([
       cancelStream(child.stdout),
       cancelStream(child.stderr),
@@ -1325,7 +1325,7 @@ Defaults:
   --host      value from DST_HOST
   --user      value from DST_USER
   --local-dir value from DST_LOCAL_DIR
-  --out       /tmp/dst-snapshot-<timestamp>.md
+  --out       <system-temp>/dst-snapshot-<timestamp>.md
 
 Notes:
   - Remote collection uses non-interactive SSH (BatchMode=yes) to avoid hanging.
@@ -1392,7 +1392,7 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
     return 0;
   }
 
-  const outputPath = expandUser(parsed.out ?? `/tmp/dst-snapshot-${fileTimestamp()}.md`);
+  const outputPath = expandUser(parsed.out ?? join(tmpdir(), `dst-snapshot-${fileTimestamp()}.md`));
   let remoteScript = "";
   if (!parsed.noRemote) {
     try {

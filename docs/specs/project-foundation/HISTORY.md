@@ -10,6 +10,8 @@ The project has a public source and Agent VM contracts, while portions of its ma
 
 [ADR 0028](../../adr/0028-language-and-runtime-policy.md) records the accepted language/runtime decision. The script matrix distinguishes that target from source implementations, and IMPLEMENTATION.md records verified coverage separately.
 
+[ADR 0029](../../adr/0029-helper-output-publication.md) records the accepted atomic output, permission, and symlink behavior for migrated helper artifacts.
+
 ## References
 
 - [Requirements](SPEC.md)

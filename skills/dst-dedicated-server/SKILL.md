@@ -13,6 +13,8 @@ Use this Skill for a configured server whose SSH alias, user and local client di
 - `DST_USER` is the remote operator account.
 - `DST_LOCAL_DIR` is the optional local client data directory.
 - `DST_CLUSTER` selects the cluster on the remote host.
+- The local CLI uses the Bun installed on the host and requires POSIX process-group support plus local Perl and `ps` runtimes for process supervision; Windows is rejected with `supervisor_unsupported_platform`, while missing POSIX tools fail closed with `supervisor_requires_perl` or `supervisor_requires_ps`. Remote collection keeps its native Shell boundary and does not require Bun on the game server.
+- The remote collection scripts are executed with Bash on the inspected host and require a standard Perl runtime for nonblocking, no-follow file reads; if either prerequisite is unavailable they fail closed instead of opening an unbounded remote stream.
 
 Set these values outside tracked files or pass them to the scripts. Missing host configuration fails closed; do not guess an address or path.
 
@@ -22,16 +24,18 @@ Treat cluster tokens, server tokens, passwords and provider credentials as secre
 
 ## Workflow
 
-1. Run `scripts/dst_snapshot.sh --host "$DST_HOST" --user "$DST_USER" --local-dir "$DST_LOCAL_DIR"`.
+1. Run `bun scripts/dst_snapshot.ts --host "$DST_HOST" --user "$DST_USER" --local-dir "$DST_LOCAL_DIR"`.
 2. Classify the failure as master, caves, shared configuration, binary/runtime or mod related.
 3. Read the remote runbook and log paths discovered by the snapshot; redact before sharing.
 4. Make one minimal authorized change and verify that the affected shard stays ready for several minutes.
 
-`scripts/dst_mods_from_modoverrides.sh` reads only shard `modoverrides.lua` and prints Workshop IDs plus enabled state; it does not read cluster secrets.
+`bun scripts/dst_mods_from_modoverrides.ts` reads only shard `modoverrides.lua` through the remote Shell collector and prints Workshop IDs plus enabled state; it does not read cluster secrets or execute Lua.
 
 ## References
 
 - `references/environment.md`: required external configuration and secret boundary.
 - `references/dst-paths.md`: layout checklist with placeholders.
-- `scripts/dst_snapshot.sh`: redacted baseline collection.
-- `scripts/dst_mods_from_modoverrides.sh`: safe mod summary.
+- `scripts/dst_snapshot.ts`: local options, filesystem reads, bounded report composition, and remote SSH orchestration.
+- `scripts/dst_snapshot_remote.sh`: native commands executed on the remote host for the redacted baseline.
+- `scripts/dst_mods_from_modoverrides.ts`: local safe parser, summaries, and shard comparison.
+- `scripts/dst_mods_remote_collect.sh`: remote bounded projection of Workshop IDs and top-level enabled state; it never emits configuration values or arbitrary source text.

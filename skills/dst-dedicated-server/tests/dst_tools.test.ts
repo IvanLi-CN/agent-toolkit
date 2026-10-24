@@ -1,0 +1,2679 @@
+import { describe, expect, test } from "bun:test";
+import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import {
+  MAX_MOD_OVERRIDE_BYTES,
+  parseRemoteResponseStream,
+  parseModOverrides,
+  parseArgs,
+  renderDiff,
+  renderSummary,
+  type ShardSummary,
+} from "../scripts/dst_mods_from_modoverrides.ts";
+import { createSnapshotOwnerMarker, main as snapshotMain, MAX_LOCAL_DIRECTORY_ENTRIES, MAX_LOCAL_LOG_LISTING_ENTRIES, MAX_REMOTE_OUTPUT_BYTES, redactOperationalText, redactSensitiveText, safeTail } from "../scripts/dst_snapshot.ts";
+import { spawnSupervised, SUPERVISOR_UNKNOWN_TARGET_STATUS } from "../scripts/process_supervisor.ts";
+
+async function runTool(script: string, args: string[], env: Record<string, string>): Promise<{ status: number; stdout: string; stderr: string }> {
+  const child = Bun.spawn([process.execPath, script, ...args], { env, stdout: "pipe", stderr: "pipe" });
+  const [status, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  return { status, stdout, stderr };
+}
+
+async function supervisorStatusDirectory(before: ReadonlySet<string>, wrapperPid: number): Promise<string> {
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    for (const entry of await readdir(tmpdir())) {
+      if (before.has(entry) || !entry.startsWith(".agent-toolkit-dst-supervisor-") || entry.includes("ack-")) continue;
+      const candidate = join(tmpdir(), entry);
+      const pid = Number((await readFile(join(candidate, "target"), "utf8").catch(() => "")).trim());
+      if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+      const parent = Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(pid)], { stdout: "pipe", stderr: "ignore" });
+      if (Number(new TextDecoder().decode(parent.stdout).trim()) === wrapperPid) return candidate;
+    }
+    await Bun.sleep(25);
+  }
+  throw new Error("supervisor fixture directory unavailable");
+}
+
+function byteStream(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(chunk);
+      controller.close();
+    },
+  });
+}
+
+describe.serial("DST local Bun tooling", () => {
+  test("uses an error envelope for CLI parse failures", async () => {
+    const env = { ...process.env } as Record<string, string>;
+    const snapshot = await runTool(join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"), ["--unknown"], env);
+    expect(snapshot.status).toBe(2);
+    expect(snapshot.stderr).toStartWith("error: Unknown arg: --unknown");
+
+    const mods = await runTool(join(import.meta.dir, "..", "scripts", "dst_mods_from_modoverrides.ts"), ["--unknown"], env);
+    expect(mods.status).toBe(2);
+    expect(mods.stderr).toStartWith("error: Unknown arg: --unknown");
+  });
+
+  test("redacts bearer, basic, and escaped quoted secrets completely", () => {
+    expect(redactSensitiveText("Authorization: Bearer fixture-secret")).toBe("Authorization: [REDACTED]");
+    expect(redactSensitiveText("Authorization: Bearer : fixture-secret")).toBe("Authorization: [REDACTED]");
+    expect(redactSensitiveText("Authorization Bearer fixture-secret")).toBe("Authorization [REDACTED]");
+    expect(redactSensitiveText("Authorization: Basic fixture-secret")).toBe("Authorization: [REDACTED]");
+    expect(redactSensitiveText("Authorization: Basic = fixture-secret")).toBe("Authorization: [REDACTED]");
+    expect(redactSensitiveText("Basic fixture-secret")).not.toContain("fixture-secret");
+    expect(redactSensitiveText("pass phrase: fixture-secret")).not.toContain("fixture-secret");
+    expect(redactSensitiveText("-----BEGIN PRIVATE KEY-----\nMIIEfixture-secret\n-----END PRIVATE KEY-----")).not.toContain("fixture-secret");
+    expect(redactSensitiveText("-----BEGIN PRIVATE KEY-----\nMIIEtruncated-fixture-secret\nvisible-after-truncation")).toBe("[REDACTED]");
+    expect(redactSensitiveText("[api_key]=fixture-secret")).not.toContain("fixture-secret");
+    expect(redactSensitiveText("password[0]=indexed-secret")).not.toContain("indexed-secret");
+    expect(redactSensitiveText("api_keys[0]: indexed-api-secret")).not.toContain("indexed-api-secret");
+    expect(redactSensitiveText("api.key=dot-separated-secret")).not.toContain("dot-separated-secret");
+    expect(redactSensitiveText("[api_key][0]=bracket-index-secret")).not.toContain("bracket-index-secret");
+    expect(redactSensitiveText('["api_key"][0]=quoted-bracket-secret')).not.toContain("quoted-bracket-secret");
+    expect(redactSensitiveText('"api_key"[0]=quoted-index-secret')).not.toContain("quoted-index-secret");
+    expect(redactSensitiveText('["api_key"] [0] = spaced-index-secret')).not.toContain("spaced-index-secret");
+    expect(redactSensitiveText('["api_key"][0]%3Dencoded-index-secret')).not.toContain("encoded-index-secret");
+    expect(redactSensitiveText("api_key%3Dfixture-secret")).not.toContain("fixture-secret");
+    expect(redactSensitiveText("api%5Fkey=percent-encoded-key-secret")).not.toContain("percent-encoded-key-secret");
+    expect(redactSensitiveText("api%5Fkey%3Dencoded-separator-secret")).not.toContain("encoded-separator-secret");
+    expect(redactSensitiveText("%5Bapi_key%5D=percent-encoded-bracket-secret")).not.toContain("percent-encoded-bracket-secret");
+    expect(redactSensitiveText("%22api_key%22%3Dpercent-encoded-quote-secret")).not.toContain("percent-encoded-quote-secret");
+    expect(redactSensitiveText("%5Bapi_key%5D%3Apercent-encoded-bracket-colon-secret")).not.toContain("percent-encoded-bracket-colon-secret");
+    expect(redactSensitiveText("%22api_key%22%3Apercent-encoded-quote-colon-secret")).not.toContain("percent-encoded-quote-colon-secret");
+    expect(redactSensitiveText("password: |\n  fixture-secret\nnext: visible")).not.toContain("fixture-secret");
+    expect(redactSensitiveText("password: |\n  fixture-secret\nnext: visible")).toContain("next: visible");
+    for (const indicator of ["|", ">", "|-", ">+", "|2", "|- # comment", "|foo", ">foo", "| foo", ">>", "|--", "|0"]) {
+      for (const body of ["fixture-block-secret", "\nfixture-block-secret", "  indented-secret\nfixture-block-secret", "looks_like_key: fixture-block-secret"]) {
+        expect(redactSensitiveText(`password: ${indicator}\n${body}\ntrailing-secret`)).not.toMatch(/fixture-block-secret|indented-secret|trailing-secret/);
+      }
+    }
+    for (const indicator of ["|foo", ">foo", "| foo", ">>", "|--", "|0"]) {
+      expect(redactSensitiveText(`password: ${indicator}\n  indented-secret\nnext: trailing-secret`)).not.toMatch(/indented-secret|trailing-secret/);
+    }
+    expect(redactSensitiveText("api_\u001b[31mkey=fixture-secret")).not.toContain("fixture-secret");
+    expect(redactSensitiveText("token\u001b[31mANSI_SECRET")).not.toContain("ANSI_SECRET");
+    expect(redactSensitiveText("api_key\u001b[31m=fixture-secret")).not.toContain("fixture-secret");
+    expect(redactSensitiveText("api_key=\u001b[31mfixture-secret")).not.toContain("fixture-secret");
+    expect(redactSensitiveText("api\tkey=tab-separated-secret")).not.toContain("tab-separated-secret");
+    expect(redactSensitiveText("pass\u0000word=nul-separated-secret")).not.toContain("nul-separated-secret");
+    for (const whitespace of [" ", "\t", "\n", "\r\n", "\u2028"]) {
+      for (const key of ["password", "passphrase", "token", "credentials", "authorization"]) {
+        expect(redactSensitiveText(`${key.split("").join(whitespace)}: split-key-value\nsplit-key-value`)).not.toContain("split-key-value");
+      }
+    }
+    expect(redactSensitiveText("token\u200B=UNICODE_SECRET")).not.toContain("UNICODE_SECRET");
+    expect(redactSensitiveText("to\u200Bken=UNICODE_KEY_SECRET")).not.toContain("UNICODE_KEY_SECRET");
+    expect(redactSensitiveText("token=\u0000NUL_SECRET")).not.toContain("NUL_SECRET");
+    expect(redactSensitiveText("api_key=\n  fixture-secret\nvisible=ok")).not.toContain("fixture-secret");
+    expect(redactSensitiveText('{"api_keys": [\n  "json-secret"\n], "nested": {"token": "nested-secret"}}')).not.toMatch(/json-secret|nested-secret/);
+    expect(redactSensitiveText('api_key="prefix\\"LEAK"')).toBe("api_key=[REDACTED]");
+    expect(redactSensitiveText('{"token":"json-secret", "api_key": "other-secret"}')).not.toMatch(/json-secret|other-secret/);
+    expect(redactSensitiveText("api_token=abc,SECRET_TAIL")).toBe("api_token=[REDACTED]");
+    expect(redactSensitiveText("api_key=value with fixture-secret")).toBe("api_key=[REDACTED]");
+    expect(redactSensitiveText("password fixture secret with spaces")).toBe("password [REDACTED]");
+    const multilineToken = ["token", "=", '"', "first-line\nsecond-line", '"'].join("");
+    expect(redactSensitiveText(multilineToken)).toBe("token=[REDACTED]");
+    expect(redactSensitiveText("api_key=[REDACTED] token raw-secret")).toBe("api_key=[REDACTED] token [REDACTED]");
+    expect(redactSensitiveText("api_key=q7Kp9Zx4\nq7Kp9Zx4")).not.toContain("q7Kp9Zx4");
+    expect(redactOperationalText("[api_key]=fixture-secret,SECRET_TAIL")).not.toContain("SECRET_TAIL");
+    expect(redactOperationalText("api_key%3Dfixture-secret&SECRET_TAIL")).not.toContain("SECRET_TAIL");
+    expect(redactSensitiveText("Cookie: sessionid=fixture-secret")).not.toContain("fixture-secret");
+    expect(redactSensitiveText("Set-Cookie: session_id=fixture-secret")).not.toContain("fixture-secret");
+    const additionalSecretNames = [
+      ["SIGNING", "_KEY"].join(""),
+      ["ENCRYPTION", "_KEY"].join(""),
+      ["DATABASE", "_URL"].join(""),
+      ["MONGO", "_URI"].join(""),
+    ];
+    for (const name of additionalSecretNames) {
+      expect(redactSensitiveText(`${name}=fixture-secret`)).not.toContain("fixture-secret");
+    }
+    expect(redactSensitiveText('{"bearer": "json-bearer-secret", "basic": "json-basic-secret"}')).not.toMatch(/json-bearer-secret|json-basic-secret/);
+    expect(redactSensitiveText("token={\n  \"value\": \"fixture-secret\"")).not.toContain("fixture-secret");
+    const mixedSecrets = ["passphrase", "=", "fixture-secret", " pwd ", "fixture-secret"].join("");
+    expect(redactSensitiveText(mixedSecrets)).toBe("passphrase=[REDACTED] pwd [REDACTED]");
+    expect(redactOperationalText("permission denied: foo\\..\\private\\fixture-secret")).toContain("<redacted-path>");
+    expect(redactOperationalText("file=%2FUsers%2Fivan%2Fprivate%2Fkey")).toContain("<redacted-path>");
+    expect(redactOperationalText("path=..%2F..%2Fprivate%2Fkey")).toContain("<redacted-path>");
+    expect(redactOperationalText("file=C%3A%5CUsers%5Civan%5Cprivate%5Ckey")).toContain("<redacted-path>");
+    expect(redactOperationalText("provider credentials fixture-secret")).not.toContain("fixture-secret");
+    expect(redactOperationalText("access_token fixture-access-token-secret")).not.toContain("fixture-access-token-secret");
+    expect(redactOperationalText("accessToken fixture-camel-token-secret")).not.toContain("fixture-camel-token-secret");
+    expect(redactOperationalText("JWT fixture-jwt-secret")).not.toContain("fixture-jwt-secret");
+    const rawJwt = ["eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9", "eyJzdWIiOiJmaXh0dXJlIn0", "fixture_signature-secret-01"].join(".");
+    expect(redactSensitiveText(rawJwt)).toBe("[REDACTED JWT]");
+  });
+
+  test("does not expose a secret that crosses the bounded log tail", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-tail-boundary-"));
+    try {
+      const log = join(root, "client_log.txt");
+      await writeFile(log, `api_key=${"x".repeat(300_000)}fixture-secret\nvisible-line\n`);
+      const tail = await safeTail(log, 80);
+      expect(tail).not.toContain("fixture-secret");
+      expect(tail).toContain("[REDACTED: bounded log tail begins mid-record]");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("redacts a multiline secret continuation when the bounded tail begins mid-record", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-tail-block-boundary-"));
+    try {
+      const log = join(root, "client_log.txt");
+      await writeFile(log, `password: |\n  ${"x".repeat(300_000)}\n  fixture-secret\nvisible-line\n`);
+      const tail = await safeTail(log, 80);
+      expect(tail).toContain("[REDACTED: bounded log tail begins mid-record]");
+      expect(tail).not.toContain("fixture-secret");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("redacts a multiline secret whose header falls outside the line tail", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-tail-line-boundary-"));
+    try {
+      const log = join(root, "client_log.txt");
+      const continuation = Array.from({ length: 100 }, (_, index) => `  fixture-line-${index}`).join("\n");
+      await writeFile(log, `password: |\n${continuation}\n  fixture-secret\nvisible-line\n`);
+      const tail = await safeTail(log, 80);
+      expect(tail).not.toContain("fixture-secret");
+      expect(tail).toContain("[REDACTED]");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("redacts a PEM body when the bounded tail begins mid-record", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-tail-pem-boundary-"));
+    try {
+      const log = join(root, "client_log.txt");
+      const body = Array.from({ length: 6_000 }, (_, index) => `MIIE${String(index).padStart(4, "0")}${"A".repeat(56)}`).join("\n");
+      await writeFile(log, `-----BEGIN PRIVATE KEY-----\n${body}\n-----END PRIVATE KEY-----\nvisible-line\n`);
+      const tail = await safeTail(log, 80);
+      expect(tail).toContain("[REDACTED: bounded log tail begins mid-record]");
+      expect(tail).not.toContain("MIIE0000");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not block on a FIFO passed to safeTail", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-fifo-"));
+    try {
+      const fifo = join(root, "client_log.txt");
+      const maker = Bun.spawn(["mkfifo", fifo], { stdout: "pipe", stderr: "pipe" });
+      expect(await maker.exited).toBe(0);
+      const result = await Promise.race([safeTail(fifo, 80), Bun.sleep(500).then(() => "timed out")]);
+      expect(result).toBe("");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects cluster path traversal before opening SSH", () => {
+    expect(() => parseArgs(["--host", "fixture-host", "--user", "fixture-user", "--cluster", "../escape"], {})).toThrow(/single path segment/);
+    expect(() => parseArgs(["--host", "fixture-host", "--user", "fixture-user", "--cluster", "fixture\\escape"], {})).toThrow(/single path segment/);
+    expect(() => parseArgs(["--host", "fixture-host", "--user", "fixture-user", "--cluster", "safe\n## forged heading"], {})).toThrow(/single path segment/);
+    expect(() => parseArgs(["--host", "-oProxyCommand=touch /tmp/pwned", "--user", "fixture-user", "--cluster", "fixture"], {})).toThrow(/invalid SSH token/);
+    expect(() => parseArgs(["--host", "fixture-host", "--user", "-oProxyCommand=touch /tmp/pwned", "--cluster", "fixture"], {})).toThrow(/invalid SSH token/);
+  });
+
+  test("escapes cluster and file labels before rendering Markdown", () => {
+    const summary = renderSummary("<img src=x onerror=alert(1)>", {
+      shard: "Master",
+      present: false,
+      filePath: "<script>alert(1)</script>",
+      mods: [],
+    });
+    expect(summary).not.toContain("<img");
+    expect(summary).not.toContain("<script>");
+    expect(summary).toContain("&lt;img");
+    expect(summary).toContain("&lt;script");
+  });
+
+  test("parses nested mod configuration without executing Lua and renders shard differences", () => {
+    const source = `return {
+  ["workshop-200"] = {
+    configuration_options = {
+      enabled = true,
+    },
+    enabled = false,
+  },
+  ["workshop-100"] = { enabled = true },
+  ["workshop-300"] = {
+    configuration_options = {
+      enabled = false,
+    },
+  },
+}`;
+    const mods = parseModOverrides(source);
+    expect(mods).toEqual([
+      { id: "100", state: "true" },
+      { id: "200", state: "false" },
+      { id: "300", state: "unknown" },
+    ]);
+    const master: ShardSummary = { shard: "Master", present: true, filePath: "fixture/Master/modoverrides.lua", mods };
+    const caves: ShardSummary = { shard: "Caves", present: true, filePath: "fixture/Caves/modoverrides.lua", mods: [{ id: "100", state: "false" }, { id: "400", state: "true" }] };
+    const summary = renderSummary("cluster", master);
+    expect(summary).toContain("enabled_ids: 100");
+    expect(summary).toContain("disabled_ids: 200");
+    expect(summary).toContain("unknown_ids: 300");
+    expect(renderDiff("cluster", master, caves)).toContain("enabled_only_in_master: 100");
+    expect(renderDiff("cluster", master, caves)).toContain("enabled_only_in_caves: 400");
+    expect(renderDiff("cluster", master, caves)).toContain("disabled_only_in_master: 200");
+    expect(renderDiff("cluster", master, caves)).toContain("disabled_only_in_caves: 100");
+
+    expect(parseModOverrides('return { ["workshop-400"] = { configuration_options = { enabled = true }, enabled = false } }')).toEqual([
+      { id: "400", state: "false" },
+    ]);
+    expect(parseModOverrides(`return {
+  ["workshop-500"] = {
+    configuration_options =
+    {
+      enabled = false,
+    },
+    enabled = true,
+  },
+}`)).toEqual([{ id: "500", state: "true" }]);
+
+    expect(parseModOverrides(`return {
+  ["workshop-550"] = { configuration_options =
+    { ["workshop-999"] = { enabled = true } },
+    enabled = false,
+  },
+}`)).toEqual([{ id: "550", state: "false" }]);
+
+    expect(parseModOverrides(`return {
+  ["workshop-600"] = {
+    configuration_options = {
+      ["workshop-999"] = { enabled = true },
+    },
+    enabled = false,
+  },
+}`)).toEqual([{ id: "600", state: "false" }]);
+
+    expect(parseModOverrides('return { ["workshop-700"] = { ["configuration_options"] = { enabled = true }, enabled = false } }')).toEqual([
+      { id: "700", state: "false" },
+    ]);
+    expect(parseModOverrides('return { [ "workshop-701" ] = { [ "configuration_options" ] = { enabled = true }, enabled = false } }')).toEqual([
+      { id: "701", state: "false" },
+    ]);
+  });
+
+  test("ignores braces and enabled assignments inside Lua strings and comments", () => {
+    const source = `return {
+  ["workshop-401"] = { title = "}", note = "enabled = false", enabled = true }, -- enabled = false
+  ["workshop-402"] = { title = "-- not a comment", enabled = false },
+}`;
+    expect(parseModOverrides(source)).toEqual([
+      { id: "401", state: "true" },
+      { id: "402", state: "false" },
+    ]);
+  });
+
+  test("collects a bounded local snapshot without printing secret contents", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-local-"));
+    try {
+      const local = join(root, "client");
+      const cluster = join(local, "profile", "Cluster_fixture");
+      const directCluster = join(local, "Cluster_direct");
+      await mkdir(cluster, { recursive: true });
+      await mkdir(directCluster, { recursive: true });
+      await Promise.all(Array.from({ length: 240 }, (_, index) => writeFile(join(local, `entry-${String(index).padStart(3, "0")}.txt`), "")));
+      const logLines = Array.from({ length: 10_000 }, (_, index) => `line-${String(index).padStart(5, "0")}`);
+      logLines[0] = "early-log-marker";
+      logLines.push("api_key=fixture-secret");
+      await writeFile(join(local, "client_log.txt"), `${logLines.join("\n")}\n`);
+      await writeFile(join(cluster, "cluster.ini"), "cluster_password=secret-fixture\n");
+      await writeFile(join(cluster, "cluster_token.txt"), "token-fixture\n");
+      await writeFile(join(directCluster, "cluster_token.txt"), "token-fixture-direct\n");
+      await writeFile(join(local, "aws-prod-secret-key-SECRET_CANARY.pem"), "private\n");
+      await writeFile(join(local, "password"), "private\n");
+      await writeFile(join(local, ".env"), "private\n");
+      await writeFile(join(local, "id_rsa"), "private\n");
+      await writeFile(join(local, "private.key"), "private\n");
+      await writeFile(join(local, "auth.json"), "private\n");
+      const output = join(root, "snapshot.md");
+      expect(await snapshotMain(["--local-dir", local, "--no-remote", "--out", output])).toBe(0);
+      const report = await readFile(output, "utf8");
+      expect(report).toContain("## Local");
+      expect(report).toContain("cluster.ini: present (contains cluster_password; do not paste)");
+      expect(report).toContain("cluster_token.txt: present (redacted)");
+      expect(report).toContain("line-09999");
+      expect(report).not.toContain("early-log-marker");
+      expect(report).not.toContain("fixture-secret");
+      expect(report).not.toContain("aws-prod-secret-key-SECRET_CANARY.pem");
+      expect(report).not.toMatch(/(^|\s)password(\s|$)/m);
+      expect(report).not.toMatch(/(^|\s)\.env(\s|$)/m);
+      expect(report).not.toMatch(/(^|\s)id_rsa(\s|$)/m);
+      expect(report).not.toMatch(/(^|\s)private\.key(\s|$)/m);
+      expect(report).not.toMatch(/(^|\s)auth\.json(\s|$)/m);
+      expect(report).toContain("api_key=[REDACTED]");
+      expect(report).not.toContain("entry-239.txt");
+      expect(report).toContain("<cluster-1>");
+      expect(report).toContain("<cluster-2>");
+      expect(report).not.toContain(local);
+      expect(report).not.toContain("secret-fixture");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("escapes filesystem names before inserting them into the report", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-name-escape-"));
+    try {
+      const local = join(root, "client");
+      await mkdir(local, { recursive: true });
+      await writeFile(join(local, "log<svg>\n- forged [link](url).txt"), "");
+      const output = join(root, "snapshot.md");
+      expect(await snapshotMain(["--local-dir", local, "--no-remote", "--out", output])).toBe(0);
+      const report = await readFile(output, "utf8");
+      expect(report).toContain("&lt;svg&gt;");
+      expect(report).not.toContain("<svg>");
+      expect(report).not.toContain("\n- forged [link]");
+      expect(report).not.toContain("[link](url)");
+      expect(report).toContain("&#91;link&#93;&#40;url&#41;");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not treat an option-like relative local directory as an ls flag", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-local-option-"));
+    const previousCwd = process.cwd();
+    try {
+      await mkdir(join(root, "-R"));
+      await writeFile(join(root, "outside-secret.txt"), "should not be listed");
+      process.chdir(root);
+      const output = join(root, "snapshot.md");
+      expect(await snapshotMain(["--local-dir", "-R", "--no-remote", "--out", output])).toBe(0);
+      const report = await readFile(output, "utf8");
+      expect(report).toContain("## Local");
+      expect(report).not.toContain("outside-secret.txt");
+    } finally {
+      process.chdir(previousCwd);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("bounds local directory entry scanning", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-local-limit-"));
+    try {
+      const local = join(root, "client");
+      await mkdir(local, { recursive: true });
+      await Promise.all(Array.from({ length: MAX_LOCAL_DIRECTORY_ENTRIES + 10 }, (_, index) => writeFile(join(local, `entry-${String(index).padStart(4, "0")}.txt`), "")));
+      const output = join(root, "snapshot.md");
+      expect(await snapshotMain(["--local-dir", local, "--no-remote", "--out", output])).toBe(0);
+      expect(await readFile(output, "utf8")).toContain(`Directory entry scan truncated at ${MAX_LOCAL_DIRECTORY_ENTRIES} entries.`);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps the known log listing at the historical 200-line bound", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-log-list-limit-"));
+    try {
+      const local = join(root, "client");
+      await mkdir(local, { recursive: true });
+      await Promise.all(Array.from({ length: MAX_LOCAL_LOG_LISTING_ENTRIES + 5 }, (_, index) => writeFile(join(local, `server-log-${String(index).padStart(3, "0")}.txt`), "")));
+      const output = join(root, "snapshot.md");
+      expect(await snapshotMain(["--local-dir", local, "--no-remote", "--out", output])).toBe(0);
+      const report = await readFile(output, "utf8");
+      const listing = report.split("### Known log files (first 200 lines of listing)\n\n")[1]?.split("### client_log.txt")[0] ?? "";
+      expect(listing).toContain("server-log-000.txt");
+      expect(listing).toContain(`server-log-${String(MAX_LOCAL_LOG_LISTING_ENTRIES - 1).padStart(3, "0")}.txt`);
+      expect(listing).not.toContain(`server-log-${String(MAX_LOCAL_LOG_LISTING_ENTRIES).padStart(3, "0")}.txt`);
+      expect(listing.match(/server-log-\d{3}\.txt/g)?.length).toBe(MAX_LOCAL_LOG_LISTING_ENTRIES);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not follow a symlinked client log", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-symlink-"));
+    try {
+      const local = join(root, "client");
+      await mkdir(local, { recursive: true });
+      const secret = join(root, "private-key.txt");
+      await writeFile(secret, "PRIVATE_KEY_MUST_NOT_APPEAR\n");
+      await symlink(secret, join(local, "client_log.txt"));
+      const output = join(root, "snapshot.md");
+      expect(await snapshotMain(["--local-dir", local, "--no-remote", "--out", output])).toBe(0);
+      const report = await readFile(output, "utf8");
+      expect(report).not.toContain("PRIVATE_KEY_MUST_NOT_APPEAR");
+      expect(report).not.toContain("client_log.txt (tail 80)");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("remote mod collection refuses symlinked shard files", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-symlink-"));
+    try {
+      const home = join(root, "home");
+      const cluster = join(home, ".klei", "DoNotStarveTogether", "fixture", "Master");
+      await mkdir(cluster, { recursive: true });
+      const outside = join(root, "outside.lua");
+      await writeFile(outside, '["workshop-999"] = { enabled = true }\n');
+      await symlink(outside, join(cluster, "modoverrides.lua"));
+      const child = Bun.spawn(["bash", join(import.meta.dir, "..", "scripts", "dst_mods_remote_collect.sh"), "fixture", "Master"], {
+        env: { ...process.env, HOME: home }, stdout: "pipe", stderr: "pipe",
+      });
+      const [status, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      expect(status).toBe(1);
+      expect(stdout).toBe("");
+      expect(stderr).toContain("symlink");
+      expect(stdout).not.toContain("workshop-999");
+
+      const traversal = Bun.spawn(["bash", join(import.meta.dir, "..", "scripts", "dst_mods_remote_collect.sh"), "../../outside", "Master"], {
+        env: { ...process.env, HOME: home }, stdout: "pipe", stderr: "pipe",
+      });
+      expect(await traversal.exited).toBe(2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("remote mod collection keeps a valid file bound across macOS and Linux stat layouts", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-valid-"));
+    try {
+      const home = join(root, "home");
+      const shard = join(home, ".klei", "DoNotStarveTogether", "fixture", "Master");
+      await mkdir(shard, { recursive: true });
+      await writeFile(join(shard, "modoverrides.lua"), '[ "workshop-123" ] = { [ "configuration_options" ] = { password = "fixture-secret", enabled = false }, enabled = true }\n');
+      const child = Bun.spawn(["bash", join(import.meta.dir, "..", "scripts", "dst_mods_remote_collect.sh"), "fixture", "Master"], {
+        env: { ...process.env, HOME: home }, stdout: "pipe", stderr: "pipe",
+      });
+      const [status, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      expect(status).toBe(0);
+      expect(stderr).toBe("");
+      expect(stdout).toContain("PRESENT ");
+      expect(stdout).toContain("workshop-123");
+      expect(stdout).toContain("enabled = true");
+      expect(stdout).not.toContain("configuration_options");
+      expect(stdout).not.toContain("fixture-secret");
+      expect(stdout).not.toContain(home);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("remote mod collection rejects a same-size in-place rewrite after reading", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-mutation-"));
+    try {
+      const home = join(root, "home");
+      const shard = join(home, ".klei", "DoNotStarveTogether", "fixture", "Master");
+      await mkdir(shard, { recursive: true });
+      const original = '["workshop-123"] = { enabled = true }\n';
+      const mutation = '["workshop-456"] = { enabled = true }\n';
+      expect(new TextEncoder().encode(original).length).toBe(new TextEncoder().encode(mutation).length);
+      const target = join(shard, "modoverrides.lua");
+      await writeFile(target, original);
+      const bin = join(root, "bin");
+      await mkdir(bin);
+      const realPerl = Bun.which("perl");
+      if (realPerl === null) throw new Error("perl is required for this regression test");
+      const wrapper = join(bin, "perl");
+      await writeFile(wrapper, `#!/bin/sh\n"$REAL_PERL" "$@"\nstatus=$?\nif [ "$status" -eq 0 ]; then printf '%s' "$MUTATION" > "$TARGET"; fi\nexit "$status"\n`);
+      await chmod(wrapper, 0o755);
+      const child = Bun.spawn(["bash", join(import.meta.dir, "..", "scripts", "dst_mods_remote_collect.sh"), "fixture", "Master"], {
+        env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH ?? ""}`, REAL_PERL: realPerl, TARGET: target, MUTATION: mutation },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [status, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      expect(status).toBe(1);
+      expect(stdout).toBe("");
+      expect(stderr).toContain("changed during collection");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("remote snapshot refuses a symlinked Klei root", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-root-"));
+    try {
+      const home = join(root, "home");
+      const outside = join(root, "outside");
+      await mkdir(home, { recursive: true });
+      await mkdir(join(outside, "DoNotStarveTogether", "Cluster_secret", "Master"), { recursive: true });
+      await writeFile(join(outside, "DoNotStarveTogether", "Cluster_secret", "cluster.ini"), "cluster_password=must-not-appear\n");
+      await symlink(outside, join(home, ".klei"));
+      const child = Bun.spawn(["bash", join(import.meta.dir, "..", "scripts", "dst_snapshot_remote.sh")], {
+        env: { ...process.env, HOME: home }, stdout: "pipe", stderr: "pipe",
+      });
+      const [status, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+      expect(status).toBe(0);
+      expect(stdout).toContain("Klei data");
+      expect(stdout).not.toContain("Cluster_secret");
+      expect(stdout).not.toContain("must-not-appear");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("remote snapshot enumerates direct clusters with a bounded walk", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-clusters-"));
+    try {
+      const home = join(root, "home");
+      const cluster = join(home, ".klei", "DoNotStarveTogether", "Cluster_fixture");
+      await mkdir(join(cluster, "Master"), { recursive: true });
+      await writeFile(join(cluster, "cluster.ini"), "cluster_password=fixture-secret\n");
+      const child = Bun.spawn(["bash", join(import.meta.dir, "..", "scripts", "dst_snapshot_remote.sh")], {
+        env: { ...process.env, HOME: home }, stdout: "pipe", stderr: "pipe",
+      });
+      const [status, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+      expect(status).toBe(0);
+      expect(stdout).toContain("#### Cluster: <cluster>");
+      expect(stdout).toContain("- cluster.ini: present (contains cluster_password; do not paste)");
+      expect(stdout).not.toContain("fixture-secret");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("remote snapshot keeps custom os-release metadata out of the report", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-os-release-"));
+    try {
+      const home = join(root, "home");
+      const osRelease = join(root, "os-release");
+      const privateHostname = ["prod-db", "internal"].join(".");
+      const secretHost = ["secret", "host"].join("-");
+      await mkdir(home, { recursive: true });
+      await writeFile(osRelease, `NAME=${privateHostname}\nID=opensuse-${secretHost}\nVERSION_ID=1.2.3.4.5\nBUILD_HOST=${secretHost}\n`);
+      const child = Bun.spawn(["bash", join(import.meta.dir, "..", "scripts", "dst_snapshot_remote.sh")], {
+        env: { ...process.env, HOME: home, AGENT_TOOLKIT_DST_OS_RELEASE_FILE: osRelease }, stdout: "pipe", stderr: "pipe",
+      });
+      const [status, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+      expect(status).toBe(0);
+      expect(stdout).toContain("ID: <redacted>");
+      expect(stdout).toContain("VERSION_ID: <redacted>");
+      expect(stdout).not.toContain(privateHostname);
+      expect(stdout).not.toContain(secretHost);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("remote snapshot ignores symlinked cluster files", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-file-symlink-"));
+    try {
+      const home = join(root, "home");
+      const cluster = join(home, ".klei", "DoNotStarveTogether", "Cluster_fixture", "Master");
+      const outside = join(root, "outside-secret.txt");
+      await mkdir(cluster, { recursive: true });
+      await writeFile(outside, "outside-secret");
+      await symlink(outside, join(cluster, "server.ini"));
+      await symlink(outside, join(join(home, ".klei", "DoNotStarveTogether", "Cluster_fixture"), "cluster.ini"));
+      const child = Bun.spawn(["bash", join(import.meta.dir, "..", "scripts", "dst_snapshot_remote.sh")], {
+        env: { ...process.env, HOME: home }, stdout: "pipe", stderr: "pipe",
+      });
+      const [status, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+      expect(status).toBe(0);
+      expect(stdout).toContain("#### Cluster: <cluster>");
+      expect(stdout).not.toContain("cluster.ini: present");
+      expect(stdout).not.toContain("server.ini:");
+      expect(stdout).not.toContain("outside-secret");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves remote selection, missing shard resources, and failed SSH diagnostics", { timeout: 90_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-"));
+    const previousPath = process.env.PATH;
+    try {
+      const fakeSsh = join(root, "ssh");
+      await writeFile(fakeSsh, `#!/bin/sh
+case "$*" in
+  *"echo ok"*) exit 0 ;;
+  *Master*)
+    cat >/dev/null
+    data='["workshop-100"] = { enabled = true, configuration_options = { enabled = false } }'
+    printf 'PRESENT %s\\n%s' "\${#data}" "$data"
+    ;;
+  *Caves*) cat >/dev/null; printf 'MISSING\\n' ;;
+  *) cat >/dev/null; exit 1 ;;
+esac
+`);
+      await chmod(fakeSsh, 0o755);
+      const env = { ...process.env, PATH: `${root}:${previousPath ?? ""}` } as Record<string, string>;
+      const result = await runTool(join(import.meta.dir, "..", "scripts", "dst_mods_from_modoverrides.ts"), ["--host", "fixture-host", "--user", "fixture-user", "--cluster", "fixture-cluster", "--shard", "both"], env);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("## fixture-cluster / Master");
+      expect(result.stdout).toContain("enabled_ids: 100");
+      expect(result.stdout).toContain("## fixture-cluster / Caves");
+      expect(result.stdout).toContain("modoverrides.lua: missing (modoverrides.lua)");
+      expect(result.stdout).not.toContain("configuration_options");
+
+      const leakedPath = ["/home", "fixture-user", "private"].join("/");
+      await writeFile(fakeSsh, `#!/bin/sh\ncase "$*" in\n  *"echo ok"*) exit 0 ;;\n  *) cat >/dev/null; echo 'denied [forged](javascript:alert(1)) ${leakedPath} api_key=fixture-secret' >&2; exit 1 ;;\nesac\n`);
+      await chmod(fakeSsh, 0o755);
+      const failed = await runTool(join(import.meta.dir, "..", "scripts", "dst_mods_from_modoverrides.ts"), ["--host", "fixture-host", "--user", "fixture-user", "--cluster", "fixture-cluster"], env);
+      expect(failed.status).toBe(1);
+      expect(failed.stderr).toContain("denied");
+      expect(failed.stderr).toContain("api_key=[REDACTED]");
+      expect(failed.stderr).not.toContain("fixture-secret");
+      expect(failed.stderr).not.toContain(leakedPath);
+
+      const snapshotOutput = join(root, "remote-failure-snapshot.md");
+      const snapshotResult = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
+        ["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", snapshotOutput],
+        env,
+      );
+      expect(snapshotResult.status).toBe(1);
+      const snapshot = await readFile(snapshotOutput, "utf8");
+      expect(snapshot).toContain("Remote collection command failed");
+      expect(snapshot).toContain("denied");
+      expect(snapshot).not.toContain("[forged](javascript:alert(1))");
+      expect(snapshot).toContain("api_key=&#91;REDACTED&#93;");
+      expect(snapshot).not.toContain("fixture-secret");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps a completed shard summary when the next shard fails", { timeout: 90_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-partial-"));
+    const previousPath = process.env.PATH;
+    try {
+      const fakeSsh = join(root, "ssh");
+      await writeFile(fakeSsh, `#!/bin/sh
+case "$*" in
+  *"echo ok"*) exit 0 ;;
+  *Master*) cat >/dev/null; data='["workshop-100"] = { enabled = true }'; printf 'PRESENT %s\\n%s' "\${#data}" "$data" ;;
+  *Caves*) cat >/dev/null; echo 'caves unavailable' >&2; exit 1 ;;
+  *) cat >/dev/null; exit 1 ;;
+esac
+`);
+      await chmod(fakeSsh, 0o755);
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_mods_from_modoverrides.ts"),
+        ["--host", "fixture-host", "--user", "fixture-user", "--cluster", "fixture-cluster", "--shard", "both"],
+        { ...process.env, PATH: `${root}:${previousPath ?? ""}` } as Record<string, string>,
+      );
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("## fixture-cluster / Master");
+      expect(result.stdout).toContain("enabled_ids: 100");
+      expect(result.stdout).not.toContain("## fixture-cluster / Caves");
+      expect(result.stderr).toContain("caves unavailable");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("reports a failed snapshot SSH check without attempting a remote operation", { timeout: 30_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-ssh-"));
+    const previousPath = process.env.PATH;
+    try {
+      const fakeSsh = join(root, "ssh");
+      await writeFile(fakeSsh, "#!/bin/sh\necho denied >&2\nexit 1\n");
+      await chmod(fakeSsh, 0o755);
+      const output = join(root, "snapshot.md");
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
+        ["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", output],
+        { ...process.env, PATH: `${root}:${previousPath ?? ""}` } as Record<string, string>,
+      );
+      expect(result.status).toBe(0);
+      const report = await readFile(output, "utf8");
+      expect(report).toContain("Remote SSH failed");
+      expect(report).toContain("configured SSH target");
+      expect(report).not.toContain("fixture-user@fixture-host");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fails a snapshot when an SSH timeout cannot verify cleanup", { timeout: 90_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-ssh-timeout-cleanup-"));
+    const previousPath = process.env.PATH;
+    try {
+      const fakeSsh = join(root, "ssh");
+      const fakePs = join(root, "ps");
+      const trigger = join(root, "fail-process-scan");
+      await writeFile(fakeSsh, `#!/bin/sh
+case "$*" in
+  *"echo ok"*) sleep 0.5; touch "$AGENT_TOOLKIT_TEST_PS_FAIL"; sleep 30 ;;
+  *) cat >/dev/null; exit 0 ;;
+esac
+`);
+      await writeFile(fakePs, `#!/bin/sh
+if [ -e "$AGENT_TOOLKIT_TEST_PS_FAIL" ]; then
+  case "$*" in
+    *"-eo pid=,pgid=,state="*|*"-eo pid=,ppid=,pgid="*) printf 'malformed process row\\n'; exit 0 ;;
+  esac
+fi
+exec /bin/ps "$@"
+`);
+      await chmod(fakeSsh, 0o755);
+      await chmod(fakePs, 0o755);
+      const output = join(root, "snapshot.md");
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
+        ["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", output],
+        { ...process.env, PATH: `${root}:${previousPath ?? ""}`, AGENT_TOOLKIT_TEST_PS_FAIL: trigger } as Record<string, string>,
+      );
+      expect(result.status).toBe(1);
+      const report = await readFile(output, "utf8");
+      expect(report).toContain("Remote SSH connectivity check timed out");
+      expect(report).toContain("cleanup could not be verified");
+      expect(report).not.toContain("Remote collection command failed");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fails a snapshot when the supervisor exits before recording SSH status", { timeout: 90_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-status-missing-"));
+    const previousPath = process.env.PATH;
+    try {
+      const fakeSsh = join(root, "ssh");
+      await writeFile(fakeSsh, `#!/bin/sh
+case "$*" in
+  *"echo ok"*)
+    supervisor_pid=""
+    ancestor="$PPID"
+    attempts=0
+    while [ "$attempts" -lt 16 ]; do
+      case "$ancestor" in ''|*[!0-9]*) break ;; esac
+      command_line="$(ps -o command= -p "$ancestor" 2>/dev/null || true)"
+      case "$command_line" in *agent-toolkit-supervisor*) supervisor_pid="$ancestor"; break ;; esac
+      next_ancestor="$(ps -o ppid= -p "$ancestor" 2>/dev/null | tr -d '[:space:]')"
+      [ "$next_ancestor" = "$ancestor" ] && break
+      ancestor="$next_ancestor"
+      attempts=$((attempts + 1))
+    done
+    case "$supervisor_pid" in ''|*[!0-9]*) exit 97 ;; esac
+    sleep 0.5
+    kill -KILL "$supervisor_pid" 2>/dev/null || true
+    sleep 1
+    exit 0
+    ;;
+  *) cat >/dev/null; exit 0 ;;
+esac
+`);
+      await chmod(fakeSsh, 0o755);
+      const output = join(root, "snapshot.md");
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
+        ["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", output],
+        { ...process.env, PATH: `${root}:${previousPath ?? ""}` } as Record<string, string>,
+      );
+      expect(result.status).toBe(1);
+      const report = await readFile(output, "utf8");
+      expect(report).toContain("supervisor exited before recording the SSH result");
+      expect(report).not.toContain("Remote SSH failed");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("redacts local setup paths from modoverrides failures", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-mods-path-redaction-"));
+    const privateTmp = join(root, "private-tmp");
+    try {
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_mods_from_modoverrides.ts"),
+        ["--host", "fixture-host", "--user", "fixture-user", "--cluster", "fixture-cluster", "--shard", "Master"],
+        { ...process.env, TMPDIR: privateTmp } as Record<string, string>,
+      );
+      expect(result.status).toBe(1);
+      expect(result.stderr).not.toContain(privateTmp);
+      expect(result.stderr).toContain("<redacted-path>");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("skips remote collection only when SSH is unavailable", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-no-ssh-"));
+    try {
+      const output = join(root, "snapshot.md");
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
+        ["--no-local", "--host", "fixture-host", "--user", "fixture-user", "--out", output],
+        { ...process.env, PATH: root } as Record<string, string>,
+      );
+      expect(result.status).toBe(0);
+      const report = await readFile(output, "utf8");
+      expect(report).toContain("ssh not found on this machine");
+      expect(report).not.toContain("Remote SSH connectivity check could not be started");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  for (const blockIndicator of ["|", "|foo", ">foo"]) {
+    test(`redacts sensitive values from successful remote snapshot output (block: ${blockIndicator})`, { timeout: 30_000 }, async () => {
+      const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-redaction-"));
+      const previousPath = process.env.PATH;
+      try {
+        const fakeSsh = join(root, "ssh");
+        await writeFile(fakeSsh, `#!/bin/sh
+case "$*" in
+  *"echo ok"*) exit 0 ;;
+  *) printf '### Remote fixture\\napi_key=fixture-secret\\npass\\nword: multiline-fixture-value\\ncreden\\ntials=credential-fixture-value\\npassword: ${blockIndicator}\\nfixture-block-secret\\ntrailing-block-secret\\n' ;;
+esac
+`);
+        await chmod(fakeSsh, 0o755);
+        const output = join(root, "snapshot.md");
+        const result = await runTool(
+          join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
+          ["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", output],
+          { ...process.env, PATH: `${root}:${previousPath ?? ""}` } as Record<string, string>,
+        );
+        expect(result.status).toBe(0);
+        const report = await readFile(output, "utf8");
+        expect(report).toContain("api_key=[REDACTED]");
+        expect(report).not.toContain("fixture-secret");
+        expect(report).not.toMatch(/multiline-fixture-value|credential-fixture-value/);
+        expect(report).not.toMatch(/fixture-block-secret|trailing-block-secret/);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+  });
+  }
+
+  test("renders untrusted remote report text without Markdown or HTML injection", { timeout: 90_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-markdown-"));
+    const previousPath = process.env.PATH;
+    try {
+      const fakeSsh = join(root, "ssh");
+      await writeFile(fakeSsh, `#!/bin/sh
+case "$*" in
+  *"echo ok"*) exit 0 ;;
+  *) printf '# forged heading\\n<img src=x onerror=alert(1)>\\n[forged](https://example.test)\\napi_key=fixture-secret\\n' ;;
+esac
+`);
+      await chmod(fakeSsh, 0o755);
+      const output = join(root, "snapshot.md");
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
+        ["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", output],
+        { ...process.env, PATH: `${root}:${previousPath ?? ""}` } as Record<string, string>,
+      );
+      expect(result.status).toBe(0);
+      const report = await readFile(output, "utf8");
+      expect(report).toContain("&lt;img src=x onerror=alert(1)&gt;");
+      expect(report).not.toContain("<img src=x onerror=alert(1)>");
+      expect(report).not.toContain("[forged](https://example.test)");
+      expect(report).toContain("api_key=[REDACTED]");
+      expect(report).not.toContain("fixture-secret");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("redacts arbitrary paths and IPv4/IPv6 addresses from operational diagnostics", () => {
+    const diagnostic = "denied /workspace/private/key /srv/fixture/My Secret/token ../relative/private/key \\\\server\\share\\private via 192.0.2.8, [2001:db8::7], and ::ffff:192.0.2.9";
+    const redacted = redactOperationalText(diagnostic);
+    expect(redacted).not.toContain("/workspace/private/key");
+    expect(redacted).not.toContain("../relative/private/key");
+    expect(redacted).not.toContain("\\\\server\\share\\private");
+    expect(redacted).not.toContain("192.0.2.8");
+    expect(redacted).not.toContain("192.0.2.9");
+    expect(redacted).not.toContain("2001:db8::7");
+    expect(redacted).toContain("<redacted-path>");
+    expect(redacted).toContain("<redacted-address>");
+    expect(redacted).not.toContain("My Secret");
+    const privateHostname = ["secret", "internal", "example"].join(".");
+    expect(redactOperationalText(`Could not resolve hostname ${privateHostname}`)).not.toContain(privateHostname);
+  });
+
+  test("redacts relative and UNC paths after assignment delimiters", () => {
+    const diagnostic = String.raw`file=..\private\key path:\\server\share\private`;
+    const redacted = redactOperationalText(diagnostic);
+    expect(redacted).not.toContain("..\\private\\key");
+    expect(redacted).not.toContain("\\\\server\\share\\private");
+    expect(redacted).toContain("<redacted-path>");
+  });
+
+  test("redacts snapshot publication errors", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-publish-error-"));
+    const previousPath = process.env.PATH;
+    try {
+      const output = join(root, "publication-secret", "snapshot.md");
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
+        ["--no-local", "--no-remote", "--out", output],
+        { ...process.env, PATH: previousPath ?? "" } as Record<string, string>,
+      );
+      expect(result.status).toBe(2);
+      expect(result.stderr).not.toContain("publication-secret");
+      expect(result.stderr).not.toContain(".dst-snapshot-tmp-");
+      expect(result.stderr).toContain("<redacted-path>");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects an oversized remote snapshot before writing unbounded output", { timeout: 90_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-limit-"));
+    const previousPath = process.env.PATH;
+    try {
+      const fakeSsh = join(root, "ssh");
+      await writeFile(fakeSsh, `#!/bin/sh
+case "$*" in
+  *"echo ok"*) exit 0 ;;
+  *) head -c $(( ${MAX_REMOTE_OUTPUT_BYTES} + 1 )) /dev/zero ;;
+esac
+`);
+      await chmod(fakeSsh, 0o755);
+      const output = join(root, "snapshot.md");
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
+        ["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", output],
+        { ...process.env, PATH: `${root}:${previousPath ?? ""}` } as Record<string, string>,
+      );
+      expect(result.status).toBe(1);
+      expect(await readFile(output, "utf8")).toContain("output limit");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves the output-limit diagnostic when cleanup acknowledgement fails", { timeout: 90_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-limit-cleanup-"));
+    const previousPath = process.env.PATH;
+    try {
+      const fakeSsh = join(root, "ssh");
+      const fakePs = join(root, "ps");
+      const trigger = join(root, "fail-process-scan");
+      await writeFile(fakeSsh, `#!/bin/sh
+case "$*" in
+  *echo*ok*) exit 0 ;;
+  *) cat >/dev/null; sleep 0.5; touch "$AGENT_TOOLKIT_TEST_PS_FAIL"; head -c $(( ${MAX_REMOTE_OUTPUT_BYTES} + 1 )) /dev/zero ;;
+esac
+`);
+      await writeFile(fakePs, `#!/bin/sh
+if [ -e "$AGENT_TOOLKIT_TEST_PS_FAIL" ]; then printf 'malformed process row\\n'; exit 0; fi
+exec /bin/ps "$@"
+`);
+      await chmod(fakeSsh, 0o755);
+      await chmod(fakePs, 0o755);
+      const output = join(root, "snapshot.md");
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
+        ["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", output],
+        { ...process.env, PATH: `${root}:${previousPath ?? ""}`, AGENT_TOOLKIT_TEST_PS_FAIL: trigger } as Record<string, string>,
+      );
+      expect(result.status).toBe(1);
+      const report = await readFile(output, "utf8");
+      expect(report).toContain("output limit");
+      expect(report).toContain("cleanup could not be verified");
+      expect(report).not.toContain("command could not be started");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fails closed when an SSH result cannot be recorded", { timeout: 90_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-connectivity-cleanup-"));
+    const previousPath = process.env.PATH;
+    try {
+      const fakeSsh = join(root, "ssh");
+      const fakePs = join(root, "ps");
+      const trigger = join(root, "fail-process-scan");
+      await writeFile(fakeSsh, `#!/bin/sh
+case "$*" in
+  *"echo ok"*) sleep 2; touch "$AGENT_TOOLKIT_TEST_PS_FAIL"; echo "fixture SSH connectivity denied" >&2; exit 1 ;;
+  *) cat >/dev/null; exit 0 ;;
+esac
+`);
+      await writeFile(fakePs, `#!/bin/sh
+if [ -e "$AGENT_TOOLKIT_TEST_PS_FAIL" ]; then printf 'malformed process row\\n'; exit 0; fi
+exec /bin/ps "$@"
+`);
+      await chmod(fakeSsh, 0o755);
+      await chmod(fakePs, 0o755);
+      const output = join(root, "snapshot.md");
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
+        ["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", output],
+        { ...process.env, PATH: `${root}:${previousPath ?? ""}`, AGENT_TOOLKIT_TEST_PS_FAIL: trigger } as Record<string, string>,
+      );
+      expect(result.status).toBe(1);
+      const report = await readFile(output, "utf8");
+      expect(report).toContain("supervisor exited before recording the SSH result");
+      expect(report).toContain("fixture SSH connectivity denied");
+      expect(report).not.toContain("Remote SSH failed");
+      expect(report).not.toContain("command could not be started");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fails closed when a remote command result cannot be recorded", { timeout: 90_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-command-cleanup-"));
+    const previousPath = process.env.PATH;
+    try {
+      const fakeSsh = join(root, "ssh");
+      await writeFile(fakeSsh, `#!/bin/sh
+case "$*" in
+  *"echo ok"*) sleep 0.5; exit 0 ;;
+  *)
+    cat >/dev/null
+    supervisor_pid=""
+    ancestor="$PPID"
+    attempts=0
+    while [ "$attempts" -lt 16 ]; do
+      case "$ancestor" in ''|*[!0-9]*) break ;; esac
+      command_line="$(ps -o command= -p "$ancestor" 2>/dev/null || true)"
+      case "$command_line" in *agent-toolkit-supervisor*) supervisor_pid="$ancestor"; break ;; esac
+      next_ancestor="$(ps -o ppid= -p "$ancestor" 2>/dev/null | tr -d '[:space:]')"
+      [ "$next_ancestor" = "$ancestor" ] && break
+      ancestor="$next_ancestor"
+      attempts=$((attempts + 1))
+    done
+    case "$supervisor_pid" in ''|*[!0-9]*) exit 97 ;; esac
+    sleep 0.5
+    kill -KILL "$supervisor_pid" 2>/dev/null || true
+    sleep 1
+    exit 0
+    ;;
+esac
+`);
+      await chmod(fakeSsh, 0o755);
+      const output = join(root, "snapshot.md");
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
+        ["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", output],
+        { ...process.env, PATH: `${root}:${previousPath ?? ""}` } as Record<string, string>,
+      );
+      expect(result.status).toBe(1);
+      const report = await readFile(output, "utf8");
+      expect(report).toContain("supervisor exited before recording the remote collection result");
+      expect(report).not.toContain("Remote collection command failed");
+      expect(report).not.toContain("command could not be started");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves an SSH failure when mods cleanup acknowledgement fails", { timeout: 90_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-mods-cleanup-"));
+    const previousPath = process.env.PATH;
+    try {
+      const fakeSsh = join(root, "ssh");
+      const fakePs = join(root, "ps");
+      const trigger = join(root, "fail-process-scan");
+      await writeFile(fakeSsh, `#!/bin/sh
+cat >/dev/null
+sleep 0.5
+touch "$AGENT_TOOLKIT_TEST_PS_FAIL"
+echo "fixture SSH denied" >&2
+exit 1
+`);
+      await writeFile(fakePs, `#!/bin/sh
+if [ -e "$AGENT_TOOLKIT_TEST_PS_FAIL" ]; then printf 'malformed process row\\n'; exit 0; fi
+exec /bin/ps "$@"
+`);
+      await chmod(fakeSsh, 0o755);
+      await chmod(fakePs, 0o755);
+      const result = await runTool(
+        join(import.meta.dir, "..", "scripts", "dst_mods_from_modoverrides.ts"),
+        ["--host", "fixture-host", "--user", "fixture-user", "--cluster", "fixture-cluster", "--shard", "Master"],
+        { ...process.env, PATH: `${root}:${previousPath ?? ""}`, AGENT_TOOLKIT_TEST_PS_FAIL: trigger } as Record<string, string>,
+      );
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("fixture SSH denied");
+      expect(result.stderr).toContain("supervisor_cleanup_unverified");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("publishes concurrent reports without partial writes or overwrites", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-publish-"));
+    try {
+      const output = join(root, "snapshot.md");
+      const results = await Promise.all([
+        snapshotMain(["--no-local", "--no-remote", "--out", output]),
+        snapshotMain(["--no-local", "--no-remote", "--out", output]),
+      ]);
+      expect(results.sort()).toEqual([0, 0]);
+      const report = await readFile(output, "utf8");
+      expect(report).toContain("# DST snapshot");
+      expect((await readdir(root)).filter((entry) => entry.startsWith(".dst-snapshot-tmp-")).length).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("cleans stale snapshot temp directories on the next publish", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-temp-cleanup-"));
+    try {
+      const tempRoot = join(root, ".agent-toolkit-dst-snapshot-tmp");
+      await mkdir(tempRoot, { mode: 0o700 });
+      await writeFile(join(tempRoot, ".owner"), await createSnapshotOwnerMarker(`root:${tempRoot}`));
+      const stale = join(tempRoot, ".dst-snapshot-tmp-stale");
+      await mkdir(stale);
+      await writeFile(join(stale, ".owner"), await createSnapshotOwnerMarker(`temp:${stale}`, 999_999_999));
+      const old = new Date(Date.now() - 20 * 60 * 1000);
+      await utimes(stale, old, old);
+      const ownerOnly = join(tempRoot, ".dst-snapshot-tmp-owner-only");
+      await mkdir(ownerOnly);
+      await writeFile(join(ownerOnly, ".owner"), await createSnapshotOwnerMarker(`temp:${ownerOnly}`, 999_999_999));
+      await utimes(ownerOnly, old, old);
+      const ownerless = join(tempRoot, ".dst-snapshot-tmp-ownerless");
+      await mkdir(ownerless);
+      await writeFile(join(ownerless, "partial.md"), "interrupted");
+      await utimes(ownerless, old, old);
+      const active = join(tempRoot, ".dst-snapshot-tmp-active");
+      await mkdir(active);
+      await writeFile(join(active, ".owner"), await createSnapshotOwnerMarker(`temp:${active}`));
+      await writeFile(join(active, "partial.md"), "in progress");
+      await utimes(active, old, old);
+      const output = join(root, "snapshot.md");
+      expect(await snapshotMain(["--no-local", "--no-remote", "--out", output])).toBe(0);
+      expect(await readdir(tempRoot)).not.toContain(".dst-snapshot-tmp-stale");
+      expect(await readdir(tempRoot)).not.toContain(".dst-snapshot-tmp-owner-only");
+      expect(await readdir(tempRoot)).toContain(".dst-snapshot-tmp-ownerless");
+      expect(await readdir(tempRoot)).toContain(".dst-snapshot-tmp-active");
+      expect(await readFile(join(ownerless, "partial.md"), "utf8")).toBe("interrupted");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("recovers an ownerless empty snapshot temp root after interruption", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-temp-root-recovery-"));
+    try {
+      const tempRoot = join(root, ".agent-toolkit-dst-snapshot-tmp");
+      await mkdir(tempRoot, { mode: 0o700 });
+      const output = join(root, "snapshot.md");
+      expect(await snapshotMain(["--no-local", "--no-remote", "--out", output])).toBe(0);
+      expect((await readFile(join(tempRoot, ".owner"), "utf8")).split("\n")).toHaveLength(5);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("parses large remote responses across arbitrary byte chunks", async () => {
+    const source = [
+      "return {",
+      ...Array.from({ length: 1_200 }, (_, index) => `  [\"workshop-${100_000 + index}\"] = { enabled = ${index % 2 === 0 ? "true" : "false"} },`),
+      "}",
+    ].join("\n");
+    const body = new TextEncoder().encode(source);
+    const payload = new TextEncoder().encode(`PRESENT ${body.byteLength}\n`);
+    const response = new Uint8Array(payload.byteLength + body.byteLength);
+    response.set(payload);
+    response.set(body, payload.byteLength);
+    const chunks: Uint8Array[] = [];
+    for (let offset = 0; offset < response.byteLength; offset += 7) chunks.push(response.slice(offset, offset + 7));
+    const summary = await parseRemoteResponseStream("fixture-cluster", "Master", "fixture/Master/modoverrides.lua", byteStream(chunks));
+    expect(summary.present).toBe(true);
+    expect(summary.mods).toHaveLength(1_200);
+    expect(summary.mods[0]).toEqual({ id: "100000", state: "true" });
+    expect(summary.mods.at(-1)).toEqual({ id: "101199", state: "false" });
+  });
+
+  test("rejects truncated and trailing remote response bodies", async () => {
+    const body = new TextEncoder().encode('["workshop-100"] = { enabled = true }');
+    const header = new TextEncoder().encode(`PRESENT ${body.byteLength + 1}\n`);
+    const truncated = new Uint8Array(header.byteLength + body.byteLength);
+    truncated.set(header);
+    truncated.set(body, header.byteLength);
+    await expect(parseRemoteResponseStream("fixture-cluster", "Master", "fixture", byteStream([truncated]))).rejects.toThrow(/truncated/);
+
+    const declared = new TextEncoder().encode(`PRESENT ${body.byteLength}\n`);
+    const trailing = new Uint8Array(declared.byteLength + body.byteLength + 1);
+    trailing.set(declared);
+    trailing.set(body, declared.byteLength);
+    trailing[trailing.length - 1] = 0x00;
+    await expect(parseRemoteResponseStream("fixture-cluster", "Master", "fixture", byteStream([trailing]))).rejects.toThrow(/invalid response/);
+
+    const oversized = new TextEncoder().encode(`PRESENT ${MAX_MOD_OVERRIDE_BYTES + 1}\n`);
+    await expect(parseRemoteResponseStream("fixture-cluster", "Master", "fixture", byteStream([oversized]))).rejects.toThrow(/exceeds/);
+
+    const missing = new TextEncoder().encode("MISSING\n");
+    await expect(parseRemoteResponseStream("fixture-cluster", "Master", "fixture/Master/modoverrides.lua", byteStream([missing]))).resolves.toMatchObject({
+      present: false,
+      filePath: "fixture/Master/modoverrides.lua",
+    });
+
+    const privateCluster = "password=fixture-secret";
+    try {
+      await parseRemoteResponseStream(privateCluster, "Master", "fixture/Master/modoverrides.lua", byteStream([new TextEncoder().encode("CLUSTER_MISSING\n")]));
+      throw new Error("expected CLUSTER_MISSING to fail");
+    } catch (error) {
+      expect(String(error)).toContain("remote cluster not found");
+      expect(String(error)).not.toContain(privateCluster);
+      expect(String(error)).not.toContain("fixture-secret");
+    }
+  });
+
+  test("times out a remote response stream that never produces bytes", async () => {
+    const hanging = new ReadableStream<Uint8Array>({ start() {} });
+    await expect(parseRemoteResponseStream("fixture-cluster", "Master", "fixture", hanging, 10)).rejects.toThrow(/timed out/);
+  });
+
+  test("publishes reports across processes while claiming the snapshot owner marker", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-process-concurrent-"));
+    try {
+      const output = join(root, "snapshot.md");
+      const script = join(import.meta.dir, "..", "scripts", "dst_snapshot.ts");
+      const env = { ...process.env } as Record<string, string>;
+      const results = await Promise.all([
+        runTool(script, ["--no-local", "--no-remote", "--out", output], env),
+        runTool(script, ["--no-local", "--no-remote", "--out", output], env),
+      ]);
+      expect(results.map((result) => result.status).sort()).toEqual([0, 0]);
+      expect(await readFile(output, "utf8")).toContain("# DST snapshot");
+      expect((await readdir(root)).filter((entry) => entry.startsWith(".dst-snapshot-tmp-")).length).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preflights every filesystem tool required by the supervisor", async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-preflight-"));
+    const required = ["sh", "perl", "ps", "awk", "cksum", "date", "od", "tr", "rm", "sleep", "dirname", "mktemp", "rmdir", "mv"];
+    const moduleUrl = pathToFileURL(join(import.meta.dir, "..", "scripts", "process_supervisor.ts")).href;
+    try {
+      for (const missing of ["dirname", "mktemp", "rmdir", "mv"]) {
+        const bin = join(root, missing);
+        await mkdir(bin);
+        for (const tool of required) {
+          if (tool === missing) continue;
+          const executable = Bun.which(tool);
+          expect(executable).not.toBeNull();
+          await symlink(executable!, join(bin, tool));
+        }
+        const child = Bun.spawn([process.execPath, "-e", `import { spawnSupervised } from ${JSON.stringify(moduleUrl)}; try { await spawnSupervised(["sh", "-c", "exit 0"]); process.exit(1); } catch (error) { console.log(error.message); }`], {
+          env: { ...process.env, PATH: bin }, stdout: "pipe", stderr: "pipe",
+        });
+        expect(await child.exited).toBe(0);
+        expect((await new Response(child.stdout).text()).trim()).toBe(`supervisor_requires_${missing}`);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("cleans a detached supervisor directory after its parent exits", { timeout: 30_000 }, async () => {
+    if (process.platform === "win32") return;
+    const before = new Set((await readdir(tmpdir())).filter((entry) => entry.startsWith(".agent-toolkit-dst-supervisor-")));
+    const markerRoot = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-parent-"));
+    const marker = join(markerRoot, "descendant.pid");
+    const finished = join(markerRoot, "finished");
+    const moduleUrl = pathToFileURL(join(import.meta.dir, "..", "scripts", "process_supervisor.ts")).href;
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const child = Bun.spawn([
+      process.execPath,
+      "-e",
+      `import { readFile } from "node:fs/promises"; import { spawnSupervised } from ${JSON.stringify(moduleUrl)}; await spawnSupervised(["sh", "-c", "sleep 30 & printf '%s\\n' \\\"$!\\\" > \\\"${marker}\\\"; printf done > \\\"${finished}\\\"; sleep 4; exit 0"]); for (let attempt = 0; attempt < 40; attempt += 1) { try { if ((await readFile(${JSON.stringify(finished)}, "utf8")).trim() === "done") break; } catch {} await Bun.sleep(5); } process.exit(0);`,
+    ], { stdout: "pipe", stderr: "pipe" });
+    try {
+      expect(await child.exited).toBe(0);
+      let leftovers: string[] = [];
+      let descendantPid: number | undefined;
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        await Bun.sleep(250);
+        leftovers = (await readdir(tmpdir())).filter((entry) => entry.startsWith(".agent-toolkit-dst-supervisor-") && !before.has(entry));
+        try {
+          descendantPid = Number((await readFile(marker, "utf8")).trim());
+        } catch {
+          // The child may exit before the target writes its marker.
+        }
+        if (leftovers.length === 0 && descendantPid !== undefined) break;
+      }
+      expect(leftovers).toEqual([]);
+      expect(Number.isInteger(descendantPid)).toBe(true);
+      for (let attempt = 0; attempt < 30 && descendantPid !== undefined && isAlive(descendantPid); attempt += 1) {
+        await Bun.sleep(100);
+      }
+      expect(descendantPid === undefined ? false : isAlive(descendantPid)).toBe(false);
+    } finally {
+      await rm(markerRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("kills a target process group after its leader exits", { timeout: 90_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-group-"));
+    const marker = join(root, "descendant.pid");
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    let descendantPid: number | undefined;
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    try {
+      supervised = await spawnSupervised([
+        "sh",
+        "-c",
+        "sleep 30 & printf '%s\\n' \"$!\" > \"$1\"; exit 0",
+        "agent-toolkit-supervised-target",
+        marker,
+      ]);
+      expect(await supervised.exited).toBe(0);
+      descendantPid = Number((await readFile(marker, "utf8")).trim());
+      expect(Number.isInteger(descendantPid)).toBe(true);
+      expect(isAlive(descendantPid)).toBe(true);
+      supervised.child.kill("SIGTERM");
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(true);
+      await supervised.wrapperExited;
+      for (let attempt = 0; attempt < 30 && isAlive(descendantPid); attempt += 1) await Bun.sleep(100);
+      expect(isAlive(descendantPid)).toBe(false);
+    } finally {
+      if (supervised !== undefined) {
+        supervised.child.kill("SIGKILL");
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (descendantPid !== undefined && isAlive(descendantPid)) {
+        try { process.kill(descendantPid, "SIGKILL"); } catch { /* The descendant may have exited. */ }
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("starts the cleanup acknowledgement deadline when stopping", { timeout: 90_000 }, async () => {
+    if (process.platform === "win32") return;
+    const before = new Set((await readdir(tmpdir())).filter((entry) => entry.startsWith(".agent-toolkit-dst-supervisor-") && !entry.includes("ack-")));
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    try {
+      supervised = await spawnSupervised(["sh", "-c", "sleep 30"]);
+      await Bun.sleep(5_500);
+      supervised.child.kill("SIGTERM");
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(true);
+      await supervised.wrapperExited;
+      await Bun.sleep(50);
+      expect((await readdir(tmpdir())).filter((entry) => entry.startsWith(".agent-toolkit-dst-supervisor-") && !entry.includes("ack-") && !before.has(entry))).toEqual([]);
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+    }
+  });
+
+  test("fails closed when the supervisor exits before recording target status", { timeout: 30_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-unknown-status-"));
+    const marker = join(root, "target-child.pid");
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    let targetChildPid: number | undefined;
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    try {
+      supervised = await spawnSupervised(["sh", "-c", "sleep 30 & printf '%s\\n' \"$!\" > \"$1\"; wait", "agent-toolkit-supervised-target", marker]);
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        try {
+          const value = Number((await readFile(marker, "utf8")).trim());
+          if (Number.isInteger(value) && value > 0) {
+            targetChildPid = value;
+            break;
+          }
+        } catch {
+          // The target may still be writing its child marker.
+        }
+        await Bun.sleep(25);
+      }
+      expect(targetChildPid).toBeDefined();
+      expect(isAlive(targetChildPid!)).toBe(true);
+      supervised.child.kill("SIGKILL");
+      expect(await supervised.exited).toBe(SUPERVISOR_UNKNOWN_TARGET_STATUS);
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(false);
+      await supervised.wrapperExited.catch(() => undefined);
+      for (let attempt = 0; attempt < 400 && isAlive(targetChildPid!); attempt += 1) await Bun.sleep(25);
+      expect(isAlive(targetChildPid!)).toBe(false);
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (targetChildPid !== undefined && isAlive(targetChildPid)) {
+        try { process.kill(targetChildPid, "SIGKILL"); } catch { /* The target may already be gone. */ }
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves a valid target exit code that matches the supervisor sentinel", { timeout: 30_000 }, async () => {
+    if (process.platform === "win32") return;
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    try {
+      supervised = await spawnSupervised(["sh", "-c", "exit 125"]);
+      expect(await supervised.exited).toBe(125);
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(true);
+      await supervised.wrapperExited;
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+    }
+  });
+
+  test("does not accept a forged target status before the target completes", { timeout: 30_000 }, async () => {
+    if (process.platform === "win32") return;
+    const before = new Set((await readdir(tmpdir())).filter((entry) => entry.startsWith(".agent-toolkit-dst-supervisor-") && !entry.includes("ack-")));
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    try {
+      supervised = await spawnSupervised(["sh", "-c", "sleep 30"]);
+      let resolvedEntry: string | undefined;
+      for (const entry of await readdir(tmpdir())) {
+        if (before.has(entry) || !entry.startsWith(".agent-toolkit-dst-supervisor-") || entry.includes("ack-")) continue;
+        if ((await lstat(join(tmpdir(), entry, "target")).catch(() => undefined))?.isFile() === true) {
+          resolvedEntry = entry;
+          break;
+        }
+      }
+      expect(resolvedEntry).toBeString();
+      await writeFile(join(tmpdir(), resolvedEntry!, "target-status"), "0\n", "utf8");
+      const forgedTargetPid = (await readFile(join(tmpdir(), resolvedEntry!, "target"), "utf8")).trim();
+      await writeFile(join(tmpdir(), resolvedEntry!, "target-status-writer"), `${forgedTargetPid}\n`, "utf8");
+      const early = await Promise.race([supervised.exited, Bun.sleep(250).then(() => "pending" as const)]);
+      expect(early).toBe("pending");
+      supervised.child.kill("SIGTERM");
+      expect(await supervised.exited).toBe(SUPERVISOR_UNKNOWN_TARGET_STATUS);
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+    }
+  });
+
+  test("does not accept a forged target status when process probing fails", { timeout: 30_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-ps-failure-"));
+    const failProbe = join(root, "fail-process-probe");
+    const fakePs = join(root, "ps");
+    const previousPath = process.env.PATH;
+    const previousFailurePath = process.env.AGENT_TOOLKIT_TEST_PS_FAIL;
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    try {
+      await writeFile(fakePs, `#!/bin/sh
+if [ -e "$AGENT_TOOLKIT_TEST_PS_FAIL" ]; then exit 1; fi
+exec /bin/ps "$@"
+`);
+      await chmod(fakePs, 0o755);
+      process.env.PATH = `${root}:${previousPath ?? ""}`;
+      process.env.AGENT_TOOLKIT_TEST_PS_FAIL = failProbe;
+      const before = new Set((await readdir(tmpdir())).filter((entry) => entry.startsWith(".agent-toolkit-dst-supervisor-") && !entry.includes("ack-")));
+      supervised = await spawnSupervised(["sh", "-c", 'sleep 0.5; touch "$1"; sleep 30', "agent-toolkit-supervised-target", failProbe]);
+      let resolvedEntry: string | undefined;
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        for (const entry of await readdir(tmpdir())) {
+          if (before.has(entry) || !entry.startsWith(".agent-toolkit-dst-supervisor-") || entry.includes("ack-")) continue;
+          if ((await lstat(join(tmpdir(), entry, "target")).catch(() => undefined))?.isFile() === true) {
+            resolvedEntry = entry;
+            break;
+          }
+        }
+        if (resolvedEntry !== undefined && (await lstat(failProbe).catch(() => undefined))?.isFile() === true) break;
+        await Bun.sleep(25);
+      }
+      expect(resolvedEntry).toBeString();
+      expect((await lstat(failProbe)).isFile()).toBe(true);
+      const statusDirectory = join(tmpdir(), resolvedEntry!);
+      const forgedTargetPid = (await readFile(join(statusDirectory, "target"), "utf8")).trim();
+      await writeFile(join(statusDirectory, "target-status"), "0\n", "utf8");
+      await writeFile(join(statusDirectory, "target-status-writer"), `${forgedTargetPid}\n`, "utf8");
+      const early = await Promise.race([supervised.exited, Bun.sleep(250).then(() => "pending" as const)]);
+      expect(early).toBe("pending");
+      supervised.child.kill("SIGTERM");
+      expect(await supervised.exited).toBe(SUPERVISOR_UNKNOWN_TARGET_STATUS);
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      if (previousFailurePath === undefined) delete process.env.AGENT_TOOLKIT_TEST_PS_FAIL;
+      else process.env.AGENT_TOOLKIT_TEST_PS_FAIL = previousFailurePath;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not trust mutable target or status markers", { timeout: 90_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-marker-canary-"));
+    const canary = join(root, "canary");
+    await writeFile(canary, "sentinel\n", "utf8");
+    try {
+      for (const markerName of ["target", "status"]) {
+        const before = new Set((await readdir(tmpdir())).filter((entry) => entry.startsWith(".agent-toolkit-dst-supervisor-") && !entry.includes("ack-")));
+        let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+        try {
+          supervised = await spawnSupervised(["sh", "-c", "sleep 30"]);
+          let resolvedEntry: string | undefined;
+          for (const entry of await readdir(tmpdir())) {
+            if (before.has(entry) || !entry.startsWith(".agent-toolkit-dst-supervisor-") || entry.includes("ack-")) continue;
+            if ((await lstat(join(tmpdir(), entry, "target")).catch(() => undefined))?.isFile() === true) {
+              resolvedEntry = entry;
+              break;
+            }
+          }
+          expect(resolvedEntry).toBeString();
+          const markerPath = join(tmpdir(), resolvedEntry!, markerName);
+          await rm(markerPath, { force: true });
+          if (markerName === "target") {
+            await symlink(canary, markerPath);
+          } else {
+            expect(Bun.spawnSync(["mkfifo", markerPath]).exitCode).toBe(0);
+          }
+          supervised.child.kill("SIGTERM");
+          const cleanupVerified = await supervised.waitForCleanupAcknowledged();
+          expect(typeof cleanupVerified).toBe("boolean");
+          await supervised.wrapperExited;
+          await Promise.race([supervised.exited, Bun.sleep(10_000).then(() => { throw new Error("supervisor marker read timed out"); })]);
+          expect(await readFile(canary, "utf8")).toBe("sentinel\n");
+        } finally {
+          if (supervised !== undefined) {
+            try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+            await supervised.wrapperExited.catch(() => undefined);
+            await supervised.cleanup();
+          }
+        }
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a status marker symlink before publication", { timeout: 90_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-status-canary-"));
+    const canary = join(root, "canary");
+    await writeFile(canary, "sentinel\n", "utf8");
+    const before = new Set((await readdir(tmpdir())).filter((entry) => entry.startsWith(".agent-toolkit-dst-supervisor-") && !entry.includes("ack-")));
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    try {
+      supervised = await spawnSupervised(["sh", "-c", "sleep 5"]);
+      let resolvedEntry: string | undefined;
+      for (const entry of await readdir(tmpdir())) {
+        if (before.has(entry) || !entry.startsWith(".agent-toolkit-dst-supervisor-") || entry.includes("ack-")) continue;
+        if ((await lstat(join(tmpdir(), entry, "target")).catch(() => undefined))?.isFile() === true) {
+          resolvedEntry = entry;
+          break;
+        }
+      }
+      expect(resolvedEntry).toBeString();
+      const markerPath = join(tmpdir(), resolvedEntry!, "status");
+      await rm(markerPath, { force: true });
+      await symlink(canary, markerPath);
+      const result = await Promise.race([
+        supervised.exited,
+        Bun.sleep(30_000).then(() => { throw new Error("supervisor status marker read timed out"); }),
+      ]);
+      expect(result).toBe(SUPERVISOR_UNKNOWN_TARGET_STATUS);
+      expect(await readFile(canary, "utf8")).toBe("sentinel\n");
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not expose the cleanup control pipe to the target", { timeout: 90_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-ack-canary-"));
+    const forged = join(root, "forged");
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    try {
+      supervised = await spawnSupervised([
+        "sh",
+        "-c",
+        "if printf forged >&4 2>/dev/null; then printf wrote > \"$1\"; fi; sleep 30",
+        "agent-toolkit-supervised-target",
+        forged,
+      ]);
+      expect(await lstat(forged).catch(() => undefined)).toBeUndefined();
+      supervised.child.kill("SIGTERM");
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(true);
+      await supervised.wrapperExited;
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not expose the cleanup acknowledgement path to the target", { timeout: 90_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-ack-env-"));
+    const marker = join(root, "target-saw-ack-path");
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    try {
+      supervised = await spawnSupervised([
+        "sh",
+        "-c",
+        "if [ -n \"$AGENT_TOOLKIT_SUPERVISOR_CLEANUP_ACK_PATH\" ]; then printf forged > \"$1\"; fi; sleep 30",
+        "agent-toolkit-supervised-target",
+        marker,
+      ]);
+      expect(await lstat(marker).catch(() => undefined)).toBeUndefined();
+      supervised.child.kill("SIGTERM");
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(true);
+      await supervised.wrapperExited;
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("cleans a target through the supervisor fallback path", { timeout: 30_000 }, async () => {
+    if (process.platform === "win32") return;
+    const previousDisableSetsid = process.env.AGENT_TOOLKIT_SUPERVISOR_DISABLE_SETSID;
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    process.env.AGENT_TOOLKIT_SUPERVISOR_DISABLE_SETSID = "1";
+    try {
+      supervised = await spawnSupervised(["sh", "-c", "sleep 30"]);
+      supervised.child.kill("SIGTERM");
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(true);
+      await supervised.wrapperExited;
+    } finally {
+      if (previousDisableSetsid === undefined) delete process.env.AGENT_TOOLKIT_SUPERVISOR_DISABLE_SETSID;
+      else process.env.AGENT_TOOLKIT_SUPERVISOR_DISABLE_SETSID = previousDisableSetsid;
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+    }
+  });
+
+  test("accepts POSIX process state modifiers during target cleanup", { timeout: 30_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-state-modifiers-"));
+    const fakePs = join(root, "ps");
+    const fixture = join(root, "fixture.ts");
+    const previousPath = process.env.PATH;
+    const moduleUrl = pathToFileURL(join(import.meta.dir, "..", "scripts", "process_supervisor.ts")).href;
+    try {
+      await writeFile(fakePs, `#!/bin/sh
+case "$*" in
+  *"-axo pid=,pgid=,state="*)
+    printf '100 200 S+\\n101 201 S<\\n102 202 Ss+\\n'
+    exit 0
+    ;;
+  *) exec /bin/ps "$@" ;;
+esac
+`);
+      await chmod(fakePs, 0o755);
+      await writeFile(fixture, `import { spawnSupervised } from ${JSON.stringify(moduleUrl)};
+const supervised = await spawnSupervised(["sh", "-c", "sleep 30"]);
+try {
+  process.stdout.write(String(await supervised.forceCleanup()));
+} finally {
+  try { supervised.child.kill("SIGKILL"); } catch {}
+  await supervised.wrapperExited.catch(() => undefined);
+  await supervised.cleanup();
+}
+`);
+      const result = await runTool(fixture, [], { ...process.env, PATH: `${root}:${previousPath ?? ""}` } as Record<string, string>);
+      expect(result.status).toBe(0);
+      expect(result.stdout.trim()).toBe("true");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a forged descendant ledger during fallback cleanup", { timeout: 30_000 }, async () => {
+    if (process.platform === "win32") return;
+    const before = new Set((await readdir(tmpdir())).filter((entry) => entry.startsWith(".agent-toolkit-dst-supervisor-") && !entry.includes("ack-")));
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    let statusDirectory: string | undefined;
+    let targetPid: number | undefined;
+    let targetPgid: number | undefined;
+    const killTarget = (signal: "SIGKILL" | "SIGTERM"): void => {
+      if (targetPgid !== undefined && targetPgid > 0) {
+        try { process.kill(-targetPgid, signal); } catch { /* The group may already have exited. */ }
+      }
+      if (targetPid !== undefined) {
+        try { process.kill(targetPid, signal); } catch { /* The target may already have exited. */ }
+      }
+    };
+    try {
+      supervised = await spawnSupervised(["sh", "-c", "sleep 30"]);
+      for (let attempt = 0; attempt < 40 && statusDirectory === undefined; attempt += 1) {
+        for (const entry of await readdir(tmpdir())) {
+          if (before.has(entry) || !entry.startsWith(".agent-toolkit-dst-supervisor-") || entry.includes("ack-")) continue;
+          if ((await lstat(join(tmpdir(), entry, "target")).catch(() => undefined))?.isFile() === true) {
+            statusDirectory = join(tmpdir(), entry);
+            break;
+          }
+        }
+        if (statusDirectory === undefined) await Bun.sleep(25);
+      }
+      expect(statusDirectory).toBeString();
+      targetPid = Number((await readFile(join(statusDirectory!, "target"), "utf8")).trim());
+      targetPgid = Number((await readFile(join(statusDirectory!, "target-pgid"), "utf8")).trim());
+      const ledgerPath = join(statusDirectory!, "descendants");
+      const authPath = join(statusDirectory!, "descendants-auth");
+      for (let attempt = 0; attempt < 80; attempt += 1) {
+        if ((await lstat(ledgerPath).catch(() => undefined))?.isFile() === true
+          && (await lstat(authPath).catch(() => undefined))?.isFile() === true) break;
+        await Bun.sleep(25);
+      }
+      const ledger = await readFile(ledgerPath, "utf8");
+      expect(ledger.trim().length).toBeGreaterThan(0);
+      await writeFile(ledgerPath, `${ledger}999999|proc:forged|999999\n`, "utf8");
+      const rejected = supervised.forceCleanup();
+      expect(await rejected).toBe(false);
+      // A failed force attempt must not suppress future cleanup attempts.
+      const retry = supervised.forceCleanup();
+      expect(retry).not.toBe(rejected);
+      expect(await retry).toBe(false);
+    } finally {
+      killTarget("SIGKILL");
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (statusDirectory !== undefined) await rm(statusDirectory, { recursive: true, force: true });
+    }
+  });
+
+  test("cleans the authenticated target group after its anchor dies", { timeout: 30_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-anchor-loss-"));
+    const marker = join(root, "child.pid");
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    let childPid: number | undefined;
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    try {
+      supervised = await spawnSupervised([
+        "sh",
+        "-c",
+        "sleep 30 & child=$!; printf '%s\\n' \"$child\" > \"$1\"; sleep 2; kill -KILL \"$PPID\"; wait",
+        "agent-toolkit-supervised-target",
+        marker,
+      ]);
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        try {
+          childPid = Number((await readFile(marker, "utf8")).trim());
+          if (Number.isInteger(childPid) && childPid > 0) break;
+        } catch {
+          // The target may still be writing its child marker.
+        }
+        await Bun.sleep(25);
+      }
+      expect(childPid).toBeDefined();
+      expect(isAlive(childPid!)).toBe(true);
+      await supervised.exited;
+      await supervised.waitForCleanupAcknowledged();
+      await supervised.wrapperExited;
+      for (let attempt = 0; attempt < 40 && isAlive(childPid!); attempt += 1) await Bun.sleep(25);
+      expect(isAlive(childPid!)).toBe(false);
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (childPid !== undefined && isAlive(childPid)) {
+        try { process.kill(childPid, "SIGKILL"); } catch { /* The child may already have exited. */ }
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("force-cleans authorized descendants after the target anchor disappears", { timeout: 45_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-force-anchor-loss-"));
+    const anchorMarker = join(root, "anchor.pid");
+    const descendantMarker = join(root, "descendant.pid");
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    let anchorPid: number | undefined;
+    let descendantPid: number | undefined;
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    try {
+      supervised = await spawnSupervised([
+        "sh",
+        "-c",
+        "trap ':' HUP TERM; printf '%s\\n' \"$PPID\" > \"$1\"; perl -e '$SIG{HUP}=\"IGNORE\"; $SIG{TERM}=\"IGNORE\"; open my $fh, \">\", $ARGV[0] or exit 1; print $fh \"$$\\n\"; close $fh or exit 1; sleep 30' \"$2\"",
+        "agent-toolkit-supervised-target",
+        anchorMarker,
+        descendantMarker,
+      ]);
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        try {
+          anchorPid = Number((await readFile(anchorMarker, "utf8")).trim());
+          descendantPid = Number((await readFile(descendantMarker, "utf8")).trim());
+          if (Number.isInteger(anchorPid) && anchorPid > 0 && Number.isInteger(descendantPid) && descendantPid > 0) break;
+        } catch {
+          // The target command may still be writing its markers.
+        }
+        await Bun.sleep(25);
+      }
+      expect(anchorPid).toBeDefined();
+      expect(descendantPid).toBeDefined();
+      expect(isAlive(anchorPid!)).toBe(true);
+      expect(isAlive(descendantPid!)).toBe(true);
+      await Bun.sleep(250);
+      process.kill(anchorPid!, "SIGKILL");
+      await Bun.sleep(50);
+      expect(isAlive(descendantPid!)).toBe(true);
+      try { supervised.child.kill("SIGKILL"); } catch { /* The wrapper may already be gone. */ }
+      expect(isAlive(descendantPid!)).toBe(true);
+      const cleaned = await supervised.forceCleanup();
+      expect(cleaned).toBe(true);
+      for (let attempt = 0; attempt < 80 && isAlive(descendantPid!); attempt += 1) await Bun.sleep(25);
+      expect(isAlive(descendantPid!)).toBe(false);
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (descendantPid !== undefined && isAlive(descendantPid)) {
+        try { process.kill(descendantPid, "SIGKILL"); } catch { /* The descendant may have exited. */ }
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  for (const snapshotFailure of [false, true]) {
+    test(`handles a natural exit with cleanup ACK zero (snapshot failure: ${snapshotFailure})`, { timeout: 45_000 }, async () => {
+      if (process.platform === "win32") return;
+      const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-natural-ack-zero-"));
+      const marker = join(root, "descendant.pid");
+      const trigger = join(root, "exit-and-fail-cleaner");
+      const failScan = join(root, "fail-cleaner-snapshot");
+      const previousPath = process.env.PATH;
+      const realMktemp = Bun.which("mktemp");
+      const realPs = Bun.which("ps");
+      const before = new Set(await readdir(tmpdir()));
+      let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+      let directory: string | undefined;
+      let pid: number | undefined;
+      const alive = (target: number): boolean => {
+        const state = Bun.spawnSync(["ps", "-o", "state=", "-p", String(target)], { stdout: "pipe", stderr: "ignore" });
+        return new TextDecoder().decode(state.stdout).trim().replace(/^Z.*$/, "") !== "";
+      };
+      try {
+        await writeFile(join(root, "mktemp"), `#!/bin/sh
+case "$*" in
+  *.cleanup-owner-candidate.*) if [ -e "${trigger}" ]; then ${snapshotFailure ? `printf failure > "${failScan}"` : "exit 1"}; fi ;;
+esac
+exec "${realMktemp}" "$@"
+`);
+        await chmod(join(root, "mktemp"), 0o755);
+        await writeFile(join(root, "ps"), `#!/bin/sh
+if [ "$*" = "-eo pid=,ppid=,pgid=" ] && [ -e "${failScan}" ]; then printf 'malformed process row\\n'; exit 0; fi
+exec "${realPs}" "$@"
+`);
+        await chmod(join(root, "ps"), 0o755);
+        process.env.PATH = `${root}:${previousPath ?? ""}`;
+        supervised = await spawnSupervised([
+          "sh", "-c",
+          "perl -e '$SIG{HUP}=\"IGNORE\"; $SIG{TERM}=\"IGNORE\"; open my $f, \">\", $ARGV[0] or exit 1; print $f \"$$\\n\"; close $f; sleep 30' \"$1\" & while [ ! -e \"$2\" ]; do sleep 0.02; done; exit 0",
+          "natural-exit-target", marker, trigger,
+        ]);
+        process.env.PATH = previousPath;
+        directory = await supervisorStatusDirectory(before, supervised.child.pid);
+        for (let attempt = 0; attempt < 160; attempt += 1) {
+          pid = Number((await readFile(marker, "utf8").catch(() => "")).trim());
+          const ledger = await readFile(join(directory, "descendants-authenticated"), "utf8");
+          if (pid > 0 && ledger.includes(`${pid}|`)) break;
+          await Bun.sleep(25);
+        }
+        expect(pid).toBeGreaterThan(0);
+        expect(await readFile(join(directory, "descendants-authenticated"), "utf8")).toContain(`${pid}|`);
+        await writeFile(trigger, "exit");
+        expect(await supervised.wrapperExited).toBe(0);
+        expect(await supervised.exited).toBe(0);
+        expect(await supervised.waitForCleanupAcknowledged()).toBe(false);
+        if (snapshotFailure) {
+          // The failure happened in the detached cleaner, after FD6 was closed.
+          // Erasing its disk markers cannot clear the private ACK-channel latch.
+          expect((await readdir(directory)).some((entry) => entry.startsWith("snapshot-failed"))).toBe(true);
+          for (const entry of await readdir(directory)) {
+            if (entry.startsWith("snapshot-failed") || entry === "descendant-scan-failed" || entry === "descendant-scan-truncated") await rm(join(directory, entry));
+          }
+          expect(await supervised.forceCleanup()).toBe(false);
+        } else {
+          expect(alive(pid!)).toBe(true);
+          expect(await supervised.forceCleanup()).toBe(true);
+          expect(alive(pid!)).toBe(false);
+        }
+      } finally {
+        process.env.PATH = previousPath;
+        if (supervised !== undefined) {
+          try { supervised.child.kill("SIGKILL"); } catch {}
+          await supervised.wrapperExited.catch(() => undefined);
+          await supervised.cleanup();
+        }
+        if (pid !== undefined && pid > 0) { try { process.kill(pid, "SIGKILL"); } catch {} }
+        if (directory !== undefined) await rm(directory, { recursive: true, force: true });
+        await rm(root, { recursive: true, force: true });
+      }
+  });
+  }
+
+  for (const replayRaw of [false, true]) {
+    test(`rejects an older signed ledger after anchor loss (raw replay: ${replayRaw})`, { timeout: 30_000 }, async () => {
+      if (process.platform === "win32") return;
+      const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-replay-"));
+      const trigger = join(root, "start");
+      const detachedMarker = join(root, "detached.pid");
+      let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+      let statusDirectory: string | undefined;
+      let anchorPid: number | undefined;
+      let detachedPid: number | undefined;
+      const before = new Set(await readdir(tmpdir()));
+      try {
+        supervised = await spawnSupervised([
+          "sh", "-c",
+          "while [ ! -e \"$1\" ]; do sleep 0.02; done; perl -MPOSIX -e 'POSIX::setsid() < 0 and exit 125; open my $f, \">\", $ARGV[0] or exit 1; print $f \"$$\\n\"; close $f; $SIG{HUP}=\"IGNORE\"; $SIG{TERM}=\"IGNORE\"; sleep 30' \"$2\" & wait",
+          "replay-target", trigger, detachedMarker,
+        ]);
+        for (const entry of await readdir(tmpdir())) {
+          if (!before.has(entry) && entry.startsWith(".agent-toolkit-dst-supervisor-") && !entry.includes("ack-")) {
+            const candidate = join(tmpdir(), entry);
+            if ((await lstat(join(candidate, "target")).catch(() => undefined))?.isFile()) statusDirectory = candidate;
+          }
+        }
+        expect(statusDirectory).toBeDefined();
+        anchorPid = Number((await readFile(join(statusDirectory!, "target"), "utf8")).trim());
+        const authenticatedPath = join(statusDirectory!, "descendants-authenticated");
+        const rawPath = join(statusDirectory!, "descendants");
+        const oldAuthenticated = await readFile(authenticatedPath, "utf8");
+        const oldRaw = oldAuthenticated.slice(oldAuthenticated.indexOf("\n") + 1);
+        await writeFile(trigger, "start");
+        for (let attempt = 0; attempt < 160; attempt += 1) {
+          detachedPid = Number((await readFile(detachedMarker, "utf8").catch(() => "")).trim());
+          const current = await readFile(authenticatedPath, "utf8");
+          if (detachedPid > 0 && current.includes(`${detachedPid}|`)) break;
+          await Bun.sleep(25);
+        }
+        expect(detachedPid).toBeGreaterThan(0);
+        expect(await readFile(authenticatedPath, "utf8")).toContain(`${detachedPid}|`);
+        // Freeze publication, then restore a valid historical signature. The
+        // second case also restores raw bytes to defeat consistency-only checks.
+        supervised.child.kill("SIGSTOP");
+        await Bun.sleep(50);
+        await writeFile(authenticatedPath, oldAuthenticated);
+        if (replayRaw) await writeFile(rawPath, oldRaw);
+        process.kill(anchorPid, "SIGKILL");
+        expect(await supervised.forceCleanup()).toBe(false);
+        expect(await supervised.exited).toBe(SUPERVISOR_UNKNOWN_TARGET_STATUS);
+        // A rejected proof must retain its directory for diagnosis.
+        expect((await lstat(statusDirectory!)).isDirectory()).toBe(true);
+      } finally {
+        if (supervised !== undefined) {
+          try { supervised.child.kill("SIGKILL"); } catch {}
+          await supervised.wrapperExited.catch(() => undefined);
+          await supervised.cleanup();
+        }
+        for (const pid of [anchorPid, detachedPid]) {
+          if (pid !== undefined && pid > 0) {
+            try { process.kill(-pid, "SIGKILL"); } catch {}
+            try { process.kill(pid, "SIGKILL"); } catch {}
+          }
+        }
+        if (statusDirectory !== undefined) await rm(statusDirectory, { recursive: true, force: true });
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  for (const reapChild of [false, true]) {
+    test(`recovers a live target when SIGKILL interrupts raw ledger append publication${reapChild ? " after the appended child is reaped" : ""}`, { timeout: 45_000 }, async () => {
+      if (process.platform === "win32") return;
+      const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-append-publication-"));
+      const childMarker = join(root, "child.pid");
+      const trigger = join(root, "spawn-child");
+      const paused = join(root, "append-paused");
+      const releaseChild = join(root, "release-child");
+      const reaped = join(root, "child-reaped");
+      const realPerl = Bun.which("perl");
+      const previousPath = process.env.PATH;
+      const before = new Set(await readdir(tmpdir()));
+      let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+      let directory: string | undefined;
+      let pid: number | undefined;
+      let anchor: number | undefined;
+      let targetPgid: number | undefined;
+      try {
+        await writeFile(join(root, "perl"), `#!/bin/sh
+case "$2" in *O_APPEND*) ;; *) exec "${realPerl}" "$@" ;; esac
+"${realPerl}" "$@"
+result=$?
+if [ "$result" = 0 ] && [ "$3" = ./descendants ] && [ -f "${childMarker}" ]; then
+  expected=$(cat "${childMarker}")
+  case "$4" in "$expected|"*) printf '%s\\n' "$PPID" > "${paused}"; kill -STOP "$PPID" ;; esac
+fi
+exit "$result"
+`);
+        await chmod(join(root, "perl"), 0o755);
+        process.env.PATH = `${root}:${previousPath ?? ""}`;
+        supervised = await spawnSupervised([
+          "perl", "-e", "while (!-e $ARGV[0]) { select undef, undef, undef, 0.02; } my $pid = fork(); defined $pid or exit 1; if ($pid == 0) { open my $f, \">\", $ARGV[1] or exit 1; print $f \"$$\\n\"; close $f; while (!-e $ARGV[2]) { select undef, undef, undef, 0.02; } exit 0; } waitpid($pid, 0); open my $f, \">\", $ARGV[3] or exit 1; print $f \"reaped\\n\"; close $f; sleep 30;",
+          trigger, childMarker, releaseChild, reaped,
+        ]);
+        process.env.PATH = previousPath;
+        directory = await supervisorStatusDirectory(before, supervised.child.pid);
+        anchor = Number((await readFile(join(directory, "target"), "utf8")).trim());
+        targetPgid = Number((await readFile(join(directory, "target-pgid"), "utf8")).trim());
+        await writeFile(trigger, "spawn");
+        let pausedWrapper = 0;
+        for (let attempt = 0; attempt < 480; attempt += 1) {
+          pausedWrapper = Number((await readFile(paused, "utf8").catch(() => "")).trim());
+          if (pausedWrapper > 0) break;
+          await Bun.sleep(25);
+        }
+        expect(pausedWrapper).toBe(supervised.child.pid);
+        pid = Number((await readFile(childMarker, "utf8")).trim());
+        expect(await readFile(join(directory, "descendants"), "utf8")).toContain(`${pid}|`);
+        expect(await readFile(join(directory, "descendants-authenticated"), "utf8")).not.toContain(`${pid}|`);
+        if (reapChild) {
+          await writeFile(releaseChild, "exit");
+          for (let attempt = 0; attempt < 80; attempt += 1) {
+            if (await readFile(reaped, "utf8").catch(() => "") === "reaped\n") break;
+            await Bun.sleep(25);
+          }
+          expect(await readFile(reaped, "utf8")).toBe("reaped\n");
+          expect(() => process.kill(pid!, 0)).toThrow();
+        }
+        expect(process.kill(anchor, 0)).toBe(true);
+        supervised.child.kill("SIGKILL");
+        expect(await supervised.forceCleanup()).toBe(true);
+        const state = Bun.spawnSync(["ps", "-o", "state=", "-p", String(pid)], { stdout: "pipe", stderr: "ignore" });
+        expect(new TextDecoder().decode(state.stdout).trim().replace(/^Z.*$/, "")).toBe("");
+        const anchorState = Bun.spawnSync(["ps", "-o", "state=", "-p", String(anchor)], { stdout: "pipe", stderr: "ignore" });
+        expect(new TextDecoder().decode(anchorState.stdout).trim().replace(/^Z.*$/, "")).toBe("");
+      } finally {
+        process.env.PATH = previousPath;
+        if (supervised !== undefined) {
+          try { supervised.child.kill("SIGKILL"); } catch {}
+          await supervised.wrapperExited.catch(() => undefined);
+          await supervised.cleanup();
+        }
+        if (pid !== undefined && pid > 0) { try { process.kill(pid, "SIGKILL"); } catch {} }
+        if (targetPgid !== undefined && targetPgid > 0) { try { process.kill(-targetPgid, "SIGKILL"); } catch {} }
+        if (directory !== undefined) await rm(directory, { recursive: true, force: true });
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test("serializes automatic and forced cleanup after wrapper SIGKILL", { timeout: 90_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-cleanup-race-"));
+    try {
+      for (const delay of [0, 25, 250, 2_100, 2_250, 2_500]) {
+        const marker = join(root, `child-${delay}.pid`);
+        let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+        let pid: number | undefined;
+        try {
+          supervised = await spawnSupervised(["sh", "-c", "sleep 30 & printf '%s\\n' \"$!\" > \"$1\"; wait", "race-target", marker]);
+          for (let attempt = 0; attempt < 80; attempt += 1) {
+            pid = Number((await readFile(marker, "utf8").catch(() => "")).trim());
+            if (Number.isSafeInteger(pid) && pid > 0) break;
+            await Bun.sleep(25);
+          }
+          expect(pid).toBeGreaterThan(0);
+          supervised.child.kill("SIGKILL");
+          await Bun.sleep(delay);
+          const first = supervised.forceCleanup();
+          expect(supervised.forceCleanup()).toBe(first);
+          expect(await first).toBe(true);
+          expect(await supervised.exited).toBe(SUPERVISOR_UNKNOWN_TARGET_STATUS);
+          const state = Bun.spawnSync(["ps", "-o", "state=", "-p", String(pid)], { stdout: "pipe", stderr: "ignore" });
+          expect(new TextDecoder().decode(state.stdout).trim().replace(/^Z.*$/, "")).toBe("");
+        } finally {
+          if (supervised !== undefined) {
+            try { supervised.child.kill("SIGKILL"); } catch {}
+            await supervised.wrapperExited.catch(() => undefined);
+            await supervised.cleanup();
+          }
+          if (pid !== undefined) { try { process.kill(pid, "SIGKILL"); } catch {} }
+        }
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("retains snapshot failure after the target deletes every failure marker", { timeout: 30_000 }, async () => {
+    if (process.platform === "win32") return;
+    const before = new Set(await readdir(tmpdir()));
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    let directory: string | undefined;
+    let anchor: number | undefined;
+    try {
+      supervised = await spawnSupervised(["sh", "-c", "sleep 30"]);
+      directory = await supervisorStatusDirectory(before, supervised.child.pid);
+      anchor = Number((await readFile(join(directory, "target"), "utf8")).trim());
+      await writeFile(join(directory, "descendant-scan-failed"), "failure");
+      let observed = false;
+      for (let attempt = 0; attempt < 160; attempt += 1) {
+        if ((await lstat(join(directory, "snapshot-failed")).catch(() => undefined))?.isFile()) { observed = true; break; }
+        await Bun.sleep(25);
+      }
+      expect(observed).toBe(true);
+      const authenticated = await readFile(join(directory, "descendants-authenticated"), "utf8");
+      for (const entry of await readdir(directory)) {
+        if (entry.startsWith("snapshot-failed") || entry === "descendant-scan-failed" || entry === "descendant-scan-truncated") {
+          await rm(join(directory, entry));
+        }
+      }
+      await Bun.sleep(250);
+      expect(await readFile(join(directory, "descendants-authenticated"), "utf8")).toBe(authenticated);
+      expect(await supervised.forceCleanup()).toBe(false);
+      expect((await lstat(directory)).isDirectory()).toBe(true);
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch {}
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (anchor !== undefined) { try { process.kill(-anchor, "SIGKILL"); } catch {} }
+      if (directory !== undefined) await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a replaced state directory even with copied valid signed files", { timeout: 30_000 }, async () => {
+    if (process.platform === "win32") return;
+    const before = new Set(await readdir(tmpdir()));
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-replacement-"));
+    const moved = join(root, "original");
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    let directory: string | undefined;
+    let anchor: number | undefined;
+    try {
+      supervised = await spawnSupervised(["sh", "-c", "sleep 30"]);
+      directory = await supervisorStatusDirectory(before, supervised.child.pid);
+      anchor = Number((await readFile(join(directory, "target"), "utf8")).trim());
+      supervised.child.kill("SIGSTOP");
+      await Bun.sleep(100);
+      await rename(directory, moved);
+      await cp(moved, directory, { recursive: true });
+      expect(await supervised.forceCleanup()).toBe(false);
+      expect((await lstat(directory)).isDirectory()).toBe(true);
+      // Restoring the pathname cannot erase an observed identity violation.
+      await rm(directory, { recursive: true, force: true });
+      await rename(moved, directory);
+      expect(await supervised.forceCleanup()).toBe(false);
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch {}
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (anchor !== undefined) { try { process.kill(-anchor, "SIGKILL"); } catch {} }
+      if (directory !== undefined) await rm(directory, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fails closed when the target truncates the descendant ledger", { timeout: 30_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-ledger-canary-"));
+    const marker = join(root, "child.pid");
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    try {
+      supervised = await spawnSupervised([
+        "sh",
+        "-c",
+        "sleep 30 & child=$!; printf '%s\\n' \"$child\" > \"$1\"; while :; do for path in \"$2\"/.agent-toolkit-dst-supervisor-*; do [ -f \"$path/descendants\" ] && : > \"$path/descendants\"; done; sleep 0.01; done",
+        "agent-toolkit-supervised-target",
+        marker,
+        tmpdir(),
+      ]);
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        try {
+          if ((await readFile(marker, "utf8")).trim().length > 0) break;
+        } catch {
+          // The target may still be writing its child marker.
+        }
+        await Bun.sleep(25);
+      }
+      await Bun.sleep(100);
+      supervised.child.kill("SIGTERM");
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(false);
+      await supervised.wrapperExited;
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("recovers when the target preclaims the cleanup owner directory", { timeout: 90_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-owner-canary-"));
+    const marker = join(root, "child.pid");
+    const claimed = join(root, "claimed");
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    let childPid: number | undefined;
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    try {
+      supervised = await spawnSupervised([
+        "sh",
+        "-c",
+        "sleep 30 & child=$!; printf '%s\\n' \"$child\" > \"$1\"; attempt=0; while [ \"$attempt\" -lt 1000 ]; do for path in \"$3\"/.agent-toolkit-dst-supervisor-*; do if [ -d \"$path\" ] && mkdir \"$path/cleanup-owner\" 2>/dev/null; then : > \"$2\"; break 2; fi; done; attempt=$((attempt + 1)); sleep 0.01; done; wait \"$child\"",
+        "agent-toolkit-supervised-target",
+        marker,
+        claimed,
+        tmpdir(),
+      ]);
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        try {
+          childPid = Number((await readFile(marker, "utf8")).trim());
+          if (Number.isInteger(childPid) && childPid > 0 && (await lstat(claimed).catch(() => undefined))?.isFile() === true) break;
+        } catch {
+          // The target may still be publishing its markers.
+        }
+        await Bun.sleep(25);
+      }
+      expect(childPid).toBeDefined();
+      expect((await lstat(claimed).catch(() => undefined))?.isFile()).toBe(true);
+      expect(isAlive(childPid!)).toBe(true);
+      supervised.child.kill("SIGTERM");
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(true);
+      await supervised.wrapperExited;
+      for (let attempt = 0; attempt < 40 && isAlive(childPid!); attempt += 1) await Bun.sleep(100);
+      expect(isAlive(childPid!)).toBe(false);
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (childPid !== undefined && isAlive(childPid)) {
+        try { process.kill(childPid, "SIGKILL"); } catch { /* The child may have exited. */ }
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("cleans a descendant that leaves the target process group", { timeout: 90_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-independent-group-"));
+    const marker = join(root, "detached.pid");
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    let detachedPid: number | undefined;
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    try {
+      supervised = await spawnSupervised([
+        "sh",
+        "-c",
+        "perl -MPOSIX -e 'POSIX::setsid() < 0 and exit 125; exec @ARGV' -- sh -c 'trap \"\" TERM; sleep 30' & detached=$!; printf '%s\\n' \"$detached\" > \"$1\"; while :; do sleep 1; done",
+        "agent-toolkit-supervised-target",
+        marker,
+      ]);
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        try {
+          detachedPid = Number((await readFile(marker, "utf8")).trim());
+          break;
+        } catch {
+          await Bun.sleep(25);
+        }
+      }
+      expect(Number.isInteger(detachedPid)).toBe(true);
+      expect(detachedPid === undefined ? false : isAlive(detachedPid)).toBe(true);
+      supervised.child.kill("SIGTERM");
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(true);
+      await supervised.wrapperExited;
+      for (let attempt = 0; attempt < 30 && detachedPid !== undefined && isAlive(detachedPid); attempt += 1) await Bun.sleep(100);
+      expect(detachedPid === undefined ? false : isAlive(detachedPid)).toBe(false);
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (detachedPid !== undefined && isAlive(detachedPid)) {
+        try { process.kill(detachedPid, "SIGKILL"); } catch { /* The detached process may have exited. */ }
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("handles an authenticated child that detaches before the target completion marker", { timeout: 90_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-completion-race-"));
+    const marker = join(root, "detached.pid");
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    let detachedPid: number | undefined;
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    try {
+      supervised = await spawnSupervised([
+        "sh",
+        "-c",
+        "perl -MPOSIX -e '$marker = shift; $pid = fork(); exit 125 unless defined $pid; if ($pid) { open my $fh, \">\", $marker or exit 125; print $fh \"$pid\\n\" or exit 125; close $fh or exit 125; waitpid($pid, 0); exit($? >> 8); } select undef, undef, undef, 4; POSIX::setsid() < 0 and exit 125; exec \"sleep\", \"30\" or exit 127' \"$1\" & while [ ! -s \"$1\" ]; do sleep 0.01; done; sleep 4.8; exit 0",
+        "agent-toolkit-supervised-target",
+        marker,
+      ]);
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        try {
+          detachedPid = Number((await readFile(marker, "utf8")).trim());
+          if (Number.isInteger(detachedPid) && detachedPid > 0) break;
+        } catch {
+          // The target may still be writing its child marker.
+        }
+        await Bun.sleep(25);
+      }
+      expect(Number.isInteger(detachedPid)).toBe(true);
+      expect(detachedPid === undefined ? false : isAlive(detachedPid)).toBe(true);
+      await Bun.sleep(250);
+      expect(await supervised.exited).toBe(0);
+      supervised.child.kill("SIGTERM");
+      const cleanupAcknowledged = await supervised.waitForCleanupAcknowledged();
+      expect(typeof cleanupAcknowledged).toBe("boolean");
+      await supervised.wrapperExited;
+      if (process.platform === "linux") {
+        for (let attempt = 0; attempt < 40 && detachedPid !== undefined && isAlive(detachedPid); attempt += 1) await Bun.sleep(25);
+        expect(detachedPid === undefined ? false : isAlive(detachedPid)).toBe(false);
+      } else {
+        // Darwin's second-resolution ps identity cannot re-authorize a child
+        // after it changes process group; fail closed and leave it untouched.
+        expect(cleanupAcknowledged).toBe(false);
+        expect(detachedPid === undefined ? false : isAlive(detachedPid)).toBe(true);
+      }
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (detachedPid !== undefined && isAlive(detachedPid)) {
+        try { process.kill(detachedPid, "SIGKILL"); } catch { /* The detached process may have exited. */ }
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("captures a Linux child that detaches before ancestry snapshots", { timeout: 90_000 }, async () => {
+    if (process.platform !== "linux") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-marker-detach-"));
+    const marker = join(root, "detached.pid");
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    let detachedPid: number | undefined;
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    try {
+      supervised = await spawnSupervised([
+        "sh",
+        "-c",
+        "perl -MPOSIX -e '$marker = shift; $pid = fork(); exit 125 unless defined $pid; if ($pid) { open my $fh, \">\", $marker or exit 125; print $fh \"$pid\\n\" or exit 125; close $fh or exit 125; exit 0; } POSIX::setsid() < 0 and exit 125; exec \"sleep\", \"30\" or exit 127' \"$1\"",
+        "agent-toolkit-supervised-target",
+        marker,
+      ]);
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        try {
+          detachedPid = Number((await readFile(marker, "utf8")).trim());
+          if (Number.isInteger(detachedPid) && detachedPid > 0) break;
+        } catch {
+          await Bun.sleep(25);
+        }
+      }
+      expect(Number.isInteger(detachedPid)).toBe(true);
+      expect(detachedPid === undefined ? false : isAlive(detachedPid)).toBe(true);
+      expect(await supervised.exited).toBe(0);
+      supervised.child.kill("SIGTERM");
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(true);
+      await supervised.wrapperExited;
+      for (let attempt = 0; attempt < 40 && detachedPid !== undefined && isAlive(detachedPid); attempt += 1) await Bun.sleep(25);
+      expect(detachedPid === undefined ? false : isAlive(detachedPid)).toBe(false);
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (detachedPid !== undefined && isAlive(detachedPid)) {
+        try { process.kill(detachedPid, "SIGKILL"); } catch { /* The detached process may have exited. */ }
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("cleans an orphaned group after its captured leader exits during termination", { timeout: 90_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-orphaned-group-"));
+    const controllerScript = join(root, "controller.sh");
+    const leaderScript = join(root, "leader.sh");
+    const childScript = join(root, "child.sh");
+    const leaderMarker = join(root, "leader.pid");
+    const childMarker = join(root, "child.pid");
+    await writeFile(childScript, "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$1\"\ntrap ':' TERM\nsleep 30\n", "utf8");
+    await chmod(childScript, 0o755);
+    await writeFile(leaderScript, "#!/bin/sh\nsh \"$3\" \"$2\" & child=\"$!\"\nprintf '%s\\n' \"$$\" > \"$1\"\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n", "utf8");
+    await chmod(leaderScript, 0o755);
+    await writeFile(controllerScript, "#!/bin/sh\nif command -v setsid >/dev/null 2>&1; then\n  setsid \"$1\" \"$2\" \"$3\" \"$4\" & leader=\"$!\"\nelse\n  perl -MPOSIX -e '$pid=fork(); exit 125 unless defined $pid; if ($pid) { waitpid($pid, 0); exit($? >> 8); } POSIX::setsid() < 0 and exit 125; exec @ARGV or exit 127' -- \"$1\" \"$2\" \"$3\" \"$4\" & launcher=\"$!\"\n  while [ ! -s \"$2\" ] && kill -0 \"$launcher\" 2>/dev/null; do sleep 0.01; done\n  leader=\"$(cat \"$2\" 2>/dev/null || printf '%s' \"$launcher\")\"\nfi\ntrap 'kill -TERM \"$leader\" 2>/dev/null || true; exit 0' TERM\nwhile kill -0 \"$leader\" 2>/dev/null; do sleep 0.01; done\n", "utf8");
+    await chmod(controllerScript, 0o755);
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    let descendantPid: number | undefined;
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    try {
+      supervised = await spawnSupervised(["sh", controllerScript, leaderScript, leaderMarker, childMarker, childScript]);
+      let leaderPid: number | undefined;
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        try {
+          leaderPid = Number((await readFile(leaderMarker, "utf8")).trim());
+          break;
+        } catch {
+          await Bun.sleep(25);
+        }
+      }
+      expect(Number.isInteger(leaderPid)).toBe(true);
+      expect(leaderPid === undefined ? false : isAlive(leaderPid)).toBe(true);
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        try {
+          const childPid = Number((await readFile(childMarker, "utf8")).trim());
+          if (Number.isInteger(childPid) && childPid > 0) break;
+        } catch {
+          await Bun.sleep(25);
+        }
+      }
+      expect((await readFile(childMarker, "utf8")).trim()).toMatch(/^[0-9]+$/);
+      await Bun.sleep(250);
+      supervised.child.kill("SIGTERM");
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(true);
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        try {
+          descendantPid = Number((await readFile(childMarker, "utf8")).trim());
+          break;
+        } catch {
+          await Bun.sleep(25);
+        }
+      }
+      expect(Number.isInteger(descendantPid)).toBe(true);
+      await supervised.wrapperExited;
+      for (let attempt = 0; attempt < 30 && descendantPid !== undefined && isAlive(descendantPid); attempt += 1) await Bun.sleep(100);
+      expect(descendantPid === undefined ? false : isAlive(descendantPid)).toBe(false);
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (descendantPid !== undefined && isAlive(descendantPid)) {
+        try { process.kill(descendantPid, "SIGKILL"); } catch { /* The descendant may have exited. */ }
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fails closed when detached descendant enumeration is truncated", { timeout: 90_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-descendant-cap-"));
+    const ps = join(root, "ps");
+    const targetPidFile = join(root, "target.pid");
+    const previousPath = process.env.PATH;
+    const previousTargetPidFile = process.env.AGENT_TOOLKIT_TEST_DESCENDANT_ROOT_PID_FILE;
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    try {
+      await writeFile(ps, `#!/bin/sh
+if [ "$1" = "-eo" ] && [ "$2" = "pid=,ppid=,pgid=" ]; then
+  /bin/ps "$@"
+  root_pid=""
+  attempt=1
+  while [ "$attempt" -le 50 ] && [ -z "$root_pid" ]; do
+    root_pid=$(cat "$AGENT_TOOLKIT_TEST_DESCENDANT_ROOT_PID_FILE" 2>/dev/null || true)
+    [ -n "$root_pid" ] || { sleep 0.01; attempt=$((attempt + 1)); }
+  done
+  root_pgid=$(/bin/ps -o pgid= -p "$root_pid" | awk 'NR == 1 { gsub(/[[:space:]]/, ""); print; exit }')
+  case "$root_pid:$root_pgid" in
+    ''|*[!0-9:]*|*:0) exit 1 ;;
+  esac
+  i=1
+  while [ "$i" -le 1025 ]; do
+    printf '%s %s %s\\n' "$((900000 + i))" "$root_pid" "$root_pgid"
+    i=$((i + 1))
+  done
+  exit 0
+fi
+exec /bin/ps "$@"
+`);
+      await chmod(ps, 0o755);
+      process.env.PATH = `${root}:${previousPath ?? ""}`;
+      process.env.AGENT_TOOLKIT_TEST_DESCENDANT_ROOT_PID_FILE = targetPidFile;
+      await expect(spawnSupervised([
+        "sh",
+        "-c",
+        "printf '%s\\n' \"$$\" > \"$1\"; while :; do sleep 1; done",
+        "agent-toolkit-cap-fixture-target",
+        targetPidFile,
+      ])).rejects.toThrow("supervisor_ledger_authentication_failed");
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      if (previousTargetPidFile === undefined) delete process.env.AGENT_TOOLKIT_TEST_DESCENDANT_ROOT_PID_FILE;
+      else process.env.AGENT_TOOLKIT_TEST_DESCENDANT_ROOT_PID_FILE = previousTargetPidFile;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fails closed when detached descendant enumeration cannot scan processes", { timeout: 90_000 }, async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-descendant-scan-failure-"));
+    const ps = join(root, "ps");
+    const trigger = join(root, "trigger");
+    const previousPath = process.env.PATH;
+    const previousFailurePath = process.env.AGENT_TOOLKIT_TEST_PS_FAIL;
+    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+    try {
+      await writeFile(ps, `#!/bin/sh
+if [ -e "$AGENT_TOOLKIT_TEST_PS_FAIL" ]; then exit 1; fi
+exec /bin/ps "$@"
+`);
+      await chmod(ps, 0o755);
+      process.env.PATH = `${root}:${previousPath ?? ""}`;
+      process.env.AGENT_TOOLKIT_TEST_PS_FAIL = trigger;
+      supervised = await spawnSupervised(["sh", "-c", "while [ ! -e \"$1\" ]; do sleep 0.01; done; sleep 30", "agent-toolkit-supervised-target", trigger]);
+      await writeFile(trigger, "fail scan\n");
+      supervised.child.kill("SIGTERM");
+      expect(await supervised.waitForCleanupAcknowledged()).toBe(false);
+      await supervised.wrapperExited;
+    } finally {
+      if (supervised !== undefined) {
+        try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }
+        await supervised.wrapperExited.catch(() => undefined);
+        await supervised.cleanup();
+      }
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      if (previousFailurePath === undefined) delete process.env.AGENT_TOOLKIT_TEST_PS_FAIL;
+      else process.env.AGENT_TOOLKIT_TEST_PS_FAIL = previousFailurePath;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});

@@ -1,0 +1,744 @@
+#!/usr/bin/env bun
+
+import { constants } from "node:fs";
+import { createHmac, randomBytes, randomUUID } from "node:crypto";
+import { lstat, link, mkdir, mkdtemp, open, opendir, realpath, rename, rmdir, unlink, type FileHandle } from "node:fs/promises";
+import { homedir } from "node:os";
+import { deflateSync } from "node:zlib";
+import { basename, dirname, join, resolve } from "node:path";
+
+export type FramebufferFormat = "ssd1306" | "mono1" | "gray8" | "rgb565" | "rgb888";
+export type PngMode = "L" | "RGB";
+
+export const MAX_FRAMEBUFFER_PIXELS = 16_777_216;
+export const MAX_FRAMEBUFFER_INPUT_BYTES = 128 * 1024 * 1024;
+export const MAX_FRAMEBUFFER_ROWS = 1_048_576;
+const TEMP_DIRECTORY_PREFIX = ".fb-to-png-tmp-";
+const TEMP_OWNER_MARKER_VERSION = "agent-toolkit-fb-to-png-v2";
+const TEMP_OWNER_RECORD_PATTERN = /^([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.([0-9a-f]{64})$/i;
+const TEMP_OWNER_PID_PATTERN = /^[1-9][0-9]*$/;
+const OWNER_KEY_FILE_ENV = "FB_TO_PNG_OWNER_KEY_FILE";
+const OWNER_KEY_BYTES = 32;
+const MAX_TEMP_DIRECTORY_SCAN_ENTRIES = 128;
+const TEMP_DIRECTORY_STALE_MS = 15 * 60 * 1000;
+const TEMP_DELETE_PREFIX = ".fb-to-png-delete-";
+const TEMP_DELETE_NAME = /^\.fb-to-png-delete-(\.fb-to-png-tmp-[A-Za-z0-9_-]+)--([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
+let ownerKeyPromise: Promise<Uint8Array> | undefined;
+
+function noFollowFlag(): number {
+  if (typeof constants.O_NOFOLLOW !== "number") throw new Error("nofollow_unsupported_platform");
+  return constants.O_NOFOLLOW;
+}
+
+function ownerKeyPath(): string {
+  const configured = process.env[OWNER_KEY_FILE_ENV];
+  return resolve(expandUser(configured ?? join("~", ".cache", "agent-toolkit", "fb-to-png-owner.key")));
+}
+
+async function readOwnerKeyFile(path: string): Promise<Uint8Array> {
+  const metadata = await lstat(path);
+  if (!metadata.isFile() || metadata.isSymbolicLink() || (metadata.mode & 0o077) !== 0) throw new Error("framebuffer owner key must be a private regular file");
+  if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) throw new Error("framebuffer owner key is not owned by the current user");
+  const handle = await open(path, constants.O_RDONLY | noFollowFlag() | (constants.O_NONBLOCK ?? 0));
+  try {
+    const openedMetadata = await handle.stat();
+    if (!openedMetadata.isFile() || openedMetadata.size !== OWNER_KEY_BYTES) throw new Error("framebuffer owner key has an invalid length");
+    const key = new Uint8Array(OWNER_KEY_BYTES);
+    let offset = 0;
+    while (offset < key.byteLength) {
+      const result = await handle.read(key, offset, key.byteLength - offset, null);
+      if (result.bytesRead === 0) break;
+      offset += result.bytesRead;
+    }
+    const finalMetadata = await handle.stat();
+    if (offset !== key.byteLength || finalMetadata.size !== openedMetadata.size) throw new Error("framebuffer owner key changed while reading");
+    return key;
+  } finally {
+    await handle.close();
+  }
+}
+
+async function syncDirectory(path: string): Promise<void> {
+  const handle = await open(path, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readOwnerKey(): Promise<Uint8Array> {
+  if (ownerKeyPromise !== undefined) return ownerKeyPromise;
+  const promise = (async () => {
+    const path = ownerKeyPath();
+    const parent = dirname(path);
+    await mkdir(parent, { recursive: true, mode: 0o700 });
+    const parentMetadata = await lstat(parent);
+    if (!parentMetadata.isDirectory() || parentMetadata.isSymbolicLink() || (parentMetadata.mode & 0o077) !== 0) throw new Error("framebuffer owner key parent must be a private directory");
+    if (typeof process.getuid === "function" && parentMetadata.uid !== process.getuid()) throw new Error("framebuffer owner key parent is not owned by the current user");
+    try {
+      return await readOwnerKeyFile(path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    const key = randomBytes(OWNER_KEY_BYTES);
+    const temporary = join(parent, `.owner-key-tmp-${randomUUID()}`);
+    try {
+      const handle = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollowFlag(), 0o600);
+      try {
+        await handle.writeFile(key);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      try {
+        await link(temporary, path);
+        await syncDirectory(parent);
+        return key;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        return await readOwnerKeyFile(path);
+      }
+    } finally {
+      await unlink(temporary).catch(() => undefined);
+    }
+  })();
+  ownerKeyPromise = promise;
+  try {
+    return await promise;
+  } catch (error) {
+    ownerKeyPromise = undefined;
+    throw error;
+  }
+}
+
+export async function createFramebufferOwnerMarker(directoryName: string, outputName: string, ownerPid = process.pid): Promise<string> {
+  if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0) throw new Error("framebuffer owner pid is invalid");
+  const nonce = randomUUID();
+  const key = await readOwnerKey();
+  const proof = createHmac("sha256", key).update(`${directoryName}\n${outputName}\n${ownerPid}\n${nonce}`).digest("hex");
+  return `${TEMP_OWNER_MARKER_VERSION}\n${nonce}.${proof}\n${directoryName}\n${outputName}\n${ownerPid}\n`;
+}
+
+async function ownerPidFromMarker(value: string, directoryName: string, outputName: string): Promise<number | undefined> {
+  const lines = value.split("\n");
+  if (lines.length !== 6 || lines[0] !== TEMP_OWNER_MARKER_VERSION || lines[2] !== directoryName || lines[3] !== outputName) return undefined;
+  const ownerPid = lines[4] ?? "";
+  if (!TEMP_OWNER_PID_PATTERN.test(ownerPid)) return undefined;
+  const match = TEMP_OWNER_RECORD_PATTERN.exec(lines[1] ?? "");
+  if (match === null) return undefined;
+  try {
+    const key = await readOwnerKey();
+    const expected = createHmac("sha256", key).update(`${directoryName}\n${outputName}\n${ownerPid}\n${match[1]}`).digest("hex");
+    return expected === match[2]!.toLowerCase() ? Number(ownerPid) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function ownerProcessMayBeAlive(ownerPid: number): boolean {
+  try {
+    process.kill(ownerPid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+async function ownedTemporaryOutput(path: string, directoryName: string): Promise<{ outputName: string; ownerPid: number } | undefined> {
+  let metadata;
+  try {
+    metadata = await lstat(path);
+  } catch {
+    return undefined;
+  }
+  if (!metadata.isFile() || metadata.isSymbolicLink() || (metadata.mode & 0o777) !== 0o600) return undefined;
+  if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) return undefined;
+  const noFollow = constants.O_NOFOLLOW;
+  if (noFollow === undefined) return undefined;
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(path, constants.O_RDONLY | noFollow | (constants.O_NONBLOCK ?? 0));
+    const openedMetadata = await handle.stat();
+    if (!openedMetadata.isFile() || openedMetadata.dev !== metadata.dev || openedMetadata.ino !== metadata.ino || openedMetadata.size > 512) return undefined;
+    const buffer = new Uint8Array(513);
+    let offset = 0;
+    while (offset < buffer.byteLength) {
+      const result = await handle.read(buffer, offset, buffer.byteLength - offset, null);
+      if (result.bytesRead === 0) break;
+      offset += result.bytesRead;
+    }
+    const finalMetadata = await handle.stat();
+    if (offset !== openedMetadata.size || finalMetadata.dev !== openedMetadata.dev || finalMetadata.ino !== openedMetadata.ino || finalMetadata.size !== openedMetadata.size) return undefined;
+    const marker = new TextDecoder().decode(buffer.subarray(0, offset));
+    const lines = marker.split("\n");
+    const outputName = lines[3] ?? "";
+    const ownerPid = await ownerPidFromMarker(marker, directoryName, outputName);
+    if (ownerPid === undefined) return undefined;
+    if (lines[2] !== directoryName) return undefined;
+    if (outputName.length === 0 || basename(outputName) !== outputName || outputName === "." || outputName === "..") return undefined;
+    return { outputName, ownerPid };
+  } catch {
+    return undefined;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+function validateDimensions(width: number, height: number): void {
+  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0) {
+    throw new Error("width/height must be > 0");
+  }
+  if (height > MAX_FRAMEBUFFER_ROWS) {
+    throw new Error(`framebuffer height exceeds the ${MAX_FRAMEBUFFER_ROWS}-row limit`);
+  }
+  if (width > 0xffff_ffff || height > 0xffff_ffff || width * height > MAX_FRAMEBUFFER_PIXELS) {
+    throw new Error(`framebuffer dimensions exceed the ${MAX_FRAMEBUFFER_PIXELS}-pixel limit`);
+  }
+}
+
+export interface ConvertOptions {
+  width: number;
+  height: number;
+  strideBytes?: number;
+  endian: "le" | "be";
+  bitOrder: "msb" | "lsb";
+  ssd1306BitOrder: "lsb" | "msb";
+  invert: boolean;
+}
+
+const CRC_TABLE = new Uint32Array(256);
+for (let index = 0; index < CRC_TABLE.length; index += 1) {
+  let value = index;
+  for (let bit = 0; bit < 8; bit += 1) value = (value & 1) === 0 ? value >>> 1 : (value >>> 1) ^ 0xedb88320;
+  CRC_TABLE[index] = value >>> 0;
+}
+
+function crc32(data: Uint8Array): number {
+  let value = 0xffffffff;
+  for (const byte of data) value = CRC_TABLE[(value ^ byte) & 0xff]! ^ (value >>> 8);
+  return (value ^ 0xffffffff) >>> 0;
+}
+
+function concatBytes(...parts: Uint8Array[]): Uint8Array {
+  const result = new Uint8Array(parts.reduce((total, part) => total + part.byteLength, 0));
+  let offset = 0;
+  for (const part of parts) {
+    result.set(part, offset);
+    offset += part.byteLength;
+  }
+  return result;
+}
+
+function pngChunk(kind: string, data: Uint8Array): Uint8Array {
+  const kindBytes = new TextEncoder().encode(kind);
+  const body = concatBytes(kindBytes, data);
+  const result = new Uint8Array(12 + data.byteLength);
+  const view = new DataView(result.buffer);
+  view.setUint32(0, data.byteLength, false);
+  result.set(body, 4);
+  view.setUint32(8 + data.byteLength, crc32(body), false);
+  return result;
+}
+
+export function encodePng(width: number, height: number, mode: PngMode, rows: Uint8Array[]): Uint8Array {
+  validateDimensions(width, height);
+  const channels = mode === "L" ? 1 : 3;
+  if (rows.length !== height) throw new Error(`expected ${height} rows, got ${rows.length}`);
+  for (const [index, row] of rows.entries()) {
+    if (row.byteLength !== width * channels) throw new Error(`row ${index} has ${row.byteLength} bytes, expected ${width * channels}`);
+  }
+
+  const raw = new Uint8Array(height * (1 + width * channels));
+  let offset = 0;
+  for (const row of rows) {
+    raw[offset] = 0;
+    offset += 1;
+    raw.set(row, offset);
+    offset += row.byteLength;
+  }
+  const ihdr = new Uint8Array(13);
+  const view = new DataView(ihdr.buffer);
+  view.setUint32(0, width, false);
+  view.setUint32(4, height, false);
+  ihdr[8] = 8;
+  ihdr[9] = mode === "L" ? 0 : 2;
+  return concatBytes(
+    Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk("IHDR", ihdr),
+    pngChunk("IDAT", new Uint8Array(deflateSync(raw, { level: 9 }))),
+    pngChunk("IEND", new Uint8Array()),
+  );
+}
+
+function strideFor(defaultStride: number, requested: number | undefined): number {
+  if (requested === undefined) return defaultStride;
+  if (!Number.isSafeInteger(requested) || requested < defaultStride) throw new Error(`stride_bytes too small: ${requested} (need >= ${defaultStride})`);
+  return requested;
+}
+
+function inputBounds(format: FramebufferFormat, options: ConvertOptions): { minimum: number; maximum: number } {
+  validateDimensions(options.width, options.height);
+  let rowBytes: number;
+  if (format === "ssd1306") {
+    const pages = Math.ceil(options.height / 8);
+    const bytes = options.width * pages;
+    if (!Number.isSafeInteger(bytes) || bytes > MAX_FRAMEBUFFER_INPUT_BYTES) throw new Error("framebuffer input exceeds the byte limit");
+    return { minimum: bytes, maximum: MAX_FRAMEBUFFER_INPUT_BYTES };
+  }
+  if (format === "mono1") rowBytes = Math.ceil(options.width / 8);
+  else if (format === "gray8") rowBytes = options.width;
+  else if (format === "rgb565") rowBytes = options.width * 2;
+  else rowBytes = options.width * 3;
+  const stride = strideFor(rowBytes, options.strideBytes);
+  const minimum = (options.height - 1) * stride + rowBytes;
+  if (!Number.isSafeInteger(minimum) || minimum > MAX_FRAMEBUFFER_INPUT_BYTES) {
+    throw new Error("framebuffer input exceeds the byte limit");
+  }
+  return { minimum, maximum: MAX_FRAMEBUFFER_INPUT_BYTES };
+}
+
+async function readFramebufferInput(path: string, bounds: { minimum: number; maximum: number }): Promise<Uint8Array> {
+  const initialMetadata = await lstat(path);
+  if (!initialMetadata.isFile() || initialMetadata.isSymbolicLink()) throw new Error("framebuffer input must be a regular file");
+  const handle = await open(path, constants.O_RDONLY | noFollowFlag() | (constants.O_NONBLOCK ?? 0));
+  try {
+    const metadata = await handle.stat();
+    if (!metadata.isFile()) throw new Error("framebuffer input must be a regular file");
+    const size = Number(metadata.size);
+    if (!Number.isSafeInteger(size) || size > bounds.maximum) throw new Error(`framebuffer input exceeds the ${bounds.maximum}-byte limit`);
+    const data = new Uint8Array(size);
+    let offset = 0;
+    while (offset < size) {
+      const result = await handle.read(data, offset, size - offset, offset);
+      if (result.bytesRead === 0) break;
+      offset += result.bytesRead;
+    }
+    const finalMetadata = await handle.stat();
+    if (offset !== size || finalMetadata.size !== metadata.size) throw new Error("framebuffer input changed while reading");
+    return data;
+  } finally {
+    await handle.close();
+  }
+}
+
+function requireBytes(data: Uint8Array, need: number): void {
+  if (data.byteLength < need) throw new Error(`input too short: ${data.byteLength} bytes (need >= ${need})`);
+}
+
+function rowsGray8(data: Uint8Array, options: ConvertOptions): Uint8Array[] {
+  const stride = strideFor(options.width, options.strideBytes);
+  requireBytes(data, (options.height - 1) * stride + options.width);
+  return Array.from({ length: options.height }, (_, y) => {
+    const row = data.slice(y * stride, y * stride + options.width);
+    if (options.invert) for (let index = 0; index < row.length; index += 1) row[index] ^= 0xff;
+    return row;
+  });
+}
+
+function rowsRgb888(data: Uint8Array, options: ConvertOptions): Uint8Array[] {
+  const rowBytes = options.width * 3;
+  const stride = strideFor(rowBytes, options.strideBytes);
+  requireBytes(data, (options.height - 1) * stride + rowBytes);
+  return Array.from({ length: options.height }, (_, y) => {
+    const row = data.slice(y * stride, y * stride + rowBytes);
+    if (options.invert) for (let index = 0; index < row.length; index += 1) row[index] ^= 0xff;
+    return row;
+  });
+}
+
+function rowsRgb565(data: Uint8Array, options: ConvertOptions): Uint8Array[] {
+  const rowBytes = options.width * 2;
+  const stride = strideFor(rowBytes, options.strideBytes);
+  requireBytes(data, (options.height - 1) * stride + rowBytes);
+  return Array.from({ length: options.height }, (_, y) => {
+    const row = data.slice(y * stride, y * stride + rowBytes);
+    const output = new Uint8Array(options.width * 3);
+    for (let x = 0; x < options.width; x += 1) {
+      const byteIndex = x * 2;
+      const value = options.endian === "le"
+        ? row[byteIndex]! | (row[byteIndex + 1]! << 8)
+        : (row[byteIndex]! << 8) | row[byteIndex + 1]!;
+      let red = Math.floor((((value >>> 11) & 0x1f) * 255 + 15) / 31);
+      let green = Math.floor((((value >>> 5) & 0x3f) * 255 + 31) / 63);
+      let blue = Math.floor(((value & 0x1f) * 255 + 15) / 31);
+      if (options.invert) {
+        red ^= 0xff;
+        green ^= 0xff;
+        blue ^= 0xff;
+      }
+      output[x * 3] = red;
+      output[x * 3 + 1] = green;
+      output[x * 3 + 2] = blue;
+    }
+    return output;
+  });
+}
+
+function rowsMono1(data: Uint8Array, options: ConvertOptions): Uint8Array[] {
+  const rowBytes = Math.ceil(options.width / 8);
+  const stride = strideFor(rowBytes, options.strideBytes);
+  requireBytes(data, (options.height - 1) * stride + rowBytes);
+  return Array.from({ length: options.height }, (_, y) => {
+    const input = data.slice(y * stride, y * stride + rowBytes);
+    const output = new Uint8Array(options.width);
+    for (let x = 0; x < options.width; x += 1) {
+      const byte = input[Math.floor(x / 8)]!;
+      const bit = options.bitOrder === "msb" ? (byte >>> (7 - (x % 8))) & 1 : (byte >>> (x % 8)) & 1;
+      let value = bit === 1 ? 255 : 0;
+      if (options.invert) value ^= 0xff;
+      output[x] = value;
+    }
+    return output;
+  });
+}
+
+function rowsSsd1306(data: Uint8Array, options: ConvertOptions): Uint8Array[] {
+  const pages = Math.ceil(options.height / 8);
+  requireBytes(data, options.width * pages);
+  const rows = Array.from({ length: options.height }, () => new Uint8Array(options.width));
+  for (let y = 0; y < options.height; y += 1) {
+    const page = Math.floor(y / 8);
+    const bitIndex = options.ssd1306BitOrder === "lsb" ? y % 8 : 7 - (y % 8);
+    const mask = 1 << bitIndex;
+    for (let x = 0; x < options.width; x += 1) {
+      let value = (data[x + page * options.width]! & mask) === 0 ? 0 : 255;
+      if (options.invert) value ^= 0xff;
+      rows[y]![x] = value;
+    }
+  }
+  return rows;
+}
+
+export function convertFramebuffer(data: Uint8Array, format: FramebufferFormat, options: ConvertOptions): { mode: PngMode; rows: Uint8Array[] } {
+  validateDimensions(options.width, options.height);
+  switch (format) {
+    case "gray8": return { mode: "L", rows: rowsGray8(data, options) };
+    case "rgb888": return { mode: "RGB", rows: rowsRgb888(data, options) };
+    case "rgb565": return { mode: "RGB", rows: rowsRgb565(data, options) };
+    case "mono1": return { mode: "L", rows: rowsMono1(data, options) };
+    case "ssd1306": return { mode: "L", rows: rowsSsd1306(data, options) };
+  }
+}
+
+export function expandUser(path: string): string {
+  const home = process.env.HOME ?? homedir();
+  return path === "~" ? home : path.startsWith("~/") ? `${home}/${path.slice(2)}` : path;
+}
+
+class CliError extends Error {
+  constructor(message: string, readonly exitCode = 2) {
+    super(message);
+  }
+}
+
+function optionValue(args: string[], index: number, option: string, inlineValue?: string): [string, number] {
+  if (inlineValue !== undefined) {
+    if (inlineValue.length === 0) throw new CliError(`${option} requires a value`);
+    return [inlineValue, index + 1];
+  }
+  const value = args[index + 1];
+  if (value === undefined || value.startsWith("--")) throw new CliError(`${option} requires a value`);
+  return [value, index + 2];
+}
+
+function integerOption(value: string, option: string): number {
+  if (!/^[+-]?\d+$/.test(value)) throw new CliError(`${option} must be an integer`);
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) throw new CliError(`${option} must be a safe integer`);
+  return parsed;
+}
+
+export interface CliOptions {
+  format: FramebufferFormat;
+  width: number;
+  height: number;
+  input: string;
+  output: string;
+  strideBytes?: number;
+  endian: "le" | "be";
+  bitOrder: "msb" | "lsb";
+  ssd1306BitOrder: "lsb" | "msb";
+  invert: boolean;
+}
+
+export function parseArgs(args: string[]): CliOptions | "help" {
+  let format: FramebufferFormat | undefined;
+  let width: number | undefined;
+  let height: number | undefined;
+  let input: string | undefined;
+  let output: string | undefined;
+  let strideBytes: number | undefined;
+  let endian: "le" | "be" = "le";
+  let bitOrder: "msb" | "lsb" = "msb";
+  let ssd1306BitOrder: "lsb" | "msb" = "lsb";
+  let invert = false;
+  for (let index = 0; index < args.length;) {
+    const arg = args[index];
+    if (arg === "-h" || arg === "--help") return "help";
+    const separator = arg.indexOf("=");
+    const option = separator > 0 ? arg.slice(0, separator) : arg;
+    const inlineValue = separator > 0 ? arg.slice(separator + 1) : undefined;
+    if (arg === "--invert") {
+      invert = true;
+      index += 1;
+      continue;
+    }
+    if (["--format", "--width", "--height", "--in", "--out", "--stride-bytes", "--endian", "--bit-order", "--ssd1306-bit-order"].includes(option)) {
+      const [value, next] = optionValue(args, index, option, inlineValue);
+      if (option === "--format") {
+        if (!["ssd1306", "mono1", "gray8", "rgb565", "rgb888"].includes(value)) throw new CliError(`invalid --format: ${value}`);
+        format = value as FramebufferFormat;
+      } else if (option === "--width") width = integerOption(value, option);
+      else if (option === "--height") height = integerOption(value, option);
+      else if (option === "--in") input = value;
+      else if (option === "--out") output = value;
+      else if (option === "--stride-bytes") strideBytes = integerOption(value, option);
+      else if (option === "--endian") {
+        if (value !== "le" && value !== "be") throw new CliError(`invalid --endian: ${value}`);
+        endian = value;
+      } else if (option === "--bit-order") {
+        if (value !== "msb" && value !== "lsb") throw new CliError(`invalid --bit-order: ${value}`);
+        bitOrder = value;
+      } else {
+        if (value !== "lsb" && value !== "msb") throw new CliError(`invalid --ssd1306-bit-order: ${value}`);
+        ssd1306BitOrder = value;
+      }
+      index = next;
+      continue;
+    }
+    throw new CliError(`Unknown arg: ${arg}`);
+  }
+  if (format === undefined || width === undefined || height === undefined || input === undefined || output === undefined) {
+    throw new CliError("--format, --width, --height, --in, and --out are required");
+  }
+  if (basename(output) === ".owner") throw new CliError("--out cannot use .owner as the output filename");
+  return { format, width, height, input, output, strideBytes, endian, bitOrder, ssd1306BitOrder, invert };
+}
+
+type DirectoryIdentity = { dev: number; ino: number };
+
+function sameDirectoryIdentity(left: DirectoryIdentity, right: DirectoryIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+async function inspectTemporaryDirectory(path: string, outputName: string, requireOutput: boolean): Promise<DirectoryIdentity | undefined> {
+  try {
+    const metadata = await lstat(path);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink() || (metadata.mode & 0o777) !== 0o700) return undefined;
+    const entries: string[] = [];
+    const directory = await opendir(path);
+    try {
+      for await (const entry of directory) {
+        if (entry.name !== ".owner" && entry.name !== outputName) return undefined;
+        if (entry.isSymbolicLink() || !entry.isFile()) return undefined;
+        entries.push(entry.name);
+      }
+    } finally {
+      await directory.close().catch(() => undefined);
+    }
+    if (!entries.includes(".owner") || (requireOutput && !entries.includes(outputName))) return undefined;
+    return { dev: metadata.dev, ino: metadata.ino };
+  } catch {
+    return undefined;
+  }
+}
+
+async function restoreTemporaryDirectory(original: string, tombstone: string, expected: DirectoryIdentity): Promise<void> {
+  try {
+    await lstat(original);
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
+  }
+  try {
+    const metadata = await lstat(tombstone);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink() || !sameDirectoryIdentity({ dev: metadata.dev, ino: metadata.ino }, expected)) return;
+    await rename(tombstone, original);
+  } catch {
+    // Preserve the tombstone when restoration cannot be proven safe.
+  }
+}
+
+async function removeTemporaryDirectoryContents(path: string, outputName: string, requireOutput: boolean, expected: DirectoryIdentity): Promise<boolean> {
+  const moved = await inspectTemporaryDirectory(path, outputName, requireOutput);
+  if (moved === undefined || !sameDirectoryIdentity(moved, expected)) return false;
+  const entries: Array<{ name: string; dev: number; ino: number }> = [];
+  const directory = await opendir(path);
+  try {
+    for await (const entry of directory) {
+      const child = await lstat(join(path, entry.name));
+      if (child.isDirectory()) return false;
+      entries.push({ name: entry.name, dev: child.dev, ino: child.ino });
+    }
+  } finally {
+    await directory.close().catch(() => undefined);
+  }
+  for (const entry of entries) {
+    const childPath = join(path, entry.name);
+    const child = await lstat(childPath);
+    if (child.isDirectory() || child.dev !== entry.dev || child.ino !== entry.ino) return false;
+    await unlink(childPath);
+  }
+  const beforeRemoval = await lstat(path);
+  if (!beforeRemoval.isDirectory() || beforeRemoval.isSymbolicLink() || !sameDirectoryIdentity({ dev: beforeRemoval.dev, ino: beforeRemoval.ino }, expected)) return false;
+  await rmdir(path);
+  return true;
+}
+
+async function removeTemporaryDirectory(path: string, outputName: string, requireOutput: boolean): Promise<boolean> {
+  const initial = await inspectTemporaryDirectory(path, outputName, requireOutput);
+  if (initial === undefined) return false;
+  const tombstone = join(dirname(path), `${TEMP_DELETE_PREFIX}${basename(path)}--${randomUUID()}`);
+  try {
+    await rename(path, tombstone);
+    if (!await removeTemporaryDirectoryContents(tombstone, outputName, requireOutput, initial)) {
+      await restoreTemporaryDirectory(path, tombstone, initial);
+      return false;
+    }
+    await syncDirectory(dirname(path)).catch(() => undefined);
+    return true;
+  } catch {
+    await restoreTemporaryDirectory(path, tombstone, initial);
+    return false;
+  }
+}
+
+async function cleanupStaleTemporaryDirectories(parent: string): Promise<void> {
+  let directory;
+  try {
+    directory = await opendir(parent);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  let scanned = 0;
+  try {
+    for await (const entry of directory) {
+      scanned += 1;
+      if (scanned > MAX_TEMP_DIRECTORY_SCAN_ENTRIES) throw new Error(`framebuffer temp directory scan exceeded ${MAX_TEMP_DIRECTORY_SCAN_ENTRIES} entries`);
+      const tombstoneMatch = TEMP_DELETE_NAME.exec(entry.name);
+      const isTombstone = tombstoneMatch !== null;
+      if ((!entry.name.startsWith(TEMP_DIRECTORY_PREFIX) && !isTombstone) || !entry.isDirectory() || entry.isSymbolicLink()) continue;
+      const temporaryDirectory = join(parent, entry.name);
+      try {
+        const metadata = await lstat(temporaryDirectory);
+        if (!metadata.isDirectory() || metadata.isSymbolicLink() || (metadata.mode & 0o777) !== 0o700) continue;
+        const originalName = isTombstone ? tombstoneMatch![1]! : entry.name;
+        if (!isTombstone && Date.now() - metadata.mtimeMs < TEMP_DIRECTORY_STALE_MS) continue;
+        if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) continue;
+        const ownedOutput = await ownedTemporaryOutput(join(temporaryDirectory, ".owner"), originalName);
+        if (ownedOutput === undefined || ownerProcessMayBeAlive(ownedOutput.ownerPid)) continue;
+        const identity = { dev: metadata.dev, ino: metadata.ino };
+        if (isTombstone) {
+          if (await removeTemporaryDirectoryContents(temporaryDirectory, ownedOutput.outputName, false, identity)) await syncDirectory(parent).catch(() => undefined);
+        } else {
+          await removeTemporaryDirectory(temporaryDirectory, ownedOutput.outputName, false);
+        }
+      } catch {
+        // Preserve an unexpected or concurrently changing directory.
+      }
+    }
+  } finally {
+    await directory.close().catch(() => undefined);
+  }
+}
+
+async function writePngAtomically(outputPath: string, data: Uint8Array): Promise<void> {
+  if (basename(outputPath) === ".owner") throw new Error("--out cannot use .owner as the output filename");
+  const parent = dirname(outputPath);
+  const canonicalParent = await realpath(parent);
+  const requestedParentMetadata = await lstat(parent);
+  const canonicalParentMetadata = await lstat(canonicalParent);
+  if (!requestedParentMetadata.isDirectory() || requestedParentMetadata.isSymbolicLink()
+    || !canonicalParentMetadata.isDirectory() || canonicalParentMetadata.isSymbolicLink()
+    || requestedParentMetadata.dev !== canonicalParentMetadata.dev
+    || requestedParentMetadata.ino !== canonicalParentMetadata.ino) {
+    throw new Error("framebuffer output parent must be a real directory");
+  }
+  const publicationPath = join(canonicalParent, basename(outputPath));
+  const parentIdentity = { dev: canonicalParentMetadata.dev, ino: canonicalParentMetadata.ino };
+  const assertParentStable = async (): Promise<void> => {
+    const current = await lstat(canonicalParent);
+    if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== parentIdentity.dev || current.ino !== parentIdentity.ino) {
+      throw new Error("framebuffer output parent changed during publication");
+    }
+  };
+  await cleanupStaleTemporaryDirectories(canonicalParent);
+  await assertParentStable();
+  const temporaryDirectory = await mkdtemp(join(canonicalParent, TEMP_DIRECTORY_PREFIX));
+  const temporaryPath = join(temporaryDirectory, basename(outputPath));
+  try {
+    const owner = await open(join(temporaryDirectory, ".owner"), "wx", 0o600);
+    try {
+      await owner.writeFile(await createFramebufferOwnerMarker(basename(temporaryDirectory), basename(outputPath)));
+      await owner.sync();
+    } finally {
+      await owner.close();
+    }
+    const handle = await open(temporaryPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollowFlag(), 0o600);
+    try {
+      await handle.writeFile(data);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await assertParentStable();
+    await rename(temporaryPath, publicationPath);
+    await assertParentStable();
+    try {
+      const directoryHandle = await open(canonicalParent, "r");
+      try {
+        await directoryHandle.sync();
+      } finally {
+        await directoryHandle.close();
+      }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EINVAL" && code !== "ENOTSUP" && code !== "EOPNOTSUPP" && code !== "EBADF" && code !== "EISDIR") throw error;
+    }
+  } finally {
+    await unlink(temporaryPath).catch(() => undefined);
+    await removeTemporaryDirectory(temporaryDirectory, basename(outputPath), false);
+  }
+}
+
+function redactDiagnosticMessage(message: string): string {
+  return message
+    .replace(/(^|[\s"'(=:])((?:\/|[A-Za-z]:[\\/])[^"'<>`\n,;)}\] ]*)/g, "$1<redacted-path>")
+    .replace(/(^|[\s"'(=:])(?:\.\.?[\\/])+[^"'<>`\n,;)}\]]+/g, "$1<redacted-path>");
+}
+
+export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> {
+  try {
+    const parsed = parseArgs(args);
+    if (parsed === "help") {
+      console.log("Convert raw embedded framebuffers to a preview PNG.\n\nUsage: fb_to_png.ts --format <format> --width <n> --height <n> --in <file> --out <file>");
+      return 0;
+    }
+    validateDimensions(parsed.width, parsed.height);
+    const options = {
+      width: parsed.width,
+      height: parsed.height,
+      strideBytes: parsed.strideBytes,
+      endian: parsed.endian,
+      bitOrder: parsed.bitOrder,
+      ssd1306BitOrder: parsed.ssd1306BitOrder,
+      invert: parsed.invert,
+    };
+    const data = await readFramebufferInput(resolve(expandUser(parsed.input)), inputBounds(parsed.format, options));
+    const converted = convertFramebuffer(data, parsed.format, options);
+    const outputPath = resolve(expandUser(parsed.output));
+    const parentStat = await lstat(dirname(outputPath));
+    if (!parentStat.isDirectory()) throw new CliError("--out parent must be a directory");
+    await writePngAtomically(outputPath, encodePng(parsed.width, parsed.height, converted.mode, converted.rows));
+    console.log("[OK] Wrote: " + outputPath);
+    return 0;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`error: ${redactDiagnosticMessage(message)}`);
+    return error instanceof CliError ? error.exitCode : 1;
+  }
+}
+
+if (import.meta.main) process.exitCode = await main();

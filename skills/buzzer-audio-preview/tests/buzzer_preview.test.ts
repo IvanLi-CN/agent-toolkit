@@ -1,0 +1,942 @@
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { createHmac, randomBytes } from "node:crypto";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  encodeMidi,
+  encodeWav,
+  MAX_RENDERED_AUDIO_BYTES,
+  MAX_PUBLISHED_WAV_BYTES,
+  MAX_SCORE_INPUT_BYTES,
+  MAX_SCORE_EVENTS,
+  discardInstalledLockDirectory,
+  main,
+  parseScore,
+  parseScoreFile,
+  parseArgs,
+  readPublishedPair,
+  type ScoreConfig,
+  type ScoreEvent,
+} from "../scripts/buzzer_preview.ts";
+
+const FIXTURE_TRANSACTION_NONCE = "00000000-0000-4000-8000-000000000000";
+const FIXTURE_LOCK_NONCE = "00000000-0000-4000-8000-000000000001";
+let ownerKeyRoot: string;
+let ownerKeyFile: string;
+
+beforeAll(async () => {
+  ownerKeyRoot = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-owner-key-"));
+  ownerKeyFile = join(ownerKeyRoot, "owner.key");
+  await writeFile(ownerKeyFile, randomBytes(32), { mode: 0o600 });
+  process.env.BUZZER_PREVIEW_OWNER_KEY_FILE = ownerKeyFile;
+});
+
+afterAll(async () => {
+  delete process.env.BUZZER_PREVIEW_OWNER_KEY_FILE;
+  await rm(ownerKeyRoot, { recursive: true, force: true });
+});
+
+async function fixtureOwnerRecord(nonce: string): Promise<string> {
+  const key = await readFile(ownerKeyFile);
+  return `${nonce}.${createHmac("sha256", key).update(nonce).digest("hex")}\n`;
+}
+
+async function captureStdout<T>(callback: () => Promise<T>): Promise<{ value: T; stdout: string[] }> {
+  const originalLog = console.log;
+  const stdout: string[] = [];
+  console.log = (...args: unknown[]) => stdout.push(args.map(String).join(" "));
+  try {
+    return { value: await callback(), stdout };
+  } finally {
+    console.log = originalLog;
+  }
+}
+
+async function captureStderr<T>(callback: () => Promise<T>): Promise<{ value: T; stderr: string[] }> {
+  const originalError = console.error;
+  const stderr: string[] = [];
+  console.error = (...args: unknown[]) => stderr.push(args.map(String).join(" "));
+  try {
+    return { value: await callback(), stderr };
+  } finally {
+    console.error = originalError;
+  }
+}
+
+function readU16BE(data: Uint8Array, offset: number): number {
+  return (data[offset]! << 8) | data[offset + 1]!;
+}
+
+function readU32LE(data: Uint8Array, offset: number): number {
+  return new DataView(data.buffer, data.byteOffset + offset, 4).getUint32(0, true);
+}
+
+function readVarLen(data: Uint8Array, offset: number): { value: number; next: number } {
+  let value = 0;
+  let next = offset;
+  while (next < data.length) {
+    const byte = data[next++]!;
+    value = value * 128 + (byte & 0x7f);
+    if ((byte & 0x80) === 0) return { value, next };
+  }
+  throw new Error("unterminated MIDI variable-length value");
+}
+
+interface MidiEvent {
+  delta: number;
+  absolute: number;
+  status: number;
+  data: number[];
+}
+
+function decodeMidi(data: Uint8Array): { division: number; events: MidiEvent[] } {
+  const decoder = new TextDecoder();
+  expect(decoder.decode(data.slice(0, 4))).toBe("MThd");
+  expect(new DataView(data.buffer, data.byteOffset + 4, 4).getUint32(0, false)).toBe(6);
+  expect(readU16BE(data, 8)).toBe(0);
+  expect(readU16BE(data, 10)).toBe(1);
+  const division = readU16BE(data, 12);
+  let offset = 14;
+  expect(decoder.decode(data.slice(offset, offset + 4))).toBe("MTrk");
+  const trackLength = new DataView(data.buffer, data.byteOffset + offset + 4, 4).getUint32(0, false);
+  offset += 8;
+  const end = offset + trackLength;
+  const events: MidiEvent[] = [];
+  let absolute = 0;
+  let runningStatus = 0;
+  while (offset < end) {
+    const delta = readVarLen(data, offset);
+    offset = delta.next;
+    let status = data[offset]!;
+    if (status < 0x80) status = runningStatus;
+    else offset += 1;
+    if (status === 0xff) {
+      const type = data[offset++]!;
+      const length = readVarLen(data, offset);
+      offset = length.next + length.value;
+      events.push({ delta: delta.value, absolute, status: 0xff00 | type, data: [] });
+      continue;
+    }
+    runningStatus = status;
+    const length = status === 0xc0 || status === 0xd0 ? 1 : 2;
+    const payload = [...data.slice(offset, offset + length)];
+    offset += length;
+    absolute += delta.value;
+    events.push({ delta: delta.value, absolute, status, data: payload });
+  }
+  expect(offset).toBe(end);
+  return { division, events };
+}
+
+function decodeWav(data: Uint8Array): { sampleRate: number; channels: number; bits: number; samples: number[] } {
+  const decoder = new TextDecoder();
+  expect(decoder.decode(data.slice(0, 4))).toBe("RIFF");
+  expect(decoder.decode(data.slice(8, 12))).toBe("WAVE");
+  expect(decoder.decode(data.slice(12, 16))).toBe("fmt ");
+  expect(new DataView(data.buffer, data.byteOffset + 20, 2).getUint16(0, true)).toBe(1);
+  const channels = new DataView(data.buffer, data.byteOffset + 22, 2).getUint16(0, true);
+  const sampleRate = readU32LE(data, 24);
+  const bits = new DataView(data.buffer, data.byteOffset + 34, 2).getUint16(0, true);
+  expect(decoder.decode(data.slice(36, 40))).toBe("data");
+  const dataLength = readU32LE(data, 40);
+  const samples: number[] = [];
+  const view = new DataView(data.buffer, data.byteOffset + 44, dataLength);
+  for (let offset = 0; offset < dataLength; offset += 2) samples.push(view.getInt16(offset, true));
+  return { sampleRate, channels, bits, samples };
+}
+
+describe("buzzer MIDI and WAV helper", () => {
+  const config: ScoreConfig = {
+    tempoBpm: 120,
+    ppqn: 480,
+    midi: { channel: 0, program: 80, velocity: 96 },
+    audio: { sampleRateHz: 8_000, waveform: "square", dutyCycle: 0.5, volume: 0.7, fadeMs: 0 },
+  };
+  const events: ScoreEvent[] = [
+    { kind: "note", durationS: 0.5, midiNote: 60, freqHz: 261.6255653005986, velocity: 96 },
+    { kind: "rest", durationS: 0.25 },
+    { kind: "note", durationS: 0.25, midiNote: 69, freqHz: 440, velocity: 96 },
+  ];
+
+  test("produces independently decodable MIDI events and timing", () => {
+    const midi = decodeMidi(encodeMidi(config, events));
+    expect(midi.division).toBe(480);
+    const noteEvents = midi.events.filter((event) => (event.status & 0xf0) === 0x90 || (event.status & 0xf0) === 0x80);
+    expect(noteEvents.map((event) => [event.status & 0xf0, event.absolute, event.data[0]])).toEqual([
+      [0x90, 0, 60],
+      [0x80, 480, 60],
+      [0x90, 720, 69],
+      [0x80, 960, 69],
+    ]);
+    expect(midi.events.at(-1)?.status).toBe(0xff2f);
+  });
+
+  test("produces valid PCM WAV samples with bounded tone and rest behavior", () => {
+    const wav = decodeWav(encodeWav(config, events));
+    expect(wav.sampleRate).toBe(8_000);
+    expect(wav.channels).toBe(1);
+    expect(wav.bits).toBe(16);
+    expect(wav.samples.length).toBe(8_000);
+    expect(Math.max(...wav.samples)).toBeLessThanOrEqual(Math.round(32_767 * 0.7 * 0.9));
+    expect(Math.min(...wav.samples)).toBeGreaterThanOrEqual(-Math.round(32_767 * 0.7 * 0.9));
+    expect(wav.samples.slice(4_000, 6_000).every((sample) => sample === 0)).toBe(true);
+    expect(new Set(wav.samples.slice(1_000, 2_000)).size).toBeGreaterThan(1);
+  });
+
+  test("supports score variants and rejects malformed input", () => {
+    const parsed = parseScore({
+      tempo_bpm: 100,
+      events: [{ note: "Bb3", beats: 0.5 }, { rest_ms: 100 }, { freq_hz: 440, ms: 20 }],
+    });
+    expect(parsed.events.map((event) => event.kind)).toEqual(["note", "rest", "note"]);
+    expect(parsed.events[0]?.kind === "note" ? parsed.events[0].midiNote : undefined).toBe(58);
+    expect(() => parseScore({ events: [] })).toThrow(/non-empty array/);
+    expect(() => parseScore({ events: [{ note: "H4", beats: 1 }] })).toThrow(/invalid note name/);
+    expect(() => parseScore({ events: [{ note: "C4" }] })).toThrow(/missing duration/);
+    expect(() => parseScore({ events: [{ note: "C4", beats: 1, ms: 10 }] })).toThrow(/ambiguous duration/);
+    expect(() => parseScore({ events: Array.from({ length: MAX_SCORE_EVENTS + 1 }, () => ({ note: "C4", ms: 1 })) })).toThrow(/at most/);
+    expect(() => encodeMidi(config, [{ kind: "rest", durationS: 1_000_000_000 }])).toThrow(/VLQ/);
+  });
+
+  test("rejects invalid UTF-8 score input", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-invalid-utf8-"));
+    try {
+      const input = join(root, "invalid.json");
+      await writeFile(input, Uint8Array.from([0x7b, 0x22, 0x65, 0x76, 0x65, 0x6e, 0x74, 0x73, 0x22, 0x3a, 0x5b, 0xc3, 0x28, 0x5d, 0x7d]));
+      await expect(parseScoreFile(input)).rejects.toThrow(/valid.*UTF-8|encoding/i);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves explicit null rejection and Python-compatible numeric conversions", () => {
+    const parsed = parseScore({ ppqn: 480.5, midi: null, audio: null, events: [{ note: "C4", beats: 1 }] });
+    expect(parsed.config.ppqn).toBe(480);
+    expect(parsed.config.midi.channel).toBe(0);
+    expect(parsed.config.audio.sampleRateHz).toBe(44_100);
+    expect(() => parseScore({ tempo_bpm: null, events: [{ note: "C4", beats: 1 }] })).toThrow(/tempo_bpm must be a number/);
+    expect(() => parseScore({ ppqn: "480.5", events: [{ note: "C4", beats: 1 }] })).toThrow(/ppqn must be an integer/);
+    expect(() => parseScore({ sample_rate_hz: "8000.5", events: [{ note: "C4", beats: 1 }] })).toThrow(/sample_rate_hz must be an integer/);
+    expect(() => parseScore({ midi: { channel: null }, events: [{ note: "C4", beats: 1 }] })).toThrow(/midi.channel must be a number/);
+    expect(() => parseScore({ audio: { volume: null }, events: [{ note: "C4", beats: 1 }] })).toThrow(/volume must be a number/);
+    expect(() => parseScore({ events: [{ note: "C4", beats: 1, velocity: null }] })).toThrow(/velocity must be a number/);
+  });
+
+  test("rejects WAV values that cannot fit fixed-width fields", () => {
+    expect(() => encodeWav(
+      { ...config, audio: { ...config.audio, sampleRateHz: 0x1_0000_0000 } },
+      [{ kind: "rest", durationS: 0 }],
+    )).toThrow(/sample rate/);
+    expect(() => encodeWav(
+      { ...config, audio: { ...config.audio, sampleRateHz: 0x8000_0000 } },
+      [{ kind: "rest", durationS: 0 }],
+    )).toThrow(/byte rate/);
+    expect(() => encodeWav(
+      config,
+      [{ kind: "rest", durationS: (MAX_RENDERED_AUDIO_BYTES + 2) / config.audio.sampleRateHz / 2 }],
+    )).toThrow(/rendering limit/);
+  });
+
+  test("writes the direct Bun CLI outputs", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      const captured = await captureStdout(() => main(["--in", input, "--out-dir", output]));
+      expect(captured.value).toBe(0);
+      expect(captured.stdout).toContain(`[OK] Wrote: ${join(output, "fixture.mid")}`);
+      expect(captured.stdout).toContain(`[OK] Wrote: ${join(output, "fixture.wav")}`);
+      expect((await readFile(join(output, "fixture.mid"))).slice(0, 4).toString()).toBe("MThd");
+      expect((await readFile(join(output, "fixture.wav"))).slice(0, 4).toString()).toBe("RIFF");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps argparse exit codes distinct from runtime failures", async () => {
+    expect(parseArgs(["--help"])).toBe("help");
+    expect(await main(["--help"])).toBe(0);
+    expect(await main(["--unknown"])).toBe(2);
+    expect(await main(["--in"])).toBe(2);
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-cli-"));
+    try {
+      expect(await main(["--in", join(root, "missing.json"), "--out-dir", join(root, "out")])).toBe(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("redacts absolute paths from CLI diagnostics", async () => {
+    const captured = await captureStderr(() => main(["--in", ".", "--out-dir", "."]));
+    expect(captured.value).toBe(1);
+    expect(captured.stderr.join(" ")).toContain("<redacted-path>");
+    expect(captured.stderr.join(" ")).not.toContain(process.cwd());
+  });
+
+  test("rejects output stems that escape the selected directory", () => {
+    expect(() => parseArgs(["--in", "fixture.json", "--stem", "../outside"])).toThrow(/without path separators/);
+    expect(() => parseArgs(["--in", "fixture.json", "--stem", "/tmp/outside"])).toThrow(/without path separators/);
+    expect(() => parseArgs(["--in", "fixture.json", "--stem", "fixture\nINJECTED"])).toThrow(/control characters/);
+    expect(parseArgs(["--in=fixture.json", "--stem=fixture"])).toEqual({ input: "fixture.json", outDir: ".", stem: "fixture" });
+  });
+
+  test("replaces preexisting output symlinks without touching their targets", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-symlink-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      const outside = join(root, "outside target\n");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      await mkdir(output, { recursive: true });
+      await writeFile(outside, "sentinel");
+      await symlink(outside, join(output, "fixture.mid"));
+      expect(await main(["--in", input, "--out-dir", output])).toBe(0);
+      expect(await Bun.file(outside).text()).toBe("sentinel");
+      expect((await readFile(join(output, "fixture.mid"))).slice(0, 4).toString()).toBe("MThd");
+      expect((await readdir(output)).some((entry) => entry.startsWith(".buzzer-preview-txn-") || entry.startsWith(".buzzer-preview-recovery-"))).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("restores a preexisting output symlink after a later publication failure", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-symlink-recovery-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      const outside = join(root, "outside target\n");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      await mkdir(output, { recursive: true });
+      await writeFile(outside, "sentinel");
+      await symlink(outside, join(output, "fixture.mid"));
+      await mkdir(join(output, "fixture.wav"));
+      expect(await main(["--in", input, "--out-dir", output])).toBe(1);
+      expect(await readlink(join(output, "fixture.mid"))).toBe(outside);
+      expect(await readFile(outside, "utf8")).toBe("sentinel");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not reclaim a partially initialized lock", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-partial-lock-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      const lock = join(output, ".buzzer-preview-fixture.lock");
+      await mkdir(lock, { recursive: true });
+      await writeFile(join(lock, "pid"), "2147483647\n");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      expect(await main(["--in", input, "--out-dir", output])).toBe(1);
+      expect(await readdir(output)).toContain(".buzzer-preview-fixture.lock");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("discards its installed lock when the parent becomes unreadable", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-installed-lock-cleanup-"));
+    const output = join(root, "out");
+    const lock = join(output, ".buzzer-preview-fixture.lock");
+    const owner = (await fixtureOwnerRecord(FIXTURE_LOCK_NONCE)).trim();
+    try {
+      await mkdir(lock, { recursive: true });
+      await writeFile(join(lock, "pid"), `${process.pid}\n`);
+      await writeFile(join(lock, "owner"), `${owner}\n`);
+      await writeFile(join(lock, "heartbeat"), `${Date.now()}\n`);
+      await writeFile(join(lock, "ready"), "");
+      await chmod(output, 0o300);
+      await discardInstalledLockDirectory(lock, owner);
+      expect(await lstat(lock).catch(() => undefined)).toBeUndefined();
+    } finally {
+      await chmod(output, 0o700).catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects output directories without deleting their contents", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-directory-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      const midiDirectory = join(output, "fixture.mid");
+      const sentinel = join(midiDirectory, "sentinel.txt");
+      await mkdir(midiDirectory, { recursive: true });
+      await writeFile(sentinel, "keep");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      expect(await main(["--in", input, "--out-dir", output])).toBe(1);
+      expect(await readFile(sentinel, "utf8")).toBe("keep");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not delete user directories that resemble internal state", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-internal-collision-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      const transaction = join(output, ".buzzer-preview-txn-fixture-user");
+      const sentinel = join(transaction, "sentinel.txt");
+      await mkdir(transaction, { recursive: true });
+      await writeFile(sentinel, "keep");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      expect(await main(["--in", input, "--out-dir", output])).toBe(0);
+      expect(await readFile(sentinel, "utf8")).toBe("keep");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not reclaim a lock directory with unknown contents", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-lock-collision-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      const lock = join(output, ".buzzer-preview-fixture.lock");
+      const sentinel = join(lock, "sentinel.txt");
+      await mkdir(lock, { recursive: true });
+      await writeFile(sentinel, "keep");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      expect(await main(["--in", input, "--out-dir", output])).toBe(1);
+      expect(await readFile(sentinel, "utf8")).toBe("keep");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves an aged lock directory without a ready marker", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-empty-lock-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      const lock = join(output, ".buzzer-preview-fixture.lock");
+      await mkdir(lock, { recursive: true });
+      const old = new Date(Date.now() - 10 * 60 * 1000);
+      await utimes(lock, old, old);
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      expect(await main(["--in", input, "--out-dir", output])).toBe(1);
+      expect(await readdir(output)).toContain(".buzzer-preview-fixture.lock");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("reclaims a dead partially initialized lock for readers", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-dead-partial-lock-"));
+    try {
+      const output = join(root, "out");
+      const lock = join(output, ".buzzer-preview-fixture.lock");
+      await mkdir(output, { recursive: true });
+      await writeFile(join(output, "fixture.mid"), "midi");
+      await writeFile(join(output, "fixture.wav"), "wav");
+      await mkdir(lock);
+      await writeFile(join(lock, "pid"), "2147483647\n");
+      await writeFile(join(lock, "owner"), await fixtureOwnerRecord(FIXTURE_LOCK_NONCE));
+      const pair = await readPublishedPair(output, "fixture");
+      expect(pair.midi.toString()).toBe("midi");
+      expect(pair.wav.toString()).toBe("wav");
+      expect(await readdir(output)).not.toContain(".buzzer-preview-fixture.lock");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves an empty transaction-shaped directory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-empty-transaction-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      const collision = join(output, ".buzzer-preview-txn-fixture-user-owned");
+      await mkdir(collision, { recursive: true });
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      expect(await main(["--in", input, "--out-dir", output])).toBe(0);
+      expect(await readdir(output)).toContain(".buzzer-preview-txn-fixture-user-owned");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("ignores unrelated output entries when bounding recovery scans", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-unrelated-entries-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      await mkdir(output, { recursive: true });
+      for (let index = 0; index < 257; index += 1) await writeFile(join(output, `unrelated-${index}`), "");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      expect(await main(["--in", input, "--out-dir", output])).toBe(0);
+      expect(await readdir(output)).toContain("fixture.mid");
+      expect(await readdir(output)).toContain("fixture.wav");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("cleans internal deletion tombstones before recovery scanning", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-delete-tombstone-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      const tombstone = join(output, ".buzzer-preview-delete-00000000-0000-4000-8000-000000000002");
+      await mkdir(tombstone, { recursive: true });
+      await writeFile(join(tombstone, "owner"), await fixtureOwnerRecord("00000000-0000-4000-8000-000000000002"));
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      expect(await main(["--in", input, "--out-dir", output])).toBe(0);
+      expect(await readdir(output)).not.toContain(".buzzer-preview-delete-00000000-0000-4000-8000-000000000002");
+      expect(await readdir(output)).toContain("fixture.mid");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves a colliding deletion tombstone without a valid owner proof", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-delete-collision-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      const tombstone = join(output, ".buzzer-preview-delete-00000000-0000-4000-8000-000000000003");
+      await mkdir(tombstone, { recursive: true });
+      await writeFile(join(tombstone, "owner"), "not-a-valid-owner\n");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      expect(await main(["--in", input, "--out-dir", output])).toBe(0);
+      expect(await readdir(output)).toContain(".buzzer-preview-delete-00000000-0000-4000-8000-000000000003");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fails closed when the recovery scan reaches its entry bound", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-scan-bound-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      await mkdir(output, { recursive: true });
+      for (let index = 0; index < 4_097; index += 1) await writeFile(join(output, `unrelated-${index}`), "");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      expect(await main(["--in", input, "--out-dir", output])).toBe(1);
+      expect(await readdir(output)).not.toContain("fixture.mid");
+      expect(await readdir(output)).not.toContain("fixture.wav");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("reclaims a dead-owner lock immediately for readers", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-dead-lock-"));
+    try {
+      const output = join(root, "out");
+      const lock = join(output, ".buzzer-preview-fixture.lock");
+      await mkdir(output, { recursive: true });
+      await writeFile(join(output, "fixture.mid"), "midi");
+      await writeFile(join(output, "fixture.wav"), "wav");
+      await mkdir(lock);
+      await writeFile(join(lock, "pid"), "2147483647\n");
+      await writeFile(join(lock, "owner"), await fixtureOwnerRecord(FIXTURE_LOCK_NONCE));
+      await writeFile(join(lock, "ready"), "");
+      const pair = await readPublishedPair(output, "fixture");
+      expect(pair.midi.toString()).toBe("midi");
+      expect(pair.wav.toString()).toBe("wav");
+      expect(await readdir(output)).not.toContain(".buzzer-preview-fixture.lock");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not reclaim an aged lock when process identity is unavailable", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-identityless-lock-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      const lock = join(output, ".buzzer-preview-fixture.lock");
+      const heartbeat = join(lock, "heartbeat");
+      await mkdir(output, { recursive: true });
+      await writeFile(join(output, "fixture.mid"), "midi");
+      await writeFile(join(output, "fixture.wav"), "wav");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      await mkdir(lock);
+      await writeFile(join(lock, "pid"), `${process.pid}\n`);
+      await writeFile(join(lock, "owner"), "identityless-owner\n");
+      await writeFile(heartbeat, `${Date.now() - 10 * 60 * 1000}\n`);
+      await writeFile(join(lock, "ready"), "");
+      const old = new Date(Date.now() - 10 * 60 * 1000);
+      await utimes(heartbeat, old, old);
+      expect(await main(["--in", input, "--out-dir", output, "--stem", "fixture"])).toBe(1);
+      expect(await readdir(output)).toContain(".buzzer-preview-fixture.lock");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves a user-owned lock with an invalid owner nonce", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-user-lock-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      const lock = join(output, ".buzzer-preview-fixture.lock");
+      await mkdir(output, { recursive: true });
+      await mkdir(lock);
+      await writeFile(join(lock, "pid"), "2147483647\n");
+      await writeFile(join(lock, "owner"), "user-owned\n");
+      await writeFile(join(lock, "ready"), "");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      expect(await main(["--in", input, "--out-dir", output, "--stem", "fixture"])).toBe(1);
+      expect(await readdir(output)).toContain(".buzzer-preview-fixture.lock");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("recovers an interrupted publication before reading a pair", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-recovery-"));
+    try {
+      const output = join(root, "out");
+      const transaction = join(output, ".buzzer-preview-txn-fixture-recovery");
+      await mkdir(transaction, { recursive: true });
+      await writeFile(join(transaction, ".owner"), await fixtureOwnerRecord(FIXTURE_TRANSACTION_NONCE));
+      await writeFile(join(output, "fixture.mid"), "new-midi");
+      await writeFile(join(output, "fixture.wav"), "old-wav");
+      await writeFile(join(transaction, "midi.backup"), "old-midi");
+      await writeFile(join(transaction, ".state"), "midi-published\n");
+      const pair = await readPublishedPair(output, "fixture");
+      const decoder = new TextDecoder();
+      expect(decoder.decode(pair.midi)).toBe("old-midi");
+      expect(decoder.decode(pair.wav)).toBe("old-wav");
+      expect(await readdir(output)).not.toContain(".buzzer-preview-txn-fixture-recovery");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("discards a pre-backup MIDI journal when no move completed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-midi-backing-up-"));
+    try {
+      const output = join(root, "out");
+      const transaction = join(output, ".buzzer-preview-txn-fixture-midi-backing-up");
+      await mkdir(transaction, { recursive: true });
+      await writeFile(join(transaction, ".owner"), await fixtureOwnerRecord(FIXTURE_TRANSACTION_NONCE));
+      await writeFile(join(transaction, ".state"), "midi-backing-up\n");
+      await writeFile(join(output, "fixture.mid"), "old-midi");
+      await writeFile(join(output, "fixture.wav"), "old-wav");
+      const pair = await readPublishedPair(output, "fixture");
+      expect(pair.midi.toString()).toBe("old-midi");
+      expect(pair.wav.toString()).toBe("old-wav");
+      expect(await readdir(output)).not.toContain(".buzzer-preview-txn-fixture-midi-backing-up");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("discards a pre-backup WAV journal when no move completed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-wav-backing-up-"));
+    try {
+      const output = join(root, "out");
+      const transaction = join(output, ".buzzer-preview-txn-fixture-wav-backing-up");
+      await mkdir(transaction, { recursive: true });
+      await writeFile(join(transaction, ".owner"), await fixtureOwnerRecord(FIXTURE_TRANSACTION_NONCE));
+      await writeFile(join(transaction, ".state"), "wav-backing-up\n");
+      await writeFile(join(output, "fixture.mid"), "old-midi");
+      await writeFile(join(output, "fixture.wav"), "old-wav");
+      const pair = await readPublishedPair(output, "fixture");
+      expect(pair.midi.toString()).toBe("old-midi");
+      expect(pair.wav.toString()).toBe("old-wav");
+      expect(await readdir(output)).not.toContain(".buzzer-preview-txn-fixture-wav-backing-up");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("cleans a durable owner transaction that crashed before publication state", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-prejournal-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      const transaction = join(output, ".buzzer-preview-txn-fixture-prejournal");
+      await mkdir(transaction, { recursive: true });
+      await writeFile(join(transaction, ".owner"), await fixtureOwnerRecord(FIXTURE_TRANSACTION_NONCE));
+      await writeFile(join(transaction, "midi.new"), "partial-midi");
+      await writeFile(join(transaction, "wav.new"), "partial-wav");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      expect(await main(["--in", input, "--out-dir", output])).toBe(0);
+      expect(await readdir(output)).not.toContain(".buzzer-preview-txn-fixture-prejournal");
+      expect((await readFile(join(output, "fixture.mid"))).length).toBeGreaterThan(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not restore a transaction without an owner nonce", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-unowned-recovery-"));
+    try {
+      const output = join(root, "out");
+      const transaction = join(output, ".buzzer-preview-txn-fixture-unowned");
+      await mkdir(transaction, { recursive: true });
+      await writeFile(join(output, "fixture.mid"), "current-midi");
+      await writeFile(join(output, "fixture.wav"), "current-wav");
+      await writeFile(join(transaction, "midi.backup"), "attacker-midi");
+      await writeFile(join(transaction, ".state"), "midi-published\n");
+      const pair = await readPublishedPair(output, "fixture");
+      expect(pair.midi.toString()).toBe("current-midi");
+      expect(pair.wav.toString()).toBe("current-wav");
+      expect(await readdir(output)).toContain(".buzzer-preview-txn-fixture-unowned");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not restore a transaction with a forged owner proof", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-forged-owner-"));
+    try {
+      const output = join(root, "out");
+      const transaction = join(output, ".buzzer-preview-txn-fixture-forged");
+      await mkdir(transaction, { recursive: true });
+      await writeFile(join(output, "fixture.mid"), "current-midi");
+      await writeFile(join(output, "fixture.wav"), "current-wav");
+      await writeFile(join(transaction, ".owner"), `${FIXTURE_TRANSACTION_NONCE}.${"0".repeat(64)}\n`);
+      await writeFile(join(transaction, "midi.backup"), "attacker-midi");
+      await writeFile(join(transaction, ".state"), "midi-published\n");
+      const pair = await readPublishedPair(output, "fixture");
+      expect(pair.midi.toString()).toBe("current-midi");
+      expect(pair.wav.toString()).toBe("current-wav");
+      expect(await readdir(output)).toContain(".buzzer-preview-txn-fixture-forged");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fails closed for a valid owner transaction with unknown entries", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-unknown-owner-entry-"));
+    try {
+      const output = join(root, "out");
+      const transaction = join(output, ".buzzer-preview-txn-fixture-unknown-entry");
+      await mkdir(transaction, { recursive: true });
+      await writeFile(join(output, "fixture.mid"), "current-midi");
+      await writeFile(join(output, "fixture.wav"), "current-wav");
+      await writeFile(join(transaction, ".owner"), await fixtureOwnerRecord(FIXTURE_TRANSACTION_NONCE));
+      await writeFile(join(transaction, ".state"), "midi-published\n");
+      await writeFile(join(transaction, "unexpected"), "must-not-be-ignored");
+      await expect(readPublishedPair(output, "fixture")).rejects.toThrow(/unknown entries/);
+      expect(await readFile(join(output, "fixture.mid"), "utf8")).toBe("current-midi");
+      expect(await readdir(output)).toContain(".buzzer-preview-txn-fixture-unknown-entry");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects an owner key in an accessible directory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-owner-key-permissions-"));
+    try {
+      const keyDirectory = join(root, "key");
+      await mkdir(keyDirectory);
+      await chmod(keyDirectory, 0o755);
+      const keyFile = join(keyDirectory, "owner.key");
+      await writeFile(keyFile, randomBytes(32), { mode: 0o644 });
+      const input = join(root, "fixture.json");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      const child = Bun.spawn([process.execPath, join(import.meta.dir, "..", "scripts", "buzzer_preview.ts"), "--in", input, "--out-dir", join(root, "out")], {
+        env: { ...process.env, BUZZER_PREVIEW_OWNER_KEY_FILE: keyFile },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [status, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+      expect(status).toBe(1);
+      expect(stderr).toContain("accessible by group");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("initializes the owner key atomically across processes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-owner-key-race-"));
+    try {
+      const keyFile = join(root, "owner.key");
+      const input = join(root, "fixture.json");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      const script = join(import.meta.dir, "..", "scripts", "buzzer_preview.ts");
+      const env = { ...process.env, BUZZER_PREVIEW_OWNER_KEY_FILE: keyFile } as Record<string, string>;
+      const results = await Promise.all(Array.from({ length: 4 }, (_, index) => {
+        const output = join(root, `out-${index}`);
+        return new Promise<number>((resolve) => {
+          const child = Bun.spawn([process.execPath, script, "--in", input, "--out-dir", output], { env, stdout: "pipe", stderr: "pipe" });
+          void child.exited.then(resolve);
+        });
+      }));
+      expect(results).toEqual([0, 0, 0, 0]);
+      expect((await readFile(keyFile)).byteLength).toBe(32);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not follow a transaction backup symlink during recovery", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-backup-symlink-"));
+    try {
+      const output = join(root, "out");
+      const transaction = join(output, ".buzzer-preview-txn-fixture-symlink");
+      const outside = join(root, "outside-secret");
+      await mkdir(transaction, { recursive: true });
+      await writeFile(join(transaction, ".owner"), await fixtureOwnerRecord(FIXTURE_TRANSACTION_NONCE));
+      await writeFile(join(output, "fixture.mid"), "new-midi");
+      await writeFile(join(output, "fixture.wav"), "old-wav");
+      await writeFile(outside, "PRIVATE_BYTES");
+      await symlink(outside, join(transaction, "midi.backup"));
+      await writeFile(join(transaction, ".state"), "midi-published\n");
+      await expect(readPublishedPair(output, "fixture")).rejects.toThrow(/regular file/);
+      expect(await readFile(outside, "utf8")).toBe("PRIVATE_BYTES");
+      expect(await readFile(join(output, "fixture.mid"), "utf8")).toBe("new-midi");
+      expect(await readdir(output)).toContain(".buzzer-preview-txn-fixture-symlink");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves rollback artifacts when the transaction state is malformed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-invalid-state-"));
+    try {
+      const output = join(root, "out");
+      const transaction = join(output, ".buzzer-preview-txn-fixture-invalid-state");
+      await mkdir(transaction, { recursive: true });
+      await writeFile(join(transaction, ".owner"), await fixtureOwnerRecord(FIXTURE_TRANSACTION_NONCE));
+      await writeFile(join(output, "fixture.mid"), "new-midi");
+      await writeFile(join(output, "fixture.wav"), "old-wav");
+      await writeFile(join(transaction, "midi.backup"), "old-midi");
+      await writeFile(join(transaction, ".state"), "not-a-publish-state\n");
+      await expect(readPublishedPair(output, "fixture")).rejects.toThrow(/transaction state is invalid/);
+      expect(await readFile(join(output, "fixture.mid"), "utf8")).toBe("new-midi");
+      expect(await readFile(join(output, "fixture.wav"), "utf8")).toBe("old-wav");
+      expect(await readFile(join(transaction, "midi.backup"), "utf8")).toBe("old-midi");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves rollback artifacts when the transaction state is a symlink", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-state-symlink-"));
+    try {
+      const output = join(root, "out");
+      const transaction = join(output, ".buzzer-preview-txn-fixture-state-symlink");
+      const outside = join(root, "outside-state");
+      await mkdir(transaction, { recursive: true });
+      await writeFile(join(transaction, ".owner"), await fixtureOwnerRecord(FIXTURE_TRANSACTION_NONCE));
+      await writeFile(join(output, "fixture.mid"), "new-midi");
+      await writeFile(join(output, "fixture.wav"), "old-wav");
+      await writeFile(join(transaction, "midi.backup"), "old-midi");
+      await writeFile(outside, "midi-published\n");
+      await symlink(outside, join(transaction, ".state"));
+      await expect(readPublishedPair(output, "fixture")).rejects.toThrow(/transaction state is unreadable/);
+      expect(await readFile(join(output, "fixture.mid"), "utf8")).toBe("new-midi");
+      expect(await readFile(join(output, "fixture.wav"), "utf8")).toBe("old-wav");
+      expect(await readFile(join(transaction, "midi.backup"), "utf8")).toBe("old-midi");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves an output after a restore crash marker is left behind", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-restore-marker-"));
+    try {
+      const output = join(root, "out");
+      const transaction = join(output, ".buzzer-preview-txn-fixture-marker");
+      await mkdir(transaction, { recursive: true });
+      await writeFile(join(transaction, ".owner"), await fixtureOwnerRecord(FIXTURE_TRANSACTION_NONCE));
+      await writeFile(join(output, "fixture.mid"), "restored-midi");
+      await writeFile(join(output, "fixture.wav"), "old-wav");
+      await writeFile(join(transaction, "midi.restoring"), "");
+      await writeFile(join(transaction, ".state"), "midi-published\n");
+      const pair = await readPublishedPair(output, "fixture");
+      expect(pair.midi.toString()).toBe("restored-midi");
+      expect(pair.wav.toString()).toBe("old-wav");
+      expect(await readdir(output)).not.toContain(".buzzer-preview-txn-fixture-marker");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("removes a newly published WAV after an interrupted pair commit", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-wav-recovery-"));
+    try {
+      const output = join(root, "out");
+      const transaction = join(output, ".buzzer-preview-txn-fixture-wav-recovery");
+      await mkdir(transaction, { recursive: true });
+      await writeFile(join(transaction, ".owner"), await fixtureOwnerRecord(FIXTURE_TRANSACTION_NONCE));
+      await writeFile(join(output, "fixture.mid"), "new-midi");
+      await writeFile(join(output, "fixture.wav"), "new-wav");
+      await writeFile(join(transaction, "midi.backup"), "old-midi");
+      await writeFile(join(transaction, ".state"), "wav-publishing\n");
+      await expect(readPublishedPair(output, "fixture")).rejects.toThrow();
+      expect(await readFile(join(output, "fixture.mid"), "utf8")).toBe("old-midi");
+      await expect(readFile(join(output, "fixture.wav"), "utf8")).rejects.toThrow(/ENOENT/);
+      expect(await readdir(output)).not.toContain(".buzzer-preview-txn-fixture-wav-recovery");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects path traversal through the published pair API", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-pair-boundary-"));
+    try {
+      await expect(readPublishedPair(root, "../outside")).rejects.toThrow(/without path separators/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("bounds score input and published output reads", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-read-bounds-"));
+    try {
+      const input = join(root, "oversized.json");
+      await writeFile(input, new Uint8Array(MAX_SCORE_INPUT_BYTES + 1));
+      expect(await main(["--in", input, "--out-dir", join(root, "generated")])).toBe(1);
+
+      const output = join(root, "out");
+      await mkdir(output, { recursive: true });
+      await writeFile(join(output, "fixture.mid"), "MThd");
+      await writeFile(join(output, "fixture.wav"), new Uint8Array(MAX_PUBLISHED_WAV_BYTES + 1));
+      await expect(readPublishedPair(output, "fixture")).rejects.toThrow(/exceeds/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects FIFO score inputs without blocking", async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-fifo-"));
+    try {
+      const input = join(root, "score.json");
+      const mkfifo = Bun.spawn(["mkfifo", input], { stdout: "pipe", stderr: "pipe" });
+      expect(await mkfifo.exited).toBe(0);
+      const child = Bun.spawn([process.execPath, join(import.meta.dir, "..", "scripts", "buzzer_preview.ts"), "--in", input, "--out-dir", join(root, "out")], {
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const status = await Promise.race([child.exited, Bun.sleep(1_000).then(() => -1)]);
+      if (status === -1) child.kill("SIGKILL");
+      expect(status).toBe(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("serializes concurrent pair publication", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-buzzer-concurrent-"));
+    try {
+      const input = join(root, "fixture.json");
+      const output = join(root, "out");
+      await writeFile(input, JSON.stringify({ tempo_bpm: 120, events: [{ note: "C4", ms: 20 }] }));
+      expect(await Promise.all([
+        main(["--in", input, "--out-dir", output]),
+        main(["--in", input, "--out-dir", output]),
+      ])).toEqual([0, 0]);
+      expect((await readFile(join(output, "fixture.mid"))).slice(0, 4).toString()).toBe("MThd");
+      expect((await readFile(join(output, "fixture.wav"))).slice(0, 4).toString()).toBe("RIFF");
+      const pair = await readPublishedPair(output, "fixture");
+      expect(pair.midi.slice(0, 4).toString()).toBe("MThd");
+      expect(pair.wav.slice(0, 4).toString()).toBe("RIFF");
+      expect((await readdir(output)).filter((entry) => entry.includes("buzzer-preview")).length).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});

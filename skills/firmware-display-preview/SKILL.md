@@ -14,7 +14,7 @@ description: "Render firmware-driven displays to preview PNGs."
 
 ## Hard requirements（确保一致）
 
-- 不要在 Python 里“重写一套渲染器”（尤其是字体光栅化、字距/换行、位图解码、透明/裁剪规则）；必须复用固件实现与资产。
+- 不要在 framebuffer 转换脚本里“重写一套渲染器”（尤其是字体光栅化、字距/换行、位图解码、透明/裁剪规则）；必须复用固件实现与资产。
 - 使用与设备一致的：`width/height`、像素格式、内存布局（stride / page layout / endian）、旋转/镜像、坐标系原点与方向。
 
 ## Workflow（推荐）
@@ -47,12 +47,12 @@ cp "$SKILL_DIR/assets/host_c/preview_main.c" tools/display_preview/main.c
 
 ### 3) 转成 `preview.png`
 
-使用 `scripts/fb_to_png.py` 把 raw framebuffer 转 PNG：
+使用 `scripts/fb_to_png.ts` 把 raw framebuffer 转 PNG。转换器需要主机已安装的 Bun；C host harness 仍需要可用的 C 编译器：
 
 #### SSD1306（1bpp，page layout）
 
 ```bash
-python3 "$SKILL_DIR/scripts/fb_to_png.py" \
+bun "$SKILL_DIR/scripts/fb_to_png.ts" \
   --format ssd1306 \
   --width 128 \
   --height 64 \
@@ -63,7 +63,7 @@ python3 "$SKILL_DIR/scripts/fb_to_png.py" \
 #### RGB565（16bpp，行优先）
 
 ```bash
-python3 "$SKILL_DIR/scripts/fb_to_png.py" \
+bun "$SKILL_DIR/scripts/fb_to_png.ts" \
   --format rgb565 \
   --endian le \
   --width 240 \
@@ -83,3 +83,5 @@ python3 "$SKILL_DIR/scripts/fb_to_png.py" \
 
 - `preview.png` is a working artifact. Consumers that display local images should use their own immutable-artifact or attachment mechanism before presenting it to an owner.
 - Keep the project output path separate from any consumer-specific presentation or chat attachment path.
+- The converter accepts at most 16,777,216 pixels and 1,048,576 rows per frame. Larger dimensions fail before reading the input or allocating output rows, preventing an extreme aspect ratio from turning the pixel limit into an unbounded row-object allocation.
+- Row-major and page-layout captures may contain bounded trailing bytes from a legacy dump; the converter ignores bytes after the required frame while enforcing the 128 MiB input limit.

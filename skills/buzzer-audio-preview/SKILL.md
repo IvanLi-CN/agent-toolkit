@@ -11,6 +11,8 @@ description: "Preview buzzer tones as MIDI and WAV."
 - `*.mid`：便于 DAW / MIDI 工具里查看与继续编辑
 - `*.wav`：便于直接试听预览（默认方波，贴近常见 PWM 驱动的无源蜂鸣器）
 
+Prerequisite: use the Bun installed on the host; no Python or Node installation is required.
+
 ## Quick start
 
 1) 复制示例输入：
@@ -23,7 +25,7 @@ cp "$SKILL_DIR/assets/score.example.json" ./score.json
 2) 生成 `MIDI + WAV`：
 
 ```bash
-python3 "$SKILL_DIR/scripts/buzzer_preview.py" \
+bun "$SKILL_DIR/scripts/buzzer_preview.ts" \
   --in ./score.json \
   --out-dir ./out
 ```
@@ -54,3 +56,5 @@ python3 "$SKILL_DIR/scripts/buzzer_preview.py" \
 
 - WAV 是“电子合成预览”，不模拟蜂鸣器腔体/谐振/音量曲线；用来确认旋律、节奏、时长是否符合预期。
 - 若你要“跟固件的毫秒级时序一致”，优先用 `ms/rest_ms` 描述事件（而不是 `beats`）。
+- 输入最多包含 4,096 个事件，WAV 数据最多生成 64 MiB；超过上限会在写文件前明确失败。
+- 两个输出在命令完成后可直接读取；若另一个进程可能同时发布同名输出，请从脚本导入 `readPublishedPair(outDir, stem)`，它会使用同一发布锁读取一组一致的 MIDI/WAV 字节。

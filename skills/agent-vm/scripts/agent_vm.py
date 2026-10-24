@@ -534,7 +534,7 @@ def _remote_error_outcome_uncertain(error: Mapping[str, Any], *, action: str | N
         return True
     if isinstance(detail, Mapping) and any(detail.get(key) in {
         "native-generation", "native-init", "native-config", "native-stop", "native-start",
-        "guest-readiness", "guest-post-check", "access-exposure", "port-add",
+        "guest-readiness", "guest-post-check", "access-exposure", "port-add", "cache-delete",
     } for key in ("phase", "operation_phase")):
         return True
     if action == "port-add" and code in {"generation_mismatch", "task_not_active"}:

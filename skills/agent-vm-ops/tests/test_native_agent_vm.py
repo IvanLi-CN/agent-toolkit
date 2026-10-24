@@ -1811,6 +1811,7 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         timeout_command=None,
         command_timeout=None,
         killpg_error=False,
+        escaped_child_pid_path=None,
         source_output="/dev/sda2\n",
         partition_marker_exists=True,
         udevadm_available=False,
@@ -1914,10 +1915,22 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
                 "sys.stdout.flush(); sys.stderr.flush(); sys.exit(" + str(returncode) + ")"
             )
             if timeout:
-                helper = helper.replace("import sys;", "import sys, time;").replace(
-                    "; sys.exit(" + str(returncode),
-                    "; time.sleep(10); sys.exit(" + str(returncode),
-                )
+                if escaped_child_pid_path is None:
+                    helper = helper.replace("import sys;", "import sys, time;").replace(
+                        "; sys.exit(" + str(returncode),
+                        "; time.sleep(10); sys.exit(" + str(returncode),
+                    )
+                else:
+                    helper = (
+                        "import os, subprocess, sys, time; "
+                        "child=subprocess.Popen([sys.executable, '-c', "
+                        "'import os,time; os.setsid(); time.sleep(10)'], close_fds=False); "
+                        "open(" + repr(escaped_child_pid_path) + ", 'w').write(str(child.pid)); "
+                        "sys.stdout.buffer.write(" + repr(output) + "); "
+                        "sys.stderr.buffer.write(" + repr(error) + "); "
+                        "sys.stdout.flush(); sys.stderr.flush(); time.sleep(10); "
+                        "sys.exit(" + str(returncode) + ")"
+                    )
             process = real_popen(
                 [os.sys.executable, "-c", helper],
                 stdout=kwargs.get("stdout"),
@@ -2182,6 +2195,39 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         self.assertTrue(error["process_group_cleanup_error"].startswith("PermissionError"))
         self.assertEqual(error["process_group_killed"], Path("/proc").is_dir())
 
+    @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
+    def test_guest_root_growth_script_kills_setsid_descendant_outside_process_group(self):
+        command = ["findmnt", "-n", "-o", "SOURCE", "-T", "/"]
+        with tempfile.TemporaryDirectory() as directory:
+            pid_path = Path(directory) / "child.pid"
+            exit_code, stdout, stderr, _ = self.execute_script(
+                timeout_command=command,
+                command_timeout=0.05,
+                escaped_child_pid_path=str(pid_path),
+            )
+
+            self.assertEqual(exit_code, 1)
+            error = json.loads(stderr)["error"]
+            self.assertEqual(error["cause"], "command_timeout")
+            for _ in range(20):
+                if pid_path.exists():
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("guest growth setsid child did not publish its pid")
+            child_pid = int(pid_path.read_text())
+            for _ in range(40):
+                try:
+                    state = (Path("/proc") / str(child_pid) / "stat").read_text()
+                    close_paren = state.rfind(")")
+                    if state[close_paren + 2 :].split()[0] == "Z":
+                        break
+                except FileNotFoundError:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("guest growth setsid descendant remained alive after timeout")
+
     def test_guest_root_growth_script_bounds_command_output(self):
         exit_code, stdout, stderr, _ = self.execute_script(source_output="/dev/sda2\n" + "x" * 20000 + "\n")
 
@@ -2242,6 +2288,19 @@ class CommandRunnerTests(unittest.TestCase):
         )
         self.assertEqual(len(result.stdout), 128)
         self.assertTrue(result.stdout_truncated)
+
+    def test_bounded_runner_nonzero_preserves_output_truncation(self):
+        code = (
+            "import sys; sys.stdout.write('o' * 1000000); "
+            "sys.stderr.write('e' * 1000000); sys.exit(3)"
+        )
+        with self.assertRaises(CONTROL.ControlError) as failure:
+            CONTROL.CommandRunner().run_bounded(
+                [os.sys.executable, "-c", code], timeout=5, stdout_limit=128, stderr_limit=128
+            )
+        self.assertEqual(failure.exception.code, "command_failed")
+        self.assertTrue(failure.exception.detail["stdout_truncated"])
+        self.assertTrue(failure.exception.detail["stderr_truncated"])
 
     def test_bounded_runner_limits_stderr_and_kills_on_timeout(self):
         flood = "import sys; sys.stderr.write('e' * 1000000)"
@@ -2325,6 +2384,40 @@ class CommandRunnerTests(unittest.TestCase):
                 time.sleep(0.01)
             else:
                 self.fail("diagnostic descendant remained alive after timeout")
+
+    @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
+    def test_bounded_runner_kills_setsid_descendant_outside_process_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pid_path = Path(directory) / "child.pid"
+            code = (
+                "import os,subprocess,sys,time; "
+                "child=subprocess.Popen([sys.executable, '-c', "
+                "'import os,time; os.setsid(); time.sleep(10)'], close_fds=False); "
+                "open(sys.argv[1], 'w').write(str(child.pid)); "
+                "time.sleep(10)"
+            )
+            with self.assertRaises(CONTROL.ControlError):
+                CONTROL.CommandRunner().run_bounded(
+                    [os.sys.executable, "-c", code, str(pid_path)], timeout=0.2
+                )
+            for _ in range(20):
+                if pid_path.exists():
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("setsid diagnostic child did not publish its pid")
+            child_pid = int(pid_path.read_text())
+            for _ in range(40):
+                try:
+                    state = (Path("/proc") / str(child_pid) / "stat").read_text()
+                    close_paren = state.rfind(")")
+                    if state[close_paren + 2 :].split()[0] == "Z":
+                        break
+                except FileNotFoundError:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("setsid diagnostic descendant remained alive after timeout")
 
     @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
     def test_bounded_runner_fallback_kills_descendants_when_group_signal_fails(self):
@@ -2456,6 +2549,22 @@ class IncusWaitTests(unittest.TestCase):
 
 
 class ReclaimTests(Fixture):
+    def test_failed_native_reclaim_delete_keeps_acquire_operation_pending(self):
+        cached = self.acquire("cached")
+        self.call("release", "cached")
+        self.runner.free = 10 * GIB
+        self.runner.failure = lambda args: args[3:4] == ["delete"]
+        request = self.request("acquire", "new", operation="reclaim-delete-uncertain", public_key=KEY)
+
+        with self.assertRaises(CONTROL.ControlError) as failure:
+            self.control.dispatch(request)
+
+        self.assertEqual(failure.exception.code, "reclaim_failed")
+        self.assertEqual(failure.exception.detail["detail"]["operation_phase"], "cache-delete")
+        self.assertFalse(failure.exception.detail["outcome_verified"])
+        self.assertEqual(self.store.operation(request["operation_id"])["outcome"], "pending")
+        self.assertEqual(self.store.get_task(task_id=cached["task_id"])["state"], "deleting")
+
     def test_manual_gc_previews_and_deletes_all_eligible_caches(self):
         old = self.acquire("old")
         self.call("release", "old")

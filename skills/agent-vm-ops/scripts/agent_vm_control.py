@@ -308,6 +308,61 @@ def run(command, phase, *, check=True):
                     complete = False
         return members, complete, None
 
+    def process_tree_members(root_pid):
+        parents = {}
+        complete = True
+        try:
+            entries = os.scandir("/proc")
+        except OSError:
+            return [], False
+        with entries:
+            for entry in entries:
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    with open(os.path.join(entry.path, "stat"), encoding="utf-8") as handle:
+                        raw_stat = handle.read()
+                    close_paren = raw_stat.rfind(")")
+                    fields = raw_stat[close_paren + 2:].split()
+                    if close_paren < 0 or len(fields) < 4:
+                        raise ValueError("invalid process stat")
+                    if fields[0] != "Z":
+                        parents[int(entry.name)] = int(fields[1])
+                except FileNotFoundError:
+                    continue
+                except (OSError, ValueError):
+                    complete = False
+        if root_pid not in parents:
+            return [], complete
+        members = {root_pid}
+        frontier = [root_pid]
+        while frontier:
+            parent = frontier.pop()
+            for pid, ppid in parents.items():
+                if ppid == parent and pid not in members:
+                    members.add(pid)
+                    frontier.append(pid)
+        return sorted(members), complete
+
+    def live_processes(pids):
+        live = []
+        complete = True
+        for pid in pids:
+            try:
+                with open(os.path.join("/proc", str(pid), "stat"), encoding="utf-8") as handle:
+                    raw_stat = handle.read()
+                close_paren = raw_stat.rfind(")")
+                fields = raw_stat[close_paren + 2:].split()
+                if close_paren < 0 or not fields:
+                    raise ValueError("invalid process stat")
+                if fields[0] != "Z":
+                    live.append(pid)
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError):
+                complete = False
+        return live, complete
+
     def kill_process_group_members(pgid):
         cleanup_error = None
         for _ in range(3):
@@ -327,6 +382,27 @@ def run(command, phase, *, check=True):
         if complete and not members:
             return True, cleanup_error
         return False, cleanup_error or inspection_error or "process_group_members_remain"
+
+    def kill_process_tree_members(pids):
+        cleanup_error = None
+        for _ in range(3):
+            members, complete = live_processes(pids)
+            if not complete:
+                return False, "process_tree_inspection_failed"
+            if not members:
+                return True, cleanup_error
+            for pid in members:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    continue
+                except OSError as error:
+                    cleanup_error = type(error).__name__
+            time.sleep(0.01)
+        members, complete = live_processes(pids)
+        if complete and not members:
+            return True, cleanup_error
+        return False, cleanup_error or "process_tree_members_remain"
 
     process = None
     selector = selectors.DefaultSelector()
@@ -354,6 +430,10 @@ def run(command, phase, *, check=True):
     except subprocess.TimeoutExpired as error:
         process_group_killed = False
         process_group_cleanup_error = None
+        tree_members = []
+        tree_complete = True
+        if os.path.isdir("/proc"):
+            tree_members, tree_complete = process_tree_members(process.pid)
         try:
             os.killpg(process.pid, signal.SIGKILL)
             process_group_killed, fallback_error = kill_process_group_members(process.pid)
@@ -371,6 +451,20 @@ def run(command, phase, *, check=True):
                     process.kill()
                 except ProcessLookupError:
                     pass
+        tree_killed = True
+        tree_error = None
+        if not tree_complete:
+            tree_killed = False
+            tree_error = "process_tree_inspection_failed"
+        elif tree_members:
+            tree_killed, tree_error = kill_process_tree_members(tree_members)
+        if not tree_killed:
+            process_group_killed = False
+        if tree_error:
+            process_group_cleanup_error = (
+                process_group_cleanup_error + ":" + tree_error
+                if process_group_cleanup_error else tree_error
+            )
         try:
             process.wait(timeout=2)
         except (subprocess.TimeoutExpired, ChildProcessError):
@@ -841,7 +935,8 @@ class CTResources:
 
     def cpu(self) -> int:
         capacity = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 0)
-        fields = self._read("/sys/fs/cgroup/cpu.max").split()
+        _cgroup_path, cpu_max_path = self._cgroup_metric_path("cpu.max")
+        fields = self._read(cpu_max_path).split()
         if len(fields) != 2:
             raise ControlError("resource_unverified", "invalid CT CPU quota")
         period = self._unsigned(fields[1], "cpu.max period", positive=True)
@@ -883,10 +978,13 @@ class CTResources:
                                {"metric": "/proc/self/cgroup"})
         return path
 
-    def cpu_pressure(self) -> dict[str, Any]:
+    def _cgroup_metric_path(self, metric: str) -> tuple[str, str]:
         self._verify_cgroup2_mount()
         cgroup_path = self.current_cgroup_path()
-        pressure_path = "/sys/fs/cgroup" + ("" if cgroup_path == "/" else cgroup_path) + "/cpu.pressure"
+        return cgroup_path, "/sys/fs/cgroup" + ("" if cgroup_path == "/" else cgroup_path) + "/" + metric
+
+    def cpu_pressure(self) -> dict[str, Any]:
+        cgroup_path, pressure_path = self._cgroup_metric_path("cpu.pressure")
         try:
             values = parse_cpu_psi(self._read(pressure_path))
         except ValueError as exc:
@@ -1189,6 +1287,60 @@ class CommandRunner:
                 complete = False
         return members, complete
 
+    @staticmethod
+    def _process_tree_members(root_pid: int) -> tuple[list[int], bool]:
+        parents: dict[int, int] = {}
+        try:
+            entries = list(Path("/proc").iterdir())
+        except OSError:
+            return [], False
+        complete = True
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                raw_stat = (entry / "stat").read_text()
+                close_paren = raw_stat.rfind(")")
+                fields = raw_stat[close_paren + 2 :].split()
+                if close_paren < 0 or len(fields) < 4:
+                    raise ValueError("invalid process stat")
+                if fields[0] != "Z":
+                    parents[int(entry.name)] = int(fields[1])
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError):
+                complete = False
+        if root_pid not in parents:
+            return [], complete
+        members = {root_pid}
+        frontier = [root_pid]
+        while frontier:
+            parent = frontier.pop()
+            for pid, ppid in parents.items():
+                if ppid == parent and pid not in members:
+                    members.add(pid)
+                    frontier.append(pid)
+        return sorted(members), complete
+
+    @staticmethod
+    def _live_processes(pids: Sequence[int]) -> tuple[list[int], bool]:
+        live: list[int] = []
+        complete = True
+        for pid in pids:
+            try:
+                raw_stat = (Path("/proc") / str(pid) / "stat").read_text()
+                close_paren = raw_stat.rfind(")")
+                fields = raw_stat[close_paren + 2 :].split()
+                if close_paren < 0 or not fields:
+                    raise ValueError("invalid process stat")
+                if fields[0] != "Z":
+                    live.append(pid)
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError):
+                complete = False
+        return live, complete
+
     @classmethod
     def _kill_process_group_members(cls, pgid: int) -> tuple[bool, str | None]:
         cleanup_error = None
@@ -1209,6 +1361,28 @@ class CommandRunner:
         if complete and not members:
             return True, cleanup_error
         return False, cleanup_error or "process_group_members_remain"
+
+    @classmethod
+    def _kill_process_tree_members(cls, pids: Sequence[int]) -> tuple[bool, str | None]:
+        cleanup_error = None
+        for _ in range(3):
+            members, complete = cls._live_processes(pids)
+            if not complete:
+                return False, "process_tree_inspection_failed"
+            if not members:
+                return True, cleanup_error
+            for pid in members:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    continue
+                except OSError as error:
+                    cleanup_error = type(error).__name__
+            time.sleep(0.01)
+        members, complete = cls._live_processes(pids)
+        if complete and not members:
+            return True, cleanup_error
+        return False, cleanup_error or "process_tree_members_remain"
 
     def run_bounded(
         self,
@@ -1288,6 +1462,10 @@ class CommandRunner:
             reaped = False
             process_group_killed = False
             process_group_cleanup_error = None
+            tree_members: list[int] = []
+            tree_complete = True
+            if Path("/proc").is_dir():
+                tree_members, tree_complete = self._process_tree_members(process.pid)
             try:
                 os.killpg(process.pid, signal.SIGKILL)
                 process_group_killed, fallback_error = self._kill_process_group_members(process.pid)
@@ -1305,6 +1483,20 @@ class CommandRunner:
                     process.kill()
                 except ProcessLookupError:
                     pass
+            tree_killed = True
+            tree_error = None
+            if not tree_complete:
+                tree_killed = False
+                tree_error = "process_tree_inspection_failed"
+            elif tree_members:
+                tree_killed, tree_error = self._kill_process_tree_members(tree_members)
+            if not tree_killed:
+                process_group_killed = False
+            if tree_error:
+                process_group_cleanup_error = (
+                    f"{process_group_cleanup_error}:{tree_error}"
+                    if process_group_cleanup_error else tree_error
+                )
             try:
                 process.wait(timeout=1)
                 reaped = True
@@ -1344,6 +1536,8 @@ class CommandRunner:
             detail = {
                 "returncode": returncode,
                 "stderr": result.stderr.decode("utf-8", "replace").strip()[-4000:],
+                "stdout_truncated": stdout_truncated,
+                "stderr_truncated": stderr_truncated,
             }
             raise ControlError(
                 "command_failed",
@@ -2607,7 +2801,7 @@ class Control:
         phases = {str(detail.get(key)) for key in ("phase", "operation_phase") if detail.get(key) is not None}
         native_phases = {
             "native-generation", "native-init", "native-config", "native-stop", "native-start",
-            "guest-readiness", "guest-post-check", "access-exposure", "port-add",
+            "guest-readiness", "guest-post-check", "access-exposure", "port-add", "cache-delete",
         }
         return bool(phases & native_phases)
 
@@ -3539,8 +3733,12 @@ class Control:
             if any(item.get("name") == task["instance_name"] for item in self.incus.list_instances()):
                 raise ControlError("cleanup_incomplete", "native deletion is not confirmed")
         except ControlError as exc:
-            self.store.update_task(task["task_id"], last_error=json.dumps(exc.as_dict()))
-            raise
+            detail = dict(exc.detail) if isinstance(exc.detail, Mapping) else {}
+            detail["operation_phase"] = "cache-delete"
+            detail["outcome_verified"] = False
+            annotated = ControlError(exc.code, exc.message, detail)
+            self.store.update_task(task["task_id"], last_error=json.dumps(annotated.as_dict()))
+            raise annotated from exc
         with self._global_lock():
             self.store.update_task(task["task_id"], state="absent", vm_ip=None, ssh_host_port=None,
                                    lease_expires_at=None, inactive_since=None, cleanup_after=None,
@@ -3568,7 +3766,10 @@ class Control:
                 reclaimed.append(task["task_id"])
             except ControlError as exc:
                 if exc.code == "object_busy" or exc.code == "cache_ineligible": continue
-                raise ControlError("reclaim_failed", "exact cache reclamation failed", exc.as_dict()) from exc
+                detail = dict(exc.as_dict())
+                detail["operation_phase"] = "cache-delete"
+                detail["outcome_verified"] = False
+                raise ControlError("reclaim_failed", "exact cache reclamation failed", detail) from exc
         facts = self._storage_headroom(request_cost)
         with self._global_lock():
             if not self._space_sufficient(facts, request_cost, "low", exclude_task_id):

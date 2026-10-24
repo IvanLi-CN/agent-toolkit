@@ -195,10 +195,37 @@ class CTObservationTests(unittest.TestCase):
         self.assertEqual(failure.exception.code, "resource_unverified")
 
     def test_cpu_capacity_is_own_quota_and_visible_affinity(self):
+        def read(path):
+            if path == "/proc/self/mountinfo":
+                return self.cgroup_mount
+            if path == "/proc/self/cgroup":
+                return self.cgroup_path
+            return "750000 100000"
+
         with mock.patch.object(CONTROL.os, "sched_getaffinity", return_value=set(range(16)), create=True), \
-             mock.patch.object(CONTROL.CTResources, "_read", return_value="750000 100000") as read:
+             mock.patch.object(CONTROL.CTResources, "_read", side_effect=read) as read:
             self.assertEqual(CONTROL.CTResources().cpu(), 7)
-            read.assert_called_once_with("/sys/fs/cgroup/cpu.max")
+            self.assertEqual(
+                read.call_args_list,
+                [mock.call("/proc/self/mountinfo"), mock.call("/proc/self/cgroup"),
+                 mock.call("/sys/fs/cgroup/cpu.max")],
+            )
+
+    def test_cpu_capacity_reads_current_nested_cgroup_quota(self):
+        nested = "0::/system.slice/agent-vm\n"
+
+        def read(path):
+            if path == "/proc/self/mountinfo":
+                return self.cgroup_mount
+            if path == "/proc/self/cgroup":
+                return nested
+            if path == "/sys/fs/cgroup/system.slice/agent-vm/cpu.max":
+                return "500000 100000"
+            raise AssertionError(path)
+
+        with mock.patch.object(CONTROL.os, "sched_getaffinity", return_value=set(range(16)), create=True), \
+             mock.patch.object(CONTROL.CTResources, "_read", side_effect=read):
+            self.assertEqual(CONTROL.CTResources().cpu(), 5)
 
     def test_cpu_pressure_requires_verified_some_and_full_psi(self):
         raw = "some avg10=12.34 avg60=5.00 avg300=1.00 total=100\nfull avg10=7.89 avg60=3.00 avg300=0.50 total=50\n"

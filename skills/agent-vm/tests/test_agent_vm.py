@@ -414,6 +414,10 @@ class SessionContractTests(unittest.TestCase):
             action="port-add",
         ))
         self.assertTrue(CLI._remote_error_outcome_uncertain(
+            {"code": "command_failed", "detail": {"operation_phase": "cache-delete"}},
+            action="admin-gc",
+        ))
+        self.assertTrue(CLI._remote_error_outcome_uncertain(
             {"code": "image_unavailable", "detail": {"outcome_verified": False}}, action="acquire"
         ))
         self.assertFalse(CLI._remote_error_outcome_uncertain(

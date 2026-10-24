@@ -784,8 +784,10 @@ def parse_cpu_psi(raw: str) -> dict[str, dict[str, float]]:
     result: dict[str, dict[str, float]] = {}
     for line in raw.splitlines():
         fields = line.split()
-        if not fields or fields[0] not in {"some", "full"}:
+        if not fields:
             continue
+        if fields[0] not in {"some", "full"}:
+            raise ValueError("unknown CPU PSI line")
         if fields[0] in result:
             raise ValueError("duplicate CPU PSI line")
         values: dict[str, float] = {}
@@ -3996,6 +3998,7 @@ class Control:
         task: Mapping[str, Any],
         resources: Mapping[str, int],
         *,
+        startup_cpu: int | None = None,
         admission_epoch: str | None = None,
     ) -> dict[str, Any]:
         """Wait for an unrelated native cleanup to leave the admission fence.
@@ -4010,7 +4013,12 @@ class Control:
         attempts = 0
         while True:
             try:
-                return self._reserve_resources(task, resources, admission_epoch=admission_epoch)
+                return self._reserve_resources(
+                    task,
+                    resources,
+                    startup_cpu=startup_cpu,
+                    admission_epoch=admission_epoch,
+                )
             except ControlError as exc:
                 if (exc.code != "resource_unverified"
                         or exc.message != TRANSITIONAL_ADMISSION_ERROR_MESSAGE):
@@ -5021,7 +5029,12 @@ class Control:
         # The deadline/timer exists before either starting the guest or exposing NAT.
         task["lease_expires_at"] = iso_time(self.now() + dt.timedelta(seconds=self.config["initial_lease_seconds"]))
         reserved = {key: max(old[key], resources[key]) for key in old} if cached else resources
-        task = self._reserve_resources_with_transition_wait(task, reserved, admission_epoch=admission_epoch)
+        task = self._reserve_resources_with_transition_wait(
+            task,
+            reserved,
+            startup_cpu=resources["cpu"],
+            admission_epoch=admission_epoch,
+        )
         completed = []
         phase = "reservation"
         stage_timings: dict[str, Any] = {}

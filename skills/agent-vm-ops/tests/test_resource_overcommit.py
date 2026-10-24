@@ -219,6 +219,12 @@ class CTObservationTests(unittest.TestCase):
                 CONTROL.CTResources().cpu_pressure()
         self.assertEqual(failure.exception.code, "resource_unverified")
 
+        contaminated = raw + "unexpected avg10=0 avg60=0 avg300=0 total=0\n"
+        with mock.patch.object(CONTROL.CTResources, "_read", return_value=contaminated):
+            with self.assertRaises(CONTROL.ControlError) as failure:
+                CONTROL.CTResources().cpu_pressure()
+        self.assertEqual(failure.exception.code, "resource_unverified")
+
 
 class AdmissionTests(Fixture):
     def test_default_ceilings_and_fractional_floor(self):
@@ -291,6 +297,19 @@ class AdmissionTests(Fixture):
         self.resources.cpu_pressure.return_value["full"]["avg10"] = 0.0
         admitted = self.call("acquire", "after", public_key=KEY, cpu=2)
         self.assertEqual(admitted["resources"]["cpu"], 2)
+
+    def test_cached_resume_pressure_projection_uses_target_cpu(self):
+        self.config.update(cpu_overcommit_ratio=8)
+        self.call("acquire", "active", public_key=KEY, cpu=11)
+        self.call("acquire", "cache", public_key=KEY, cpu=8)
+        self.call("release", "cache")
+        self.resources.cpu_pressure.return_value["some"]["avg10"] = 55.12
+        self.resources.cpu_pressure.return_value["full"]["avg10"] = 45.67
+
+        resumed = self.call("acquire", "cache", public_key=KEY, cpu=4)
+
+        self.assertEqual(resumed["resources"]["cpu"], 4)
+        self.assertEqual(self.runner.instances[resumed["instance_name"]]["config"]["limits.cpu"], "4")
 
     def test_unverified_cpu_pressure_blocks_new_startup(self):
         self.resources.cpu_pressure.return_value = {
@@ -1244,7 +1263,7 @@ class CreationTests(Fixture):
                 )
 
         self.assertIs(raised.exception, failure)
-        reserve.assert_called_once_with(task, resources, admission_epoch="admission-epoch")
+        reserve.assert_called_once_with(task, resources, startup_cpu=None, admission_epoch="admission-epoch")
         sleep.assert_not_called()
 
     def test_transitional_admission_wait_is_bounded(self):

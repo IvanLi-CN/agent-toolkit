@@ -485,6 +485,24 @@ def _parse_remote_error(raw: bytes | None) -> dict[str, Any] | None:
     return None
 
 
+_DETERMINISTIC_REMOTE_ERROR_CODES = frozenset({
+    "cache_ineligible",
+    "config_invalid",
+    "config_missing",
+    "draining",
+    "generation_mismatch",
+    "invalid_request",
+    "operation_conflict",
+    "protocol_mismatch",
+    "resource_insufficient",
+    "resource_pressure",
+    "resource_budget_invalid",
+    "task_missing",
+    "task_not_active",
+    "unknown_action",
+})
+
+
 def _remote_error_outcome_uncertain(error: Mapping[str, Any]) -> bool:
     code = error.get("code")
     if code == "sqlite_unavailable":
@@ -493,12 +511,14 @@ def _remote_error_outcome_uncertain(error: Mapping[str, Any]) -> bool:
     if code in {"acquire_partial", "resize_partial", "restart_partial", "cleanup_incomplete", "operation_unverified"}:
         return True
     detail = error.get("detail")
-    if not isinstance(detail, Mapping):
-        return False
-    return any(detail.get(key) in {
+    if isinstance(detail, Mapping) and any(detail.get(key) in {
         "native-generation", "native-init", "native-config", "native-stop", "native-start",
         "guest-readiness", "guest-post-check", "access-exposure",
-    } for key in ("phase", "operation_phase"))
+    } for key in ("phase", "operation_phase")):
+        return True
+    if code in _DETERMINISTIC_REMOTE_ERROR_CODES:
+        return False
+    return True
 
 
 def control_request(action: str, *, session: str | None, generation: int | None = None,

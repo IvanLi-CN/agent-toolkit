@@ -275,6 +275,26 @@ class SessionContractTests(unittest.TestCase):
             self.assertEqual(saved["outcome"], "error")
             self.assertEqual(saved["error"]["code"], "resource_pressure")
 
+    def test_unknown_structured_remote_failure_keeps_journal_pending(self):
+        error = {
+            "ok": False,
+            "error": {
+                "code": "internal_error",
+                "message": "control process failed unexpectedly",
+                "detail": {"phase": "unknown"},
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(CLI, "local_session_dir", return_value=Path(directory)), \
+             mock.patch.object(CLI.subprocess, "run", return_value=subprocess.CompletedProcess(
+                 [], 2, b"", (json.dumps(error) + "\n").encode()
+             )):
+            with self.assertRaises(CLI.CliError) as failure:
+                CLI.control_request("acquire", session="thread", generation=0, write=True, operation_id="unknown")
+            self.assertEqual(failure.exception.code, "internal_error")
+            journal = Path(directory) / "operations" / (hashlib.sha256(b"unknown").hexdigest() + ".json")
+            self.assertEqual(json.loads(journal.read_text(encoding="utf-8"))["outcome"], "pending")
+
     def test_incompatible_remote_response_is_rejected_before_return(self):
         response = {
             "ok": True,

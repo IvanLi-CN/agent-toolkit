@@ -464,7 +464,7 @@ const JSON_AUTHORIZATION_ASSIGNMENT = /(["'])(Bearer|Basic)\1\s*:\s*("(?:\\.|[^"
 const BRACKETED_SENSITIVE_ASSIGNMENT = new RegExp(`(\\[[^\\]\\r\\n]*${SENSITIVE_NAME}[^\\]\\r\\n]*\\]\\s*[:=]\\s*)(?!\\s*\\[REDACTED\\])([^\\r\\n]+)`, "gi");
 const ENCODED_SENSITIVE_ASSIGNMENT = new RegExp(`((?<![A-Za-z0-9_.-])${SENSITIVE_KEY}\\s*%3[dD]\\s*)(?!\\s*\\[REDACTED\\])([^\\r\\n]+)`, "gi");
 const PERCENT_ENCODED_KEY_ASSIGNMENT = /(?<![A-Za-z0-9_.-])((?:[A-Za-z0-9_.+-]|%[0-9A-Fa-f]{2})+?)\s*(%3[dDaA]|[:=])\s*([^;\r\n]+)/gi;
-const SENSITIVE_BLOCK_HEADER = new RegExp(`^([ \\t]*${SENSITIVE_KEY_TOKEN}\\s*[:=]\\s*[|>][-+0-9]*)\\s*$`, "i");
+const SENSITIVE_BLOCK_HEADER = new RegExp(`^([ \\t]*${SENSITIVE_KEY_TOKEN}\\s*[:=]\\s*[|>][-+0-9]*)(?:[ \\t]+#[^\\r\\n]*)?\\s*$`, "i");
 const PRIVATE_KEY_BLOCK = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/gi;
 const SENSITIVE_FILENAME = new RegExp("(?<![A-Za-z0-9])(?:[A-Za-z0-9_.-]*(?:" + SENSITIVE_NAME + "|env|id[_ -]?rsa|private[._-]?(?:key|pem)|api[._-]?key|auth[._-]?json)[A-Za-z0-9_.-]*)(?![A-Za-z0-9])", "gi");
 const RAW_JWT = /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?![A-Za-z0-9_-])/g;
@@ -547,11 +547,26 @@ function redactSensitiveBlocks(text: string): string {
   const lines = text.split(/\r?\n/);
   const redacted: string[] = [];
   let blockIndent: number | undefined;
+  let blockHasContent = false;
+  let redactRemainder = false;
   for (const line of lines) {
     const indent = line.match(/^[ \\t]*/)?.[0].length ?? 0;
+    if (redactRemainder) {
+      redacted.push("[REDACTED]");
+      continue;
+    }
     if (blockIndent !== undefined) {
       if (line.trim() === "" || indent > blockIndent) {
+        if (line.trim() !== "") blockHasContent = true;
         redacted.push(`${line.slice(0, indent)}[REDACTED]`);
+        continue;
+      }
+      // Remote diagnostics need not be valid YAML. A missing indentation or
+      // an unstructured dedent cannot prove where the secret ends, so suppress
+      // the remaining text instead of exposing a malformed scalar body.
+      if (!blockHasContent || !/^[ \t]*(?:[A-Za-z0-9_.-]+|"[^"\r\n]+"|'[^'\r\n]+')\s*[:=]/.test(line)) {
+        redactRemainder = true;
+        redacted.push("[REDACTED]");
         continue;
       }
       blockIndent = undefined;
@@ -560,6 +575,7 @@ function redactSensitiveBlocks(text: string): string {
     SENSITIVE_BLOCK_HEADER.lastIndex = 0;
     if (match !== null) {
       blockIndent = indent;
+      blockHasContent = false;
       redacted.push(`${match[1]} [REDACTED]`);
     } else {
       redacted.push(line);
@@ -594,8 +610,8 @@ export function redactSensitiveText(text: string): string {
     .replace(/\t/g, " ")
     .replace(/(?<=[A-Za-z0-9_.-])\p{Cf}+(?=[A-Za-z0-9_.-])/gu, "")
     .replace(UNICODE_FORMAT_CHARACTERS, " ")
-    .replace(/([A-Za-z0-9])\s+([_.-])(?=[A-Za-z0-9])/g, "$1$2")
-    .replace(/([_.-])\s+([A-Za-z0-9])/g, "$1$2");
+    .replace(/([A-Za-z0-9])[ \t]+([_.-])(?=[A-Za-z0-9])/g, "$1$2")
+    .replace(/([_.-])[ \t]+([A-Za-z0-9])/g, "$1$2");
   // Canonicalize split keys before line-based continuation/block handling.
   const canonical = normalized.replace(SENSITIVE_KEY_WHITESPACE, (key) => key.replace(/\s+/g, ""));
   const redacted = redactSensitiveCollections(redactSensitiveBlocks(redactSensitiveContinuations(canonical)))

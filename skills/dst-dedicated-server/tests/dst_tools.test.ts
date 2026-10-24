@@ -85,10 +85,13 @@ describe.serial("DST local Bun tooling", () => {
     expect(redactSensitiveText("%22api_key%22%3Apercent-encoded-quote-colon-secret")).not.toContain("percent-encoded-quote-colon-secret");
     expect(redactSensitiveText("password: |\n  fixture-secret\nnext: visible")).not.toContain("fixture-secret");
     expect(redactSensitiveText("password: |\n  fixture-secret\nnext: visible")).toContain("next: visible");
-    for (const indicator of ["|", ">", "|-", ">+", "|2", "|- # comment"]) {
+    for (const indicator of ["|", ">", "|-", ">+", "|2", "|- # comment", "|foo", ">foo", "| foo", ">>", "|--", "|0"]) {
       for (const body of ["fixture-block-secret", "\nfixture-block-secret", "  indented-secret\nfixture-block-secret", "looks_like_key: fixture-block-secret"]) {
         expect(redactSensitiveText(`password: ${indicator}\n${body}\ntrailing-secret`)).not.toMatch(/fixture-block-secret|indented-secret|trailing-secret/);
       }
+    }
+    for (const indicator of ["|foo", ">foo", "| foo", ">>", "|--", "|0"]) {
+      expect(redactSensitiveText(`password: ${indicator}\n  indented-secret\nnext: trailing-secret`)).not.toMatch(/indented-secret|trailing-secret/);
     }
     expect(redactSensitiveText("api_\u001b[31mkey=fixture-secret")).not.toContain("fixture-secret");
     expect(redactSensitiveText("token\u001b[31mANSI_SECRET")).not.toContain("ANSI_SECRET");
@@ -847,34 +850,36 @@ esac
     }
   });
 
-  test("redacts sensitive values from successful remote snapshot output", { timeout: 30_000 }, async () => {
-    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-redaction-"));
-    const previousPath = process.env.PATH;
-    try {
-      const fakeSsh = join(root, "ssh");
-      await writeFile(fakeSsh, `#!/bin/sh
+  for (const blockIndicator of ["|", "|foo", ">foo"]) {
+    test(`redacts sensitive values from successful remote snapshot output (block: ${blockIndicator})`, { timeout: 30_000 }, async () => {
+      const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-redaction-"));
+      const previousPath = process.env.PATH;
+      try {
+        const fakeSsh = join(root, "ssh");
+        await writeFile(fakeSsh, `#!/bin/sh
 case "$*" in
   *"echo ok"*) exit 0 ;;
-  *) printf '### Remote fixture\\napi_key=fixture-secret\\npass\\nword: multiline-fixture-value\\ncreden\\ntials=credential-fixture-value\\npassword: |\\nfixture-block-secret\\ntrailing-block-secret\\n' ;;
+  *) printf '### Remote fixture\\napi_key=fixture-secret\\npass\\nword: multiline-fixture-value\\ncreden\\ntials=credential-fixture-value\\npassword: ${blockIndicator}\\nfixture-block-secret\\ntrailing-block-secret\\n' ;;
 esac
 `);
-      await chmod(fakeSsh, 0o755);
-      const output = join(root, "snapshot.md");
-      const result = await runTool(
-        join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
-        ["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", output],
-        { ...process.env, PATH: `${root}:${previousPath ?? ""}` } as Record<string, string>,
-      );
-      expect(result.status).toBe(0);
-      const report = await readFile(output, "utf8");
-      expect(report).toContain("api_key=[REDACTED]");
-      expect(report).not.toContain("fixture-secret");
-      expect(report).not.toMatch(/multiline-fixture-value|credential-fixture-value/);
-      expect(report).not.toMatch(/fixture-block-secret|trailing-block-secret/);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
+        await chmod(fakeSsh, 0o755);
+        const output = join(root, "snapshot.md");
+        const result = await runTool(
+          join(import.meta.dir, "..", "scripts", "dst_snapshot.ts"),
+          ["--host", "fixture-host", "--user", "fixture-user", "--no-local", "--out", output],
+          { ...process.env, PATH: `${root}:${previousPath ?? ""}` } as Record<string, string>,
+        );
+        expect(result.status).toBe(0);
+        const report = await readFile(output, "utf8");
+        expect(report).toContain("api_key=[REDACTED]");
+        expect(report).not.toContain("fixture-secret");
+        expect(report).not.toMatch(/multiline-fixture-value|credential-fixture-value/);
+        expect(report).not.toMatch(/fixture-block-secret|trailing-block-secret/);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
   });
+  }
 
   test("renders untrusted remote report text without Markdown or HTML injection", { timeout: 90_000 }, async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-markdown-"));

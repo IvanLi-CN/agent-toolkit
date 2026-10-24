@@ -473,11 +473,13 @@ def run(command, phase, *, check=True):
         root_identity = next((identity for identity in tree_members if identity[0] == process.pid), None)
         root_live = []
         root_verified = not os.path.isdir("/proc")
+        root_identity_missing = False
         if tree_complete and root_identity is not None:
-            root_live, root_complete = live_processes([root_identity])
-            if not root_complete:
+            root_live, root_identity_complete = live_processes([root_identity])
+            if not root_identity_complete:
                 tree_complete = False
             root_verified = bool(root_live)
+            root_identity_missing = root_identity_complete and not root_live
         if root_verified:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
@@ -498,12 +500,23 @@ def run(command, phase, *, check=True):
                         process.kill()
                     except ProcessLookupError:
                         pass
+        elif root_identity_missing and tracked_tree_valid:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+                process_group_killed, fallback_error = kill_process_group_members(process.pid)
+                if fallback_error:
+                    process_group_cleanup_error = fallback_error
+            except ProcessLookupError:
+                process_group_killed, fallback_error = kill_process_group_members(process.pid)
+                if fallback_error:
+                    process_group_cleanup_error = fallback_error
+            except (AttributeError, PermissionError, OSError) as group_error:
+                process_group_cleanup_error = type(group_error).__name__
+                process_group_killed, fallback_error = kill_process_group_members(process.pid)
+                if fallback_error:
+                    process_group_cleanup_error += ":" + fallback_error
         else:
             process_group_cleanup_error = "process_identity_unverified"
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
         tree_killed = True
         tree_error = None
         if not tree_complete:
@@ -1568,11 +1581,13 @@ class CommandRunner:
             root_identity = next((identity for identity in tree_members if identity[0] == process.pid), None)
             root_live: list[tuple[int, int]] = []
             root_verified = not Path("/proc").is_dir()
+            root_identity_missing = False
             if tree_complete and root_identity is not None:
-                root_live, root_complete = self._live_processes([root_identity])
-                if not root_complete:
+                root_live, root_identity_complete = self._live_processes([root_identity])
+                if not root_identity_complete:
                     tree_complete = False
                 root_verified = bool(root_live)
+                root_identity_missing = root_identity_complete and not root_live
             if root_verified:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
@@ -1592,12 +1607,23 @@ class CommandRunner:
                         process.kill()
                     except ProcessLookupError:
                         pass
+            elif root_identity_missing and tracked_tree_valid:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process_group_killed, fallback_error = self._kill_process_group_members(process.pid)
+                    if fallback_error:
+                        process_group_cleanup_error = fallback_error
+                except ProcessLookupError:
+                    process_group_killed, fallback_error = self._kill_process_group_members(process.pid)
+                    if fallback_error:
+                        process_group_cleanup_error = fallback_error
+                except OSError as group_error:
+                    process_group_cleanup_error = type(group_error).__name__
+                    process_group_killed, fallback_error = self._kill_process_group_members(process.pid)
+                    if fallback_error:
+                        process_group_cleanup_error += ":" + fallback_error
             else:
                 process_group_cleanup_error = "process_identity_unverified"
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
             tree_killed = True
             tree_error = None
             if not tree_complete:

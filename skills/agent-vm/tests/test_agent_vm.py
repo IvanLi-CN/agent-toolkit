@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -413,33 +414,29 @@ class SessionContractTests(unittest.TestCase):
             "server_time": "2026-10-22T00:00:00+00:00",
             "result": {},
         }
-        holders = []
+        release_readers = threading.Event()
 
         def run(*_args, **kwargs):
-            duplicated = CLI.os.dup(kwargs["stdout"].fileno())
-            holders.append(
-                subprocess.Popen(
-                    [CLI.sys.executable, "-c", "import time; time.sleep(10)"],
-                    close_fds=True,
-                    pass_fds=(duplicated,),
-                )
-            )
-            CLI.os.close(duplicated)
             kwargs["stdout"].write(json.dumps(response).encode())
             return subprocess.CompletedProcess([], 0, None, None)
 
+        def block_reader(*_args):
+            release_readers.wait(10)
+
         try:
             with mock.patch.object(CLI, "control_timeout", return_value=0.1), \
+                 mock.patch.object(CLI, "_drain_bounded_stream", side_effect=block_reader), \
                  mock.patch.object(CLI.subprocess, "run", side_effect=run):
                 started = time.monotonic()
-                result = CLI.control_request("status", session="thread")
+                with self.assertRaises(CLI.CliError) as failure:
+                    CLI.control_request("status", session="thread")
                 elapsed = time.monotonic() - started
             self.assertLess(elapsed, 1.0)
-            self.assertEqual(result["action"], "status")
+            self.assertEqual(failure.exception.code, "remote_failed")
+            self.assertFalse(failure.exception.detail["stream_cleanup_verified"])
+            self.assertEqual(failure.exception.detail["stream_cleanup_error"], "reader_join_timeout")
         finally:
-            for holder in holders:
-                holder.kill()
-                holder.wait()
+            release_readers.set()
 
     def test_remote_timeout_bounds_stream_reader_cleanup(self):
         with mock.patch.object(

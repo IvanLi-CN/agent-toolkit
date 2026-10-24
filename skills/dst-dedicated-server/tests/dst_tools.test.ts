@@ -2070,20 +2070,25 @@ exec "${realPs}" "$@"
     });
   }
 
-  test("recovers a live target when SIGKILL interrupts raw ledger append publication", { timeout: 45_000 }, async () => {
-    if (process.platform === "win32") return;
-    const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-append-publication-"));
-    const childMarker = join(root, "child.pid");
-    const trigger = join(root, "spawn-child");
-    const paused = join(root, "append-paused");
-    const realPerl = Bun.which("perl");
-    const previousPath = process.env.PATH;
-    const before = new Set(await readdir(tmpdir()));
-    let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
-    let directory: string | undefined;
-    let pid: number | undefined;
-    try {
-      await writeFile(join(root, "perl"), `#!/bin/sh
+  for (const reapChild of [false, true]) {
+    test(`recovers a live target when SIGKILL interrupts raw ledger append publication${reapChild ? " after the appended child is reaped" : ""}`, { timeout: 45_000 }, async () => {
+      if (process.platform === "win32") return;
+      const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-append-publication-"));
+      const childMarker = join(root, "child.pid");
+      const trigger = join(root, "spawn-child");
+      const paused = join(root, "append-paused");
+      const releaseChild = join(root, "release-child");
+      const reaped = join(root, "child-reaped");
+      const realPerl = Bun.which("perl");
+      const previousPath = process.env.PATH;
+      const before = new Set(await readdir(tmpdir()));
+      let supervised: Awaited<ReturnType<typeof spawnSupervised>> | undefined;
+      let directory: string | undefined;
+      let pid: number | undefined;
+      let anchor: number | undefined;
+      let targetPgid: number | undefined;
+      try {
+        await writeFile(join(root, "perl"), `#!/bin/sh
 case "$2" in *O_APPEND*) ;; *) exec "${realPerl}" "$@" ;; esac
 "${realPerl}" "$@"
 result=$?
@@ -2093,41 +2098,57 @@ if [ "$result" = 0 ] && [ "$3" = ./descendants ] && [ -f "${childMarker}" ]; the
 fi
 exit "$result"
 `);
-      await chmod(join(root, "perl"), 0o755);
-      process.env.PATH = `${root}:${previousPath ?? ""}`;
-      supervised = await spawnSupervised([
-        "perl", "-e", "while (!-e $ARGV[0]) { select undef, undef, undef, 0.02; } my $pid = fork(); defined $pid or exit 1; if ($pid == 0) { open my $f, \">\", $ARGV[1] or exit 1; print $f \"$$\\n\"; close $f; sleep 30; exit 0; } waitpid($pid, 0);",
-        trigger, childMarker,
-      ]);
-      process.env.PATH = previousPath;
-      directory = await supervisorStatusDirectory(before, supervised.child.pid);
-      await writeFile(trigger, "spawn");
-      let pausedWrapper = 0;
-      for (let attempt = 0; attempt < 480; attempt += 1) {
-        pausedWrapper = Number((await readFile(paused, "utf8").catch(() => "")).trim());
-        if (pausedWrapper > 0) break;
-        await Bun.sleep(25);
+        await chmod(join(root, "perl"), 0o755);
+        process.env.PATH = `${root}:${previousPath ?? ""}`;
+        supervised = await spawnSupervised([
+          "perl", "-e", "while (!-e $ARGV[0]) { select undef, undef, undef, 0.02; } my $pid = fork(); defined $pid or exit 1; if ($pid == 0) { open my $f, \">\", $ARGV[1] or exit 1; print $f \"$$\\n\"; close $f; while (!-e $ARGV[2]) { select undef, undef, undef, 0.02; } exit 0; } waitpid($pid, 0); open my $f, \">\", $ARGV[3] or exit 1; print $f \"reaped\\n\"; close $f; sleep 30;",
+          trigger, childMarker, releaseChild, reaped,
+        ]);
+        process.env.PATH = previousPath;
+        directory = await supervisorStatusDirectory(before, supervised.child.pid);
+        anchor = Number((await readFile(join(directory, "target"), "utf8")).trim());
+        targetPgid = Number((await readFile(join(directory, "target-pgid"), "utf8")).trim());
+        await writeFile(trigger, "spawn");
+        let pausedWrapper = 0;
+        for (let attempt = 0; attempt < 480; attempt += 1) {
+          pausedWrapper = Number((await readFile(paused, "utf8").catch(() => "")).trim());
+          if (pausedWrapper > 0) break;
+          await Bun.sleep(25);
+        }
+        expect(pausedWrapper).toBe(supervised.child.pid);
+        pid = Number((await readFile(childMarker, "utf8")).trim());
+        expect(await readFile(join(directory, "descendants"), "utf8")).toContain(`${pid}|`);
+        expect(await readFile(join(directory, "descendants-authenticated"), "utf8")).not.toContain(`${pid}|`);
+        if (reapChild) {
+          await writeFile(releaseChild, "exit");
+          for (let attempt = 0; attempt < 80; attempt += 1) {
+            if (await readFile(reaped, "utf8").catch(() => "") === "reaped\n") break;
+            await Bun.sleep(25);
+          }
+          expect(await readFile(reaped, "utf8")).toBe("reaped\n");
+          expect(() => process.kill(pid!, 0)).toThrow();
+        }
+        expect(process.kill(anchor, 0)).toBe(true);
+        supervised.child.kill("SIGKILL");
+        expect(await supervised.forceCleanup()).toBe(true);
+        const state = Bun.spawnSync(["ps", "-o", "state=", "-p", String(pid)], { stdout: "pipe", stderr: "ignore" });
+        expect(new TextDecoder().decode(state.stdout).trim().replace(/^Z.*$/, "")).toBe("");
+        const anchorState = Bun.spawnSync(["ps", "-o", "state=", "-p", String(anchor)], { stdout: "pipe", stderr: "ignore" });
+        expect(new TextDecoder().decode(anchorState.stdout).trim().replace(/^Z.*$/, "")).toBe("");
+      } finally {
+        process.env.PATH = previousPath;
+        if (supervised !== undefined) {
+          try { supervised.child.kill("SIGKILL"); } catch {}
+          await supervised.wrapperExited.catch(() => undefined);
+          await supervised.cleanup();
+        }
+        if (pid !== undefined && pid > 0) { try { process.kill(pid, "SIGKILL"); } catch {} }
+        if (targetPgid !== undefined && targetPgid > 0) { try { process.kill(-targetPgid, "SIGKILL"); } catch {} }
+        if (directory !== undefined) await rm(directory, { recursive: true, force: true });
+        await rm(root, { recursive: true, force: true });
       }
-      expect(pausedWrapper).toBe(supervised.child.pid);
-      pid = Number((await readFile(childMarker, "utf8")).trim());
-      expect(await readFile(join(directory, "descendants"), "utf8")).toContain(`${pid}|`);
-      expect(await readFile(join(directory, "descendants-authenticated"), "utf8")).not.toContain(`${pid}|`);
-      supervised.child.kill("SIGKILL");
-      expect(await supervised.forceCleanup()).toBe(true);
-      const state = Bun.spawnSync(["ps", "-o", "state=", "-p", String(pid)], { stdout: "pipe", stderr: "ignore" });
-      expect(new TextDecoder().decode(state.stdout).trim().replace(/^Z.*$/, "")).toBe("");
-    } finally {
-      process.env.PATH = previousPath;
-      if (supervised !== undefined) {
-        try { supervised.child.kill("SIGKILL"); } catch {}
-        await supervised.wrapperExited.catch(() => undefined);
-        await supervised.cleanup();
-      }
-      if (pid !== undefined && pid > 0) { try { process.kill(pid, "SIGKILL"); } catch {} }
-      if (directory !== undefined) await rm(directory, { recursive: true, force: true });
-      await rm(root, { recursive: true, force: true });
-    }
-  });
+    });
+  }
 
   test("serializes automatic and forced cleanup after wrapper SIGKILL", { timeout: 90_000 }, async () => {
     if (process.platform === "win32") return;

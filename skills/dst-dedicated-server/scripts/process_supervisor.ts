@@ -3249,7 +3249,7 @@ async function cleanupAuthorizedTargetGroup(
   }
   // A wrapper can die after appending raw records but before signing them.
   // The private header still pins the last signed prefix. Only a live anchor
-  // permits recovery of the suffix, and every added process needs fresh
+  // permits recovery of the suffix, and every live added process needs fresh
   // identity, group and ancestry proof; unsigned bytes grant no authority.
   if (authenticatedLedger?.uncommittedAppend !== undefined) {
     if (!allowCurrentGroupMembers) return false;
@@ -3262,12 +3262,18 @@ async function cleanupAuthorizedTargetGroup(
       if (fields.length !== 3 || !/^[1-9][0-9]*$/.test(fields[0]!) || !/^[1-9][0-9]*$/.test(fields[2]!)) return false;
       const member = { pid: Number(fields[0]), identity: fields[1]!, pgid: Number(fields[2]) };
       if (!Number.isSafeInteger(member.pid) || !Number.isSafeInteger(member.pgid) || member.identity.length === 0) return false;
-      const probe = await withinCleanupDeadline(probeAuthorizedMember(member));
-      if (probe === undefined || probe.kind !== "live") return false;
-      if (probe.member.pgid !== member.pgid) return false;
-      if (await withinCleanupDeadline(processDescendsFrom(member.pid, reference.pid)) !== true) return false;
+      const psIdentity = psIdentityFields(member.identity);
+      if (!/^proc:[0-9]+$/.test(member.identity)
+        && (psIdentity === undefined || psIdentity.start.trim().length === 0 || psIdentity.pgid !== String(member.pgid))) return false;
       const previous = authorized.get(member.pid);
       if (previous !== undefined && (previous.identity !== member.identity || previous.pgid !== member.pgid)) return false;
+      const probe = await withinCleanupDeadline(probeAuthorizedMember(member));
+      if (probe === undefined || probe.kind === "unavailable") return false;
+      // A confirmed absent process contributes no signal authority. It may
+      // have exited and been reaped while publication was interrupted.
+      if (probe.kind === "dead") continue;
+      if (probe.member.pgid !== member.pgid) return false;
+      if (await withinCleanupDeadline(processDescendsFrom(member.pid, reference.pid)) !== true) return false;
       authorized.set(member.pid, member);
     }
   }

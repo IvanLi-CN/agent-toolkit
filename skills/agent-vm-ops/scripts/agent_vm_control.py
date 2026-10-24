@@ -324,39 +324,42 @@ def run(command, phase, *, check=True):
                         raw_stat = handle.read()
                     close_paren = raw_stat.rfind(")")
                     fields = raw_stat[close_paren + 2:].split()
-                    if close_paren < 0 or len(fields) < 4:
+                    if close_paren < 0 or len(fields) < 20:
                         raise ValueError("invalid process stat")
                     if fields[0] != "Z":
-                        parents[int(entry.name)] = int(fields[1])
+                        parents[int(entry.name)] = (int(fields[1]), int(fields[19]))
                 except FileNotFoundError:
                     continue
                 except (OSError, ValueError):
                     complete = False
         if root_pid not in parents:
-            return [], complete
+            return [], False
         members = {root_pid}
         frontier = [root_pid]
         while frontier:
             parent = frontier.pop()
-            for pid, ppid in parents.items():
+            for pid, (ppid, _) in parents.items():
                 if ppid == parent and pid not in members:
                     members.add(pid)
                     frontier.append(pid)
-        return sorted(members), complete
+        return sorted((pid, parents[pid][1]) for pid in members), complete
 
-    def live_processes(pids):
+    def live_processes(identities):
         live = []
         complete = True
-        for pid in pids:
+        for pid, starttime in identities:
             try:
                 with open(os.path.join("/proc", str(pid), "stat"), encoding="utf-8") as handle:
                     raw_stat = handle.read()
                 close_paren = raw_stat.rfind(")")
                 fields = raw_stat[close_paren + 2:].split()
-                if close_paren < 0 or not fields:
+                if close_paren < 0 or len(fields) < 20:
                     raise ValueError("invalid process stat")
+                if int(fields[19]) != starttime:
+                    complete = False
+                    continue
                 if fields[0] != "Z":
-                    live.append(pid)
+                    live.append((pid, starttime))
             except FileNotFoundError:
                 continue
             except (OSError, ValueError):
@@ -383,10 +386,10 @@ def run(command, phase, *, check=True):
             return True, cleanup_error
         return False, cleanup_error or inspection_error or "process_group_members_remain"
 
-    def kill_process_tree_members(pids):
+    def kill_process_tree_members(identities):
         cleanup_error = None
         for _ in range(3):
-            members, complete = live_processes(pids)
+            members, complete = live_processes(identities)
             if not complete:
                 return False, "process_tree_inspection_failed"
             if not members:
@@ -399,7 +402,7 @@ def run(command, phase, *, check=True):
                 except OSError as error:
                     cleanup_error = type(error).__name__
             time.sleep(0.01)
-        members, complete = live_processes(pids)
+        members, complete = live_processes(identities)
         if complete and not members:
             return True, cleanup_error
         return False, cleanup_error or "process_tree_members_remain"
@@ -434,23 +437,40 @@ def run(command, phase, *, check=True):
         tree_complete = True
         if os.path.isdir("/proc"):
             tree_members, tree_complete = process_tree_members(process.pid)
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-            process_group_killed, fallback_error = kill_process_group_members(process.pid)
-            if fallback_error:
-                process_group_cleanup_error = fallback_error
-        except ProcessLookupError:
-            process_group_killed = True
-        except (AttributeError, PermissionError, OSError) as group_error:
-            process_group_cleanup_error = type(group_error).__name__
-            process_group_killed, fallback_error = kill_process_group_members(process.pid)
-            if fallback_error:
-                process_group_cleanup_error += ":" + fallback_error
-            if process is not None:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
+        root_identity = next((identity for identity in tree_members if identity[0] == process.pid), None)
+        root_live = []
+        root_verified = not os.path.isdir("/proc")
+        if tree_complete and root_identity is not None:
+            root_live, root_complete = live_processes([root_identity])
+            if not root_complete:
+                tree_complete = False
+            root_verified = bool(root_live)
+        if root_verified:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+                process_group_killed, fallback_error = kill_process_group_members(process.pid)
+                if fallback_error:
+                    process_group_cleanup_error = fallback_error
+            except ProcessLookupError:
+                process_group_killed, fallback_error = kill_process_group_members(process.pid)
+                if fallback_error:
+                    process_group_cleanup_error = fallback_error
+            except (AttributeError, PermissionError, OSError) as group_error:
+                process_group_cleanup_error = type(group_error).__name__
+                process_group_killed, fallback_error = kill_process_group_members(process.pid)
+                if fallback_error:
+                    process_group_cleanup_error += ":" + fallback_error
+                if process is not None:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+        else:
+            process_group_cleanup_error = "process_identity_unverified"
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
         tree_killed = True
         tree_error = None
         if not tree_complete:
@@ -1288,8 +1308,8 @@ class CommandRunner:
         return members, complete
 
     @staticmethod
-    def _process_tree_members(root_pid: int) -> tuple[list[int], bool]:
-        parents: dict[int, int] = {}
+    def _process_tree_members(root_pid: int) -> tuple[list[tuple[int, int]], bool]:
+        parents: dict[int, tuple[int, int]] = {}
         try:
             entries = list(Path("/proc").iterdir())
         except OSError:
@@ -1302,39 +1322,42 @@ class CommandRunner:
                 raw_stat = (entry / "stat").read_text()
                 close_paren = raw_stat.rfind(")")
                 fields = raw_stat[close_paren + 2 :].split()
-                if close_paren < 0 or len(fields) < 4:
+                if close_paren < 0 or len(fields) < 20:
                     raise ValueError("invalid process stat")
                 if fields[0] != "Z":
-                    parents[int(entry.name)] = int(fields[1])
+                    parents[int(entry.name)] = (int(fields[1]), int(fields[19]))
             except FileNotFoundError:
                 continue
             except (OSError, ValueError):
                 complete = False
         if root_pid not in parents:
-            return [], complete
+            return [], False
         members = {root_pid}
         frontier = [root_pid]
         while frontier:
             parent = frontier.pop()
-            for pid, ppid in parents.items():
+            for pid, (ppid, _) in parents.items():
                 if ppid == parent and pid not in members:
                     members.add(pid)
                     frontier.append(pid)
-        return sorted(members), complete
+        return sorted((pid, parents[pid][1]) for pid in members), complete
 
     @staticmethod
-    def _live_processes(pids: Sequence[int]) -> tuple[list[int], bool]:
-        live: list[int] = []
+    def _live_processes(identities: Sequence[tuple[int, int]]) -> tuple[list[tuple[int, int]], bool]:
+        live: list[tuple[int, int]] = []
         complete = True
-        for pid in pids:
+        for pid, starttime in identities:
             try:
                 raw_stat = (Path("/proc") / str(pid) / "stat").read_text()
                 close_paren = raw_stat.rfind(")")
                 fields = raw_stat[close_paren + 2 :].split()
-                if close_paren < 0 or not fields:
+                if close_paren < 0 or len(fields) < 20:
                     raise ValueError("invalid process stat")
+                if int(fields[19]) != starttime:
+                    complete = False
+                    continue
                 if fields[0] != "Z":
-                    live.append(pid)
+                    live.append((pid, starttime))
             except FileNotFoundError:
                 continue
             except (OSError, ValueError):
@@ -1363,15 +1386,15 @@ class CommandRunner:
         return False, cleanup_error or "process_group_members_remain"
 
     @classmethod
-    def _kill_process_tree_members(cls, pids: Sequence[int]) -> tuple[bool, str | None]:
+    def _kill_process_tree_members(cls, identities: Sequence[tuple[int, int]]) -> tuple[bool, str | None]:
         cleanup_error = None
         for _ in range(3):
-            members, complete = cls._live_processes(pids)
+            members, complete = cls._live_processes(identities)
             if not complete:
                 return False, "process_tree_inspection_failed"
             if not members:
                 return True, cleanup_error
-            for pid in members:
+            for pid, _ in members:
                 try:
                     os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError:
@@ -1379,7 +1402,7 @@ class CommandRunner:
                 except OSError as error:
                     cleanup_error = type(error).__name__
             time.sleep(0.01)
-        members, complete = cls._live_processes(pids)
+        members, complete = cls._live_processes(identities)
         if complete and not members:
             return True, cleanup_error
         return False, cleanup_error or "process_tree_members_remain"
@@ -1466,19 +1489,35 @@ class CommandRunner:
             tree_complete = True
             if Path("/proc").is_dir():
                 tree_members, tree_complete = self._process_tree_members(process.pid)
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-                process_group_killed, fallback_error = self._kill_process_group_members(process.pid)
-                if fallback_error:
-                    process_group_cleanup_error = fallback_error
-            except ProcessLookupError:
-                # The leader and its process group are already gone.
-                process_group_killed = True
-            except OSError as group_error:
-                process_group_cleanup_error = type(group_error).__name__
-                process_group_killed, fallback_error = self._kill_process_group_members(process.pid)
-                if fallback_error:
-                    process_group_cleanup_error += ":" + fallback_error
+            root_identity = next((identity for identity in tree_members if identity[0] == process.pid), None)
+            root_live: list[tuple[int, int]] = []
+            root_verified = not Path("/proc").is_dir()
+            if tree_complete and root_identity is not None:
+                root_live, root_complete = self._live_processes([root_identity])
+                if not root_complete:
+                    tree_complete = False
+                root_verified = bool(root_live)
+            if root_verified:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process_group_killed, fallback_error = self._kill_process_group_members(process.pid)
+                    if fallback_error:
+                        process_group_cleanup_error = fallback_error
+                except ProcessLookupError:
+                    process_group_killed, fallback_error = self._kill_process_group_members(process.pid)
+                    if fallback_error:
+                        process_group_cleanup_error = fallback_error
+                except OSError as group_error:
+                    process_group_cleanup_error = type(group_error).__name__
+                    process_group_killed, fallback_error = self._kill_process_group_members(process.pid)
+                    if fallback_error:
+                        process_group_cleanup_error += ":" + fallback_error
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+            else:
+                process_group_cleanup_error = "process_identity_unverified"
                 try:
                     process.kill()
                 except ProcessLookupError:
@@ -2801,7 +2840,7 @@ class Control:
         phases = {str(detail.get(key)) for key in ("phase", "operation_phase") if detail.get(key) is not None}
         native_phases = {
             "native-generation", "native-init", "native-config", "native-stop", "native-start",
-            "guest-readiness", "guest-post-check", "access-exposure", "port-add", "cache-delete",
+            "guest-readiness", "guest-post-check", "access-exposure", "port-add", "port-remove", "cache-delete",
         }
         return bool(phases & native_phases)
 
@@ -6391,10 +6430,16 @@ class Control:
         port = self.store.get_port(task["task_id"], name, protocol)
         if port:
             self.store.update_port(task["task_id"], name, protocol, state="closing")
-            with self._native_lock(task):
-                self._remove_proxy(task, port)
-                self._conntrack_delete(port, task)
-                self.store.remove_port(task["task_id"], name, protocol)
+            try:
+                with self._native_lock(task):
+                    self._remove_proxy(task, port)
+                    self._conntrack_delete(port, task)
+                    self.store.remove_port(task["task_id"], name, protocol)
+            except ControlError as exc:
+                detail = dict(exc.detail) if isinstance(exc.detail, Mapping) else {}
+                detail.setdefault("operation_phase", "port-remove")
+                detail["outcome_verified"] = False
+                raise ControlError(exc.code, exc.message, detail) from exc
         return {"task_id": task["task_id"], "name": name, "protocol": protocol, "removed": True}
 
 

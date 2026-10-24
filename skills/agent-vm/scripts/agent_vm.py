@@ -534,7 +534,7 @@ def _remote_error_outcome_uncertain(error: Mapping[str, Any], *, action: str | N
         return True
     if isinstance(detail, Mapping) and any(detail.get(key) in {
         "native-generation", "native-init", "native-config", "native-stop", "native-start",
-        "guest-readiness", "guest-post-check", "access-exposure", "port-add", "cache-delete",
+        "guest-readiness", "guest-post-check", "access-exposure", "port-add", "port-remove", "cache-delete",
     } for key in ("phase", "operation_phase")):
         return True
     if action == "port-add" and code in {"generation_mismatch", "task_not_active"}:
@@ -549,17 +549,24 @@ def _remote_error_outcome_uncertain(error: Mapping[str, Any], *, action: str | N
 def _drain_bounded_stream(fd: int, limit: int, output: list[bytes], truncated: list[bool]) -> None:
     retained = bytearray()
     try:
-        while True:
-            chunk = os.read(fd, 65536)
-            if not chunk:
-                break
-            remaining = limit + 1 - len(retained)
-            if remaining > 0:
-                retained.extend(chunk[:remaining])
-            if len(retained) > limit:
-                truncated[0] = True
+        try:
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                remaining = limit + 1 - len(retained)
+                if remaining > 0:
+                    retained.extend(chunk[:remaining])
+                if len(retained) > limit:
+                    truncated[0] = True
+        except OSError:
+            # A timeout closes the read end to release a descendant-held pipe.
+            pass
     finally:
-        os.close(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
     output.append(bytes(retained))
 
 
@@ -618,24 +625,45 @@ def control_request(action: str, *, session: str | None, generation: int | None 
         stdout_reader = threading.Thread(
             target=_drain_bounded_stream,
             args=(stdout_read, REMOTE_STDOUT_LIMIT_BYTES, stdout_output, stdout_truncated_flag),
+            daemon=True,
         )
         stderr_reader = threading.Thread(
             target=_drain_bounded_stream,
             args=(stderr_read, REMOTE_STDERR_LIMIT_BYTES, stderr_output, stderr_truncated_flag),
+            daemon=True,
         )
         stdout_reader.start()
         stderr_reader.start()
         process = None
+        remote_timeout = False
+        stream_cleanup_verified = True
+        stream_cleanup_error = None
         try:
-            process = subprocess.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", control_host,
-                                      shlex.join(["python3", remote_control])],
-                                     input=json.dumps(request, sort_keys=True).encode(), stdout=stdout_sink,
-                                     stderr=stderr_sink, check=False, timeout=control_timeout(action, fields))
+            try:
+                process = subprocess.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", control_host,
+                                          shlex.join(["python3", remote_control])],
+                                         input=json.dumps(request, sort_keys=True).encode(), stdout=stdout_sink,
+                                         stderr=stderr_sink, check=False, timeout=control_timeout(action, fields))
+            except subprocess.TimeoutExpired:
+                remote_timeout = True
+                raise
         finally:
             stdout_sink.close()
             stderr_sink.close()
-            stdout_reader.join()
-            stderr_reader.join()
+            if remote_timeout:
+                for fd in (stdout_read, stderr_read):
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                stdout_reader.join(timeout=1)
+                stderr_reader.join(timeout=1)
+                if stdout_reader.is_alive() or stderr_reader.is_alive():
+                    stream_cleanup_verified = False
+                    stream_cleanup_error = "reader_join_timeout"
+            else:
+                stdout_reader.join()
+                stderr_reader.join()
         stdout = stdout_output[0] if stdout_output else b""
         stderr = stderr_output[0] if stderr_output else b""
         if process is not None:
@@ -649,8 +677,14 @@ def control_request(action: str, *, session: str | None, generation: int | None 
                 stderr_truncated_flag[0] = stderr_truncated_flag[0] or mocked_stderr_truncated
     except FileNotFoundError: fail("command_missing", "ssh is not installed")
     except subprocess.TimeoutExpired:
+        detail = {
+            "operation_id": request.get("operation_id"),
+            "stream_cleanup_verified": stream_cleanup_verified,
+        }
+        if stream_cleanup_error is not None:
+            detail["stream_cleanup_error"] = stream_cleanup_error
         fail("remote_timeout", "control outcome is uncertain; retry the same operation ID",
-             {"operation_id": request.get("operation_id")})
+             detail)
     stdout_truncated = stdout_truncated_flag[0]
     stderr_truncated = stderr_truncated_flag[0]
     stderr = stderr[:REMOTE_STDERR_LIMIT_BYTES]
@@ -686,16 +720,27 @@ def control_request(action: str, *, session: str | None, generation: int | None 
         fail("protocol_mismatch", "response protocol or request identity differs")
     if "generation" in request and not _json_value_matches(response.get("generation"), request["generation"]):
         fail("protocol_mismatch", "response generation differs")
-    if response.get("outcome") not in {"success", "replayed"}:
+    compatibility = request.get("compatibility")
+    if not isinstance(compatibility, dict):
+        fail("protocol_mismatch", "request compatibility capability is missing")
+    warnings = _validate_response_warnings(response.get("warnings"), action)
+    legacy_outcome = compatibility.get("legacy") is True and "outcome" not in response
+    if legacy_outcome:
+        response["outcome"] = "success"
+        _append_warning(
+            warnings,
+            _client_warning(
+                "legacy_response_outcome",
+                "control response omitted outcome; accepted as legacy protocol-4 success",
+                action,
+            ),
+        )
+    elif response.get("outcome") not in {"success", "replayed"}:
         fail("invalid_remote_response", "control response outcome is missing or invalid")
     if response.get("ok") is not True or not isinstance(response.get("result"), dict) or not isinstance(response.get("server_time"), str):
         fail("invalid_remote_response", "invalid control response envelope")
     if write and response.get("operation_id") != request["operation_id"]:
         fail("protocol_mismatch", "operation identity differs")
-    warnings = _validate_response_warnings(response.get("warnings"), action)
-    compatibility = request.get("compatibility")
-    if not isinstance(compatibility, dict):
-        fail("protocol_mismatch", "request compatibility capability is missing")
     response_warning = _validate_response_compatibility(
         response.get("response"), action, compatibility.get("accepted_response")
     )

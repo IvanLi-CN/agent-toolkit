@@ -59,7 +59,6 @@ class SessionContractTests(unittest.TestCase):
             "protocol": CLI.PROTOCOL_VERSION,
             "action": "status",
             "session_id": "thread",
-            "outcome": "success",
             "server_time": "2026-10-22T00:00:00+00:00",
             "result": {},
         }
@@ -70,7 +69,9 @@ class SessionContractTests(unittest.TestCase):
         request = json.loads(run.call_args.kwargs["input"])
         self.assertEqual(request["compatibility"]["release_id"], CLI.LEGACY_RELEASE_ID)
         self.assertTrue(request["compatibility"]["legacy"])
+        self.assertEqual(result["outcome"], "success")
         self.assertTrue(any(item["code"] == "legacy_compatibility" for item in result["warnings"]))
+        self.assertTrue(any(item["code"] == "legacy_response_outcome" for item in result["warnings"]))
         self.assertTrue(any(item["code"] == "legacy_control_release" for item in result["warnings"]))
 
     def test_replay_reuses_journaled_capability_after_sidecar_change(self):
@@ -400,6 +401,17 @@ class SessionContractTests(unittest.TestCase):
         self.assertEqual(failure.exception.code, "remote_failed")
         self.assertTrue(failure.exception.detail["stdout_truncated"])
         self.assertTrue(failure.exception.detail["stderr_truncated"])
+
+    def test_remote_timeout_bounds_stream_reader_cleanup(self):
+        with mock.patch.object(
+            CLI.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["ssh"], 1),
+        ):
+            with self.assertRaises(CLI.CliError) as failure:
+                CLI.control_request("status", session="thread")
+        self.assertEqual(failure.exception.code, "remote_timeout")
+        self.assertTrue(failure.exception.detail["stream_cleanup_verified"])
 
     def test_pre_native_errors_are_deterministic_but_port_add_generation_is_uncertain(self):
         for code in ("resource_unverified", "capacity_insufficient", "lease_window_short"):

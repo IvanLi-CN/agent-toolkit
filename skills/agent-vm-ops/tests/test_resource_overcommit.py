@@ -364,6 +364,15 @@ class AdmissionTests(Fixture):
         admitted = self.call("acquire", "after", public_key=KEY, cpu=2)
         self.assertEqual(admitted["resources"]["cpu"], 2)
 
+    def test_cpu_startup_pressure_threshold_is_inclusive(self):
+        self.config.update(cpu_budget=15, cpu_overcommit_ratio=4, cpu_startup_pressure_full_avg10_percent=45.67)
+        self.resources.cpu_pressure.return_value["some"]["avg10"] = 45.67
+        self.resources.cpu_pressure.return_value["full"]["avg10"] = 45.67
+        self.call("acquire", "base", public_key=KEY, cpu=16)
+        with self.assertRaises(CONTROL.ControlError) as failure:
+            self.call("acquire", "equal", public_key=KEY, cpu=2)
+        self.assertEqual(failure.exception.code, "resource_pressure")
+
     def test_cached_resume_pressure_projection_uses_target_cpu(self):
         self.config.update(cpu_overcommit_ratio=8)
         self.call("acquire", "active", public_key=KEY, cpu=11)

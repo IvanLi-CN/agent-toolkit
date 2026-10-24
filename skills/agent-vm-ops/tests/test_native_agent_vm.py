@@ -857,6 +857,18 @@ class LifecycleTests(Fixture):
         task = self.store.get_task(session_id="thread-a")
         self.assertIsNone(self.store.get_port(task["task_id"], "web", "tcp"))
 
+    def test_port_remove_failure_keeps_closing_state_and_marks_outcome_uncertain(self):
+        self.acquire()
+        self.call("port-add", name="web", vm_port=8080)
+        task = self.store.get_task(session_id="thread-a")
+        failure = CONTROL.ControlError("conntrack_unverified", "matching flows remain")
+        with mock.patch.object(self.control, "_conntrack_delete", side_effect=failure):
+            with self.assertRaises(CONTROL.ControlError) as raised:
+                self.call("port-remove", name="web")
+        self.assertEqual(raised.exception.detail["operation_phase"], "port-remove")
+        self.assertFalse(raised.exception.detail["outcome_verified"])
+        self.assertEqual(self.store.get_port(task["task_id"], "web", "tcp")["state"], "closing")
+
     def test_existing_port_retry_cannot_reopen_mapping_after_expiry_preemption(self):
         self.acquire()
         self.call("port-add", name="web", vm_port=8080)

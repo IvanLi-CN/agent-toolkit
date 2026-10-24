@@ -278,11 +278,13 @@ async function raceWithTimeout<T, U>(promise: Promise<T>, timeoutMs: number, tim
 async function terminateAndReap(supervised: SupervisedChild): Promise<boolean> {
   const observedExit = supervised.wrapperExited;
   killProcessTree(supervised, "SIGTERM");
-  const cleanupReady = await supervised.waitForCleanupAcknowledged();
+  let cleanupReady = await supervised.waitForCleanupAcknowledged();
   await raceWithTimeout(observedExit, SUPERVISOR_STOP_GRACE_MS, undefined);
   const wrapperExited = await Promise.race([observedExit.then(() => true, () => true), Bun.sleep(0).then(() => false)]);
   if (!cleanupReady || !wrapperExited) {
-    if (!cleanupReady) await supervised.forceCleanup();
+    if (!cleanupReady) {
+      cleanupReady = await supervised.forceCleanup();
+    }
     killProcessTree(supervised, "SIGKILL");
   }
   await raceWithTimeout(observedExit, SUPERVISOR_STOP_GRACE_MS, undefined);

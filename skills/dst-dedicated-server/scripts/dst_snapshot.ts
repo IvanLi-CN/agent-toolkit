@@ -387,7 +387,9 @@ async function runWithStdin(
     await Promise.race([supervised.wrapperExited.then(() => undefined, () => undefined), new Promise<void>((resolve) => setTimeout(resolve, SUPERVISOR_STOP_GRACE_MS))]);
     const wrapperExited = await Promise.race([supervised.wrapperExited.then(() => true, () => true), Bun.sleep(0).then(() => false)]);
     if (!cleanupReady || !wrapperExited) {
-      if (!cleanupReady) await supervised.forceCleanup();
+      if (!cleanupReady) {
+        cleanupReady = await supervised.forceCleanup();
+      }
       killProcessTree(supervised, "SIGKILL");
     }
     await Promise.race([supervised.wrapperExited.then(() => undefined, () => undefined), new Promise<void>((resolve) => setTimeout(resolve, SUPERVISOR_STOP_GRACE_MS))]);
@@ -395,7 +397,9 @@ async function runWithStdin(
       clearTimeout(forceKillTimer);
       forceKillTimer = undefined;
     }
-    if (!cleanupReady) await supervised.cleanup();
+    if (!cleanupReady) {
+      await supervised.cleanup();
+    }
     await Promise.all([
       cancelStream(child.stdout),
       cancelStream(child.stderr),

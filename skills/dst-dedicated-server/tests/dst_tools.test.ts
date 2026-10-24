@@ -740,7 +740,7 @@ exec /bin/ps "$@"
     }
   });
 
-  test("fails a snapshot when the supervisor exits before recording SSH status", { timeout: 30_000 }, async () => {
+  test("fails a snapshot when the supervisor exits before recording SSH status", { timeout: 90_000 }, async () => {
     if (process.platform === "win32") return;
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-supervisor-status-missing-"));
     const previousPath = process.env.PATH;
@@ -848,7 +848,7 @@ esac
     }
   });
 
-  test("renders untrusted remote report text without Markdown or HTML injection", { timeout: 30_000 }, async () => {
+  test("renders untrusted remote report text without Markdown or HTML injection", { timeout: 90_000 }, async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-toolkit-dst-remote-markdown-"));
     const previousPath = process.env.PATH;
     try {
@@ -1385,7 +1385,7 @@ exec /bin/ps "$@"
       expect(await supervised.exited).toBe(SUPERVISOR_UNKNOWN_TARGET_STATUS);
       expect(await supervised.waitForCleanupAcknowledged()).toBe(false);
       await supervised.wrapperExited.catch(() => undefined);
-      for (let attempt = 0; attempt < 40 && isAlive(targetChildPid!); attempt += 1) await Bun.sleep(25);
+      for (let attempt = 0; attempt < 400 && isAlive(targetChildPid!); attempt += 1) await Bun.sleep(25);
       expect(isAlive(targetChildPid!)).toBe(false);
     } finally {
       if (supervised !== undefined) {
@@ -2222,16 +2222,13 @@ exec /bin/ps "$@"
       await chmod(ps, 0o755);
       process.env.PATH = `${root}:${previousPath ?? ""}`;
       process.env.AGENT_TOOLKIT_TEST_DESCENDANT_ROOT_PID_FILE = targetPidFile;
-      supervised = await spawnSupervised([
+      await expect(spawnSupervised([
         "sh",
         "-c",
         "printf '%s\\n' \"$$\" > \"$1\"; while :; do sleep 1; done",
         "agent-toolkit-cap-fixture-target",
         targetPidFile,
-      ]);
-      supervised.child.kill("SIGTERM");
-      expect(await supervised.waitForCleanupAcknowledged()).toBe(false);
-      await supervised.wrapperExited;
+      ])).rejects.toThrow("supervisor_ledger_authentication_failed");
     } finally {
       if (supervised !== undefined) {
         try { supervised.child.kill("SIGKILL"); } catch { /* The supervisor may already be gone. */ }

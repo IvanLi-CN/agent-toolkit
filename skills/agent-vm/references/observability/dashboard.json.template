@@ -90,7 +90,7 @@
         "x": 0,
         "y": 0
       },
-      "id": 507,
+      "id": 515,
       "panels": [],
       "title": "Agent VM capacity summary",
       "type": "row"
@@ -940,6 +940,18 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
+          "expr": "100 * agent_vm_admission_cpu_allocated_and_reserved_vcpu{job=\"$controller_job\"}",
+          "format": "time_series",
+          "hide": false,
+          "interval": "",
+          "legendFormat": "Allocated + reserved VM CPU",
+          "refId": "E"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
           "expr": "agent_vm_cpu_pressure_some_avg10_percent{job=\"$controller_job\"}",
           "format": "time_series",
           "hide": false,
@@ -1238,6 +1250,17 @@
           "format": "time_series",
           "legendFormat": "Reserved VM RAM",
           "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "editorMode": "code",
+          "expr": "agent_vm_admission_memory_allocated_and_reserved_bytes{job=\"$controller_job\"}",
+          "format": "time_series",
+          "legendFormat": "Allocated + reserved VM RAM",
+          "refId": "G"
         },
         {
           "datasource": {
@@ -4143,7 +4166,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 64
+      "y": 65
       },
       "id": 502,
       "panels": [],
@@ -4207,7 +4230,7 @@
         "h": 5,
         "w": 6,
         "x": 0,
-        "y": 65
+        "y": 66
       },
       "id": 507,
       "options": {
@@ -4293,7 +4316,7 @@
         "h": 5,
         "w": 6,
         "x": 6,
-        "y": 65
+        "y": 66
       },
       "id": 508,
       "options": {
@@ -4368,7 +4391,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 65
+        "y": 66
       },
       "id": 509,
       "options": {
@@ -4399,6 +4422,431 @@
       ],
       "title": "Task state counts",
       "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 75
+      },
+      "id": 510,
+      "panels": [],
+      "title": "Admission detail",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "__PROMETHEUS_UID__"
+      },
+      "description": "Physical disk admission composition and authoritative disk limits. Missing or unverified limits remain absent.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 16,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "mappings": [],
+          "unit": "bytes"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*(limit|capacity)$"
+            },
+            "properties": [
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 76
+      },
+      "id": 511,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "agent_vm_admission_disk_allocated_bytes{job=\"$controller_job\"}",
+          "legendFormat": "Disk allocated",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "agent_vm_admission_disk_reserved_bytes{job=\"$controller_job\"}",
+          "legendFormat": "Disk reserved",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "agent_vm_admission_disk_allocated_and_reserved_bytes{job=\"$controller_job\"}",
+          "legendFormat": "Disk allocated + reserved",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "agent_vm_admission_disk_remaining_bytes{job=\"$controller_job\"}",
+          "legendFormat": "Disk remaining",
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "agent_vm_admission_disk_limit_bytes{job=\"$controller_job\"}",
+          "legendFormat": "Disk limit",
+          "refId": "E"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "agent_vm_admission_disk_capacity_bytes{job=\"$controller_job\"}",
+          "legendFormat": "Disk capacity",
+          "refId": "F"
+        }
+      ],
+      "title": "Disk admission",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "__PROMETHEUS_UID__"
+      },
+      "description": "VM slot admission composition. A missing line means Incus did not expose an authoritative slot limit.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 16,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*(limit|capacity)$"
+            },
+            "properties": [
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 76
+      },
+      "id": 512,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "agent_vm_admission_instances_allocated_count{job=\"$controller_job\"}",
+          "legendFormat": "VMs allocated",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "agent_vm_admission_instances_reserved_count{job=\"$controller_job\"}",
+          "legendFormat": "VMs reserved",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "agent_vm_admission_instances_allocated_and_reserved_count{job=\"$controller_job\"}",
+          "legendFormat": "VMs allocated + reserved",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "agent_vm_admission_instances_remaining_count{job=\"$controller_job\"}",
+          "legendFormat": "VM slots remaining",
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "agent_vm_admission_instances_limit_count{job=\"$controller_job\"}",
+          "legendFormat": "VM slots limit",
+          "refId": "E"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "agent_vm_admission_instances_capacity_count{job=\"$controller_job\"}",
+          "legendFormat": "VM slots capacity",
+          "refId": "F"
+        }
+      ],
+      "title": "VM slot admission",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "__PROMETHEUS_UID__"
+      },
+      "description": "CT-local filesystem capacity for the root and Incus image staging boundaries.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 16,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "mappings": [],
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 85
+      },
+      "id": 513,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "agent_vm_filesystem_size_bytes{job=\"$controller_job\",mountpoint=~\"/|/var/lib/incus/images\"}",
+          "legendFormat": "{{mountpoint}} total",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "agent_vm_filesystem_used_bytes{job=\"$controller_job\",mountpoint=~\"/|/var/lib/incus/images\"}",
+          "legendFormat": "{{mountpoint}} used",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "agent_vm_filesystem_available_bytes{job=\"$controller_job\",mountpoint=~\"/|/var/lib/incus/images\"}",
+          "legendFormat": "{{mountpoint}} available",
+          "refId": "C"
+        }
+      ],
+      "title": "Control filesystem capacity",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "__PROMETHEUS_UID__"
+      },
+      "description": "Admission and collector state. Warning rate is shown only when the source counter is present.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 85
+      },
+      "id": 514,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "agent_vm_admission_reclaim_required{job=\"$controller_job\"}",
+          "instant": true,
+          "legendFormat": "Reclaim required",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "agent_vm_admission_draining{job=\"$controller_job\"}",
+          "instant": true,
+          "legendFormat": "Draining",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "sum(rate(agent_vm_warnings_total{job=\"$controller_job\"}[5m]))",
+          "instant": true,
+          "legendFormat": "Warnings / s",
+          "refId": "C"
+        }
+      ],
+      "title": "Admission state",
+      "type": "stat"
     }
   ],
   "refresh": "auto",

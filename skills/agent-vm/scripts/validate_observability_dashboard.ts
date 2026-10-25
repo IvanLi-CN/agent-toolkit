@@ -13,6 +13,11 @@ export const REQUIRED_PANEL_TITLES = [
   "CT MemAvailable",
   "Runtime pressure",
   "Admission headroom",
+  "Policy and task snapshot",
+  "Disk admission",
+  "VM slot admission",
+  "Control filesystem capacity",
+  "Admission state",
 ];
 
 export const REQUIRED_METRICS = [
@@ -20,11 +25,13 @@ export const REQUIRED_METRICS = [
   "agent_vm_admission_cpu_limit_vcpu",
   "agent_vm_admission_cpu_allocated_vcpu",
   "agent_vm_admission_cpu_reserved_vcpu",
+  "agent_vm_admission_cpu_allocated_and_reserved_vcpu",
   "agent_vm_admission_cpu_remaining_vcpu",
   "agent_vm_admission_memory_capacity_bytes",
   "agent_vm_admission_memory_limit_bytes",
   "agent_vm_admission_memory_allocated_bytes",
   "agent_vm_admission_memory_reserved_bytes",
+  "agent_vm_admission_memory_allocated_and_reserved_bytes",
   "agent_vm_admission_memory_remaining_bytes",
   "agent_vm_admission_default_request_cpu_vcpu",
   "agent_vm_admission_default_request_memory_bytes",
@@ -32,12 +39,29 @@ export const REQUIRED_METRICS = [
   "agent_vm_admission_default_request_physical_cost_bytes",
   "agent_vm_admission_default_vm_logical_slots",
   "agent_vm_admission_default_vm_startable_slots",
+  "agent_vm_admission_disk_allocated_bytes",
+  "agent_vm_admission_disk_reserved_bytes",
+  "agent_vm_admission_disk_allocated_and_reserved_bytes",
   "agent_vm_cpu_pressure_some_avg10_percent",
   "agent_vm_cpu_pressure_full_avg10_percent",
   "agent_vm_cpu_startup_pressure_threshold_percent",
   "agent_vm_cpu_startup_blocked",
   "agent_vm_admission_disk_remaining_bytes",
+  "agent_vm_admission_disk_limit_bytes",
+  "agent_vm_admission_disk_capacity_bytes",
+  "agent_vm_admission_instances_allocated_count",
+  "agent_vm_admission_instances_reserved_count",
+  "agent_vm_admission_instances_allocated_and_reserved_count",
+  "agent_vm_admission_instances_remaining_count",
+  "agent_vm_admission_instances_limit_count",
+  "agent_vm_admission_instances_capacity_count",
   "agent_vm_admission_ready",
+  "agent_vm_admission_reclaim_required",
+  "agent_vm_admission_draining",
+  "agent_vm_filesystem_size_bytes",
+  "agent_vm_filesystem_used_bytes",
+  "agent_vm_filesystem_available_bytes",
+  "agent_vm_warnings_total",
   "agent_vm_memory_current_bytes",
   "agent_vm_memory_available_bytes",
   "agent_vm_memory_pressure",
@@ -47,6 +71,7 @@ export const REQUIRED_METRICS = [
   "incus_storage_pool_size_bytes",
   "incus_storage_pool_used_bytes",
   "incus_filesystem_size_bytes",
+  "incus_filesystem_avail_bytes",
   "incus_network_receive_packets_total",
   "incus_network_transmit_packets_total",
 ];
@@ -118,6 +143,15 @@ function targetRecords(dashboard: JsonRecord): JsonRecord[] {
   return targets;
 }
 
+function panelIds(dashboard: JsonRecord): Map<number, number> {
+  const counts = new Map<number, number>();
+  walk(dashboard.panels, (value) => {
+    if (typeof value.id !== "number" || typeof value.type !== "string") return;
+    counts.set(value.id, (counts.get(value.id) ?? 0) + 1);
+  });
+  return counts;
+}
+
 function stringsInTargets(targets: JsonRecord[]): string[] {
   return targets.flatMap((target) => Object.values(target).filter((value): value is string => typeof value === "string"));
 }
@@ -131,6 +165,10 @@ export function validateDashboard(dashboard: unknown, expectedDatasourceUid?: st
   const titles = panelTitles(dashboard);
   for (const title of options.requiredPanelTitles ?? REQUIRED_PANEL_TITLES) {
     if (!titles.has(title)) findings.push(`missing panel or row: ${title}`);
+  }
+
+  for (const [id, count] of panelIds(dashboard)) {
+    if (count > 1) findings.push(`dashboard panel id must be unique: ${id}`);
   }
 
   const variables = isRecord(dashboard.templating) && Array.isArray(dashboard.templating.list)

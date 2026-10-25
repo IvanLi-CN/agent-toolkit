@@ -201,10 +201,19 @@ export function writeBundle(bundle: RenderedBundle, outputDir: string, force = f
     { path: inventoryDashboardPath, text: bundle.inventoryDashboardText },
     { path: provisioningPath, text: bundle.provisioningText },
   ];
-  const staging = mkdtempSync(join(directory, ".agent-vm-observability-"));
+  const lockPath = join(directory, ".agent-vm-observability.lock");
+  let lockAcquired = false;
+  let staging: string | undefined;
   const backups: Array<{ path: string; backup: string }> = [];
   const installed: string[] = [];
   try {
+    try {
+      mkdirSync(lockPath);
+      lockAcquired = true;
+    } catch (error) {
+      throw new Error(`output directory is locked: ${directory}: ${String(error)}`);
+    }
+    staging = mkdtempSync(join(directory, ".agent-vm-observability-"));
     for (const [index, output] of outputs.entries()) writeFileSync(join(staging, String(index)), output.text, "utf8");
     for (const [index, output] of outputs.entries()) {
       const stagedPath = join(staging, String(index));
@@ -221,7 +230,8 @@ export function writeBundle(bundle: RenderedBundle, outputDir: string, force = f
     for (const { path, backup } of backups.reverse()) if (existsSync(backup)) renameSync(backup, path);
     throw error;
   } finally {
-    if (existsSync(staging)) rmSync(staging, { recursive: true, force: true });
+    if (staging && existsSync(staging)) rmSync(staging, { recursive: true, force: true });
+    if (lockAcquired && existsSync(lockPath)) rmSync(lockPath, { recursive: true, force: true });
   }
   return { dashboardPath, inventoryDashboardPath, provisioningPath };
 }

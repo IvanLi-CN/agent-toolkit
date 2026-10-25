@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { renderBundle, readConfig, writeBundle, type ObservabilityConfig } from "../scripts/render_observability_dashboard.ts";
 import {
@@ -33,7 +33,7 @@ test("renders a portable dashboard and provisioning bundle", () => {
   expect(bundle.inventoryDashboardText).toContain('"ssh_host_port": "SSH port"');
   expect(bundle.inventoryDashboardText).toContain('"options": "state_order"');
   expect(bundle.inventoryDashboardText).not.toContain('"state_order": true');
-  expect(bundle.inventoryDashboardText).toContain('"text": [\n            "active",\n            "preparing",\n            "closing",\n            "deleting",\n            "failed",\n            "cached",\n            "absent"');
+  expect(bundle.inventoryDashboardText).toContain('"text": [\n            "active",\n            "preparing",\n            "failed",\n            "closing",\n            "deleting"');
   expect(bundle.inventoryDashboardText).not.toContain("or vector(0)");
   expect(bundle.dashboardText).toContain('"uid": "prometheus-test"');
   expect(bundle.dashboardText).toContain('"value": "controller-test"');
@@ -80,6 +80,14 @@ test("rejects dashboards that mix Prometheus datasource UIDs", () => {
   const panel = panels.find((candidate) => candidate.datasource && typeof candidate.datasource === "object") as Record<string, unknown>;
   (panel.datasource as Record<string, unknown>).uid = "another-prometheus";
   expect(validateDashboard(dashboard)).toContain("dashboard must use exactly one Prometheus datasource UID");
+});
+
+test("rejects dashboards with duplicate panel ids", () => {
+  const bundle = renderBundle(config);
+  const dashboard = structuredClone(bundle.dashboard) as Record<string, unknown>;
+  const panels = dashboard.panels as Array<Record<string, unknown>>;
+  panels.push({ ...panels[0] });
+  expect(validateDashboard(dashboard).some((finding) => finding.startsWith("dashboard panel id must be unique:"))).toBe(true);
 });
 
 test("refuses unresolved configuration placeholders", () => {
@@ -142,6 +150,17 @@ test("writes both outputs and refuses accidental replacement", () => {
     expect(readFileSync(paths.inventoryDashboardPath, "utf8")).toContain('"title": "Agent VM / Incus / Inventory & Operations"');
     expect(() => writeBundle(bundle, root)).toThrow("pass --force");
     expect(writeBundle(bundle, root, true).dashboardPath).toBe(paths.dashboardPath);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("serializes bundle writes with an output-directory lock", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-vm-observability-lock-"));
+  try {
+    const bundle = renderBundle(config);
+    mkdirSync(join(root, ".agent-vm-observability.lock"));
+    expect(() => writeBundle(bundle, root, true)).toThrow("output directory is locked");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

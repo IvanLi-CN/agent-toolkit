@@ -36,7 +36,7 @@ The deployment repository should review and commit the rendered files together w
 
 The template uses a hidden `controller_job` variable so controller queries remain portable while the deployment supplies its actual job label. CPU capacity is read from `agent_vm_admission_cpu_capacity_vcpu`; memory and disk limits are rendered only from their authoritative metric families.
 
-The capacity dashboard separates logical admission from runtime pressure: its summary shows logical RAM remaining, CT-local `MemAvailable`, pressure/OOM state, and compact CPU/disk readiness; the policy snapshot below shows the default request, slot estimates, and task-state counts. The inventory dashboard defaults to active and transitional/failed tasks, orders rows by lifecycle priority, and leaves cached/absent history available through the state filter.
+The capacity dashboard separates logical admission from runtime pressure: its summary shows logical RAM remaining, CT-local `MemAvailable`, pressure/OOM state, and compact CPU/disk readiness; the policy snapshot below shows the default request, slot estimates, and task-state counts. The inventory dashboard exposes every lifecycle state through the state filter, shows active and transitional/failed rows by default, and keeps cached/absent history collapsed until selected. Inventory fields are joined by a `task_id|state` snapshot key so a lifecycle transition cannot combine resource data from different states.
 
 ## Validate
 

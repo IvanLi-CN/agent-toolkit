@@ -47,6 +47,7 @@ Local Bun follows the installed host runtime; CI follows the latest stable Bun a
 - Convert the embedded guest disk-growth action along with the guest runtime prerequisite. Preserve direct ext4/xfs partition constraints and use native `findmnt`, `lsblk`, `blockdev`, `growpart`, and filesystem growth commands.
 - Update control-host SSH execution, systemd expiry/reconcile/age-GC launch assets, managed-image checks, and deployment prerequisites together. The current client invokes `bun /opt/agent-vm-native/agent_vm_control.ts` over SSH, and the manual publisher uses `python3 skills/agent-vm-ops/scripts/agent_vm_release.py build`, `verify`, and `publish` for the fixed release set. Bun on the developer's computer does not establish its presence on the control host or guest.
 - Existing persisted digests, database records, and request serialization are compatibility contracts. Ordinary JS object serialization or floating-point arithmetic must not silently replace their semantics.
+- The deployment-owned Agent VM observability bridge is not shipped in public source. When it owns recurring scheduling, snapshot normalization, and Prometheus textfile reporting, its target runtime is TypeScript + Bun; it must invoke the canonical controller contract rather than create a second control plane. Public source carries only the bridge contract and behavior scenarios.
 
 ### XP operations
 

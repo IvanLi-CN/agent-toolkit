@@ -13,7 +13,7 @@ bun skills/agent-vm/scripts/render_observability_dashboard.ts \
   --force
 ```
 
-The renderer writes the parameterized dashboard source and a Grafana file-provider definition. The deployment implementation must render the approved `Agent VM / Capacity & Admission` and `Agent VM / Inventory & Operations` views, either as two dashboard JSON files or through a documented split-render wrapper; the YAML path must be visible inside the Grafana container.
+The renderer writes the parameterized capacity dashboard, inventory dashboard, and Grafana file-provider definition. The deployment implementation must render the approved `Agent VM / Capacity & Admission` and `Agent VM / Inventory & Operations` views; the YAML path must be visible inside the Grafana container.
 
 The deployment repository should review and commit the rendered files together with its Prometheus scrape configuration and read-only controller metrics bridge. The public repository does not receive those rendered files, datasource credentials, hostnames, collector paths, or live inventory.
 
@@ -30,17 +30,22 @@ The deployment repository should review and commit the rendered files together w
 | `controller_job` | Prometheus `job` label for the read-only Agent VM controller bridge. |
 | `dashboard_path` | Container-visible directory that Grafana scans for JSON dashboards. |
 | `dashboard_filename` | Optional rendered filename; defaults to `agent-vm-observability.json`. |
+| `inventory_dashboard_uid` | Optional stable UID for the inventory dashboard; defaults to `<dashboard_uid>-inventory`. |
+| `inventory_dashboard_title` | Optional inventory dashboard title; defaults to `<dashboard_title> / Inventory & Operations`. |
+| `inventory_dashboard_filename` | Optional inventory filename; defaults to `agent-vm-observability-inventory.json`. |
 
 The template uses a hidden `controller_job` variable so controller queries remain portable while the deployment supplies its actual job label. CPU capacity is read from `agent_vm_admission_cpu_capacity_vcpu`; memory and disk limits are rendered only from their authoritative metric families.
 
 ## Validate
 
-The renderer validates both outputs before writing them. A previously rendered bundle can be checked directly:
+The renderer validates both dashboards before writing them. A previously rendered bundle can be checked directly:
 
 ```bash
 bun skills/agent-vm/scripts/validate_observability_dashboard.ts \
   --dashboard /path/to/deployment/grafana/generated/agent-vm-observability.json \
   --provisioning /path/to/deployment/grafana/generated/agent-vm-observability.yml
 ```
+
+Run the same validator for `agent-vm-observability-inventory.json` when checking the inventory view.
 
 The validator checks the required panel/metric contract, automatic refresh, datasource consistency, the controller variable, and the rule that packet-rate PromQL must not multiply by `8`.

@@ -15,13 +15,19 @@ export type ObservabilityConfig = {
   controller_job: string;
   dashboard_path: string;
   dashboard_filename?: string;
+  inventory_dashboard_uid?: string;
+  inventory_dashboard_title?: string;
+  inventory_dashboard_filename?: string;
 };
 
 export type RenderedBundle = {
   dashboard: Record<string, unknown>;
   dashboardText: string;
+  inventoryDashboard: Record<string, unknown>;
+  inventoryDashboardText: string;
   provisioningText: string;
   dashboardFilename: string;
+  inventoryDashboardFilename: string;
 };
 
 const TEMPLATE_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "../references/observability");
@@ -48,6 +54,11 @@ function requiredString(config: Record<string, unknown>, field: keyof Observabil
   return value;
 }
 
+function optionalString(config: Record<string, unknown>, field: keyof ObservabilityConfig): string | undefined {
+  if (typeof config[field] === "undefined") return undefined;
+  return requiredString(config, field);
+}
+
 export function readConfig(path: string): ObservabilityConfig {
   let parsed: unknown;
   try {
@@ -69,13 +80,18 @@ export function readConfig(path: string): ObservabilityConfig {
     controller_job: requiredString(parsed, "controller_job"),
     dashboard_path: requiredString(parsed, "dashboard_path"),
     dashboard_filename: typeof parsed.dashboard_filename === "undefined" ? undefined : requiredString(parsed, "dashboard_filename"),
+    inventory_dashboard_uid: optionalString(parsed, "inventory_dashboard_uid"),
+    inventory_dashboard_title: optionalString(parsed, "inventory_dashboard_title"),
+    inventory_dashboard_filename: optionalString(parsed, "inventory_dashboard_filename"),
   } satisfies ObservabilityConfig;
 
   if (!/^[A-Za-z0-9_-]{1,40}$/.test(config.dashboard_uid)) throw new Error("dashboard_uid contains unsupported characters");
+  if (config.inventory_dashboard_uid && !/^[A-Za-z0-9_-]{1,40}$/.test(config.inventory_dashboard_uid)) throw new Error("inventory_dashboard_uid contains unsupported characters");
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(config.prometheus_datasource_uid)) throw new Error("prometheus_datasource_uid contains unsupported characters");
   if (!/^[A-Za-z0-9_.:-]{1,128}$/.test(config.controller_job)) throw new Error("controller_job contains unsupported characters");
   if (!config.dashboard_path.startsWith("/") || config.dashboard_path.includes("..")) throw new Error("dashboard_path must be an absolute path without ..");
   if (config.dashboard_filename && !/^[A-Za-z0-9._-]+\.json$/.test(config.dashboard_filename)) throw new Error("dashboard_filename must be a simple .json filename");
+  if (config.inventory_dashboard_filename && !/^[A-Za-z0-9._-]+\.json$/.test(config.inventory_dashboard_filename)) throw new Error("inventory_dashboard_filename must be a simple .json filename");
   return config;
 }
 
@@ -88,9 +104,7 @@ function renderText(template: string, replacements: Record<string, string>): str
 }
 
 export function renderBundle(config: ObservabilityConfig, templateDir: string = TEMPLATE_DIR): RenderedBundle {
-  const replacements = {
-    [TOKENS.dashboard_uid]: config.dashboard_uid,
-    [TOKENS.dashboard_title]: config.dashboard_title,
+  const commonReplacements = {
     [TOKENS.grafana_org_id]: String(config.grafana_org_id),
     [TOKENS.provider_name]: config.provider_name,
     [TOKENS.dashboard_folder]: config.dashboard_folder,
@@ -98,40 +112,87 @@ export function renderBundle(config: ObservabilityConfig, templateDir: string = 
     [TOKENS.controller_job]: config.controller_job,
     [TOKENS.dashboard_path]: config.dashboard_path,
   };
-  const dashboardText = renderText(readFileSync(resolve(templateDir, "dashboard.json.template"), "utf8"), replacements);
-  let dashboard: Record<string, unknown>;
-  try {
-    const parsed: unknown = JSON.parse(dashboardText);
-    if (!isRecord(parsed)) throw new Error("dashboard must be an object");
-    dashboard = parsed;
-  } catch (error) {
-    throw new Error(`rendered dashboard is not valid JSON: ${String(error)}`);
-  }
-  const provisioningText = renderText(readFileSync(resolve(templateDir, "provisioning.yml.template"), "utf8"), replacements);
+  const renderDashboard = (templateName: string, uid: string, title: string): { dashboard: Record<string, unknown>; text: string } => {
+    const replacements = {
+      ...commonReplacements,
+      [TOKENS.dashboard_uid]: uid,
+      [TOKENS.dashboard_title]: title,
+    };
+    const text = renderText(readFileSync(resolve(templateDir, templateName), "utf8"), replacements);
+    let dashboard: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(text);
+      if (!isRecord(parsed)) throw new Error("dashboard must be an object");
+      dashboard = parsed;
+    } catch (error) {
+      throw new Error(`rendered ${templateName} is not valid JSON: ${String(error)}`);
+    }
+    return { dashboard, text: `${JSON.stringify(dashboard, null, 2)}\n` };
+  };
+
+  const capacity = renderDashboard("dashboard.json.template", config.dashboard_uid, config.dashboard_title);
+  const inventory = renderDashboard(
+    "inventory-dashboard.json.template",
+    config.inventory_dashboard_uid ?? `${config.dashboard_uid}-inventory`,
+    config.inventory_dashboard_title ?? `${config.dashboard_title} / Inventory & Operations`,
+  );
+  const dashboard = capacity.dashboard;
+  const inventoryDashboard = inventory.dashboard;
+  const dashboardText = capacity.text;
+  const inventoryDashboardText = inventory.text;
+  const provisioningText = renderText(readFileSync(resolve(templateDir, "provisioning.yml.template"), "utf8"), commonReplacements);
   const findings = [
     ...validateDashboard(dashboard, config.prometheus_datasource_uid),
+    ...validateDashboard(inventoryDashboard, config.prometheus_datasource_uid, {
+      requiredPanelTitles: [
+        "Agent VM inventory summary",
+        "Managed VM inventory",
+        "Task state counts",
+        "Controller scrape health",
+        "Operation failures & image unpack",
+      ],
+      requiredMetrics: [
+        "agent_vm_task_info",
+        "agent_vm_task_cpu_vcpu",
+        "agent_vm_task_memory_bytes",
+        "agent_vm_task_disk_bytes",
+        "agent_vm_task_lease_expires_at_seconds",
+        "agent_vm_task_ssh_mapping",
+        "agent_vm_task_last_error_info",
+        "agent_vm_task_states",
+        "agent_vm_up",
+        "agent_vm_scrape_timestamp_seconds",
+        "agent_vm_operations_total",
+        "agent_vm_image_unpack_failures_total",
+      ],
+    }),
     ...validateProvisioning(provisioningText),
   ];
   if (findings.length > 0) throw new Error(`rendered observability bundle failed validation:\n${findings.join("\n")}`);
   return {
     dashboard,
-    dashboardText: `${JSON.stringify(dashboard, null, 2)}\n`,
+    dashboardText,
+    inventoryDashboard,
+    inventoryDashboardText,
     provisioningText,
     dashboardFilename: config.dashboard_filename ?? "agent-vm-observability.json",
+    inventoryDashboardFilename: config.inventory_dashboard_filename ?? "agent-vm-observability-inventory.json",
   };
 }
 
-export function writeBundle(bundle: RenderedBundle, outputDir: string, force = false): { dashboardPath: string; provisioningPath: string } {
+export function writeBundle(bundle: RenderedBundle, outputDir: string, force = false): { dashboardPath: string; inventoryDashboardPath: string; provisioningPath: string } {
   const directory = resolve(outputDir);
   mkdirSync(directory, { recursive: true });
   const dashboardPath = resolve(directory, bundle.dashboardFilename);
+  const inventoryDashboardPath = resolve(directory, bundle.inventoryDashboardFilename);
   const provisioningPath = resolve(directory, "agent-vm-observability.yml");
-  if (!force && (existsSync(dashboardPath) || existsSync(provisioningPath))) {
-    throw new Error(`output exists; pass --force to replace ${basename(dashboardPath)} or agent-vm-observability.yml`);
+  if (!force && (existsSync(dashboardPath) || existsSync(inventoryDashboardPath) || existsSync(provisioningPath))) {
+    throw new Error(`output exists; pass --force to replace ${basename(dashboardPath)}, ${basename(inventoryDashboardPath)} or agent-vm-observability.yml`);
   }
   writeFileSync(dashboardPath, bundle.dashboardText, "utf8");
+  writeFileSync(inventoryDashboardPath, bundle.inventoryDashboardText, "utf8");
   writeFileSync(provisioningPath, bundle.provisioningText, "utf8");
-  return { dashboardPath, provisioningPath };
+  return { dashboardPath, inventoryDashboardPath, provisioningPath };
 }
 
 function parseArgs(args: string[]): { config: string; outputDir: string; templateDir?: string; force: boolean } {
@@ -172,6 +233,7 @@ export function main(args: string[] = Bun.argv.slice(2)): number {
     const bundle = renderBundle(config, parsed.templateDir ? resolve(parsed.templateDir) : TEMPLATE_DIR);
     const paths = writeBundle(bundle, parsed.outputDir, parsed.force);
     console.log(`WROTE dashboard ${paths.dashboardPath}`);
+    console.log(`WROTE inventory dashboard ${paths.inventoryDashboardPath}`);
     console.log(`WROTE provisioning ${paths.provisioningPath}`);
     return 0;
   } catch (error) {

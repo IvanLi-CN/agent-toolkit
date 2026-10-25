@@ -17,12 +17,21 @@ export const REQUIRED_PANEL_TITLES = [
 
 export const REQUIRED_METRICS = [
   "agent_vm_admission_cpu_capacity_vcpu",
+  "agent_vm_admission_cpu_allocated_vcpu",
+  "agent_vm_admission_cpu_reserved_vcpu",
   "agent_vm_admission_cpu_remaining_vcpu",
   "agent_vm_admission_memory_capacity_bytes",
   "agent_vm_admission_memory_limit_bytes",
   "agent_vm_admission_memory_allocated_bytes",
   "agent_vm_admission_memory_reserved_bytes",
   "agent_vm_admission_memory_remaining_bytes",
+  "agent_vm_admission_default_request_memory_bytes",
+  "agent_vm_admission_default_vm_logical_slots",
+  "agent_vm_admission_default_vm_startable_slots",
+  "agent_vm_cpu_pressure_some_avg10_percent",
+  "agent_vm_cpu_pressure_full_avg10_percent",
+  "agent_vm_cpu_startup_pressure_threshold_percent",
+  "agent_vm_cpu_startup_blocked",
   "agent_vm_admission_disk_remaining_bytes",
   "agent_vm_admission_ready",
   "agent_vm_memory_current_bytes",
@@ -36,6 +45,11 @@ export const REQUIRED_METRICS = [
   "incus_network_receive_packets_total",
   "incus_network_transmit_packets_total",
 ];
+
+export type DashboardValidationOptions = {
+  requiredPanelTitles?: readonly string[];
+  requiredMetrics?: readonly string[];
+};
 
 type JsonRecord = Record<string, unknown>;
 
@@ -78,14 +92,14 @@ function stringsInTargets(targets: JsonRecord[]): string[] {
   return targets.flatMap((target) => Object.values(target).filter((value): value is string => typeof value === "string"));
 }
 
-export function validateDashboard(dashboard: unknown, expectedDatasourceUid?: string): string[] {
+export function validateDashboard(dashboard: unknown, expectedDatasourceUid?: string, options: DashboardValidationOptions = {}): string[] {
   const findings: string[] = [];
   if (!isRecord(dashboard)) return ["dashboard must be a JSON object"];
   if (dashboard.refresh !== "auto") findings.push("dashboard refresh must be auto");
   if (!Array.isArray(dashboard.panels)) findings.push("dashboard panels must be an array");
 
   const titles = panelTitles(dashboard);
-  for (const title of REQUIRED_PANEL_TITLES) {
+  for (const title of options.requiredPanelTitles ?? REQUIRED_PANEL_TITLES) {
     if (!titles.has(title)) findings.push(`missing panel or row: ${title}`);
   }
 
@@ -106,7 +120,7 @@ export function validateDashboard(dashboard: unknown, expectedDatasourceUid?: st
     .filter((expr): expr is string => typeof expr === "string");
   const allTargetText = targetStrings.join("\n");
 
-  for (const metric of REQUIRED_METRICS) {
+  for (const metric of options.requiredMetrics ?? REQUIRED_METRICS) {
     if (!allTargetText.includes(metric)) findings.push(`missing required metric: ${metric}`);
   }
 

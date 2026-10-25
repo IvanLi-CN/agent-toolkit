@@ -494,7 +494,7 @@ class AdmissionTests(Fixture):
         self.assertEqual(CONTROL.parse_time(result["observed_at"]), self.now)
         self.assertTrue({
             "observed_at", "up", "draining", "admission_ready", "reclaim_required", "resources",
-            "capacity", "disk_admission", "ct_cpu", "ct_memory", "instances", "task_states", "operations",
+            "capacity", "disk_admission", "default_admission", "ct_cpu", "ct_memory", "instances", "task_states", "operations",
             "pending_operations", "image_unpack_failures", "warnings", "warning_counts", "doctor",
         }.issubset(result))
         self.assertTrue(result["up"])
@@ -512,6 +512,9 @@ class AdmissionTests(Fixture):
         self.assertEqual(result["resources"]["allocated_and_reserved"]["memory_mib"], 4096)
         self.assertEqual(result["resources"]["limits"]["memory_mib"], 65536)
         self.assertEqual(result["resources"]["remaining"]["memory_mib"], 61440)
+        self.assertEqual(result["default_admission"]["requested"], {"cpu": 2, "memory_mib": 4096, "disk_gib": 20})
+        self.assertIn("request_cost_bytes", result["default_admission"])
+        self.assertIn("reasons", result["default_admission"])
         self.assertIn("layers", result["capacity"])
         self.assertTrue(result["disk_admission"]["verified"])
         self.assertIn("physical_admission", result["disk_admission"])

@@ -863,6 +863,78 @@
           "interval": "",
           "legendFormat": "CT CPU capacity",
           "refId": "L"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "100 * agent_vm_admission_cpu_allocated_vcpu{job=\"$controller_job\"}",
+          "format": "time_series",
+          "hide": false,
+          "interval": "",
+          "legendFormat": "Allocated VM CPU",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "100 * agent_vm_admission_cpu_reserved_vcpu{job=\"$controller_job\"}",
+          "format": "time_series",
+          "hide": false,
+          "interval": "",
+          "legendFormat": "Reserved VM CPU",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "agent_vm_cpu_pressure_some_avg10_percent{job=\"$controller_job\"}",
+          "format": "time_series",
+          "hide": false,
+          "interval": "",
+          "legendFormat": "CPU PSI some.avg10",
+          "refId": "P"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "agent_vm_cpu_pressure_full_avg10_percent{job=\"$controller_job\"}",
+          "format": "time_series",
+          "hide": false,
+          "interval": "",
+          "legendFormat": "CPU PSI full.avg10",
+          "refId": "Q"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "agent_vm_cpu_startup_pressure_threshold_percent{job=\"$controller_job\"}",
+          "format": "time_series",
+          "hide": false,
+          "interval": "",
+          "legendFormat": "Startup pressure threshold",
+          "refId": "T"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "100 * agent_vm_cpu_startup_blocked{job=\"$controller_job\"}",
+          "format": "time_series",
+          "hide": false,
+          "interval": "",
+          "legendFormat": "Startup blocked",
+          "refId": "U"
         }
       ],
       "title": "Project CPU Usage",
@@ -4001,6 +4073,39 @@
           "instant": true,
           "legendFormat": "Ready",
           "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "editorMode": "code",
+          "expr": "agent_vm_admission_default_vm_logical_slots{job=\"$controller_job\"}",
+          "instant": true,
+          "legendFormat": "Default VM logical slots",
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "editorMode": "code",
+          "expr": "agent_vm_admission_default_vm_startable_slots{job=\"$controller_job\"}",
+          "instant": true,
+          "legendFormat": "Default VM startable slots",
+          "refId": "E"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "editorMode": "code",
+          "expr": "agent_vm_admission_default_request_memory_bytes{job=\"$controller_job\"}",
+          "instant": true,
+          "legendFormat": "Default VM RAM request",
+          "refId": "F"
         }
       ],
       "title": "Admission headroom",

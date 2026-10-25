@@ -7413,6 +7413,7 @@ class Control:
                 "resources": resources,
                 "capacity": doctor.get("capacity"),
                 "disk_admission": disk_admission,
+                "default_admission": doctor.get("default_admission"),
                 "ct_cpu": {
                     "capacity_vcpu": (resources.get("ct_capacity") or {}).get("cpu")
                     if isinstance(resources, Mapping) else None,

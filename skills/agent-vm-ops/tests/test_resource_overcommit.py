@@ -576,6 +576,29 @@ class AdmissionTests(Fixture):
         self.assertTrue(result["observation_consistent"])
         self.assertEqual(result["observation_attempts"], 2)
 
+    def test_admin_metrics_disk_fallback_uses_the_final_state_snapshot(self):
+        original_doctor = self.control.doctor
+        original_disk_diagnostics = self.control._disk_admission_diagnostics
+        fallback_tasks = []
+
+        def doctor_without_embedded_disk(request, session_id):
+            result = original_doctor(request, session_id)
+            result["resources"] = dict(result["resources"])
+            result["resources"]["disk_admission"] = None
+            return result
+
+        def disk_diagnostics(capacity, *, tasks=None):
+            fallback_tasks.append(tasks)
+            return original_disk_diagnostics(capacity, tasks=tasks)
+
+        with mock.patch.object(self.control, "doctor", side_effect=doctor_without_embedded_disk), \
+             mock.patch.object(self.control, "_disk_admission_diagnostics", side_effect=disk_diagnostics):
+            result = self.call("admin-metrics")
+
+        self.assertTrue(result["observation_consistent"])
+        self.assertGreaterEqual(len(fallback_tasks), 1)
+        self.assertIsNotNone(fallback_tasks[-1])
+
     def test_admin_metrics_reports_pending_operation_journals(self):
         request = self.request("acquire", operation="metrics-pending", public_key=KEY)
         digest = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()

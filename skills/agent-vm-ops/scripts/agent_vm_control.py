@@ -4949,7 +4949,12 @@ class Control:
                 result["memory_pressure"] = memory["available_bytes"] < memory["threshold_bytes"]
             return result
 
-    def _disk_admission_diagnostics(self, capacity: Mapping[str, Any] | None) -> dict[str, Any]:
+    def _disk_admission_diagnostics(
+        self,
+        capacity: Mapping[str, Any] | None,
+        *,
+        tasks: Iterable[Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         if not isinstance(capacity, Mapping) or not isinstance(capacity.get("layers"), list):
             return {"verified": False, "error": {"code": "resource_unverified", "message": "disk capacity is unavailable"}}
         try:
@@ -4958,7 +4963,8 @@ class Control:
                 raise ValueError()
             allocated = reserved = allocated_and_reserved = 0
             durable_reserved = 0
-            for task in self.store.list_tasks():
+            task_rows = self.store.list_tasks() if tasks is None else tasks
+            for task in task_rows:
                 if task["state"] in {"absent", "cached"}:
                     continue
                 resources = parse_resource_mapping(task["resources_json"], "resources", allow_empty=False)
@@ -7492,15 +7498,20 @@ class Control:
             with self.store.read_transaction():
                 state_epoch_before = self.store.get_meta("state_epoch") or "initial"
             doctor = self.doctor(request, session_id)
+            resources = doctor.get("resources", {})
             with self.store.read_transaction():
                 state_epoch_after = self.store.get_meta("state_epoch") or "initial"
                 tasks = self.store.list_tasks()
                 audit = self.store.audit_summary()
+                disk_admission = resources.get("disk_admission") if isinstance(resources, Mapping) else None
+                if not isinstance(disk_admission, Mapping):
+                    disk_admission = self._disk_admission_diagnostics(doctor.get("capacity"), tasks=tasks)
                 snapshot = {
                     "draining": self.store.get_meta("draining") == "1",
                     "task_states": dict(Counter(str(task["state"]) for task in tasks)),
                     "pending_operations": self.store.pending_operations(),
                     "audit": audit,
+                    "disk_admission": disk_admission,
                 }
             if state_epoch_before == state_epoch_after:
                 observation_consistent = True
@@ -7518,9 +7529,6 @@ class Control:
                 "attempts": observation_attempts,
             })
         audit = snapshot["audit"]
-        disk_admission = resources.get("disk_admission") if isinstance(resources, Mapping) else None
-        if not isinstance(disk_admission, Mapping):
-            disk_admission = self._disk_admission_diagnostics(doctor.get("capacity"))
         return {
             "observation_epoch": state_epoch_after,
             "observation_consistent": observation_consistent,
@@ -7532,7 +7540,7 @@ class Control:
             "reclaim_required": doctor.get("default_admission", {}).get("reclaim_required"),
             "resources": resources,
             "capacity": doctor.get("capacity"),
-            "disk_admission": disk_admission,
+            "disk_admission": snapshot["disk_admission"],
             "default_admission": doctor.get("default_admission"),
             "ct_cpu": {
                 "capacity_vcpu": (resources.get("ct_capacity") or {}).get("cpu")

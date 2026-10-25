@@ -546,6 +546,46 @@ class SessionContractTests(unittest.TestCase):
         self.assertEqual(saved["outcome"], "error")
         self.assertEqual(saved["error"]["code"], "request_schema_incompatible")
 
+    def test_existing_operation_journal_replays_after_exclusive_create_race(self):
+        operation_id = "exclusive-race"
+        metadata = {
+            "manifest_present": False,
+            "actions": {},
+        }
+        request = {
+            "protocol": CLI.PROTOCOL_VERSION,
+            "action": "acquire",
+            "session_id": "thread",
+            "generation": 0,
+            "operation_id": operation_id,
+            "compatibility": CLI.client_capability("acquire", metadata),
+        }
+        response = {
+            "ok": True,
+            "protocol": CLI.PROTOCOL_VERSION,
+            "action": "acquire",
+            "session_id": "thread",
+            "generation": 0,
+            "operation_id": operation_id,
+            "outcome": "success",
+            "server_time": "2026-10-22T00:00:00+00:00",
+            "result": {},
+        }
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(CLI, "local_session_dir", return_value=Path(directory)), \
+             mock.patch.object(CLI, "load_client_release_metadata", return_value=(metadata, [])), \
+             mock.patch.object(CLI.subprocess, "run", return_value=subprocess.CompletedProcess(
+                 [], 0, (json.dumps(response) + "\n").encode(), b""
+             )):
+            operations = Path(directory) / "operations"
+            operations.mkdir()
+            journal = operations / (hashlib.sha256(operation_id.encode()).hexdigest() + ".json")
+            journal.write_text(json.dumps({"request": request, "outcome": "pending"}), encoding="utf-8")
+            result = CLI.control_request("acquire", session="thread", generation=0, write=True, operation_id=operation_id)
+            saved = json.loads(journal.read_text(encoding="utf-8"))
+        self.assertEqual(result["outcome"], "success")
+        self.assertEqual(saved["outcome"], "success")
+
     def test_success_response_must_match_request_generation(self):
         response = {
             "ok": True,

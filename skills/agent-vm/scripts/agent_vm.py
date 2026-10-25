@@ -467,6 +467,28 @@ def _write_local_operation(path: Path, request: Mapping[str, Any], result: Mappi
         )
 
 
+def _reuse_local_operation(path: Path, request: Mapping[str, Any], *, wait_for_writer: bool = False) -> dict[str, Any]:
+    attempts = 50 if wait_for_writer else 1
+    for attempt in range(attempts):
+        try:
+            old = json.loads(path.read_text())
+        except (ValueError, OSError):
+            if attempt + 1 == attempts:
+                fail("local_journal_invalid", "operation journal is unreadable")
+            time.sleep(0.01)
+            continue
+        old_request = old.get("request") if isinstance(old, dict) else None
+        if not isinstance(old_request, dict):
+            fail("local_journal_invalid", "operation journal request is invalid")
+        current_intent = {key: value for key, value in request.items() if key != "compatibility"}
+        old_intent = {key: value for key, value in old_request.items() if key != "compatibility"}
+        if old_intent != current_intent:
+            fail("operation_conflict", "operation ID already describes another request")
+        # Replay the exact request recorded before the client sidecar changed.
+        return dict(old_request)
+    fail("local_journal_invalid", "operation journal is unreadable")
+
+
 def _json_value_matches(actual: Any, expected: Any) -> bool:
     return type(actual) is type(expected) and actual == expected
 
@@ -631,25 +653,16 @@ def control_request(action: str, *, session: str | None, generation: int | None 
         directory = local_session_dir(session) / "operations"
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         op_path = directory / (hashlib.sha256(request["operation_id"].encode()).hexdigest() + ".json")
-        if op_path.exists():
-            try: old = json.loads(op_path.read_text())
-            except (ValueError, OSError): fail("local_journal_invalid", "operation journal is unreadable")
-            old_request = old.get("request") if isinstance(old, dict) else None
-            if not isinstance(old_request, dict):
-                fail("local_journal_invalid", "operation journal request is invalid")
-            current_intent = {key: value for key, value in request.items() if key != "compatibility"}
-            old_intent = {key: value for key, value in old_request.items() if key != "compatibility"}
-            if old_intent != current_intent:
-                fail("operation_conflict", "operation ID already describes another request")
-            # Replay the exact request recorded before the client sidecar changed.
-            # The compatibility warning is still added to the returned envelope.
-            request = dict(old_request)
-        else:
+        try:
             with op_path.open("x", encoding="utf-8") as handle:
                 os.fchmod(handle.fileno(), 0o600)
                 json.dump({"request": request, "outcome": "pending"}, handle, sort_keys=True)
                 handle.flush()
                 os.fsync(handle.fileno())
+        except FileExistsError:
+            # Another client may have created the journal just before us.  The
+            # bounded retry also avoids reading its file between create and fsync.
+            request = _reuse_local_operation(op_path, request, wait_for_writer=True)
     try:
         control_host = os.environ.get(CONTROL_HOST_ENV, DEFAULT_CONTROL_HOST)
         remote_control = os.environ.get(REMOTE_CONTROL_ENV, DEFAULT_REMOTE_CONTROL)

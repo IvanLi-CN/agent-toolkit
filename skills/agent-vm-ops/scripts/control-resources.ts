@@ -349,7 +349,7 @@ export class ResourceControl extends ControlCore {
 
   async _eligible_cache(snapshot: Data): Promise<Data> {
     const task = this.store.get_task({ task_id: snapshot.task_id });
-    if (!task || task.state !== "cached" || !task.inactive_since)
+    if (!task || !["cached", "deleting"].includes(task.state) || !task.inactive_since)
       throw new ControlError("cache_ineligible", "not an eligible stopped cache");
     if (compare(task.generation, snapshot.generation) !== 0 || task.session_id !== snapshot.session_id)
       throw new ControlError("cache_ineligible", "cache ownership or generation changed");

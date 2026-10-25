@@ -177,7 +177,7 @@ export class Client {
     try { response = parseJson(new TextDecoder("utf-8", { fatal: true }).decode(result.stdout)); } catch { fail("invalid_remote_response", "control did not return JSON", detail); }
     if (!record(response) || response.protocol !== PROTOCOL || response.action !== action || (response.session_id ?? null) !== session) fail("protocol_mismatch", "response protocol or request identity differs");
     if ("generation" in request && !equal(response.generation, request.generation)) fail("protocol_mismatch", "response generation differs");
-    if (write && response.operation_id !== request.operation_id) fail("protocol_mismatch", "operation identity differs");
+    if ("operation_id" in request && response.operation_id !== request.operation_id) fail("protocol_mismatch", "operation identity differs");
     responseMetadata(response, request, warnings);
     if (op) this.finalize(op, request, { outcome: "success", response });
     return response;
@@ -203,7 +203,9 @@ export class Client {
     return [config, hosts];
   }
   async sshInfo(session: string): Promise<[Data, Data, string]> {
-    const response = await this.request("ssh-info", { session }), info = response.result, state = this.state(session);
+    const state = this.state(session);
+    if (state.cleanup_only === true) fail("lease_unavailable", "local recovery state is cleanup-only; release or destroy the session first");
+    const response = await this.request("ssh-info", { session }), info = response.result;
     if (!equal(state.task_id, info.task_id) || !equal(state.generation, info.generation)) fail("generation_mismatch", "connection material belongs to another lease; acquire the current lease first");
     if (typeof state.private_key !== "string") fail("key_missing", "private key is missing");
     try { if (!lstatSync(state.private_key).isFile()) throw 0; } catch { fail("key_missing", "private key is missing"); }

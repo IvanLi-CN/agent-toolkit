@@ -648,12 +648,11 @@ export class LifecycleControl extends ResourceControl {
     if (!task) throw new ControlError("task_missing", "no owned instance exists");
     this._validate_task_state(task); this._check_generation(task, request);
     if (task.state === "absent") return this._state_summary(task);
-    if (task.state === "deleting") throw new ControlError("task_transition", "deletion requires reconciliation");
-    if (task.state !== "cached") {
+    if (!["cached", "deleting"].includes(task.state)) {
       await this._release_task(task);
       task = this.store.get_task({ task_id: task.task_id })!;
     }
-    if (task.state === "cached") await this._delete_cache(task);
+    if (["cached", "deleting"].includes(task.state)) await this._delete_cache(task);
     return this._state_summary(this.store.get_task({ task_id: task.task_id })!);
   }
 

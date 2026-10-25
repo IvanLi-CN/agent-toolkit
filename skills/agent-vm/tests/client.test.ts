@@ -208,10 +208,21 @@ test("recovery state requires an exact committed or partial operation proof", as
   expect(f.client.state("explicit")).toMatchObject({ generation: 9, cleanup_only: true });
   expect(f.client.persistRecoveryState("explicit", key, { ...partial, task_id: "avm-other" }, "partial-op", 9)).toBe(false);
 
+  const commandCount = f.commands.length;
+  await expect(f.client.sshInfo("explicit")).rejects.toMatchObject({ code: "lease_unavailable" });
+  expect(f.commands).toHaveLength(commandCount);
+
   f.handler = request => result(response(request, {
     result: { ...partial, generation: 10, partial_operation_id: "remote-op" },
   }));
   expect(await f.client.recoverAcquireState("explicit", key, "remote-op", 9)).toBe(true);
   expect(f.requests.at(-1)).toMatchObject({ action: "status", operation_id: "remote-op" });
+  expect(f.client.state("explicit")).toMatchObject({ generation: 10, cleanup_only: true });
+
+  f.handler = request => result(response(request, {
+    operation_id: "different-op",
+    result: { ...partial, generation: 11, partial_operation_id: "remote-op" },
+  }));
+  expect(await f.client.recoverAcquireState("explicit", key, "remote-op", 10)).toBe(false);
   expect(f.client.state("explicit")).toMatchObject({ generation: 10, cleanup_only: true });
 });

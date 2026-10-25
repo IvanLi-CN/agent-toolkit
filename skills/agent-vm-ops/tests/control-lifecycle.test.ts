@@ -753,6 +753,21 @@ scenario("foreign ownership and failed deletion retain durable ownership", async
   expect(f.runner.instances[cached.instance_name]).toBeUndefined();
 });
 
+scenario("destroy retries a deleting cache with the same operation", async f => {
+  const cached = await cache(f, "cache");
+  const request = f.request("destroy", { session: "cache", operation: "destroy-cache" });
+  f.runner.failure = async argv => argv[3] === "delete";
+  await expect_error("command_failed", () => f.control.dispatch(request));
+  expect(task(f, "cache").state).toBe("deleting");
+  expect(f.store.operation("destroy-cache")?.outcome).toBe("pending");
+
+  f.runner.failure = null;
+  await f.control.dispatch(request);
+  expect(task(f, "cache").state).toBe("absent");
+  expect(f.store.operation("destroy-cache")?.outcome).toBe("success");
+  expect(f.runner.instances[cached.instance_name]).toBeUndefined();
+});
+
 scenario("unconfirmed native deletion never frees durable ownership", async f => {
   const cached = await cache(f, "cache");
   f.runner.on_run = async argv => {

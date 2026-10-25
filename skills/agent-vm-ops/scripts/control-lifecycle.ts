@@ -398,7 +398,7 @@ export class LifecycleControl extends ResourceControl {
       try {
         cleanup.result = await this._release_task(this.store.get_task({ task_id: task.task_id })!, {
           require_native_init_absence_retry: uncertain, native_init_cleanup_verified: verified,
-          protect_native_init_residue: phase === "native-init", recover_pending_acquire: false,
+          protect_native_init_residue: phase === "native-init", recover_pending_acquire: true,
         });
         cleanup.ok = true;
       } catch (error) {
@@ -478,7 +478,8 @@ export class LifecycleControl extends ResourceControl {
       if (recover_pending_acquire && cancellation_marker !== null) {
         pending_acquires_to_cancel = this._pending_acquire_cancellation_operations(task);
       } else if (recover_pending_acquire &&
-        (requested_state === "active" || ["cached", "absent"].includes(task.state))) {
+        (requested_state === "active" || requested_state === "preparing" ||
+          ["cached", "absent"].includes(task.state))) {
         pending_acquires_to_cancel = this._pending_acquire_operations_for_task(task);
       }
       if (["cached", "absent"].includes(task.state) && requested_state !== "closing") {

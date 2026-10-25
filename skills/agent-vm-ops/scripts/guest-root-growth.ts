@@ -552,15 +552,7 @@ export async function grow_guest_root(
       expected: "part" | "disk",
     ): string[] {
       const lines = nonempty_lines(result.stdout);
-      const valid_partition = expected === "part" &&
-        lines.length === 1 && lines[0] === "part";
-      const valid_disk = expected === "disk" &&
-        lines.length > 0 &&
-        lines[0] === "disk" &&
-        lines.filter((line) => line === "disk").length === 1 &&
-        lines.includes("part") &&
-        lines.every((line) => line === "disk" || line === "part");
-      if (!valid_partition && !valid_disk) {
+      if (lines.length !== 1 || lines[0] !== expected) {
         throw new GuestFailure(phase, command, {
           ...result_evidence(result),
           cause: "invalid_topology",
@@ -715,7 +707,7 @@ export async function grow_guest_root(
         });
       }
       const source_type_command = [
-        "lsblk", "-n", "-o", "TYPE", source,
+        "lsblk", "-n", "--nodeps", "-o", "TYPE", source,
       ];
       topology_types(
         await run(source_type_command, "topology-type"),
@@ -725,7 +717,7 @@ export async function grow_guest_root(
       );
 
       const disk_type_command = [
-        "lsblk", "-n", "-o", "TYPE", disk,
+        "lsblk", "-n", "--nodeps", "-o", "TYPE", disk,
       ];
       topology_types(
         await run(disk_type_command, "topology-type"),

@@ -175,10 +175,10 @@ function fixture(config: FixtureOptions = {}) {
             return result(`${config.filesystem_type ?? "ext4"}\n`);
           case `lsblk -n -o PKNAME ${SOURCE}`:
             return result(config.parent_output ?? "sda\n");
-          case `lsblk -n -o TYPE ${SOURCE}`:
+          case `lsblk -n --nodeps -o TYPE ${SOURCE}`:
             return result(`${config.source_type ?? "part"}\n`);
-          case `lsblk -n -o TYPE ${DISK}`:
-            return result(config.parent_type ?? "disk\npart\npart\n");
+          case `lsblk -n --nodeps -o TYPE ${DISK}`:
+            return result(config.parent_type ?? "disk\n");
           case `blockdev --getsize64 ${DISK}`:
             return result(`${state.disk}\n`);
           case `blockdev --getsize64 ${SOURCE}`:

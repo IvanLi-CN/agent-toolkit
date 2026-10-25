@@ -1172,11 +1172,31 @@ def parse_cpu_psi(raw: str) -> dict[str, dict[str, float]]:
         if "avg10" not in values:
             raise ValueError("CPU PSI avg10 is missing")
         result[fields[0]] = values
-    if set(result) != {"some", "full"}:
+    return normalize_cpu_psi(result)
+
+
+def normalize_cpu_psi(value: Any) -> dict[str, dict[str, float]]:
+    if not isinstance(value, Mapping) or any(scope not in value for scope in ("some", "full")):
         raise ValueError("CPU PSI data is missing")
     required = {"avg10", "avg60", "avg300", "total"}
-    if any(set(values) != required for values in result.values()):
-        raise ValueError("CPU PSI fields are incomplete")
+    result: dict[str, dict[str, float]] = {}
+    for scope in ("some", "full"):
+        values = value[scope]
+        if not isinstance(values, Mapping) or set(values) != required:
+            raise ValueError("CPU PSI fields are incomplete")
+        normalized: dict[str, float] = {}
+        for name in required:
+            number = values[name]
+            if isinstance(number, bool):
+                raise ValueError("CPU PSI value is invalid")
+            try:
+                number = float(number)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("CPU PSI value is invalid") from exc
+            if not math.isfinite(number) or number < 0 or (name.startswith("avg") and number > 100):
+                raise ValueError("CPU PSI value is out of range")
+            normalized[name] = number
+        result[scope] = normalized
     if any(result["full"][name] > result["some"][name] for name in required):
         raise ValueError("CPU PSI full pressure exceeds some pressure")
     return result
@@ -4598,7 +4618,17 @@ class Control:
                 "code": "resource_unverified",
                 "message": "CT CPU pressure metric path is not current-cgroup local",
             }}
-        return {"verified": True, **dict(observation), "observed_at": iso_time(self.now())}
+        try:
+            psi = normalize_cpu_psi(observation)
+        except ValueError:
+            return {"verified": False, "error": {
+                "code": "resource_unverified",
+                "message": "CT CPU pressure observation is malformed",
+            }}
+        result = dict(observation)
+        result.update(psi)
+        result.update({"verified": True, "observed_at": iso_time(self.now())})
+        return result
 
     def _cpu_startup_pressure_diagnostics(
         self,
@@ -6153,6 +6183,7 @@ class Control:
                     self.store.get_task(task_id=task["task_id"]),
                     require_native_init_absence_retry=native_init_uncertain,
                     native_init_cleanup_verified=native_init_cleanup_verified,
+                    protect_native_init_residue=phase == "native-init",
                     recover_pending_acquire=False,
                 )
                 cleanup["ok"] = True
@@ -6229,6 +6260,9 @@ class Control:
         *,
         require_native_init_absence_retry: bool = False,
         native_init_cleanup_verified: bool | None = None,
+        # A failed native init may leave a stopped, partially unpacked guest.
+        # Never turn that residue into a reusable cache entry.
+        protect_native_init_residue: bool = False,
         recover_pending_acquire: bool = True,
     ) -> dict[str, Any]:
         requested_state = task.get("state")
@@ -6286,7 +6320,11 @@ class Control:
                 if native_init_cleanup_verified is not None
                 else self._native_init_cleanup_verified(task)
             )
-            native_init_retry_required = require_native_init_absence_retry or delayed_absence
+            native_init_retry_required = (
+                require_native_init_absence_retry
+                or delayed_absence
+                or (protect_native_init_residue and not absent)
+            )
             if native_init_retry_required and not absent:
                 if cleanup_verified is True:
                     try:

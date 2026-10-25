@@ -486,7 +486,15 @@ class SessionContractTests(unittest.TestCase):
                 self.assertEqual(failure.exception.code, "invalid_remote_response")
 
     def test_pre_native_errors_are_deterministic_but_port_add_generation_is_uncertain(self):
-        for code in ("resource_unverified", "capacity_insufficient", "lease_window_short"):
+        for code in (
+            "resource_unverified",
+            "capacity_insufficient",
+            "lease_window_short",
+            "artifact_checksum_mismatch",
+            "manifest_invalid",
+            "request_schema_incompatible",
+            "response_semantic_incompatible",
+        ):
             with self.subTest(code=code):
                 self.assertFalse(CLI._remote_error_outcome_uncertain({"code": code}, action="acquire"))
         self.assertTrue(CLI._remote_error_outcome_uncertain({"code": "generation_mismatch"}, action="port-add"))
@@ -511,6 +519,32 @@ class SessionContractTests(unittest.TestCase):
             {"code": "acquire_partial", "detail": {"phase": "guest-readiness", "outcome_verified": True}},
             action="acquire",
         ))
+
+    def test_preflight_failure_finalizes_write_journal(self):
+        error = {
+            "ok": False,
+            "protocol": CLI.PROTOCOL_VERSION,
+            "action": "acquire",
+            "session_id": "thread",
+            "generation": 0,
+            "operation_id": "preflight",
+            "error": {
+                "code": "request_schema_incompatible",
+                "message": "request schema is outside the control compatibility window",
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(CLI, "local_session_dir", return_value=Path(directory)), \
+             mock.patch.object(CLI.subprocess, "run", return_value=subprocess.CompletedProcess(
+                 [], 2, b"", (json.dumps(error) + "\n").encode()
+             )):
+            with self.assertRaises(CLI.CliError) as failure:
+                CLI.control_request("acquire", session="thread", generation=0, write=True, operation_id="preflight")
+            journal = Path(directory) / "operations" / (hashlib.sha256(b"preflight").hexdigest() + ".json")
+            saved = json.loads(journal.read_text(encoding="utf-8"))
+        self.assertEqual(failure.exception.code, "request_schema_incompatible")
+        self.assertEqual(saved["outcome"], "error")
+        self.assertEqual(saved["error"]["code"], "request_schema_incompatible")
 
     def test_success_response_must_match_request_generation(self):
         response = {

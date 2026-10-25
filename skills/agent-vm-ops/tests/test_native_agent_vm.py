@@ -1491,6 +1491,32 @@ class LifecycleTests(Fixture):
         self.assertTrue(json.loads(task["last_error"])["native_init_absence_retry"])
         self.assertEqual(self.store.operation("op-1")["outcome"], "pending")
 
+    def test_native_init_failure_with_residual_instance_is_never_cached(self):
+        failure = CONTROL.ControlError("command_failed", "image unpack failed")
+
+        def init_with_residue(_image, name, metadata):
+            self.runner.instances[name] = {
+                "name": name,
+                "status": "Stopped",
+                "config": dict(metadata),
+                "devices": {},
+                "expanded_devices": {
+                    "eth0": {"type": "nic", "network": "agentsbr0"},
+                    "root": {"type": "disk", "size": "20GiB"},
+                },
+            }
+            raise failure
+
+        with mock.patch.object(self.control.incus, "init", side_effect=init_with_residue):
+            with self.assertRaises(CONTROL.ControlError) as error:
+                self.acquire()
+        self.assertEqual(error.exception.code, "command_failed")
+        task = self.store.get_task(session_id="thread-a")
+        self.assertEqual(task["state"], "absent")
+        self.assertEqual(task["reservation_bytes"], 0)
+        self.assertNotIn(task["instance_name"], self.runner.instances)
+        self.assertEqual(self.store.operation("op-1")["outcome"], "error")
+
     def test_native_init_cleanup_failure_never_caches_visible_instance(self):
         task = self.control._base_task("thread-a", 1)
         task.update(
@@ -2058,6 +2084,22 @@ class LifecycleTests(Fixture):
             diagnostic["cpu_psi"]["metric"],
             "/sys/fs/cgroup/system.slice/agent-vm/cpu.pressure",
         )
+
+    def test_cpu_pressure_observation_rejects_malformed_payload(self):
+        base = self.resources.cpu_pressure.return_value
+        mutations = (
+            ("missing-full", lambda value: value.pop("full")),
+            ("full-exceeds-some", lambda value: value["full"].update(avg10=1.0)),
+            ("non-finite", lambda value: value["some"].update(avg10=float("nan"))),
+        )
+        for name, mutate in mutations:
+            with self.subTest(name=name):
+                observation = json.loads(json.dumps(base))
+                mutate(observation)
+                with mock.patch.object(self.resources, "cpu_pressure", return_value=observation):
+                    result = self.control._cpu_pressure_observation()
+                self.assertFalse(result["verified"])
+                self.assertEqual(result["error"]["code"], "resource_unverified")
 
 
 class GuestRootGrowthScriptTests(unittest.TestCase):

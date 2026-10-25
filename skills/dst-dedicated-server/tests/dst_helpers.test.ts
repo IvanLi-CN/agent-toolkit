@@ -22,8 +22,13 @@ function cluster(path: string) {
 function fakeSsh(mode = "native") {
   const bin = join(root, "bin"); mkdirSync(bin, { recursive: true });
   const path = join(bin, "ssh");
-  writeFileSync(path, `#!/bin/sh\nprintf '%s\\n' "$@" > "$SSH_ARGS_FILE"\ncase "$SSH_TEST_MODE" in\nfail) echo SECRET_STDERR >&2; exit 255;;\nlarge) dd if=/dev/zero bs=1024 count=3125 2>/dev/null; exit 0;;\noversized-file) mkdir -p "$HOME/.klei/DoNotStarveTogether/Cluster_1/Master" "$HOME/.klei/DoNotStarveTogether/Cluster_1/Caves"; dd if=/dev/zero bs=1024 count=1025 of="$HOME/.klei/DoNotStarveTogether/Cluster_1/Master/modoverrides.lua" 2>/dev/null;;\nstall) exec sleep 30;;\nesac\nfor arg do command=$arg; done\nexec sh -c "$command"\n`);
+  writeFileSync(path, `#!/bin/sh\nprintf '%s\\n' "$@" > "$SSH_ARGS_FILE"\ncase "$SSH_TEST_MODE" in\nfail) echo SECRET_STDERR >&2; exit 255;;\nlarge) dd if=/dev/zero bs=1024 count=3125 2>/dev/null; exit 0;;\noversized-file) mkdir -p "$HOME/.klei/DoNotStarveTogether/Cluster_1/Master" "$HOME/.klei/DoNotStarveTogether/Cluster_1/Caves"; dd if=/dev/zero bs=1024 count=1025 of="$HOME/.klei/DoNotStarveTogether/Cluster_1/Master/modoverrides.lua" 2>/dev/null;;\nbounded-snapshot) mkdir -p "$HOME/backups" "$HOME/.klei/DoNotStarveTogether"; i=0; while [ "$i" -lt 130 ]; do : > "$HOME/backups/backup-$(printf '%03d' "$i")"; i=$((i + 1)); done; i=0; while [ "$i" -lt 110 ]; do mkdir "$HOME/.klei/DoNotStarveTogether/Cluster_$(printf '%03d' "$i")"; i=$((i + 1)); done;;\nstall) exec sleep 30;;\nesac\nfor arg do command=$arg; done\nexec sh -c "$command"\n`);
   chmodSync(path, 0o755);
+  if (mode === "bounded-snapshot") {
+    const ls = join(bin, "ls");
+    writeFileSync(ls, "#!/bin/sh\nprintf 'ls must not be called\\n' >&2\nexit 127\n");
+    chmodSync(ls, 0o755);
+  }
   if (mode === "no-head") {
     const head = join(bin, "head");
     writeFileSync(head, "#!/bin/sh\nprintf 'head must not be called\\n' >&2\nexit 127\n");
@@ -82,6 +87,17 @@ describe("VER-FOUNDATION-HELPERS-03: DST snapshots and local/remote reports", ()
     expect(readFileSync(out, "utf8") + mods.stderr.toString()).not.toContain("SECRET_STDERR");
     const args = readFileSync(join(root, "ssh-args"), "utf8");
     expect(args).toContain("BatchMode=yes"); expect(args).toContain("StrictHostKeyChecking=yes"); expect(args).toContain("operator@dst.example");
+  });
+  test("remote snapshot bounds oversized backup and cluster directories before collection", () => {
+    const out = join(root, "bounded.md");
+    const result = run("dst_snapshot.ts", ["--host", "dst.example", "--no-local", "--out", out], fakeSsh("bounded-snapshot"));
+    expect(result.exitCode).toBe(0);
+    const report = readFileSync(out, "utf8");
+    const backups = report.split("### Backups (names only)\n\n")[1].split("### Klei data")[0];
+    const clusters = report.split("### Klei data (metadata only; secrets omitted)\n\n")[1].split("### Server binary candidates")[0];
+    expect((backups.match(/^backup-/gm) ?? []).length).toBe(120);
+    expect((clusters.match(/^Cluster: /gm) ?? []).length).toBe(100);
+    expect(report).not.toContain("ls must not be called");
   });
   test("local mod summaries and numeric shard differences use only IDs and states", () => {
     const path = join(root, "Cluster_1"); cluster(path);

@@ -49,13 +49,16 @@ case "$mode" in
       if [ -f "$file" ]; then printf '%s\n' "$file"; fi
     done
     printf '\n### Backups (names only)\n\n'
-    if [ -d "$HOME/backups" ]; then ls -1 "$HOME/backups" | head -n 120; fi
+    if [ -d "$HOME/backups" ]; then
+      # Walk only direct children; head closes the stream at the metadata cap.
+      find "$HOME/backups" \( -path "$HOME/backups" -o \( -prune -print \) \) | head -n 120 | while IFS= read -r path; do
+        printf '%s\n' "${path##*/}"
+      done
+    fi
     printf '\n### Klei data (metadata only; secrets omitted)\n\n'
     if [ ! -d "$root" ]; then printf 'Klei data directory not found\n'; exit 0; fi
-    count=0
-    for dir in "$root"/*; do
-      [ -d "$dir" ] || continue
-      count=$((count + 1)); [ "$count" -le 100 ] || break
+    # Walk only direct cluster directories; head closes the stream at 100 paths.
+    find "$root" \( -path "$root" -o \( -type d -prune -print \) -o -prune \) | head -n 100 | while IFS= read -r dir; do
       printf 'Cluster: %s\n' "${dir##*/}"
       for file in cluster.ini cluster_token.txt; do
         if [ -f "$dir/$file" ]; then printf '%s: present (redacted)\n' "$file"; fi

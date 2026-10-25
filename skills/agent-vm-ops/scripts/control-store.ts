@@ -497,9 +497,11 @@ export class StateStore {
     // Conversion failures are application errors, not SQLite failures.
     const values = bindings(args);
     sqlite_call(() => {
-      this.connection.query(sql).run(...values);
+      const result = this.connection.query(sql).run(...values);
+      if (this.depth > 0 && result.changes > 0) {
+        this.transaction_mutated = true;
+      }
     });
-    if (this.depth > 0) this.transaction_mutated = true;
   }
 
   private _state_epoch_value(value: string | null): string {
@@ -781,6 +783,22 @@ export class StateStore {
             reservation_bytes=excluded.reservation_bytes,
             previous_generation=excluded.previous_generation,
             resource_reservation_json=excluded.resource_reservation_json
+        WHERE
+            tasks.session_id IS NOT excluded.session_id OR
+            tasks.generation IS NOT excluded.generation OR
+            tasks.state IS NOT excluded.state OR
+            tasks.instance_name IS NOT excluded.instance_name OR
+            tasks.vm_ip IS NOT excluded.vm_ip OR
+            tasks.ssh_host_port IS NOT excluded.ssh_host_port OR
+            tasks.lease_expires_at IS NOT excluded.lease_expires_at OR
+            tasks.inactive_since IS NOT excluded.inactive_since OR
+            tasks.updated_at IS NOT excluded.updated_at OR
+            tasks.last_error IS NOT excluded.last_error OR
+            tasks.image_fingerprint IS NOT excluded.image_fingerprint OR
+            tasks.resources_json IS NOT excluded.resources_json OR
+            tasks.reservation_bytes IS NOT excluded.reservation_bytes OR
+            tasks.previous_generation IS NOT excluded.previous_generation OR
+            tasks.resource_reservation_json IS NOT excluded.resource_reservation_json
         `,
         values,
       );
@@ -797,14 +815,20 @@ export class StateStore {
     }
 
     const updates: Data = { ...changes, updated_at: iso_time() };
-    const assignments = Object.keys(updates)
+    const update_values = Object.values(updates);
+    const update_keys = Object.keys(updates);
+    const assignments = update_keys
       .map((key) => `${key} = ?`)
       .join(", ");
+    const changed = update_keys
+      .map((key) => `${key} IS NOT ?`)
+      .join(" OR ");
 
     this.transaction(() => {
-      this._run(`UPDATE tasks SET ${assignments} WHERE task_id = ?`, [
-        ...Object.values(updates),
+      this._run(`UPDATE tasks SET ${assignments} WHERE task_id = ? AND (${changed})`, [
+        ...update_values,
         task_id,
+        ...update_values,
       ]);
     });
 
@@ -850,6 +874,12 @@ export class StateStore {
             vm_port=excluded.vm_port,
             device_name=excluded.device_name,
             state=excluded.state
+        WHERE
+            ports.generation IS NOT excluded.generation OR
+            ports.host_port IS NOT excluded.host_port OR
+            ports.vm_port IS NOT excluded.vm_port OR
+            ports.device_name IS NOT excluded.device_name OR
+            ports.state IS NOT excluded.state
         `,
         PORT_FIELDS.map((field) => get(port, field)),
       );
@@ -864,15 +894,20 @@ export class StateStore {
   ): void {
     if (Object.keys(changes).length === 0) return;
 
-    const assignments = Object.keys(changes)
+    const update_values = Object.values(changes);
+    const update_keys = Object.keys(changes);
+    const assignments = update_keys
       .map((key) => `${key} = ?`)
       .join(", ");
+    const changed = update_keys
+      .map((key) => `${key} IS NOT ?`)
+      .join(" OR ");
 
     this.transaction(() => {
       this._run(
         `UPDATE ports SET ${assignments}
-         WHERE task_id = ? AND port_name = ? AND protocol = ?`,
-        [...Object.values(changes), task_id, port_name, protocol],
+         WHERE task_id = ? AND port_name = ? AND protocol = ? AND (${changed})`,
+        [...update_values, task_id, port_name, protocol, ...update_values],
       );
     });
   }
@@ -1169,7 +1204,8 @@ export class StateStore {
     this.transaction(() => {
       this._run(
         "INSERT INTO meta(key, value) VALUES (?, ?) " +
-          "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+          "ON CONFLICT(key) DO UPDATE SET value=excluded.value " +
+          "WHERE meta.value IS NOT excluded.value",
         [key, value],
       );
     });

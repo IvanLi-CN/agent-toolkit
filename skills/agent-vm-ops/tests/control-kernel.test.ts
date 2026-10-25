@@ -670,13 +670,24 @@ describe("control-store: legacy schema and durable transaction behavior", () => 
       const committed_epoch = store.state_epoch();
       expect(committed_epoch).toMatch(/^[0-9a-f]{32}$/);
 
+      store.set_meta("epoch-test", "1");
+      expect(store.state_epoch()).toBe(committed_epoch);
+
+      store.put_task(task());
+      const task_epoch = store.state_epoch();
+      store.put_task(task());
+      expect(store.state_epoch()).toBe(task_epoch);
+
+      store.remove_port("missing-task", "ssh", "tcp");
+      expect(store.state_epoch()).toBe(task_epoch);
+
       const original = new ControlError("native_failed", "native failed");
       expect(caught(() => store.transaction(() => {
         store.set_meta("rolled-back", "1");
         throw original;
       }))).toBe(original);
       expect(store.get_meta("rolled-back")).toBeNull();
-      expect(store.state_epoch()).toBe(committed_epoch);
+      expect(store.state_epoch()).toBe(task_epoch);
     });
   });
 

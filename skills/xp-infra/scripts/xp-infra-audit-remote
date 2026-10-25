@@ -93,9 +93,24 @@ else
   docker_access=direct
   command -v docker >/dev/null 2>&1 && docker_cmd ps >/dev/null 2>&1 || exit 1
 fi
+read_host_environment() {
+  bounded_command sudo -n awk '
+    {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      sub(/^export[[:space:]]+/, "", line)
+      split(line, pair, "=")
+      if (pair[1] ~ /^(XP_BIND|XP_CLOUDFLARED_MONITOR_MODE|XP_CLOUDFLARED_OPENRC_SERVICE|XP_CLOUDFLARED_RESTART_MODE|XP_CLOUDFLARED_SYSTEMD_UNIT|XP_CLOUDFLARE_DDNS_FAST_INTERVAL_SECS|XP_CLOUDFLARE_DDNS_INTERVAL_SECS_NO_MONITOR|XP_CLOUDFLARE_DDNS_INTERVAL_SECS_WITH_MONITOR|XP_CLOUDFLARE_HOSTNAME|XP_DATA_DIR|XP_IP_GEO_ORIGIN|XP_XRAY_OPENRC_SERVICE|XP_XRAY_SYSTEMD_UNIT|XP_CLOUDFLARE_DDNS_ENABLED|XP_ENABLE_CLOUDFLARE|XP_IP_GEO_ENABLED)$/) {
+        if (seen[pair[1]]++) exit 1
+        print $0
+      }
+    }
+  ' "$env_file"
+}
+
 env_snapshot=""
 if [ "$env_probe" = readable ]; then
-  env_snapshot="$(bounded_command sudo -n cat "$env_file" 2>/dev/null)" || exit 1
+  env_snapshot="$(read_host_environment 2>/dev/null)" || exit 1
 fi
 docker_inventory=""
 docker_available=false
@@ -167,63 +182,36 @@ env_value() {
 raw_env_payload() {
   key="$1"
   marker="$2"
+  # Select only the requested public runtime key. Never spool the process
+  # environment (which may contain administrator credentials) into a temp file.
+  read_selected='
+    runtime_pid="$1"
+    key="$2"
+    marker="$3"
+    env_file="/proc/$runtime_pid/environ"
+    [ -r "$env_file" ] || exit 1
+    awk -v key="$key" -v marker="$marker" '\''
+      BEGIN { RS = "\0" }
+      index($0, key "=") == 1 { count++; value = $0 }
+      END { if (count > 1) exit 1; printf "%s%s", value, marker }
+    '\'' "$env_file"
+  '
   if [ "$mode" = container ]; then
-    value="$(bounded_command docker_cmd exec "$container" sh -c '
-      runtime_pid="$1"
-      key="$2"
-      marker="$3"
-      env_file="/proc/$runtime_pid/environ"
-      [ -r "$env_file" ] || exit 1
-      env_dump="$(mktemp)" || exit 1
-      tr "\\000" "\\n" < "$env_file" > "$env_dump" || exit 1
-      if env_value_line="$(grep -m1 "^$key=" "$env_dump")"; then
-        rm -f "$env_dump"
-        printf "%s" "$env_value_line"
-        printf "%s" "$marker"
-      else
-        status=$?
-        rm -f "$env_dump"
-        [ "$status" -eq 1 ] && { printf "%s" "$marker"; exit 0; }
-        exit "$status"
-      fi
-    ' sh "$container_xp_pid" "$key" "$marker" 2>/dev/null)" || {
+    value="$(bounded_command docker_cmd exec "$container" sh -c "$read_selected" sh "$container_xp_pid" "$key" "$marker" 2>/dev/null)" || {
       printf '%s%s' "$READ_ERROR_SENTINEL" "$marker"
       return 0
     }
-    case "$value" in
-      "$key="*"$marker") printf '%s' "${value#"$key="}" ;;
-      "$marker") printf '%s' "$marker" ;;
-      *) printf '%s%s' "$READ_ERROR_SENTINEL" "$marker" ;;
-    esac
   else
-    value="$(bounded_command sudo -n sh -c '
-      runtime_pid="$1"
-      key="$2"
-      marker="$3"
-      env_file="/proc/$runtime_pid/environ"
-      [ -r "$env_file" ] || exit 1
-      env_dump="$(mktemp)" || exit 1
-      tr "\\000" "\\n" < "$env_file" > "$env_dump" || exit 1
-      if env_value_line="$(grep -m1 "^$key=" "$env_dump")"; then
-        rm -f "$env_dump"
-        printf "%s" "$env_value_line"
-        printf "%s" "$marker"
-      else
-        status=$?
-        rm -f "$env_dump"
-        [ "$status" -eq 1 ] && { printf "%s" "$marker"; exit 0; }
-        exit "$status"
-      fi
-    ' sh "$host_xp_pid" "$key" "$marker" 2>/dev/null)" || {
+    value="$(bounded_command sudo -n sh -c "$read_selected" sh "$host_xp_pid" "$key" "$marker" 2>/dev/null)" || {
       printf '%s%s' "$READ_ERROR_SENTINEL" "$marker"
       return 0
     }
-    case "$value" in
-      "$key="*"$marker") printf '%s' "${value#"$key="}" ;;
-      "$marker") printf '%s' "$marker" ;;
-      *) printf '%s%s' "$READ_ERROR_SENTINEL" "$marker" ;;
-    esac
   fi
+  case "$value" in
+    "$key="*"$marker") printf '%s' "${value#"$key="}" ;;
+    "$marker") printf '%s' "$marker" ;;
+    *) printf '%s%s' "$READ_ERROR_SENTINEL" "$marker" ;;
+  esac
 }
 
 strict_bool_value() {
@@ -628,7 +616,7 @@ if [ "$docker_access" = sudo ]; then
   env_probe_after="$(sudo -n sh -c 'if [ -e "$1" ] || [ -L "$1" ]; then [ -r "$1" ] || exit 2; printf %s readable; else printf %s absent; fi' sh "$env_file" 2>/dev/null)" || exit 1
   [ "$env_probe_after" = "$env_probe" ] || exit 1
   if [ "$env_probe" = readable ]; then
-    env_snapshot_after="$(bounded_command sudo -n cat "$env_file" 2>/dev/null)" || exit 1
+    env_snapshot_after="$(read_host_environment 2>/dev/null)" || exit 1
     [ "$env_snapshot_after" = "$env_snapshot" ] || exit 1
   fi
 elif [ "$docker_access" = direct ]; then

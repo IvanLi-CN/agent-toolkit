@@ -330,10 +330,10 @@ def run(command, phase, *, check=True):
             return False, inspection_error or "process_group_inspection_failed"
         if any(tracked.get(pid) != starttime for pid, starttime in members):
             return False, "process_group_identity_unverified"
-        for _ in range(3):
+        for _ in range(5):
             if not members:
                 return True, None
-            killed, cleanup_error = kill_process_tree_members(members)
+            killed, cleanup_error = kill_process_identities(members)
             if not killed:
                 return False, cleanup_error
             members, complete, inspection_error = process_group_identities(pgid)
@@ -522,13 +522,20 @@ def run(command, phase, *, check=True):
     def kill_process_group_members(pgid, *, required_identity=None):
         if not os.path.isdir("/proc"):
             return False, "process_group_identity_unavailable"
+        identities, complete, inspection_error = process_group_identities(pgid)
+        if not complete:
+            return False, inspection_error or "process_group_inspection_failed"
         cleanup_error = None
-        for attempt in range(3):
-            identities, complete, inspection_error = process_group_identities(pgid)
-            if not complete:
-                return False, inspection_error or "process_group_inspection_failed"
+        known = {pid: starttime for pid, starttime in identities}
+        for attempt in range(5):
+            if attempt:
+                identities, complete, inspection_error = process_group_identities(pgid)
+                if not complete:
+                    return False, inspection_error or "process_group_inspection_failed"
             if not identities:
                 return True, cleanup_error
+            if any(known.get(pid) != starttime for pid, starttime in identities):
+                return False, "process_group_identity_unverified"
             if attempt == 0 and required_identity is not None and required_identity not in identities:
                 return False, "process_group_identity_unverified"
             killed, cleanup_error = kill_process_identities(identities)
@@ -538,45 +545,6 @@ def run(command, phase, *, check=True):
         if complete and not members:
             return True, cleanup_error
         return False, cleanup_error or inspection_error or "process_group_members_remain"
-
-    def kill_process_tree_members(identities, *, root_pid=None, required_root=None):
-        tracked = dict(identities)
-        cleanup_error = None
-        for _ in range(3):
-            if root_pid is not None and os.path.isdir("/proc"):
-                discovered, tree_complete = process_tree_members(root_pid)
-                if not tree_complete:
-                    return False, "process_tree_inspection_failed"
-                for pid, starttime in discovered:
-                    previous = tracked.get(pid)
-                    if previous is not None and previous != starttime:
-                        return False, "process_tree_identity_unverified"
-                    tracked[pid] = starttime
-                if required_root is not None:
-                    current_root = tracked.get(root_pid)
-                    if current_root is not None and current_root != required_root:
-                        return False, "process_tree_identity_unverified"
-            members, complete = live_processes(sorted(tracked.items()))
-            if not complete:
-                return False, "process_tree_inspection_failed"
-            if not members:
-                return True, cleanup_error
-            killed, cleanup_error = kill_process_identities(members)
-            if not killed:
-                return False, cleanup_error
-        if root_pid is not None and os.path.isdir("/proc"):
-            discovered, tree_complete = process_tree_members(root_pid)
-            if not tree_complete:
-                return False, "process_tree_inspection_failed"
-            for pid, starttime in discovered:
-                previous = tracked.get(pid)
-                if previous is not None and previous != starttime:
-                    return False, "process_tree_identity_unverified"
-                tracked[pid] = starttime
-        members, complete = live_processes(sorted(tracked.items()))
-        if complete and not members:
-            return True, cleanup_error
-        return False, cleanup_error or "process_tree_members_remain"
 
     procfs_available = os.path.isdir("/proc")
     owner_pid = os.getpid()
@@ -608,15 +576,13 @@ def run(command, phase, *, check=True):
             )
         except FileNotFoundError:
             raise GuestFailure(phase, command, cause="command_missing")
-        tracked_tree_members = {}
-        tracked_tree_valid = False
         tracked_group_members = {}
         tracked_group_valid = False
         leader_identity = process_identity(process.pid) if procfs_available else None
 
         # Keep detached descendants in the one-shot guest process's owner tree.
         def track_process_tree():
-            nonlocal leader_identity, tracked_tree_valid, tracked_group_valid
+            nonlocal leader_identity, tracked_group_valid
             nonlocal owner_tracking_enabled, owner_tracking_error
             if not procfs_available:
                 return
@@ -629,15 +595,6 @@ def run(command, phase, *, check=True):
                     owner_tracking_error = discovery_error
             if leader_identity is None and process.poll() is None:
                 leader_identity = process_identity(process.pid)
-            members, complete = process_tree_members(process.pid)
-            if complete and members:
-                for pid, starttime in members:
-                    previous = tracked_tree_members.get(pid)
-                    if previous is not None and previous != starttime:
-                        tracked_tree_valid = False
-                        return
-                    tracked_tree_members[pid] = starttime
-                tracked_tree_valid = True
             group_members, group_complete, _ = process_group_identities(process.pid)
             if not group_complete or not group_members:
                 return
@@ -710,70 +667,47 @@ def run(command, phase, *, check=True):
     except subprocess.TimeoutExpired as error:
         process_group_killed = False
         process_group_cleanup_error = None
-        tree_members = []
-        tree_complete = True
-        if os.path.isdir("/proc"):
-            tree_members, tree_complete = process_tree_members(process.pid)
-        current_tree_members = tree_members
-        if tracked_tree_members and tracked_tree_valid:
-            merged = dict(tracked_tree_members)
-            for pid, starttime in current_tree_members:
-                previous = merged.get(pid)
-                if previous is not None and previous != starttime:
-                    tree_complete = False
-                    continue
-                merged[pid] = starttime
-            tree_members = sorted(merged.items())
-        root_identity = (
-            leader_identity
-            if os.path.isdir("/proc")
-            else next((identity for identity in tree_members if identity[0] == process.pid), None)
-        )
+        root_identity = leader_identity if os.path.isdir("/proc") else None
         root_live = []
         root_verified = not os.path.isdir("/proc")
         root_identity_missing = leader_identity is not None and os.path.isdir("/proc")
         if root_identity is not None:
             root_live, root_identity_complete = live_processes([root_identity])
-            if not root_identity_complete:
-                tree_complete = False
             root_verified = bool(root_live)
             root_identity_missing = root_identity_complete and not root_live
         elif leader_identity is not None and os.path.isdir("/proc"):
             root_live, root_identity_complete = live_processes([leader_identity])
-            if not root_identity_complete:
-                tree_complete = False
             root_identity_missing = root_identity_complete and not root_live
         if root_verified:
             try:
                 if os.path.isdir("/proc"):
                     os.killpg(process.pid, 0)
+                    process_group_killed, fallback_error = kill_process_group_members(
+                        process.pid, required_identity=leader_identity
+                    )
+                    if fallback_error:
+                        process_group_cleanup_error = fallback_error
                 else:
                     os.killpg(process.pid, signal.SIGKILL)
-                group_signal_confirmed = True
-                process_group_killed, fallback_error = kill_process_group_members(
-                    process.pid, required_identity=leader_identity
-                )
-                if not os.path.isdir("/proc"):
-                    process_group_killed = group_signal_confirmed
-                if fallback_error:
-                    process_group_cleanup_error = fallback_error
-            except ProcessLookupError:
-                process_group_killed = True
-                process_group_killed, fallback_error = kill_process_group_members(
-                    process.pid, required_identity=leader_identity
-                )
-                if not os.path.isdir("/proc"):
                     process_group_killed = True
-                if fallback_error:
-                    process_group_cleanup_error = fallback_error
+            except ProcessLookupError:
+                if os.path.isdir("/proc"):
+                    process_group_killed, fallback_error = kill_process_group_members(
+                        process.pid, required_identity=leader_identity
+                    )
+                    if fallback_error:
+                        process_group_cleanup_error = fallback_error
+                else:
+                    process_group_killed = True
             except (AttributeError, PermissionError, OSError) as group_error:
                 process_group_cleanup_error = type(group_error).__name__
-                process_group_killed, fallback_error = kill_process_group_members(
-                    process.pid, required_identity=leader_identity
-                )
-                if fallback_error:
-                    process_group_cleanup_error += ":" + fallback_error
-                if not os.path.isdir("/proc"):
+                if os.path.isdir("/proc"):
+                    process_group_killed, fallback_error = kill_process_group_members(
+                        process.pid, required_identity=leader_identity
+                    )
+                    if fallback_error:
+                        process_group_cleanup_error += ":" + fallback_error
+                else:
                     try:
                         process.kill()
                     except ProcessLookupError:
@@ -784,32 +718,6 @@ def run(command, phase, *, check=True):
             )
         else:
             process_group_cleanup_error = "process_identity_unverified"
-        tree_root_verified = not procfs_available or (
-            leader_identity is not None
-            and (leader_identity in tree_members or leader_identity in tracked_tree_members)
-        )
-        tree_killed = True
-        tree_error = None
-        if tree_members:
-            if not tree_root_verified:
-                tree_killed = False
-                tree_error = "process_tree_identity_unverified"
-            else:
-                tree_killed, tree_error = kill_process_tree_members(
-                    tree_members,
-                    root_pid=process.pid,
-                    required_root=leader_identity,
-                )
-        if not tree_complete:
-            tree_killed = False
-            tree_error = "process_tree_inspection_failed"
-        if not tree_killed:
-            process_group_killed = False
-        if tree_error:
-            process_group_cleanup_error = (
-                process_group_cleanup_error + ":" + tree_error
-                if process_group_cleanup_error else tree_error
-            )
         if procfs_available:
             if owner_tracking_enabled:
                 owner_killed, owner_cleanup_error = kill_owned_processes(
@@ -819,10 +727,13 @@ def run(command, phase, *, check=True):
                 owner_killed = False
                 owner_cleanup_error = owner_tracking_error or "process_owner_boundary_unavailable"
             if not owner_killed:
+                process_group_killed = False
                 process_group_cleanup_error = (
                     f"{process_group_cleanup_error}:{owner_cleanup_error}"
                     if process_group_cleanup_error else owner_cleanup_error
                 )
+        if process_group_cleanup_error:
+            process_group_killed = False
         reaped = False
         try:
             process.wait(timeout=2)
@@ -1879,13 +1790,20 @@ class CommandRunner:
     ) -> tuple[bool, str | None]:
         if not Path("/proc").is_dir():
             return False, "process_group_identity_unavailable"
+        identities, complete = cls._process_group_identities(pgid)
+        if not complete:
+            return False, "process_group_inspection_failed"
         cleanup_error = None
-        for attempt in range(3):
-            identities, complete = cls._process_group_identities(pgid)
-            if not complete:
-                return False, "process_group_inspection_failed"
+        known = {pid: starttime for pid, starttime in identities}
+        for attempt in range(5):
+            if attempt:
+                identities, complete = cls._process_group_identities(pgid)
+                if not complete:
+                    return False, "process_group_inspection_failed"
             if not identities:
                 return True, cleanup_error
+            if any(known.get(pid) != starttime for pid, starttime in identities):
+                return False, "process_group_identity_unverified"
             if attempt == 0 and required_identity is not None and required_identity not in identities:
                 return False, "process_group_identity_unverified"
             killed, cleanup_error = cls._kill_process_identities(identities)
@@ -1905,10 +1823,11 @@ class CommandRunner:
             return False, "process_group_inspection_failed"
         if any(tracked.get(pid) != starttime for pid, starttime in members):
             return False, "process_group_identity_unverified"
-        for _ in range(3):
+        cleanup_error = None
+        for _ in range(5):
             if not members:
-                return True, None
-            killed, cleanup_error = cls._kill_process_tree_members(members)
+                return True, cleanup_error
+            killed, cleanup_error = cls._kill_process_identities(members)
             if not killed:
                 return False, cleanup_error
             members, complete = cls._process_group_identities(pgid)
@@ -1917,52 +1836,6 @@ class CommandRunner:
             if any(tracked.get(pid) != starttime for pid, starttime in members):
                 return False, "process_group_identity_unverified"
         return (not members), "process_group_members_remain" if members else None
-
-    @classmethod
-    def _kill_process_tree_members(
-        cls,
-        identities: Sequence[tuple[int, int]],
-        *,
-        root_pid: int | None = None,
-        required_root: tuple[int, int] | None = None,
-    ) -> tuple[bool, str | None]:
-        tracked = dict(identities)
-        cleanup_error = None
-        for _ in range(3):
-            if root_pid is not None and Path("/proc").is_dir():
-                discovered, tree_complete = cls._process_tree_members(root_pid)
-                if not tree_complete:
-                    return False, "process_tree_inspection_failed"
-                for pid, starttime in discovered:
-                    previous = tracked.get(pid)
-                    if previous is not None and previous != starttime:
-                        return False, "process_tree_identity_unverified"
-                    tracked[pid] = starttime
-                if required_root is not None:
-                    current_root = tracked.get(root_pid)
-                    if current_root is not None and current_root != required_root:
-                        return False, "process_tree_identity_unverified"
-            members, complete = cls._live_processes(sorted(tracked.items()))
-            if not complete:
-                return False, "process_tree_inspection_failed"
-            if not members:
-                return True, cleanup_error
-            killed, cleanup_error = cls._kill_process_identities(members)
-            if not killed:
-                return False, cleanup_error
-        if root_pid is not None and Path("/proc").is_dir():
-            discovered, tree_complete = cls._process_tree_members(root_pid)
-            if not tree_complete:
-                return False, "process_tree_inspection_failed"
-            for pid, starttime in discovered:
-                previous = tracked.get(pid)
-                if previous is not None and previous != starttime:
-                    return False, "process_tree_identity_unverified"
-                tracked[pid] = starttime
-        members, complete = cls._live_processes(sorted(tracked.items()))
-        if complete and not members:
-            return True, cleanup_error
-        return False, cleanup_error or "process_tree_members_remain"
 
     def run_bounded(
         self,
@@ -2011,8 +1884,6 @@ class CommandRunner:
             if stream is not None:
                 selector.register(stream, selectors.EVENT_READ, name)
 
-        tracked_tree_members: dict[int, int] = {}
-        tracked_tree_valid = False
         tracked_group_members: dict[int, int] = {}
         tracked_group_valid = False
         leader_identity: tuple[int, int] | None = None
@@ -2022,7 +1893,7 @@ class CommandRunner:
         # The subreaper owner tree is the containment boundary for descendants
         # that leave the original process group or outlive the command leader.
         def track_process_tree() -> None:
-            nonlocal leader_identity, tracked_tree_valid, tracked_group_valid
+            nonlocal leader_identity, tracked_group_valid
             nonlocal owner_tracking_enabled, owner_tracking_error
             if not procfs_available:
                 return
@@ -2035,15 +1906,6 @@ class CommandRunner:
                     owner_tracking_error = discovery_error
             if leader_identity is None and process.poll() is None:
                 leader_identity = self._process_identity(process.pid)
-            members, complete = self._process_tree_members(process.pid)
-            if complete and members:
-                for pid, starttime in members:
-                    previous = tracked_tree_members.get(pid)
-                    if previous is not None and previous != starttime:
-                        tracked_tree_valid = False
-                        return
-                    tracked_tree_members[pid] = starttime
-                tracked_tree_valid = True
             group_members, group_complete = self._process_group_identities(process.pid)
             if not group_complete or not group_members:
                 return
@@ -2156,70 +2018,47 @@ class CommandRunner:
             reaped = False
             process_group_killed = False
             process_group_cleanup_error = None
-            tree_members: list[tuple[int, int]] = []
-            tree_complete = True
-            if Path("/proc").is_dir():
-                tree_members, tree_complete = self._process_tree_members(process.pid)
-            current_tree_members = tree_members
-            if tracked_tree_members and tracked_tree_valid:
-                merged = dict(tracked_tree_members)
-                for pid, starttime in current_tree_members:
-                    previous = merged.get(pid)
-                    if previous is not None and previous != starttime:
-                        tree_complete = False
-                        continue
-                    merged[pid] = starttime
-                tree_members = sorted(merged.items())
-            root_identity = (
-                leader_identity
-                if Path("/proc").is_dir()
-                else next((identity for identity in tree_members if identity[0] == process.pid), None)
-            )
+            root_identity = leader_identity if Path("/proc").is_dir() else None
             root_live: list[tuple[int, int]] = []
             root_verified = not Path("/proc").is_dir()
             root_identity_missing = leader_identity is not None and Path("/proc").is_dir()
             if root_identity is not None:
                 root_live, root_identity_complete = self._live_processes([root_identity])
-                if not root_identity_complete:
-                    tree_complete = False
                 root_verified = bool(root_live)
                 root_identity_missing = root_identity_complete and not root_live
             elif leader_identity is not None and Path("/proc").is_dir():
                 root_live, root_identity_complete = self._live_processes([leader_identity])
-                if not root_identity_complete:
-                    tree_complete = False
                 root_identity_missing = root_identity_complete and not root_live
             if root_verified:
                 try:
                     if Path("/proc").is_dir():
                         os.killpg(process.pid, 0)
+                        process_group_killed, fallback_error = self._kill_process_group_members(
+                            process.pid, required_identity=leader_identity
+                        )
+                        if fallback_error:
+                            process_group_cleanup_error = fallback_error
                     else:
                         os.killpg(process.pid, signal.SIGKILL)
-                    group_signal_confirmed = True
-                    process_group_killed, fallback_error = self._kill_process_group_members(
-                        process.pid, required_identity=leader_identity
-                    )
-                    if not Path("/proc").is_dir():
-                        process_group_killed = group_signal_confirmed
-                    if fallback_error:
-                        process_group_cleanup_error = fallback_error
-                except ProcessLookupError:
-                    process_group_killed = True
-                    process_group_killed, fallback_error = self._kill_process_group_members(
-                        process.pid, required_identity=leader_identity
-                    )
-                    if not Path("/proc").is_dir():
                         process_group_killed = True
-                    if fallback_error:
-                        process_group_cleanup_error = fallback_error
+                except ProcessLookupError:
+                    if Path("/proc").is_dir():
+                        process_group_killed, fallback_error = self._kill_process_group_members(
+                            process.pid, required_identity=leader_identity
+                        )
+                        if fallback_error:
+                            process_group_cleanup_error = fallback_error
+                    else:
+                        process_group_killed = True
                 except OSError as group_error:
                     process_group_cleanup_error = type(group_error).__name__
-                    process_group_killed, fallback_error = self._kill_process_group_members(
-                        process.pid, required_identity=leader_identity
-                    )
-                    if fallback_error:
-                        process_group_cleanup_error += ":" + fallback_error
-                    if not Path("/proc").is_dir():
+                    if Path("/proc").is_dir():
+                        process_group_killed, fallback_error = self._kill_process_group_members(
+                            process.pid, required_identity=leader_identity
+                        )
+                        if fallback_error:
+                            process_group_cleanup_error += ":" + fallback_error
+                    else:
                         try:
                             process.kill()
                         except ProcessLookupError:
@@ -2230,32 +2069,6 @@ class CommandRunner:
                 )
             else:
                 process_group_cleanup_error = "process_identity_unverified"
-            tree_root_verified = not procfs_available or (
-                leader_identity is not None
-                and (leader_identity in tree_members or leader_identity in tracked_tree_members)
-            )
-            tree_killed = True
-            tree_error = None
-            if tree_members:
-                if not tree_root_verified:
-                    tree_killed = False
-                    tree_error = "process_tree_identity_unverified"
-                else:
-                    tree_killed, tree_error = self._kill_process_tree_members(
-                        tree_members,
-                        root_pid=process.pid,
-                        required_root=leader_identity,
-                    )
-            if not tree_complete:
-                tree_killed = False
-                tree_error = "process_tree_inspection_failed"
-            if not tree_killed:
-                process_group_killed = False
-            if tree_error:
-                process_group_cleanup_error = (
-                    f"{process_group_cleanup_error}:{tree_error}"
-                    if process_group_cleanup_error else tree_error
-                )
             if procfs_available:
                 if owner_tracking_enabled:
                     owner_killed, owner_cleanup_error = self._kill_owned_processes(
@@ -2265,10 +2078,13 @@ class CommandRunner:
                     owner_killed = False
                     owner_cleanup_error = owner_tracking_error or "process_owner_boundary_unavailable"
                 if not owner_killed:
+                    process_group_killed = False
                     process_group_cleanup_error = (
                         f"{process_group_cleanup_error}:{owner_cleanup_error}"
                         if process_group_cleanup_error else owner_cleanup_error
                     )
+            if process_group_cleanup_error:
+                process_group_killed = False
             pipes_drained = False
             try:
                 process.wait(timeout=1)

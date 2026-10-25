@@ -2597,7 +2597,10 @@ class CommandRunnerTests(unittest.TestCase):
             with self.assertRaises(CONTROL.ControlError) as failure:
                 CONTROL.CommandRunner().run_bounded([os.sys.executable, "-c", sleeper], timeout=0.05)
         killpg.assert_called_once()
-        members.assert_called_once()
+        if Path("/proc").is_dir():
+            members.assert_called_once()
+        else:
+            members.assert_not_called()
         self.assertEqual(failure.exception.code, "command_timeout")
         self.assertTrue(failure.exception.detail["reaped"])
         self.assertTrue(failure.exception.detail["process_group_killed"])
@@ -2630,11 +2633,11 @@ class CommandRunnerTests(unittest.TestCase):
                 CONTROL.CommandRunner().run_bounded([os.sys.executable, "-c", sleeper], timeout=0.05)
         self.assertTrue(failure.exception.detail["reaped"])
         self.assertFalse(failure.exception.detail["process_group_killed"])
-        self.assertTrue(
-            failure.exception.detail["process_group_cleanup_error"].startswith(
-                "PermissionError:process_group_inspection_failed"
-            )
-        )
+        cleanup_error = failure.exception.detail["process_group_cleanup_error"]
+        if Path("/proc").is_dir():
+            self.assertTrue(cleanup_error.startswith("PermissionError:process_group_inspection_failed"))
+        else:
+            self.assertEqual(cleanup_error, "PermissionError")
 
     @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
     def test_bounded_runner_refuses_tree_cleanup_without_leader_identity(self):
@@ -2642,14 +2645,20 @@ class CommandRunnerTests(unittest.TestCase):
         with mock.patch.object(CONTROL.CommandRunner, "_process_identity", return_value=None), \
              mock.patch.object(
                  CONTROL.CommandRunner,
-                 "_kill_process_tree_members",
+                 "_kill_process_group_members",
                  side_effect=AssertionError("unverified tree must not be signalled"),
-             ) as tree_cleanup:
+             ) as group_cleanup, \
+             mock.patch.object(
+                 CONTROL.CommandRunner,
+                 "_kill_verified_process_group_members",
+                 side_effect=AssertionError("unverified group must not be signalled"),
+             ) as verified_group_cleanup:
             with self.assertRaises(CONTROL.ControlError) as failure:
                 CONTROL.CommandRunner().run_bounded([os.sys.executable, "-c", sleeper], timeout=0.05)
         self.assertEqual(failure.exception.code, "command_timeout")
-        self.assertIn("process_tree_identity_unverified", failure.exception.detail["process_group_cleanup_error"])
-        tree_cleanup.assert_not_called()
+        self.assertIn("process_identity_unverified", failure.exception.detail["process_group_cleanup_error"])
+        group_cleanup.assert_not_called()
+        verified_group_cleanup.assert_not_called()
 
     @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
     def test_bounded_runner_kills_descendants_holding_pipes(self):

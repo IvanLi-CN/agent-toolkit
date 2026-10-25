@@ -826,6 +826,20 @@ class AdmissionTests(Fixture):
         self.assertNotIn("message", task["last_error"])
         self.assertNotIn("detail", task["last_error"])
 
+    def test_admin_status_redacts_guest_error_details(self):
+        active = self.acquire()
+        failure = CONTROL.ControlError(
+            "guest_probe_failed",
+            "private guest probe output",
+            {"phase": "guest-exec", "stderr": "private stderr", "message": "private message"},
+        )
+        with mock.patch.object(self.control.incus, "instance_info", side_effect=failure):
+            result = self.control.admin_status(self.request("admin-status"), None)
+        task = next(item for item in result["tasks"] if item["task_id"] == active["task_id"])
+        self.assertEqual(task["guest_error"], {"code": "guest_probe_failed", "phase": "guest-exec"})
+        self.assertNotIn("stderr", task["guest_error"])
+        self.assertNotIn("message", task["guest_error"])
+
     def test_drain_exit_keeps_admission_closed_with_pending_operation(self):
         self.store.set_meta("draining", "1")
         self.store.record_operation(

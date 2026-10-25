@@ -36,6 +36,8 @@ The deployment repository should review and commit the rendered files together w
 
 The template uses a hidden `controller_job` variable so controller queries remain portable while the deployment supplies its actual job label. CPU capacity is read from `agent_vm_admission_cpu_capacity_vcpu`; memory and disk limits are rendered only from their authoritative metric families.
 
+The capacity dashboard separates logical admission from runtime pressure: its summary shows logical RAM remaining, CT-local `MemAvailable`, pressure/OOM state, and compact CPU/disk readiness; the policy snapshot below shows the default request, slot estimates, and task-state counts. The inventory dashboard defaults to active and transitional/failed tasks, orders rows by lifecycle priority, and leaves cached/absent history available through the state filter.
+
 ## Validate
 
 The renderer validates both dashboards before writing them. A previously rendered bundle can be checked directly:
@@ -46,6 +48,13 @@ bun skills/agent-vm/scripts/validate_observability_dashboard.ts \
   --provisioning /path/to/deployment/grafana/generated/agent-vm-observability.yml
 ```
 
-Run the same validator for `agent-vm-observability-inventory.json` when checking the inventory view.
+Use the inventory profile when checking `agent-vm-observability-inventory.json`:
 
-The validator checks the required panel/metric contract, automatic refresh, datasource consistency, the controller variable, and the rule that packet-rate PromQL must not multiply by `8`.
+```bash
+bun skills/agent-vm/scripts/validate_observability_dashboard.ts \
+  --dashboard /path/to/deployment/grafana/generated/agent-vm-observability-inventory.json \
+  --provisioning /path/to/deployment/grafana/generated/agent-vm-observability.yml \
+  --profile inventory
+```
+
+The validator checks the selected dashboard profile's panel/metric contract, automatic refresh, datasource consistency, the controller variable, and the rule that packet-rate PromQL must not multiply by `8`.

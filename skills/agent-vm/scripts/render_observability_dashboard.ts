@@ -1,9 +1,14 @@
 #!/usr/bin/env bun
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, dirname, resolve } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { validateDashboard, validateProvisioning } from "./validate_observability_dashboard.ts";
+import {
+  INVENTORY_REQUIRED_METRICS,
+  INVENTORY_REQUIRED_PANEL_TITLES,
+  validateDashboard,
+  validateProvisioning,
+} from "./validate_observability_dashboard.ts";
 
 export type ObservabilityConfig = {
   dashboard_uid: string;
@@ -59,6 +64,22 @@ function optionalString(config: Record<string, unknown>, field: keyof Observabil
   return requiredString(config, field);
 }
 
+function inventoryUid(config: ObservabilityConfig): string {
+  const value = config.inventory_dashboard_uid ?? `${config.dashboard_uid}-inventory`;
+  if (!/^[A-Za-z0-9_-]{1,40}$/.test(value)) throw new Error("derived inventory_dashboard_uid contains unsupported characters or exceeds 40 characters");
+  if (value === config.dashboard_uid) throw new Error("capacity and inventory dashboard UIDs must be unique");
+  return value;
+}
+
+function validateOutputFilenames(config: ObservabilityConfig): void {
+  const filenames = [
+    config.dashboard_filename ?? "agent-vm-observability.json",
+    config.inventory_dashboard_filename ?? "agent-vm-observability-inventory.json",
+    "agent-vm-observability.yml",
+  ];
+  if (new Set(filenames).size !== filenames.length) throw new Error("dashboard output filenames must be unique");
+}
+
 export function readConfig(path: string): ObservabilityConfig {
   let parsed: unknown;
   try {
@@ -92,6 +113,8 @@ export function readConfig(path: string): ObservabilityConfig {
   if (!config.dashboard_path.startsWith("/") || config.dashboard_path.includes("..")) throw new Error("dashboard_path must be an absolute path without ..");
   if (config.dashboard_filename && !/^[A-Za-z0-9._-]+\.json$/.test(config.dashboard_filename)) throw new Error("dashboard_filename must be a simple .json filename");
   if (config.inventory_dashboard_filename && !/^[A-Za-z0-9._-]+\.json$/.test(config.inventory_dashboard_filename)) throw new Error("inventory_dashboard_filename must be a simple .json filename");
+  inventoryUid(config);
+  validateOutputFilenames(config);
   return config;
 }
 
@@ -133,7 +156,7 @@ export function renderBundle(config: ObservabilityConfig, templateDir: string = 
   const capacity = renderDashboard("dashboard.json.template", config.dashboard_uid, config.dashboard_title);
   const inventory = renderDashboard(
     "inventory-dashboard.json.template",
-    config.inventory_dashboard_uid ?? `${config.dashboard_uid}-inventory`,
+    inventoryUid(config),
     config.inventory_dashboard_title ?? `${config.dashboard_title} / Inventory & Operations`,
   );
   const dashboard = capacity.dashboard;
@@ -144,27 +167,8 @@ export function renderBundle(config: ObservabilityConfig, templateDir: string = 
   const findings = [
     ...validateDashboard(dashboard, config.prometheus_datasource_uid),
     ...validateDashboard(inventoryDashboard, config.prometheus_datasource_uid, {
-      requiredPanelTitles: [
-        "Agent VM inventory summary",
-        "Managed VM inventory",
-        "Task state counts",
-        "Controller scrape health",
-        "Operation failures & image unpack",
-      ],
-      requiredMetrics: [
-        "agent_vm_task_info",
-        "agent_vm_task_cpu_vcpu",
-        "agent_vm_task_memory_bytes",
-        "agent_vm_task_disk_bytes",
-        "agent_vm_task_lease_expires_at_seconds",
-        "agent_vm_task_ssh_mapping",
-        "agent_vm_task_last_error_info",
-        "agent_vm_task_states",
-        "agent_vm_up",
-        "agent_vm_scrape_timestamp_seconds",
-        "agent_vm_operations_total",
-        "agent_vm_image_unpack_failures_total",
-      ],
+      requiredPanelTitles: INVENTORY_REQUIRED_PANEL_TITLES,
+      requiredMetrics: INVENTORY_REQUIRED_METRICS,
     }),
     ...validateProvisioning(provisioningText),
   ];
@@ -186,12 +190,39 @@ export function writeBundle(bundle: RenderedBundle, outputDir: string, force = f
   const dashboardPath = resolve(directory, bundle.dashboardFilename);
   const inventoryDashboardPath = resolve(directory, bundle.inventoryDashboardFilename);
   const provisioningPath = resolve(directory, "agent-vm-observability.yml");
+  if (new Set([dashboardPath, inventoryDashboardPath, provisioningPath]).size !== 3) {
+    throw new Error("dashboard output paths must be unique");
+  }
   if (!force && (existsSync(dashboardPath) || existsSync(inventoryDashboardPath) || existsSync(provisioningPath))) {
     throw new Error(`output exists; pass --force to replace ${basename(dashboardPath)}, ${basename(inventoryDashboardPath)} or agent-vm-observability.yml`);
   }
-  writeFileSync(dashboardPath, bundle.dashboardText, "utf8");
-  writeFileSync(inventoryDashboardPath, bundle.inventoryDashboardText, "utf8");
-  writeFileSync(provisioningPath, bundle.provisioningText, "utf8");
+  const outputs = [
+    { path: dashboardPath, text: bundle.dashboardText },
+    { path: inventoryDashboardPath, text: bundle.inventoryDashboardText },
+    { path: provisioningPath, text: bundle.provisioningText },
+  ];
+  const staging = mkdtempSync(join(directory, ".agent-vm-observability-"));
+  const backups: Array<{ path: string; backup: string }> = [];
+  const installed: string[] = [];
+  try {
+    for (const [index, output] of outputs.entries()) writeFileSync(join(staging, String(index)), output.text, "utf8");
+    for (const [index, output] of outputs.entries()) {
+      const stagedPath = join(staging, String(index));
+      if (existsSync(output.path)) {
+        const backup = join(staging, `.backup-${index}`);
+        renameSync(output.path, backup);
+        backups.push({ path: output.path, backup });
+      }
+      renameSync(stagedPath, output.path);
+      installed.push(output.path);
+    }
+  } catch (error) {
+    for (const path of installed) if (existsSync(path)) rmSync(path, { force: true });
+    for (const { path, backup } of backups.reverse()) if (existsSync(backup)) renameSync(backup, path);
+    throw error;
+  } finally {
+    if (existsSync(staging)) rmSync(staging, { recursive: true, force: true });
+  }
   return { dashboardPath, inventoryDashboardPath, provisioningPath };
 }
 

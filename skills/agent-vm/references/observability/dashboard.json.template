@@ -816,6 +816,41 @@
                 }
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Logical CPU admission limit"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#F2495C",
+                  "mode": "fixed"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              },
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "mode": "none"
+                }
+              }
+            ]
           }
         ]
       },
@@ -863,6 +898,18 @@
           "interval": "",
           "legendFormat": "CT CPU capacity",
           "refId": "L"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "100 * agent_vm_admission_cpu_limit_vcpu{job=\"$controller_job\"}",
+          "format": "time_series",
+          "hide": false,
+          "interval": "",
+          "legendFormat": "Logical CPU admission limit",
+          "refId": "M"
         },
         {
           "datasource": {
@@ -3939,7 +3986,7 @@
         "type": "prometheus",
         "uid": "__PROMETHEUS_UID__"
       },
-      "description": "Current CPU and physical-disk admission headroom, with the controller readiness state.",
+      "description": "Current CPU and physical-disk admission headroom. Default VM request and slot estimates are shown in the policy snapshot below.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4084,7 +4131,186 @@
           "instant": true,
           "legendFormat": "Ready",
           "refId": "C"
+        }
+      ],
+      "title": "Admission headroom",
+      "transparent": true,
+      "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 64
+      },
+      "id": 502,
+      "panels": [],
+      "title": "Policy and task snapshot",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "__PROMETHEUS_UID__"
+      },
+      "description": "Default request policy used for the VM slot estimates. This is not the memory or disk already allocated to any task.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "short"
         },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "RAM"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bytes"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Disk"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bytes"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Physical cost"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bytes"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 65
+      },
+      "id": 507,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "editorMode": "code",
+          "expr": "agent_vm_admission_default_request_cpu_vcpu{job=\"$controller_job\"}",
+          "instant": true,
+          "legendFormat": "CPU vCPU",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "editorMode": "code",
+          "expr": "agent_vm_admission_default_request_memory_bytes{job=\"$controller_job\"}",
+          "instant": true,
+          "legendFormat": "RAM",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "editorMode": "code",
+          "expr": "agent_vm_admission_default_request_disk_bytes{job=\"$controller_job\"}",
+          "instant": true,
+          "legendFormat": "Disk",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "editorMode": "code",
+          "expr": "agent_vm_admission_default_request_physical_cost_bytes{job=\"$controller_job\"}",
+          "instant": true,
+          "legendFormat": "Physical cost",
+          "refId": "D"
+        }
+      ],
+      "title": "Default VM request",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "__PROMETHEUS_UID__"
+      },
+      "description": "Estimated number of default-size VM requests that fit in logical CPU/memory and disk admission headroom.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 65
+      },
+      "id": 508,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value_and_name"
+      },
+      "targets": [
         {
           "datasource": {
             "type": "prometheus",
@@ -4093,8 +4319,8 @@
           "editorMode": "code",
           "expr": "agent_vm_admission_default_vm_logical_slots{job=\"$controller_job\"}",
           "instant": true,
-          "legendFormat": "Default VM logical slots",
-          "refId": "D"
+          "legendFormat": "Logical slots",
+          "refId": "A"
         },
         {
           "datasource": {
@@ -4104,13 +4330,75 @@
           "editorMode": "code",
           "expr": "agent_vm_admission_default_vm_startable_slots{job=\"$controller_job\"}",
           "instant": true,
-          "legendFormat": "Default VM startable slots",
-          "refId": "E"
+          "legendFormat": "Startable slots",
+          "refId": "B"
         }
       ],
-      "title": "Admission headroom",
-      "transparent": true,
+      "title": "Default VM slots",
       "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "__PROMETHEUS_UID__"
+      },
+      "description": "Count of managed tasks by lifecycle state. The inventory dashboard shows the task-level table.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "steps-post",
+            "fillOpacity": 12,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 65
+      },
+      "id": 509,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "editorMode": "code",
+          "expr": "agent_vm_task_states{job=\"$controller_job\"}",
+          "legendFormat": "{{state}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Task state counts",
+      "type": "timeseries"
     }
   ],
   "refresh": "auto",

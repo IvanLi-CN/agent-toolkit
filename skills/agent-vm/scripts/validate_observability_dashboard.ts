@@ -17,6 +17,7 @@ export const REQUIRED_PANEL_TITLES = [
 
 export const REQUIRED_METRICS = [
   "agent_vm_admission_cpu_capacity_vcpu",
+  "agent_vm_admission_cpu_limit_vcpu",
   "agent_vm_admission_cpu_allocated_vcpu",
   "agent_vm_admission_cpu_reserved_vcpu",
   "agent_vm_admission_cpu_remaining_vcpu",
@@ -25,7 +26,10 @@ export const REQUIRED_METRICS = [
   "agent_vm_admission_memory_allocated_bytes",
   "agent_vm_admission_memory_reserved_bytes",
   "agent_vm_admission_memory_remaining_bytes",
+  "agent_vm_admission_default_request_cpu_vcpu",
   "agent_vm_admission_default_request_memory_bytes",
+  "agent_vm_admission_default_request_disk_bytes",
+  "agent_vm_admission_default_request_physical_cost_bytes",
   "agent_vm_admission_default_vm_logical_slots",
   "agent_vm_admission_default_vm_startable_slots",
   "agent_vm_cpu_pressure_some_avg10_percent",
@@ -39,6 +43,7 @@ export const REQUIRED_METRICS = [
   "agent_vm_memory_pressure",
   "agent_vm_memory_pressure_threshold_bytes",
   "agent_vm_memory_oom_events_total",
+  "agent_vm_task_states",
   "incus_storage_pool_size_bytes",
   "incus_storage_pool_used_bytes",
   "incus_filesystem_size_bytes",
@@ -46,10 +51,35 @@ export const REQUIRED_METRICS = [
   "incus_network_transmit_packets_total",
 ];
 
+export const INVENTORY_REQUIRED_PANEL_TITLES = [
+  "Agent VM inventory summary",
+  "Managed VM inventory",
+  "Task state counts",
+  "Controller scrape health",
+  "Operation failures & image unpack",
+];
+
+export const INVENTORY_REQUIRED_METRICS = [
+  "agent_vm_task_info",
+  "agent_vm_task_cpu_vcpu",
+  "agent_vm_task_memory_bytes",
+  "agent_vm_task_disk_bytes",
+  "agent_vm_task_lease_expires_at_seconds",
+  "agent_vm_task_ssh_mapping",
+  "agent_vm_task_last_error_info",
+  "agent_vm_task_states",
+  "agent_vm_up",
+  "agent_vm_scrape_timestamp_seconds",
+  "agent_vm_operations_total",
+  "agent_vm_image_unpack_failures_total",
+];
+
 export type DashboardValidationOptions = {
   requiredPanelTitles?: readonly string[];
   requiredMetrics?: readonly string[];
 };
+
+export type DashboardProfile = "capacity" | "inventory";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -159,14 +189,24 @@ export function validateProvisioning(provisioning: string): string[] {
   return findings;
 }
 
-export function validateDashboardFile(dashboardPath: string, provisioningPath?: string): string[] {
+export function validateDashboardFile(
+  dashboardPath: string,
+  provisioningPath?: string,
+  profile: DashboardProfile = "capacity",
+): string[] {
   let dashboard: unknown;
   try {
     dashboard = JSON.parse(readFileSync(dashboardPath, "utf8"));
   } catch (error) {
     return [`cannot parse dashboard JSON: ${String(error)}`];
   }
-  const findings = validateDashboard(dashboard);
+  const options = profile === "inventory"
+    ? {
+        requiredPanelTitles: INVENTORY_REQUIRED_PANEL_TITLES,
+        requiredMetrics: INVENTORY_REQUIRED_METRICS,
+      }
+    : {};
+  const findings = validateDashboard(dashboard, undefined, options);
   if (provisioningPath) {
     try {
       findings.push(...validateProvisioning(readFileSync(provisioningPath, "utf8")));
@@ -177,13 +217,13 @@ export function validateDashboardFile(dashboardPath: string, provisioningPath?: 
   return findings;
 }
 
-function parseArgs(args: string[]): { dashboard?: string; provisioning?: string } {
-  const parsed: { dashboard?: string; provisioning?: string } = {};
+function parseArgs(args: string[]): { dashboard?: string; provisioning?: string; profile: DashboardProfile } {
+  const parsed: { dashboard?: string; provisioning?: string; profile: DashboardProfile } = { profile: "capacity" };
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     const next = args[index + 1];
     if (arg === "--help") {
-      if (args.length !== 1) throw new Error("usage: validate_observability_dashboard.ts --dashboard <path> [--provisioning <path>]");
+      if (args.length !== 1) throw new Error("usage: validate_observability_dashboard.ts --dashboard <path> [--provisioning <path>] [--profile capacity|inventory]");
       return parsed;
     }
     if (arg === "--dashboard" && next && !next.startsWith("--")) {
@@ -192,11 +232,14 @@ function parseArgs(args: string[]): { dashboard?: string; provisioning?: string 
     } else if (arg === "--provisioning" && next && !next.startsWith("--")) {
       parsed.provisioning = next;
       index += 1;
+    } else if (arg === "--profile" && next && !next.startsWith("--") && (next === "capacity" || next === "inventory")) {
+      parsed.profile = next;
+      index += 1;
     } else {
-      throw new Error("usage: validate_observability_dashboard.ts --dashboard <path> [--provisioning <path>]");
+      throw new Error("usage: validate_observability_dashboard.ts --dashboard <path> [--provisioning <path>] [--profile capacity|inventory]");
     }
   }
-  if (!parsed.dashboard) throw new Error("usage: validate_observability_dashboard.ts --dashboard <path> [--provisioning <path>]");
+  if (!parsed.dashboard) throw new Error("usage: validate_observability_dashboard.ts --dashboard <path> [--provisioning <path>] [--profile capacity|inventory]");
   return parsed;
 }
 
@@ -204,10 +247,10 @@ export function main(args: string[] = Bun.argv.slice(2)): number {
   try {
     const parsed = parseArgs(args);
     if (!parsed.dashboard) {
-      console.log("usage: validate_observability_dashboard.ts --dashboard <path> [--provisioning <path>]");
+      console.log("usage: validate_observability_dashboard.ts --dashboard <path> [--provisioning <path>] [--profile capacity|inventory]");
       return 0;
     }
-    const findings = validateDashboardFile(parsed.dashboard, parsed.provisioning);
+    const findings = validateDashboardFile(parsed.dashboard, parsed.provisioning, parsed.profile);
     for (const finding of findings) console.log(`FINDING ${finding}`);
     if (findings.length > 0) return 1;
     console.log("PASS Agent VM observability dashboard contract");

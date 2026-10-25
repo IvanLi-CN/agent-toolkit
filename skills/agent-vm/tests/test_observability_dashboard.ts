@@ -2,7 +2,11 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { renderBundle, readConfig, writeBundle, type ObservabilityConfig } from "../scripts/render_observability_dashboard.ts";
-import { validateDashboard } from "../scripts/validate_observability_dashboard.ts";
+import {
+  INVENTORY_REQUIRED_METRICS,
+  INVENTORY_REQUIRED_PANEL_TITLES,
+  validateDashboard,
+} from "../scripts/validate_observability_dashboard.ts";
 
 const config: ObservabilityConfig = {
   dashboard_uid: "agent-vm-test",
@@ -25,14 +29,23 @@ test("renders a portable dashboard and provisioning bundle", () => {
   expect(bundle.inventoryDashboardText).not.toContain("__PROMETHEUS_UID__");
   expect(bundle.inventoryDashboardText).toContain('"id": "joinByField"');
   expect(bundle.inventoryDashboardText).toContain('"name": "state"');
+  expect(bundle.inventoryDashboardText).toContain('"vm_ip": "VM IP"');
+  expect(bundle.inventoryDashboardText).toContain('"ssh_host_port": "SSH port"');
+  expect(bundle.inventoryDashboardText).not.toContain("or vector(0)");
   expect(bundle.dashboardText).toContain('"uid": "prometheus-test"');
   expect(bundle.dashboardText).toContain('"value": "controller-test"');
   expect(bundle.dashboardText).toContain('job=\\"$controller_job\\"');
   expect(bundle.dashboardText).toContain("clamp_max");
+  expect(bundle.dashboardText).toContain("agent_vm_admission_default_request_cpu_vcpu");
+  expect(bundle.dashboardText).toContain("agent_vm_admission_default_request_disk_bytes");
+  expect(bundle.dashboardText).toContain("agent_vm_admission_default_request_physical_cost_bytes");
+  expect(bundle.dashboardText).toContain("agent_vm_task_states");
   const panels = bundle.dashboard.panels as Array<Record<string, unknown>>;
   const cpuPanel = panels.find((panel) => panel.id === 328);
   const cpuTarget = (cpuPanel?.targets as Array<Record<string, unknown>>).find((target) => target.refId === "C");
+  const cpuLimitTarget = (cpuPanel?.targets as Array<Record<string, unknown>>).find((target) => target.refId === "M");
   expect(String(cpuTarget?.expr)).not.toContain("by (mode)");
+  expect(String(cpuLimitTarget?.expr)).toContain("agent_vm_admission_cpu_limit_vcpu");
   expect(bundle.dashboardText).not.toContain("vector(1600)");
   expect(bundle.dashboardText).not.toContain("16 cores");
   expect(bundle.dashboardText).not.toContain("64 GiB");
@@ -40,6 +53,10 @@ test("renders a portable dashboard and provisioning bundle", () => {
   expect(bundle.provisioningText).toContain('path: "/var/lib/grafana/dashboards/agent-vm"');
   expect(bundle.provisioningText).toContain("orgId: 2");
   expect(bundle.provisioningText).not.toContain("__DASHBOARD_PATH__");
+  expect(validateDashboard(bundle.inventoryDashboard, "prometheus-test", {
+    requiredPanelTitles: INVENTORY_REQUIRED_PANEL_TITLES,
+    requiredMetrics: INVENTORY_REQUIRED_METRICS,
+  })).toEqual([]);
 });
 
 test("rejects packet-rate expressions that convert counts to bits", () => {
@@ -70,6 +87,35 @@ test("requires a positive numeric Grafana organization ID", () => {
     const path = join(root, "config.json");
     writeFileSync(path, JSON.stringify({ ...config, grafana_org_id: 0 }));
     expect(() => readConfig(path)).toThrow("grafana_org_id must be a positive integer");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects an inventory UID that cannot fit the Grafana UID contract", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-vm-observability-uid-"));
+  try {
+    const path = join(root, "config.json");
+    writeFileSync(path, JSON.stringify({
+      ...config,
+      dashboard_uid: "a".repeat(40),
+    }));
+    expect(() => readConfig(path)).toThrow("inventory_dashboard_uid");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects colliding dashboard output filenames", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-vm-observability-filenames-"));
+  try {
+    const path = join(root, "config.json");
+    writeFileSync(path, JSON.stringify({
+      ...config,
+      dashboard_filename: "agent-vm-test.json",
+      inventory_dashboard_filename: "agent-vm-test.json",
+    }));
+    expect(() => readConfig(path)).toThrow("output filenames must be unique");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -31,6 +31,9 @@ test("renders a portable dashboard and provisioning bundle", () => {
   expect(bundle.inventoryDashboardText).toContain('"name": "state"');
   expect(bundle.inventoryDashboardText).toContain('"vm_ip": "VM IP"');
   expect(bundle.inventoryDashboardText).toContain('"ssh_host_port": "SSH port"');
+  expect(bundle.inventoryDashboardText).toContain('"options": "state_order"');
+  expect(bundle.inventoryDashboardText).not.toContain('"state_order": true');
+  expect(bundle.inventoryDashboardText).toContain('"text": [\n            "active",\n            "preparing",\n            "closing",\n            "deleting",\n            "failed",\n            "cached",\n            "absent"');
   expect(bundle.inventoryDashboardText).not.toContain("or vector(0)");
   expect(bundle.dashboardText).toContain('"uid": "prometheus-test"');
   expect(bundle.dashboardText).toContain('"value": "controller-test"');
@@ -68,6 +71,15 @@ test("rejects packet-rate expressions that convert counts to bits", () => {
   const targets = packetPanel?.targets as Array<Record<string, unknown>>;
   targets[0].expr = `${String(targets[0].expr)} * 8`;
   expect(validateDashboard(dashboard).some((finding) => finding.includes("packet-rate target") && finding.includes("must not multiply by 8"))).toBe(true);
+});
+
+test("rejects dashboards that mix Prometheus datasource UIDs", () => {
+  const bundle = renderBundle(config);
+  const dashboard = structuredClone(bundle.dashboard) as Record<string, unknown>;
+  const panels = dashboard.panels as Array<Record<string, unknown>>;
+  const panel = panels.find((candidate) => candidate.datasource && typeof candidate.datasource === "object") as Record<string, unknown>;
+  (panel.datasource as Record<string, unknown>).uid = "another-prometheus";
+  expect(validateDashboard(dashboard)).toContain("dashboard must use exactly one Prometheus datasource UID");
 });
 
 test("refuses unresolved configuration placeholders", () => {

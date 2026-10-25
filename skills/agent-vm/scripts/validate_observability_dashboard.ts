@@ -169,8 +169,12 @@ export function validateDashboard(dashboard: unknown, expectedDatasourceUid?: st
       datasourceUids.add(value.datasource.uid);
     }
   });
-  if (expectedDatasourceUid && (datasourceUids.size !== 1 || !datasourceUids.has(expectedDatasourceUid))) {
-    findings.push(`prometheus datasource UID must be ${expectedDatasourceUid}`);
+  if (expectedDatasourceUid) {
+    if (datasourceUids.size !== 1 || !datasourceUids.has(expectedDatasourceUid)) {
+      findings.push(`prometheus datasource UID must be ${expectedDatasourceUid}`);
+    }
+  } else if (datasourceUids.size !== 1) {
+    findings.push("dashboard must use exactly one Prometheus datasource UID");
   }
   if ([...datasourceUids].some((uid) => uid.includes("__") || uid.includes("${"))) {
     findings.push("rendered dashboard contains a datasource placeholder");

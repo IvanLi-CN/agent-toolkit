@@ -341,7 +341,24 @@
           "mappings": [],
           "unit": "short"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "state_order"
+            },
+            "properties": [
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": true,
+                  "tooltip": true,
+                  "viz": true
+                }
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 12,
@@ -474,7 +491,6 @@
               "job": true,
               "service": true,
               "Value #A": true,
-              "state_order": true,
               "Value #F": true,
               "Value #G": true
             },
@@ -678,14 +694,18 @@
             "preparing",
             "closing",
             "deleting",
-            "failed"
+            "failed",
+            "cached",
+            "absent"
           ],
           "value": [
             "active",
             "preparing",
             "closing",
             "deleting",
-            "failed"
+            "failed",
+            "cached",
+            "absent"
           ]
         },
         "hide": 0,

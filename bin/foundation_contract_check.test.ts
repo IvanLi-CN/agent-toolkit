@@ -9,7 +9,7 @@ const TOPIC = "docs/specs/project-foundation";
 function fixture(run: (root: string) => void): void {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "toolkit-foundation-"));
   try {
-    for (const path of ["docs", "skills", "AGENTS.md", "README.md", "GLOSSARY.md", "PUBLIC_SKILLS.txt", "package.json", ".github/workflows/ci.yml"]) {
+    for (const path of ["docs", "skills", "AGENTS.md", "README.md", "GLOSSARY.md", "PUBLIC_SKILLS.txt", "package.json", ".github/workflows/ci.yml", "bin/foundation_contract_check.test.ts"]) {
       mkdirSync(dirname(join(root, path)), { recursive: true });
       cpSync(join(REPO_ROOT, path), join(root, path), { recursive: true });
     }
@@ -79,7 +79,7 @@ test("rejects historical delivery numbering used in an active contract", () => {
 
 test("requires complete migration coverage and behavior evidence for completion", () => {
   fixture((root) => {
-    replace(root, `${TOPIC}/IMPLEMENTATION.md`, "| `agent-vm` | deferred |", "| `agent-vm` | migrated |");
+    replace(root, `${TOPIC}/IMPLEMENTATION.md`, "[Behavior evidence](../../../skills/agent-vm/tests/client.test.ts)", "[Release integration evidence missing](../../../skills/agent-vm/tests/client.test.ts)");
     expect(check(root)).toContain("FOUNDATION_MIGRATION_EVIDENCE_MISSING agent-vm");
   });
   fixture((root) => {
@@ -88,7 +88,7 @@ test("requires complete migration coverage and behavior evidence for completion"
     expect(check(root)).toContain("FOUNDATION_INVALID_COVERAGE unknown-skill");
   });
   fixture((root) => {
-    replace(root, `${TOPIC}/IMPLEMENTATION.md`, "| `agent-vm` | deferred |", "| `agent-vm` | no-runtime |");
+    replace(root, `${TOPIC}/IMPLEMENTATION.md`, "| `agent-vm` | migrated |", "| `agent-vm` | no-runtime |");
     expect(check(root)).toContain("FOUNDATION_ALLOCATION_COVERAGE_DRIFT agent-vm");
   });
 });
@@ -104,7 +104,7 @@ test("preserves GOV, LANG, COMMON and all domain scenario identities", () => {
 
 test("rejects broken source links, escaping links, and non-regular inputs", () => {
   fixture((root) => {
-    replace(root, `${TOPIC}/SCRIPT-LANGUAGE-MATRIX.md`, "../../../skills/agent-vm/scripts/agent_vm.py", "../../../skills/agent-vm/scripts/missing.py");
+    replace(root, `${TOPIC}/SCRIPT-LANGUAGE-MATRIX.md`, "../../../skills/agent-vm/scripts/agent_vm.ts", "../../../skills/agent-vm/scripts/missing.ts");
     expect(check(root).some((finding) => finding.startsWith("FOUNDATION_BROKEN_LINK"))).toBe(true);
   });
   fixture((root) => {

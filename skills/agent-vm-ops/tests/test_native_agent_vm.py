@@ -31,6 +31,24 @@ def load(name, relative):
     return module
 
 
+def wait_until(predicate, *, timeout=3.0, interval=0.02):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+    return bool(predicate())
+
+
+def process_is_zombie(pid):
+    try:
+        state = (Path("/proc") / str(pid) / "stat").read_text()
+    except FileNotFoundError:
+        return True
+    close_paren = state.rfind(")")
+    return close_paren >= 0 and state[close_paren + 2 :].split()[0] == "Z"
+
+
 CONTROL = load("native_control", "skills/agent-vm-ops/scripts/agent_vm_control.py")
 CLI = load("native_cli", "skills/agent-vm/scripts/agent_vm.py")
 import release_manifest as MANIFEST  # noqa: E402
@@ -1397,7 +1415,11 @@ class LifecycleTests(Fixture):
         with mock.patch.object(self.control, "_cleanup_task", return_value=([], [])), \
              mock.patch.object(self.control.incus, "list_instances", return_value=[]):
             with self.assertRaises(CONTROL.ControlError) as failure:
-                self.control._release_task(task, require_native_init_absence_retry=True)
+                self.control._release_task(
+                    task,
+                    require_native_init_absence_retry=True,
+                    native_init_cleanup_verified=True,
+                )
         self.assertEqual(failure.exception.code, "cleanup_incomplete")
         pending = self.store.get_task(task_id=task["task_id"])
         self.assertEqual(pending["state"], "closing")
@@ -1409,6 +1431,120 @@ class LifecycleTests(Fixture):
              mock.patch.object(self.control.incus, "list_instances", return_value=[]):
             self.control._release_task(pending)
         self.assertEqual(self.store.get_task(task_id=task["task_id"])["state"], "absent")
+
+    def test_native_init_timeout_reconciles_through_public_admin_action(self):
+        timeout = CONTROL.ControlError(
+            "command_timeout",
+            "native init timed out",
+            {
+                "reaped": True,
+                "pipes_drained": True,
+                "process_group_killed": True,
+                "process_group_cleanup_error": None,
+            },
+        )
+        with mock.patch.object(self.control.incus, "init", side_effect=timeout):
+            with self.assertRaises(CONTROL.ControlError) as failure:
+                self.acquire()
+        self.assertEqual(failure.exception.code, "command_timeout")
+        task = self.store.get_task(session_id="thread-a")
+        self.assertEqual(task["state"], "closing")
+        self.assertGreater(task["reservation_bytes"], 0)
+        record = json.loads(task["last_error"])
+        self.assertTrue(record["native_init_absence_retry"])
+        self.assertTrue(record["native_init_cleanup_verified"])
+
+        self.now += dt.timedelta(seconds=CONTROL.NATIVE_INIT_ABSENCE_RETRY_SECONDS)
+        result = self.call("admin-reconcile", apply=True)
+        self.assertFalse(result["dry_run"])
+        self.assertEqual(self.store.get_task(session_id="thread-a")["state"], "absent")
+
+    def test_deterministic_native_init_failure_releases_reservation(self):
+        failure = CONTROL.ControlError("command_failed", "image unpack failed")
+        with mock.patch.object(self.control.incus, "init", side_effect=failure):
+            with self.assertRaises(CONTROL.ControlError) as error:
+                self.acquire()
+        self.assertEqual(error.exception.code, "command_failed")
+        task = self.store.get_task(session_id="thread-a")
+        self.assertEqual(task["state"], "absent")
+        self.assertEqual(task["reservation_bytes"], 0)
+        self.assertFalse(json.loads(task["last_error"])["native_init_absence_retry"])
+        self.assertEqual(self.store.operation("op-1")["outcome"], "error")
+
+    def test_native_inventory_failure_keeps_expiry_retryable(self):
+        task = self.control._base_task("thread-a", 1)
+        task.update(
+            state="preparing",
+            lease_expires_at=CONTROL.iso_time(self.now + dt.timedelta(minutes=10)),
+            resources_json=json.dumps({"cpu": 2, "memory_mib": 4096, "disk_gib": 20}),
+            resource_reservation_json=json.dumps({"cpu": 2, "memory_mib": 4096, "disk_gib": 20}),
+            reservation_bytes=4 * GIB,
+        )
+        self.store.put_task(task)
+        with mock.patch.object(
+            self.control.incus,
+            "list_instances",
+            side_effect=[[], CONTROL.ControlError("command_failed", "inventory unavailable")],
+        ), mock.patch.object(self.systemd, "remove_expiry") as remove_expiry, mock.patch.object(
+            self.systemd, "retry_cleanup"
+        ) as retry_cleanup:
+            with self.assertRaises(CONTROL.ControlError) as error:
+                self.control._release_task(task)
+        self.assertEqual(error.exception.code, "cleanup_incomplete")
+        remove_expiry.assert_not_called()
+        retry_cleanup.assert_called_once()
+        self.assertEqual(self.store.get_task(task_id=task["task_id"])["state"], "closing")
+
+    def test_pending_native_init_recovery_waits_for_stable_absence(self):
+        task = self.control._base_task("thread-a", 1)
+        task.update(
+            state="preparing",
+            lease_expires_at=CONTROL.iso_time(self.now + dt.timedelta(minutes=10)),
+            resources_json=json.dumps({"cpu": 2, "memory_mib": 4096, "disk_gib": 20}),
+            resource_reservation_json=json.dumps({"cpu": 2, "memory_mib": 4096, "disk_gib": 20}),
+            reservation_bytes=4 * GIB,
+        )
+        self.store.put_task(task)
+        self.store.record_operation(
+            "pending-acquire", "acquire", "thread-a", 1,
+            {"outcome": "pending", "_request_digest": "digest"},
+        )
+        with mock.patch.object(self.control, "_cleanup_task", return_value=([], [])), \
+             mock.patch.object(self.control.incus, "list_instances", return_value=[]):
+            with self.assertRaises(CONTROL.ControlError):
+                self.control._release_task(task)
+        pending = self.store.get_task(task_id=task["task_id"])
+        self.assertEqual(pending["state"], "closing")
+        self.assertEqual(json.loads(pending["last_error"])["native_init_absence_checks"], 1)
+
+        self.now += dt.timedelta(seconds=CONTROL.NATIVE_INIT_ABSENCE_RETRY_SECONDS)
+        with mock.patch.object(self.control, "_cleanup_task", return_value=([], [])), \
+             mock.patch.object(self.control.incus, "list_instances", return_value=[]):
+            self.control._release_task(pending)
+        self.assertEqual(self.store.get_task(task_id=task["task_id"])["state"], "absent")
+
+    def test_malformed_native_init_retry_timestamp_is_repaired(self):
+        task = self.control._base_task("thread-a", 1)
+        task.update(
+            state="closing",
+            lease_expires_at=None,
+            resources_json=json.dumps({"cpu": 2, "memory_mib": 4096, "disk_gib": 20}),
+            resource_reservation_json=json.dumps({"cpu": 2, "memory_mib": 4096, "disk_gib": 20}),
+            reservation_bytes=4 * GIB,
+            last_error=json.dumps({
+                "native_init_absence_retry": True,
+                "native_init_absence_retry_after": None,
+                "native_init_cleanup_verified": True,
+            }),
+        )
+        self.store.put_task(task)
+        with mock.patch.object(self.control, "_cleanup_task", return_value=([], [])), \
+             mock.patch.object(self.control.incus, "list_instances", return_value=[]):
+            with self.assertRaises(CONTROL.ControlError):
+                self.control._release_task(task)
+        repaired = json.loads(self.store.get_task(task_id=task["task_id"])["last_error"])
+        self.assertIsInstance(repaired["native_init_absence_retry_after"], str)
+        self.assertEqual(repaired["native_init_absence_checks"], 1)
 
     def test_resize_guest_growth_failure_is_structured_and_closed(self):
         self.acquire()
@@ -2208,7 +2344,7 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
 
     def test_guest_root_growth_script_preserves_timeout_evidence(self):
         command = ["findmnt", "-n", "-o", "SOURCE", "-T", "/"]
-        exit_code, stdout, stderr, _ = self.execute_script(timeout_command=command, command_timeout=0.05)
+        exit_code, stdout, stderr, _ = self.execute_script(timeout_command=command, command_timeout=0.2)
 
         self.assertEqual(exit_code, 1)
         self.assertEqual(stdout, "")
@@ -2219,7 +2355,7 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         self.assertEqual(error["stderr"], "partial stderr")
         self.assertFalse(error["stdout_truncated"])
         self.assertFalse(error["stderr_truncated"])
-        self.assertEqual(error["process_group_killed"], Path("/proc").is_dir())
+        self.assertTrue(error["process_group_killed"])
 
     def test_guest_root_growth_script_falls_back_when_group_kill_is_denied(self):
         command = ["findmnt", "-n", "-o", "SOURCE", "-T", "/"]
@@ -2249,23 +2385,10 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
             self.assertEqual(exit_code, 1)
             error = json.loads(stderr)["error"]
             self.assertEqual(error["cause"], "command_timeout")
-            for _ in range(20):
-                if pid_path.exists():
-                    break
-                time.sleep(0.01)
-            else:
+            if not wait_until(pid_path.exists):
                 self.fail("guest growth setsid child did not publish its pid")
             child_pid = int(pid_path.read_text())
-            for _ in range(40):
-                try:
-                    state = (Path("/proc") / str(child_pid) / "stat").read_text()
-                    close_paren = state.rfind(")")
-                    if state[close_paren + 2 :].split()[0] == "Z":
-                        break
-                except FileNotFoundError:
-                    break
-                time.sleep(0.01)
-            else:
+            if not wait_until(lambda: process_is_zombie(child_pid)):
                 self.fail("guest growth setsid descendant remained alive after timeout")
 
     @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
@@ -2283,23 +2406,10 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
             self.assertEqual(exit_code, 1)
             error = json.loads(stderr)["error"]
             self.assertEqual(error["cause"], "command_timeout")
-            for _ in range(20):
-                if pid_path.exists():
-                    break
-                time.sleep(0.01)
-            else:
+            if not wait_until(pid_path.exists):
                 self.fail("guest growth setsid child did not publish its pid")
             child_pid = int(pid_path.read_text())
-            for _ in range(40):
-                try:
-                    state = (Path("/proc") / str(child_pid) / "stat").read_text()
-                    close_paren = state.rfind(")")
-                    if state[close_paren + 2 :].split()[0] == "Z":
-                        break
-                except FileNotFoundError:
-                    break
-                time.sleep(0.01)
-            else:
+            if not wait_until(lambda: process_is_zombie(child_pid)):
                 self.fail("guest growth setsid descendant remained alive after leader exit")
 
     def test_guest_root_growth_script_bounds_command_output(self):
@@ -2455,23 +2565,10 @@ class CommandRunnerTests(unittest.TestCase):
                 CONTROL.CommandRunner().run_bounded(
                     [os.sys.executable, "-c", code, str(pid_path)], timeout=0.2
                 )
-            for _ in range(20):
-                if pid_path.exists():
-                    break
-                time.sleep(0.01)
-            else:
+            if not wait_until(pid_path.exists):
                 self.fail("diagnostic child did not publish its pid")
             child_pid = int(pid_path.read_text())
-            for _ in range(20):
-                try:
-                    state = (Path("/proc") / str(child_pid) / "stat").read_text()
-                    close_paren = state.rfind(")")
-                    if state[close_paren + 2 :].split()[0] == "Z":
-                        break
-                except FileNotFoundError:
-                    break
-                time.sleep(0.01)
-            else:
+            if not wait_until(lambda: process_is_zombie(child_pid)):
                 self.fail("diagnostic descendant remained alive after timeout")
 
     @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
@@ -2489,23 +2586,10 @@ class CommandRunnerTests(unittest.TestCase):
                 CONTROL.CommandRunner().run_bounded(
                     [os.sys.executable, "-c", code, str(pid_path)], timeout=0.2
                 )
-            for _ in range(20):
-                if pid_path.exists():
-                    break
-                time.sleep(0.01)
-            else:
+            if not wait_until(pid_path.exists):
                 self.fail("setsid diagnostic child did not publish its pid")
             child_pid = int(pid_path.read_text())
-            for _ in range(40):
-                try:
-                    state = (Path("/proc") / str(child_pid) / "stat").read_text()
-                    close_paren = state.rfind(")")
-                    if state[close_paren + 2 :].split()[0] == "Z":
-                        break
-                except FileNotFoundError:
-                    break
-                time.sleep(0.01)
-            else:
+            if not wait_until(lambda: process_is_zombie(child_pid)):
                 self.fail("setsid diagnostic descendant remained alive after timeout")
 
     @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
@@ -2524,23 +2608,10 @@ class CommandRunnerTests(unittest.TestCase):
                     [os.sys.executable, "-c", code, str(pid_path)], timeout=0.3
                 )
             self.assertEqual(failure.exception.code, "command_timeout")
-            for _ in range(20):
-                if pid_path.exists():
-                    break
-                time.sleep(0.01)
-            else:
+            if not wait_until(pid_path.exists):
                 self.fail("setsid diagnostic child did not publish its pid")
             child_pid = int(pid_path.read_text())
-            for _ in range(40):
-                try:
-                    state = (Path("/proc") / str(child_pid) / "stat").read_text()
-                    close_paren = state.rfind(")")
-                    if state[close_paren + 2 :].split()[0] == "Z":
-                        break
-                except FileNotFoundError:
-                    break
-                time.sleep(0.01)
-            else:
+            if not wait_until(lambda: process_is_zombie(child_pid)):
                 self.fail("setsid diagnostic descendant remained alive after leader exit")
 
     @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
@@ -2566,23 +2637,10 @@ class CommandRunnerTests(unittest.TestCase):
                 failure.exception.detail["process_group_cleanup_error"],
                 (None, "PermissionError"),
             )
-            for _ in range(20):
-                if pid_path.exists():
-                    break
-                time.sleep(0.01)
-            else:
+            if not wait_until(pid_path.exists):
                 self.fail("diagnostic fallback child did not publish its pid")
             child_pid = int(pid_path.read_text())
-            for _ in range(20):
-                try:
-                    state = (Path("/proc") / str(child_pid) / "stat").read_text()
-                    close_paren = state.rfind(")")
-                    if state[close_paren + 2 :].split()[0] == "Z":
-                        break
-                except FileNotFoundError:
-                    break
-                time.sleep(0.01)
-            else:
+            if not wait_until(lambda: process_is_zombie(child_pid)):
                 self.fail("diagnostic fallback descendant remained alive after timeout")
 
 

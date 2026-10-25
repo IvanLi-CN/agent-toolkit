@@ -539,18 +539,41 @@ def run(command, phase, *, check=True):
             return True, cleanup_error
         return False, cleanup_error or inspection_error or "process_group_members_remain"
 
-    def kill_process_tree_members(identities):
+    def kill_process_tree_members(identities, *, root_pid=None, required_root=None):
+        tracked = dict(identities)
         cleanup_error = None
         for _ in range(3):
-            members, complete = live_processes(identities)
+            if root_pid is not None and os.path.isdir("/proc"):
+                discovered, tree_complete = process_tree_members(root_pid)
+                if not tree_complete:
+                    return False, "process_tree_inspection_failed"
+                for pid, starttime in discovered:
+                    previous = tracked.get(pid)
+                    if previous is not None and previous != starttime:
+                        return False, "process_tree_identity_unverified"
+                    tracked[pid] = starttime
+                if required_root is not None:
+                    current_root = tracked.get(root_pid)
+                    if current_root is not None and current_root != required_root:
+                        return False, "process_tree_identity_unverified"
+            members, complete = live_processes(sorted(tracked.items()))
             if not complete:
                 return False, "process_tree_inspection_failed"
             if not members:
                 return True, cleanup_error
-            killed, cleanup_error = kill_process_identities(identities)
+            killed, cleanup_error = kill_process_identities(members)
             if not killed:
                 return False, cleanup_error
-        members, complete = live_processes(identities)
+        if root_pid is not None and os.path.isdir("/proc"):
+            discovered, tree_complete = process_tree_members(root_pid)
+            if not tree_complete:
+                return False, "process_tree_inspection_failed"
+            for pid, starttime in discovered:
+                previous = tracked.get(pid)
+                if previous is not None and previous != starttime:
+                    return False, "process_tree_identity_unverified"
+                tracked[pid] = starttime
+        members, complete = live_processes(sorted(tracked.items()))
         if complete and not members:
             return True, cleanup_error
         return False, cleanup_error or "process_tree_members_remain"
@@ -726,15 +749,21 @@ def run(command, phase, *, check=True):
                     os.killpg(process.pid, 0)
                 else:
                     os.killpg(process.pid, signal.SIGKILL)
+                group_signal_confirmed = True
                 process_group_killed, fallback_error = kill_process_group_members(
                     process.pid, required_identity=leader_identity
                 )
+                if not os.path.isdir("/proc"):
+                    process_group_killed = group_signal_confirmed
                 if fallback_error:
                     process_group_cleanup_error = fallback_error
             except ProcessLookupError:
+                process_group_killed = True
                 process_group_killed, fallback_error = kill_process_group_members(
                     process.pid, required_identity=leader_identity
                 )
+                if not os.path.isdir("/proc"):
+                    process_group_killed = True
                 if fallback_error:
                     process_group_cleanup_error = fallback_error
             except (AttributeError, PermissionError, OSError) as group_error:
@@ -766,7 +795,11 @@ def run(command, phase, *, check=True):
                 tree_killed = False
                 tree_error = "process_tree_identity_unverified"
             else:
-                tree_killed, tree_error = kill_process_tree_members(tree_members)
+                tree_killed, tree_error = kill_process_tree_members(
+                    tree_members,
+                    root_pid=process.pid,
+                    required_root=leader_identity,
+                )
         if not tree_complete:
             tree_killed = False
             tree_error = "process_tree_inspection_failed"
@@ -1443,11 +1476,13 @@ def iso_time(value: dt.datetime | None = None) -> str:
 def parse_time(value: str | None) -> dt.datetime | None:
     if not value:
         return None
+    if not isinstance(value, str):
+        raise ControlError("invalid_time", "timestamp must be a string")
     try:
         return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(
             dt.timezone.utc
         )
-    except ValueError as exc:
+    except (AttributeError, TypeError, ValueError) as exc:
         raise ControlError("invalid_time", f"invalid timestamp: {value}") from exc
 
 
@@ -1885,10 +1920,30 @@ class CommandRunner:
         return (not members), "process_group_members_remain" if members else None
 
     @classmethod
-    def _kill_process_tree_members(cls, identities: Sequence[tuple[int, int]]) -> tuple[bool, str | None]:
+    def _kill_process_tree_members(
+        cls,
+        identities: Sequence[tuple[int, int]],
+        *,
+        root_pid: int | None = None,
+        required_root: tuple[int, int] | None = None,
+    ) -> tuple[bool, str | None]:
+        tracked = dict(identities)
         cleanup_error = None
         for _ in range(3):
-            members, complete = cls._live_processes(identities)
+            if root_pid is not None and Path("/proc").is_dir():
+                discovered, tree_complete = cls._process_tree_members(root_pid)
+                if not tree_complete:
+                    return False, "process_tree_inspection_failed"
+                for pid, starttime in discovered:
+                    previous = tracked.get(pid)
+                    if previous is not None and previous != starttime:
+                        return False, "process_tree_identity_unverified"
+                    tracked[pid] = starttime
+                if required_root is not None:
+                    current_root = tracked.get(root_pid)
+                    if current_root is not None and current_root != required_root:
+                        return False, "process_tree_identity_unverified"
+            members, complete = cls._live_processes(sorted(tracked.items()))
             if not complete:
                 return False, "process_tree_inspection_failed"
             if not members:
@@ -1896,7 +1951,16 @@ class CommandRunner:
             killed, cleanup_error = cls._kill_process_identities(members)
             if not killed:
                 return False, cleanup_error
-        members, complete = cls._live_processes(identities)
+        if root_pid is not None and Path("/proc").is_dir():
+            discovered, tree_complete = cls._process_tree_members(root_pid)
+            if not tree_complete:
+                return False, "process_tree_inspection_failed"
+            for pid, starttime in discovered:
+                previous = tracked.get(pid)
+                if previous is not None and previous != starttime:
+                    return False, "process_tree_identity_unverified"
+                tracked[pid] = starttime
+        members, complete = cls._live_processes(sorted(tracked.items()))
         if complete and not members:
             return True, cleanup_error
         return False, cleanup_error or "process_tree_members_remain"
@@ -2132,15 +2196,21 @@ class CommandRunner:
                         os.killpg(process.pid, 0)
                     else:
                         os.killpg(process.pid, signal.SIGKILL)
+                    group_signal_confirmed = True
                     process_group_killed, fallback_error = self._kill_process_group_members(
                         process.pid, required_identity=leader_identity
                     )
+                    if not Path("/proc").is_dir():
+                        process_group_killed = group_signal_confirmed
                     if fallback_error:
                         process_group_cleanup_error = fallback_error
                 except ProcessLookupError:
+                    process_group_killed = True
                     process_group_killed, fallback_error = self._kill_process_group_members(
                         process.pid, required_identity=leader_identity
                     )
+                    if not Path("/proc").is_dir():
+                        process_group_killed = True
                     if fallback_error:
                         process_group_cleanup_error = fallback_error
                 except OSError as group_error:
@@ -2172,7 +2242,11 @@ class CommandRunner:
                     tree_killed = False
                     tree_error = "process_tree_identity_unverified"
                 else:
-                    tree_killed, tree_error = self._kill_process_tree_members(tree_members)
+                    tree_killed, tree_error = self._kill_process_tree_members(
+                        tree_members,
+                        root_pid=process.pid,
+                        required_root=leader_identity,
+                    )
             if not tree_complete:
                 tree_killed = False
                 tree_error = "process_tree_inspection_failed"
@@ -3520,11 +3594,61 @@ class Control:
             return False
         try:
             retry_after = parse_time(record.get("native_init_absence_retry_after"))
-        except (TypeError, ValueError):
+        except (AttributeError, ControlError, TypeError, ValueError):
             return False
         if retry_after is None:
             return False
         return retry_after <= self.now()
+
+    def _native_init_retry_after(self, task: Mapping[str, Any]) -> str:
+        record = self._native_init_absence_retry_record(task) or {}
+        try:
+            retry_after = parse_time(record.get("native_init_absence_retry_after"))
+        except (AttributeError, ControlError, TypeError, ValueError):
+            retry_after = None
+        if retry_after is None or retry_after <= self.now():
+            retry_after = self.now() + dt.timedelta(seconds=NATIVE_INIT_ABSENCE_RETRY_SECONDS)
+        return iso_time(retry_after)
+
+    @staticmethod
+    def _native_init_absence_checks(task: Mapping[str, Any]) -> int:
+        record = Control._native_init_absence_retry_record(task) or {}
+        value = record.get("native_init_absence_checks", 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return 0
+        return value
+
+    @staticmethod
+    def _native_init_cleanup_verified(task: Mapping[str, Any]) -> bool | None:
+        record = Control._native_init_absence_retry_record(task) or {}
+        value = record.get("native_init_cleanup_verified")
+        return value if isinstance(value, bool) else None
+
+    def _pending_native_init_for_task(self, task: Mapping[str, Any]) -> bool:
+        try:
+            pending = self.store.pending_operations()
+        except ControlError as exc:
+            raise ControlError(
+                "operation_unverified",
+                "pending acquire operations cannot be verified",
+                {"task_id": task["task_id"], "cause": exc.as_dict()},
+            ) from exc
+        return any(
+            item.get("action") == "acquire"
+            and item.get("session_id") == task.get("session_id")
+            and item.get("generation") == task.get("generation")
+            for item in pending
+        )
+
+    @staticmethod
+    def _native_init_timeout_cleanup_verified(error: ControlError) -> bool | None:
+        if error.code != "command_timeout":
+            return True
+        detail = error.detail if isinstance(error.detail, Mapping) else {}
+        return all(
+            detail.get(key) is True
+            for key in ("reaped", "pipes_drained", "process_group_killed")
+        ) and not detail.get("process_group_cleanup_error")
 
     @staticmethod
     def _operation_outcome_uncertain(action: str, error: ControlError) -> bool:
@@ -3537,6 +3661,8 @@ class Control:
         cleanup = detail.get("cleanup")
         if isinstance(cleanup, Mapping) and cleanup.get("ok") is False:
             return True
+        if detail.get("native_init_absence_retry") is False:
+            return False
         if isinstance(detail.get("outcome_verified"), bool):
             return not detail["outcome_verified"]
         cleanup_result = cleanup.get("result") if isinstance(cleanup, Mapping) else None
@@ -6145,11 +6271,18 @@ class Control:
                     "readiness": readiness, "stage_timings": stage_timings}
         except ControlError as exc:
             cleanup = {"ok": False, "error": {"code": "not_attempted", "message": "cleanup was not attempted"}}
-            native_init_uncertain = phase == "native-init"
+            native_init_uncertain = phase == "native-init" and exc.code == "command_timeout"
+            native_init_cleanup_verified = (
+                self._native_init_timeout_cleanup_verified(exc)
+                if phase == "native-init"
+                else None
+            )
             try:
                 cleanup["result"] = self._release_task(
                     self.store.get_task(task_id=task["task_id"]),
                     require_native_init_absence_retry=native_init_uncertain,
+                    native_init_cleanup_verified=native_init_cleanup_verified,
+                    recover_pending_acquire=False,
                 )
                 cleanup["ok"] = True
             except ControlError as cleanup_error:
@@ -6160,6 +6293,7 @@ class Control:
                            "requested": resources, "cleanup": cleanup})
             if native_init_uncertain:
                 detail["native_init_absence_retry"] = True
+                detail["native_init_cleanup_verified"] = native_init_cleanup_verified
                 cleanup_error = cleanup.get("error") if isinstance(cleanup, Mapping) else None
                 cleanup_detail = cleanup_error.get("detail") if isinstance(cleanup_error, Mapping) else None
                 detail["native_init_absence_retry_after"] = (
@@ -6168,6 +6302,15 @@ class Control:
                     and cleanup_detail.get("native_init_absence_retry_after")
                     else iso_time(self.now() + dt.timedelta(seconds=NATIVE_INIT_ABSENCE_RETRY_SECONDS))
                 )
+                if isinstance(cleanup_detail, Mapping):
+                    detail["native_init_absence_checks"] = cleanup_detail.get(
+                        "native_init_absence_checks", 1
+                    )
+                    detail["native_init_cleanup_verified"] = cleanup_detail.get(
+                        "native_init_cleanup_verified", native_init_cleanup_verified
+                    )
+            elif phase == "native-init":
+                detail["native_init_absence_retry"] = False
             if readiness is not None:
                 detail["readiness"] = readiness
             error = {"code": "acquire_partial", **detail, "error": exc.as_dict()}
@@ -6214,6 +6357,8 @@ class Control:
         task: Mapping[str, Any],
         *,
         require_native_init_absence_retry: bool = False,
+        native_init_cleanup_verified: bool | None = None,
+        recover_pending_acquire: bool = True,
     ) -> dict[str, Any]:
         requested_state = task.get("state")
         with self._object_lock("cleanup:" + str(task["session_id"])):
@@ -6235,22 +6380,57 @@ class Control:
                 # Reuse the native expiry oneshot's bounded Restart=on-failure path.
                 self.systemd.retry_cleanup(task["task_id"], task["generation"])
                 raise ControlError("cleanup_incomplete", "entry/port reservations remain closed until reconciliation succeeds", errors)
-            self.systemd.remove_expiry(task["task_id"], task["generation"])
-            absent = not any(item.get("name") == task["instance_name"] for item in self.incus.list_instances())
+            try:
+                instances = self.incus.list_instances()
+            except ControlError as exc:
+                detail = {"native_absence": "unverified", "cause": exc.as_dict()}
+                self.store.update_task(task["task_id"], last_error=json.dumps(detail))
+                self.systemd.retry_cleanup(task["task_id"], task["generation"])
+                raise ControlError(
+                    "cleanup_incomplete",
+                    "native absence cannot be verified; delayed reconciliation is required",
+                    detail,
+                ) from exc
+            absent = not any(item.get("name") == task["instance_name"] for item in instances)
+            try:
+                pending_acquire = (
+                    self._pending_native_init_for_task(task)
+                    if recover_pending_acquire
+                    else False
+                )
+            except ControlError as exc:
+                detail = {"native_absence": "unverified", "cause": exc.as_dict()}
+                self.store.update_task(task["task_id"], last_error=json.dumps(detail))
+                self.systemd.retry_cleanup(task["task_id"], task["generation"])
+                raise ControlError(
+                    "cleanup_incomplete",
+                    "pending native initialization cannot be verified; delayed reconciliation is required",
+                    detail,
+                ) from exc
             delayed_absence = self._native_init_absence_retry_pending(task)
+            retry_required = require_native_init_absence_retry or delayed_absence or pending_acquire
             retry_ready = self._native_init_absence_retry_ready(task)
-            if absent and (require_native_init_absence_retry or delayed_absence) and not (
-                delayed_absence and retry_ready
-            ):
-                retry_record = self._native_init_absence_retry_record(task) or {}
+            cleanup_verified = (
+                native_init_cleanup_verified
+                if native_init_cleanup_verified is not None
+                else self._native_init_cleanup_verified(task)
+            )
+            absence_checks = self._native_init_absence_checks(task)
+            if absent and retry_required:
+                absence_checks += 1
+            stable_absence = retry_ready and absence_checks >= 2
+            absence_verified = cleanup_verified is True or (
+                cleanup_verified is None and pending_acquire and stable_absence
+            )
+            if absent and retry_required and not (stable_absence and absence_verified):
+                retry_after = self._native_init_retry_after(task)
                 detail = {
                     "native_init_absence_retry": True,
                     "outcome_verified": False,
                     "native_absence": "pending",
-                    "native_init_absence_retry_after": retry_record.get(
-                        "native_init_absence_retry_after",
-                        iso_time(self.now() + dt.timedelta(seconds=NATIVE_INIT_ABSENCE_RETRY_SECONDS)),
-                    ),
+                    "native_init_absence_retry_after": retry_after,
+                    "native_init_absence_checks": absence_checks,
+                    "native_init_cleanup_verified": cleanup_verified,
                 }
                 self.store.update_task(task["task_id"], last_error=json.dumps(detail))
                 self.systemd.retry_cleanup(task["task_id"], task["generation"])
@@ -6259,6 +6439,7 @@ class Control:
                     "native init result remains unresolved; delayed reconciliation is required",
                     detail,
                 )
+            self.systemd.remove_expiry(task["task_id"], task["generation"])
             if not absent and task.get("previous_generation") is not None:
                 self._ownership(task)
                 self.incus.config_set(task["instance_name"], "user.agent-vm.generation", str(task["generation"]))

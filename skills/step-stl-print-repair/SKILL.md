@@ -7,6 +7,14 @@ description: "Repair and regenerate print-ready STL files from STEP/CAD sources,
 
 Use this skill when the user provides STEP/STL files for 3D printing, asks to repair STL service errors, regenerate STL from STEP, improve mesh precision, or fix visible artifacts around fillets/rounded openings.
 
+## Runtime and output boundary
+
+All five domain scripts retain Python because they call FreeCAD/Blender application APIs or the official Gmsh binding directly. Run them in the matching application Python environment on a supported Linux/macOS installation; Bun is not a production prerequisite and no TS launcher is added. FreeCAD needs `FreeCAD`, `Import`, `Part`, `Mesh` and `MeshPart`; Gmsh needs its Python `gmsh` module/native library; Blender needs its bundled `bpy`/`mathutils`, with the 3D Print Toolbox extension for batch checks. A system Python installation alone does not provide these interfaces. See the application invocation notes below.
+
+For the smallest meshing example, configure `CAD_PYTHON` as a Python executable with the Gmsh binding, then run `"$CAD_PYTHON" scripts/gmsh_step_to_stl.py model.step out/model.stl --mesh-size 0.25 --report out/report.json` from this Skill. The scripts read selected geometry and write STL, JSON or rendered image outputs; matching outputs may be replaced, so use a fresh output directory. They do not modify source CAD or upload models. Blender scripts reset the in-memory scene: launch the documented background/factory-startup process, not an unsaved interactive project. Native applications, plugins and rendering are explicit prerequisites, not automatically installed dependencies.
+
+The helper source smoke under `../git-remote-troubleshoot/tests/helper_sources.test.ts` checks source links and retained binding imports only. It does not execute CAD or establish geometry/rendering correctness; application-level evidence is unavailable when those environments are absent.
+
 ## Core Lessons
 
 - Prefer the original STEP/CAD source over repairing a bad STL.

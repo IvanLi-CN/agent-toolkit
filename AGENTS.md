@@ -18,6 +18,7 @@ Use the Bun installed on the host; this repository does not select or download a
 
 ```bash
 bun install --frozen-lockfile
+bun --version
 bun run typecheck
 bun run check
 bun run test:repo
@@ -37,6 +38,8 @@ bun run bin/source_target_inventory_check.ts --source-root /path/to/source --sou
 It is not required for ordinary standalone checkout validation.
 
 ## Public boundaries
+
+`bun run check` includes the foundation consistency gate: membership, catalog, language allocation, Spec/implementation coverage, requirement/scenario identities, and local/CI validation wiring must agree. Record migration targets separately from completed behavior evidence; root validation does not prove domain migration, deployment, or remote required-check enforcement.
 
 Use direct repository-relative links and neutral placeholders in public content. Do not add credentials, real hostnames, personal filesystem paths, private runtime/task integration, copied consumer Skills, or resident synchronization services. Python, C, and POSIX Shell remain allowed only where the public language matrix records a concrete application, native-rendering, or remote-observation boundary.
 

@@ -10,6 +10,8 @@ The project has a public source and Agent VM contracts, while portions of its ma
 
 [ADR 0028](../../adr/0028-language-and-runtime-policy.md) records the accepted language/runtime decision. The script matrix distinguishes that target from source implementations, and IMPLEMENTATION.md records verified coverage separately.
 
+[ADR 0032](../../adr/0032-project-foundation-rebaseline.md) makes the public manifest authoritative for membership and supersedes the older ADR's inventory-count assertion. Foundation contracts retain their cross-cutting requirements and domain verification identities while distinguishing target allocation from completed migration. Historical delivery numbering does not define the active contract.
+
 ## References
 
 - [Requirements](SPEC.md)

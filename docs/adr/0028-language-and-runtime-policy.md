@@ -42,7 +42,7 @@ This is a responsibility boundary, not a Python percentage target. Both implemen
 
 The [project foundation contract](../specs/project-foundation/SPEC.md) requires governance, repository checks, portable helpers, XP local logic, VM control/client/guest logic, usage documentation, and the site to follow this policy. Implementation, tests, entrypoints, and prerequisites must change together. A control-plane rewrite must independently demonstrate lock exclusion, transaction/numeric behavior, atomic updates, process-tree termination, recovery, and existing lifecycle contracts before replacing its implementation. Documenting the policy does not establish a completed conversion or authorize production deployment.
 
-The accepted [per-Skill script matrix](../specs/project-foundation/SCRIPT-LANGUAGE-MATRIX.md) records all 16 public Skills, exact script responsibilities, concrete Python/Shell/C exceptions, and deployment implications. It distinguishes target language decisions from completed migrations.
+The accepted [per-Skill script matrix](../specs/project-foundation/SCRIPT-LANGUAGE-MATRIX.md) records all 13 public Skills, exact script responsibilities, concrete Python/Shell/C exceptions, and deployment implications. It distinguishes target language decisions from completed migrations.
 
 ## Complexity and type contracts
 

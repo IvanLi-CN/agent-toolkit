@@ -68,7 +68,7 @@ The deployment-facing collector must expose the following stable metric families
 | `agent_vm_filesystem_available_bytes` | gauge | `mountpoint=/` or `/var/lib/incus/images` |
 | `agent_vm_operations_total` | counter | `action`, `outcome`, and `phase` |
 | `agent_vm_image_unpack_failures_total` | counter | `phase` and `reason` |
-| `agent_vm_task_states` | gauge | `state=preparing|active|cached|closing|failed|absent` |
+| `agent_vm_task_states` | gauge | `state=preparing|active|cached|closing|deleting|failed|absent` |
 | `agent_vm_task_info` | gauge | bounded labels for task ID, instance/session identity, state, native status, guest availability and effective lease |
 | `agent_vm_task_cpu_vcpu` | gauge | requested task CPU, labelled by bounded task ID and state |
 | `agent_vm_task_memory_bytes` | gauge | requested task memory, labelled by bounded task ID and state |
@@ -78,6 +78,7 @@ The deployment-facing collector must expose the following stable metric families
 | `agent_vm_task_last_error_info` | gauge | stable error `code` and `phase`, without raw message text, labelled by task ID and state |
 | `agent_vm_warnings_total` | counter | stable warning `code` |
 | `agent_vm_up` | gauge | `0` or `1` |
+| `agent_vm_observation_consistent` | gauge | `1` only when the native metrics snapshot passed its durable epoch check; `0` otherwise |
 
 The one-shot controller remains the source of truth for native state and must not be replaced with a resident HTTP broker solely to serve these metrics. The deployment must provide an authorized, read-only scrape bridge or textfile collector that preserves the controller's failure and freshness semantics. `agent_vm_admission_memory_limit_bytes` is the logical reservation ceiling (for the deployment, 65536 MiB = 68719476736 bytes), while `agent_vm_admission_memory_capacity_bytes` is the CT-visible capacity (32768 MiB = 34359738368 bytes). The controller JSON uses `memory_mib`; the Prometheus bridge must convert that field to bytes before emitting the memory families. `agent_vm_memory_pressure` is a runtime observation and must not be used to reduce `agent_vm_admission_memory_remaining_bytes`. CPU PSI is valid only when the controller verifies the cgroup v2 mount root, the single unified entry in `/proc/self/cgroup`, and the pressure file under that current cgroup path; an exporter must preserve the controller's unverified state rather than relabeling host or ancestor pressure as CT-local. Until that bridge exists, a Grafana query for these families is not a working panel.
 

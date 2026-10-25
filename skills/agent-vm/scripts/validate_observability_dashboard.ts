@@ -59,6 +59,7 @@ export const REQUIRED_METRICS = [
   "agent_vm_admission_reclaim_required",
   "agent_vm_admission_draining",
   "agent_vm_up",
+  "agent_vm_observation_consistent",
   "agent_vm_scrape_timestamp_seconds",
   "agent_vm_filesystem_size_bytes",
   "agent_vm_filesystem_used_bytes",
@@ -96,14 +97,18 @@ export const INVENTORY_REQUIRED_METRICS = [
   "agent_vm_task_last_error_info",
   "agent_vm_task_states",
   "agent_vm_up",
+  "agent_vm_observation_consistent",
   "agent_vm_scrape_timestamp_seconds",
   "agent_vm_operations_total",
   "agent_vm_image_unpack_failures_total",
 ];
 
+export const INVENTORY_REQUIRED_TASK_STATES = ["active", "preparing", "closing", "deleting", "failed", "cached", "absent"] as const;
+
 export type DashboardValidationOptions = {
   requiredPanelTitles?: readonly string[];
   requiredMetrics?: readonly string[];
+  requiredTaskStates?: readonly string[];
 };
 
 export type DashboardProfile = "capacity" | "inventory";
@@ -219,6 +224,20 @@ export function validateDashboard(dashboard: unknown, expectedDatasourceUid?: st
     findings.push("controller_job variable must be a hidden custom variable");
   }
 
+  if (options.requiredTaskStates) {
+    const stateVariable = variables.find((variable) => variable.name === "state");
+    const query = stateVariable?.query;
+    if (typeof query !== "string") {
+      findings.push("missing task state variable query");
+    } else {
+      for (const state of options.requiredTaskStates) {
+        if (!query.split(",").map((value) => value.trim()).includes(state)) {
+          findings.push(`task state variable must include: ${state}`);
+        }
+      }
+    }
+  }
+
   const targets = targetRecords(dashboard);
   const expressions = targets
     .map((target) => target.expr)
@@ -300,6 +319,7 @@ export function validateDashboardFile(
     ? {
         requiredPanelTitles: INVENTORY_REQUIRED_PANEL_TITLES,
         requiredMetrics: INVENTORY_REQUIRED_METRICS,
+        requiredTaskStates: INVENTORY_REQUIRED_TASK_STATES,
       }
     : {};
   const findings = validateDashboard(dashboard, undefined, options);

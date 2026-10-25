@@ -7,6 +7,7 @@ import {
   INVENTORY_REQUIRED_PANEL_TITLES,
   validateDashboard,
   validateProvisioning,
+  INVENTORY_REQUIRED_TASK_STATES,
 } from "../scripts/validate_observability_dashboard.ts";
 
 const config: ObservabilityConfig = {
@@ -38,6 +39,7 @@ test("renders a portable dashboard and provisioning bundle", () => {
   expect(bundle.inventoryDashboardText).toContain('"options": "Scrape age (s)"');
   expect(bundle.inventoryDashboardText).not.toContain('agent_vm_operations_total{job=\\"$controller_job\\",outcome=\\"failure\\"}) + sum(agent_vm_image_unpack_failures_total');
   expect(bundle.inventoryDashboardText).toContain('"legendFormat": "Image unpack failures"');
+  expect(bundle.inventoryDashboardText).toContain('"expr": "agent_vm_observation_consistent{job=\\"$controller_job\\"}"');
   expect(bundle.inventoryDashboardText).toContain('"text": [\n            "active",\n            "preparing",\n            "closing",\n            "deleting",\n            "failed"');
   expect(bundle.inventoryDashboardText).not.toContain("or vector(0)");
   expect(bundle.inventoryDashboardText).toContain("time() - agent_vm_scrape_timestamp_seconds");
@@ -71,7 +73,22 @@ test("renders a portable dashboard and provisioning bundle", () => {
   expect(validateDashboard(bundle.inventoryDashboard, "prometheus-test", {
     requiredPanelTitles: INVENTORY_REQUIRED_PANEL_TITLES,
     requiredMetrics: INVENTORY_REQUIRED_METRICS,
+    requiredTaskStates: INVENTORY_REQUIRED_TASK_STATES,
   })).toEqual([]);
+});
+
+test("requires the complete inventory task-state filter", () => {
+  const bundle = renderBundle(config);
+  const dashboard = structuredClone(bundle.inventoryDashboard) as Record<string, unknown>;
+  const templating = dashboard.templating as Record<string, unknown>;
+  const variables = templating.list as Array<Record<string, unknown>>;
+  const stateVariable = variables.find((variable) => variable.name === "state");
+  stateVariable!.query = "active,preparing,closing,failed,cached,absent";
+  expect(validateDashboard(dashboard, "prometheus-test", {
+    requiredPanelTitles: INVENTORY_REQUIRED_PANEL_TITLES,
+    requiredMetrics: INVENTORY_REQUIRED_METRICS,
+    requiredTaskStates: INVENTORY_REQUIRED_TASK_STATES,
+  })).toContain("task state variable must include: deleting");
 });
 
 test("requires dashboard metrics in PromQL expressions", () => {

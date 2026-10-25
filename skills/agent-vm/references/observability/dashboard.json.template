@@ -4154,6 +4154,17 @@
           "instant": true,
           "legendFormat": "Ready",
           "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "editorMode": "code",
+          "expr": "agent_vm_observation_consistent{job=\"$controller_job\"}",
+          "instant": true,
+          "legendFormat": "Snapshot consistent",
+          "refId": "D"
         }
       ],
       "title": "Admission headroom",

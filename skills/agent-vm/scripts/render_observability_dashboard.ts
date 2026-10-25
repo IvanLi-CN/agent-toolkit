@@ -9,6 +9,7 @@ import {
   INVENTORY_REQUIRED_PANEL_TITLES,
   validateDashboard,
   validateProvisioning,
+  INVENTORY_REQUIRED_TASK_STATES,
 } from "./validate_observability_dashboard.ts";
 
 export type ObservabilityConfig = {
@@ -170,6 +171,7 @@ export function renderBundle(config: ObservabilityConfig, templateDir: string = 
     ...validateDashboard(inventoryDashboard, config.prometheus_datasource_uid, {
       requiredPanelTitles: INVENTORY_REQUIRED_PANEL_TITLES,
       requiredMetrics: INVENTORY_REQUIRED_METRICS,
+      requiredTaskStates: INVENTORY_REQUIRED_TASK_STATES,
     }),
     ...validateProvisioning(provisioningText, config.dashboard_path),
   ];

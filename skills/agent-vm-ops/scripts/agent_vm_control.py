@@ -2956,6 +2956,12 @@ class StateStore:
 
     def set_meta(self, key: str, value: str) -> None:
         with self.transaction():
+            current = self.connection.execute(
+                "SELECT value FROM meta WHERE key = ?",
+                (key,),
+            ).fetchone()
+            if current is not None and current["value"] == value:
+                return
             self.connection.execute(
                 "INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (key, value),

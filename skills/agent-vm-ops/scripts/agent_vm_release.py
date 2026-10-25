@@ -691,7 +691,11 @@ class ReleasePublisher:
     def _healthy(metrics: Mapping[str, Any], doctor: Mapping[str, Any]) -> bool:
         if not isinstance(metrics, Mapping) or not isinstance(doctor, Mapping):
             return False
-        if metrics.get("up") is not True or metrics.get("draining") is not True:
+        if (
+            metrics.get("up") is not True
+            or metrics.get("draining") is not True
+            or metrics.get("observation_consistent") is not True
+        ):
             return False
         pending = metrics.get("pending_operations")
         task_states = metrics.get("task_states")
@@ -738,6 +742,16 @@ class ReleasePublisher:
             states = last.get("task_states")
             if last.get("draining") is not True:
                 _fail("drain_unverified", "admission drain was not confirmed during convergence", {"draining": last.get("draining")})
+            if last.get("observation_consistent") is not True:
+                _fail(
+                    "observation_unverified",
+                    "control returned an inconsistent metrics snapshot during convergence",
+                    {
+                        "observation_consistent": last.get("observation_consistent"),
+                        "observation_attempts": last.get("observation_attempts"),
+                        "observation_epoch": last.get("observation_epoch"),
+                    },
+                )
             if isinstance(states, Mapping) and any(state not in KNOWN_TASK_STATES for state in states):
                 _fail("state_unverified", "control returned an unknown task state during convergence", {"task_states": states})
             converged = False

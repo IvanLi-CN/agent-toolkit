@@ -25,7 +25,10 @@ class SQLiteStateTests(unittest.TestCase):
                 self.assertEqual(store.get_meta("state_epoch"), before)
                 with store.transaction():
                     store.set_meta("epoch-marker", "changed")
-                self.assertNotEqual(store.get_meta("state_epoch"), before)
+                changed = store.get_meta("state_epoch")
+                self.assertNotEqual(changed, before)
+                store.set_meta("epoch-marker", "changed")
+                self.assertEqual(store.get_meta("state_epoch"), changed)
             finally:
                 store.close()
 

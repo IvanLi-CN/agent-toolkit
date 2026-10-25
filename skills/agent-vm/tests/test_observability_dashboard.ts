@@ -19,7 +19,12 @@ test("renders a portable dashboard and provisioning bundle", () => {
   const bundle = renderBundle(config);
   expect(bundle.dashboard.uid).toBe(config.dashboard_uid);
   expect(bundle.dashboard.title).toBe(config.dashboard_title);
+  expect(bundle.inventoryDashboard.uid).toBe(`${config.dashboard_uid}-inventory`);
+  expect(bundle.inventoryDashboard.title).toBe(`${config.dashboard_title} / Inventory & Operations`);
   expect(bundle.dashboardText).not.toContain("__PROMETHEUS_UID__");
+  expect(bundle.inventoryDashboardText).not.toContain("__PROMETHEUS_UID__");
+  expect(bundle.inventoryDashboardText).toContain('"id": "joinByField"');
+  expect(bundle.inventoryDashboardText).toContain('"name": "state"');
   expect(bundle.dashboardText).toContain('"uid": "prometheus-test"');
   expect(bundle.dashboardText).toContain('"value": "controller-test"');
   expect(bundle.dashboardText).toContain('job=\\"$controller_job\\"');
@@ -76,6 +81,7 @@ test("writes both outputs and refuses accidental replacement", () => {
     const bundle = renderBundle(config);
     const paths = writeBundle(bundle, root);
     expect(readFileSync(paths.dashboardPath, "utf8")).toContain('"refresh": "auto"');
+    expect(readFileSync(paths.inventoryDashboardPath, "utf8")).toContain('"title": "Agent VM / Incus / Inventory & Operations"');
     expect(() => writeBundle(bundle, root)).toThrow("pass --force");
     expect(writeBundle(bundle, root, true).dashboardPath).toBe(paths.dashboardPath);
   } finally {

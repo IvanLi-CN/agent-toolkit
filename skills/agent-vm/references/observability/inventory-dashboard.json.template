@@ -370,7 +370,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_task_info{job=\"$controller_job\"}",
+          "expr": "agent_vm_task_info{job=\"$controller_job\",state=~\"$state\"}",
           "format": "table",
           "instant": true,
           "legendFormat": "{{task_id}}",
@@ -382,7 +382,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_task_cpu_vcpu{job=\"$controller_job\"}",
+          "expr": "agent_vm_task_cpu_vcpu{job=\"$controller_job\",state=~\"$state\"}",
           "format": "table",
           "instant": true,
           "legendFormat": "{{task_id}} CPU",
@@ -394,7 +394,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_task_memory_bytes{job=\"$controller_job\"}",
+          "expr": "agent_vm_task_memory_bytes{job=\"$controller_job\",state=~\"$state\"}",
           "format": "table",
           "instant": true,
           "legendFormat": "{{task_id}} RAM",
@@ -406,7 +406,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_task_disk_bytes{job=\"$controller_job\"}",
+          "expr": "agent_vm_task_disk_bytes{job=\"$controller_job\",state=~\"$state\"}",
           "format": "table",
           "instant": true,
           "legendFormat": "{{task_id}} disk",
@@ -418,7 +418,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_task_lease_expires_at_seconds{job=\"$controller_job\"}",
+          "expr": "agent_vm_task_lease_expires_at_seconds{job=\"$controller_job\",state=~\"$state\"}",
           "format": "table",
           "instant": true,
           "legendFormat": "{{task_id}} lease",
@@ -430,7 +430,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_task_ssh_mapping{job=\"$controller_job\"}",
+          "expr": "agent_vm_task_ssh_mapping{job=\"$controller_job\",state=~\"$state\"}",
           "format": "table",
           "instant": true,
           "legendFormat": "{{task_id}} SSH",
@@ -442,7 +442,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_task_last_error_info{job=\"$controller_job\"}",
+          "expr": "agent_vm_task_last_error_info{job=\"$controller_job\",state=~\"$state\"}",
           "format": "table",
           "instant": true,
           "legendFormat": "{{task_id}} error",
@@ -450,6 +450,28 @@
         }
       ],
       "title": "Managed VM inventory",
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "task_id",
+            "mode": "outer"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "environment": true,
+              "instance": true,
+              "job": true,
+              "service": true
+            }
+          }
+        }
+      ],
       "type": "table"
     },
     {
@@ -625,6 +647,36 @@
           }
         ],
         "query": "__CONTROLLER_JOB__",
+        "skipUrlSync": false,
+        "type": "custom"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "text": [
+            "active",
+            "preparing",
+            "closing",
+            "deleting",
+            "failed",
+            "cached"
+          ],
+          "value": [
+            "active",
+            "preparing",
+            "closing",
+            "deleting",
+            "failed",
+            "cached"
+          ]
+        },
+        "hide": 0,
+        "includeAll": true,
+        "label": "Task state",
+        "multi": true,
+        "name": "state",
+        "options": [],
+        "query": "active,preparing,closing,deleting,failed,cached,absent",
         "skipUrlSync": false,
         "type": "custom"
       }

@@ -1202,6 +1202,17 @@
           "format": "time_series",
           "legendFormat": "CT memory.current",
           "refId": "E"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "editorMode": "code",
+          "expr": "agent_vm_admission_default_request_memory_bytes{job=\"$controller_job\"}",
+          "format": "time_series",
+          "legendFormat": "Default VM RAM request",
+          "refId": "F"
         }
       ],
       "title": "Agent VM Memory Capacity & Runtime",
@@ -4095,17 +4106,6 @@
           "instant": true,
           "legendFormat": "Default VM startable slots",
           "refId": "E"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "__PROMETHEUS_UID__"
-          },
-          "editorMode": "code",
-          "expr": "agent_vm_admission_default_request_memory_bytes{job=\"$controller_job\"}",
-          "instant": true,
-          "legendFormat": "Default VM RAM request",
-          "refId": "F"
         }
       ],
       "title": "Admission headroom",

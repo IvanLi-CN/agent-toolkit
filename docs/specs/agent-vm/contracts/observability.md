@@ -70,12 +70,12 @@ The deployment-facing collector must expose the following stable metric families
 | `agent_vm_image_unpack_failures_total` | counter | `phase` and `reason` |
 | `agent_vm_task_states` | gauge | `state=preparing|active|cached|closing|failed|absent` |
 | `agent_vm_task_info` | gauge | bounded labels for task ID, instance/session identity, state, native status, guest availability and effective lease |
-| `agent_vm_task_cpu_vcpu` | gauge | requested task CPU, labelled by bounded task ID |
-| `agent_vm_task_memory_bytes` | gauge | requested task memory, labelled by bounded task ID |
-| `agent_vm_task_disk_bytes` | gauge | requested task virtual disk, labelled by bounded task ID |
-| `agent_vm_task_lease_expires_at_seconds` | gauge | lease deadline, labelled by bounded task ID |
-| `agent_vm_task_ssh_mapping` | gauge | bounded task-to-SSH mapping metadata, without credentials |
-| `agent_vm_task_last_error_info` | gauge | stable error `code` and `phase`, without raw message text |
+| `agent_vm_task_cpu_vcpu` | gauge | requested task CPU, labelled by bounded task ID and state |
+| `agent_vm_task_memory_bytes` | gauge | requested task memory, labelled by bounded task ID and state |
+| `agent_vm_task_disk_bytes` | gauge | requested task virtual disk, labelled by bounded task ID and state |
+| `agent_vm_task_lease_expires_at_seconds` | gauge | lease deadline, labelled by bounded task ID and state |
+| `agent_vm_task_ssh_mapping` | gauge | bounded task-to-SSH mapping metadata, without credentials, labelled by task ID and state |
+| `agent_vm_task_last_error_info` | gauge | stable error `code` and `phase`, without raw message text, labelled by task ID and state |
 | `agent_vm_warnings_total` | counter | stable warning `code` |
 | `agent_vm_up` | gauge | `0` or `1` |
 

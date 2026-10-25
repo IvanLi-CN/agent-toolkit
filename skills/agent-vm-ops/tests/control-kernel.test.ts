@@ -660,14 +660,15 @@ describe("control-store: legacy schema and durable transaction behavior", () => 
 
   test("state epoch advances only for committed writes", async () => {
     await withStore((store) => {
-      expect(store.state_epoch()).toBe(0);
+      expect(store.state_epoch()).toBe("initial");
       store.transaction(() => {
         expect(store.get_meta("missing")).toBeNull();
       });
-      expect(store.state_epoch()).toBe(0);
+      expect(store.state_epoch()).toBe("initial");
 
       store.set_meta("epoch-test", "1");
-      expect(store.state_epoch()).toBe(1);
+      const committed_epoch = store.state_epoch();
+      expect(committed_epoch).toMatch(/^[0-9a-f]{32}$/);
 
       const original = new ControlError("native_failed", "native failed");
       expect(caught(() => store.transaction(() => {
@@ -675,7 +676,7 @@ describe("control-store: legacy schema and durable transaction behavior", () => 
         throw original;
       }))).toBe(original);
       expect(store.get_meta("rolled-back")).toBeNull();
-      expect(store.state_epoch()).toBe(1);
+      expect(store.state_epoch()).toBe(committed_epoch);
     });
   });
 

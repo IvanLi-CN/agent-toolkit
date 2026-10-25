@@ -780,13 +780,21 @@ class ReleasePublisher:
         return _result(response)
 
     @staticmethod
-    def _healthy(metrics: Mapping[str, Any], doctor: Mapping[str, Any]) -> bool:
+    def _healthy(
+        metrics: Mapping[str, Any],
+        doctor: Mapping[str, Any],
+        *,
+        allow_legacy_observation: bool = False,
+    ) -> bool:
         if not isinstance(metrics, Mapping) or not isinstance(doctor, Mapping):
             return False
+        observation_ok = metrics.get("observation_consistent") is True
+        if allow_legacy_observation and "observation_consistent" not in metrics:
+            observation_ok = True
         if (
             metrics.get("up") is not True
             or metrics.get("draining") is not True
-            or metrics.get("observation_consistent") is not True
+            or not observation_ok
         ):
             return False
         pending = metrics.get("pending_operations")
@@ -900,13 +908,22 @@ class ReleasePublisher:
                 {"rollback": dict(rollback_result), "status": status, "failed_release_id": failed_release_id},
             )
 
-    def _health(self, manifest: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    def _health(
+        self,
+        manifest: Mapping[str, Any],
+        *,
+        allow_legacy_observation: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         doctor = self._control(manifest, "doctor")
         metrics = self._control(manifest, "admin-metrics")
         reconcile = self._control(manifest, "admin-reconcile", fields={"apply": False})
         actions = reconcile.get("actions")
         reconcile_ok = self._reconcile_healthy(reconcile)
-        if not self._healthy(metrics, doctor):
+        if not self._healthy(
+            metrics,
+            doctor,
+            allow_legacy_observation=allow_legacy_observation,
+        ):
             _fail("remote_health_failed", "remote control health or timer checks failed", {
                 "doctor": {"ready": doctor.get("ready"), "issues": doctor.get("issues")},
                 "metrics": {"up": metrics.get("up"), "draining": metrics.get("draining"), "pending_operations": metrics.get("pending_operations"), "task_states": metrics.get("task_states")},
@@ -976,7 +993,7 @@ class ReleasePublisher:
                 # retained previous release.  Validate that peer through the
                 # explicit protocol-4 legacy contract, not the failed bundle's
                 # release-specific action window.
-                self._health(rollback_manifest)
+                self._health(rollback_manifest, allow_legacy_observation=True)
             except ReleaseError as rollback_error:
                 raise ReleaseError("rollback_failed", "remote health failed and the single rollback did not restore verified health", {
                     "health_error": health_error.as_dict(),

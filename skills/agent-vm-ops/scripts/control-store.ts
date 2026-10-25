@@ -1,4 +1,5 @@
 import { Database, SQLiteError, type SQLQueryBindings } from "bun:sqlite";
+import { randomUUID } from "node:crypto";
 import { chmodSync, lstatSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import {
@@ -501,10 +502,10 @@ export class StateStore {
     if (this.depth > 0) this.transaction_mutated = true;
   }
 
-  private _state_epoch_value(value: string | null): Integer {
-    if (value === null) return 0;
+  private _state_epoch_value(value: string | null): string {
+    if (value === null) return "initial";
     const text = value.trim();
-    if (!/^(?:0|[1-9][0-9]*)$/.test(text)) {
+    if (!text || text.length > 256) {
       throw new ControlError(
         "state_unverified",
         "state database epoch is invalid",
@@ -512,30 +513,15 @@ export class StateStore {
       );
     }
 
-    const epoch = BigInt(text);
-    if (epoch > MAX_SQLITE_INTEGER) {
-      throw new ControlError(
-        "state_unverified",
-        "state database epoch is out of range",
-        { key: STATE_EPOCH_KEY },
-      );
-    }
-    return normalize_integer(epoch);
+    return text;
   }
 
   private _advance_state_epoch(): void {
-    const next = BigInt(this._state_epoch_value(this.get_meta(STATE_EPOCH_KEY))) + 1n;
-    if (next > MAX_SQLITE_INTEGER) {
-      throw new ControlError(
-        "state_unverified",
-        "state database epoch overflowed",
-        { key: STATE_EPOCH_KEY },
-      );
-    }
+    const next = randomUUID().replaceAll("-", "");
     this._run(
       "INSERT INTO meta(key, value) VALUES (?, ?) " +
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-      [STATE_EPOCH_KEY, next.toString()],
+      [STATE_EPOCH_KEY, next],
     );
   }
 
@@ -1175,7 +1161,7 @@ export class StateStore {
     return row === null ? null : python_string(row.value);
   }
 
-  state_epoch(): Integer {
+  state_epoch(): string {
     return this._state_epoch_value(this.get_meta(STATE_EPOCH_KEY));
   }
 

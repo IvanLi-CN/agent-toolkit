@@ -179,7 +179,7 @@ scenario("admin metrics reports a stable durable observation window", async f =>
 
   expect(result.observation_consistent).toBe(true);
   expect(result.observation_attempts).toBe(1);
-  expect(result.observation_epoch).toBe(0);
+  expect(result.observation_epoch).toBe("initial");
   expect(result.default_admission).not.toBeNull();
   expect(result.warnings).not.toContainEqual({
     code: "observation_inconsistent",
@@ -200,7 +200,7 @@ scenario("admin metrics retries when durable state changes during native samplin
   expect(probes).toBeGreaterThanOrEqual(2);
   expect(result.observation_consistent).toBe(true);
   expect(result.observation_attempts).toBe(2);
-  expect(result.observation_epoch).toBe(1);
+  expect(result.observation_epoch).toBe(f.store.state_epoch());
 });
 
 scenario("admin metrics bounds an unstable observation and reports a warning", async f => {

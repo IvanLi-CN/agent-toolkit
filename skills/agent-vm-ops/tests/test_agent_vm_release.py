@@ -376,6 +376,21 @@ class ReleasePublisherTests(unittest.TestCase):
         self.assertEqual(result["pending_operations"], [])
         self.assertNotIn("activate", [item[1] for item in transport.calls])
 
+    def test_health_requires_observation_for_candidates_but_allows_legacy_rollback(self):
+        transport = FakeTransport(legacy_metrics=True)
+        publisher = self.publisher(transport)
+        temporary, _, manifest = RELEASE._open_bundle(self.bundle)
+        try:
+            with self.assertRaises(RELEASE.ReleaseError) as failure:
+                publisher._health(manifest)
+            self.assertEqual(failure.exception.code, "remote_health_failed")
+            publisher._health(
+                RELEASE.legacy_manifest(),
+                allow_legacy_observation=True,
+            )
+        finally:
+            temporary.cleanup()
+
     def test_post_activation_health_failure_attempts_one_rollback(self):
         transport = FakeTransport(fail_health_once=True, require_legacy_drain_exit=True)
         target = self.root / "client" / "agent_vm.ts"

@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { encodeMidi, encodeWav, noteToMidi, parseScore } from "../scripts/buzzer_preview.ts";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { encodeMidi, encodeWav, main, MAX_EVENTS, MAX_INPUT_BYTES, noteToMidi, parseScore } from "../scripts/buzzer_preview.ts";
 
 function midiEvents(bytes: Buffer) {
   expect(bytes.toString("ascii", 0, 4)).toBe("MThd");
@@ -83,6 +86,19 @@ describe("VER-FOUNDATION-HELPERS-01: independent media decoding", () => {
     expect(score.audio).toMatchObject({ volume: 1, duty: 0, fade: 0 });
     expect(wavSamples(encodeWav(score))).toEqual([0, 0]);
     expect(midiEvents(encodeMidi(parseScore({ events: [{ rest_beats: 1 }] }))).at(-1)?.tick).toBe(480);
+  });
+  test("rejects oversized JSON before parsing or output creation", () => {
+    const root = mkdtempSync(join(tmpdir(), "buzzer-preview-"));
+    try {
+      const input = join(root, "oversized.json"), out = join(root, "out");
+      writeFileSync(input, Buffer.alloc(MAX_INPUT_BYTES + 1, 0x20));
+      expect(() => main(["--in", input, "--out-dir", out])).toThrow(`input exceeds ${MAX_INPUT_BYTES} bytes`);
+      expect(existsSync(out)).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  test("rejects excessive zero-duration events before mapping", () => {
+    const events = Array.from({ length: MAX_EVENTS + 1 }, () => ({ note: "C4", ms: 0 }));
+    expect(() => parseScore({ events })).toThrow(`events exceed ${MAX_EVENTS}`);
   });
   test("invalid and unrepresentable scores fail before encoding", () => {
     for (const value of [{ events: [] }, { tempo_bpm: 0 }, { ppqn: 32768 }, { midi: [] }, { audio: [] }, { audio: { waveform: "triangle" } }, { sample_rate_hz: 0 }, { volume: NaN }]) {

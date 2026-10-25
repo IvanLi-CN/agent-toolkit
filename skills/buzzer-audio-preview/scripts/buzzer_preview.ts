@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /** Portable score validation and MIDI/PCM encoding; no physical buzzer model. */
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, extname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 
@@ -12,6 +12,8 @@ export interface Score {
   audio: { sampleRate: number; waveform: "square" | "sine"; volume: number; duty: number; fade: number };
   events: Event[];
 }
+export const MAX_INPUT_BYTES = 1_048_576;
+export const MAX_EVENTS = 65_536;
 function object(value: unknown, label: string): ObjectValue {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
   return value as ObjectValue;
@@ -57,6 +59,7 @@ export function parseScore(value: unknown): Score {
     fade: Math.max(0, number(field("fade_ms", 2), "fade_ms", -Number.MAX_VALUE, Infinity, true)),
   } satisfies Score["audio"];
   if (!Array.isArray(raw.events) || !raw.events.length) throw new Error("events must be a non-empty array");
+  if (raw.events.length > MAX_EVENTS) throw new Error(`events exceed ${MAX_EVENTS}`);
   const duration = (event: ObjectValue, rest: boolean): number => {
     const beats = event[rest ? "rest_beats" : "beats"];
     const ms = event[rest ? "rest_ms" : "ms"];
@@ -140,7 +143,12 @@ export function main(args = process.argv.slice(2)): void {
   const input = resolve(values.in);
   const stem = values.stem ?? basename(input, extname(input));
   if (!stem || stem === "." || stem === ".." || /[/\\]/.test(stem)) throw new Error("--stem must be a filename stem");
-  const score = parseScore(JSON.parse(readFileSync(input, "utf8")));
+  const inputStat = statSync(input);
+  if (!inputStat.isFile()) throw new Error("input must be a regular file");
+  if (inputStat.size > MAX_INPUT_BYTES) throw new Error(`input exceeds ${MAX_INPUT_BYTES} bytes`);
+  const source = readFileSync(input);
+  if (source.length > MAX_INPUT_BYTES) throw new Error(`input exceeds ${MAX_INPUT_BYTES} bytes`);
+  const score = parseScore(JSON.parse(source.toString("utf8")));
   const midi = encodeMidi(score), wav = encodeWav(score);
   const out = resolve(values["out-dir"]!);
   mkdirSync(out, { recursive: true });

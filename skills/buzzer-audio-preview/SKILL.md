@@ -7,7 +7,7 @@ description: "Preview buzzer tones as MIDI and WAV."
 
 ## Prerequisites and boundary
 
-Use installed Bun on Linux or macOS; no Python or third-party MIDI/audio library is required. The helper reads one JSON score and writes `.mid`/`.wav` files in the selected output directory. It performs no playback, network access or device writes. Existing matching output files are replaced, so choose a fresh output directory when keeping prior previews.
+Use installed Bun on Linux or macOS; no Python or third-party MIDI/audio library is required. The helper reads one regular UTF-8 JSON score no larger than 1,048,576 bytes and accepts at most 65,536 events, including zero-duration events. These limits are checked before JSON parsing or event mapping/encoding. It writes `.mid`/`.wav` files in the selected output directory, performs no playback, network access or device writes, and replaces existing matching output files; choose a fresh output directory when keeping prior previews.
 
 ## Overview
 

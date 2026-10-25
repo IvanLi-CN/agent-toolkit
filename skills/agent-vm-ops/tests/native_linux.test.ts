@@ -1030,7 +1030,9 @@ systemdTest("systemd assets validate against the Bun runtime path", async () => 
   const processHandle = Bun.spawn(["systemd-analyze", "verify", ...UNIT_PATHS], { stdout: "pipe", stderr: "pipe" });
   const result = await collect(processHandle);
   if (result.exit !== 0) throw new Error(`systemd verify failed: ${JSON.stringify(result)}`);
-  if (result.stderr !== "") throw new Error(`systemd verify stderr: ${result.stderr}`);
+  // Verify diagnostics for the assets under test; hosted images may warn about unrelated system units.
+  const assetDiagnostics = result.stderr.split("\n").filter((line) => UNIT_PATHS.some((path) => line.includes(path)));
+  expect(assetDiagnostics).toEqual([]);
 });
 
 linuxTest("the real Bun controller entrypoint accepts an isolated protected config override", async () => {

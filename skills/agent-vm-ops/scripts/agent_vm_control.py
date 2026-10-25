@@ -514,7 +514,7 @@ def run(command, phase, *, check=True):
                 )
 
         def track_process_tree():
-            nonlocal tracked_tree_valid, tracked_group_valid
+            nonlocal leader_identity, tracked_tree_valid, tracked_group_valid
             if not os.path.isdir("/proc"):
                 return
             members, complete = process_tree_members(process.pid)
@@ -529,6 +529,11 @@ def run(command, phase, *, check=True):
             group_members, group_complete, _ = process_group_identities(process.pid)
             if not group_complete or not group_members:
                 return
+            if leader_identity is None:
+                leader_identity = next(
+                    (identity for identity in group_members if identity[0] == process.pid),
+                    None,
+                )
             if leader_identity is None:
                 return
             for pid, starttime in group_members:
@@ -1704,7 +1709,7 @@ class CommandRunner:
                 )
 
         def track_process_tree() -> None:
-            nonlocal tracked_tree_valid, tracked_group_valid
+            nonlocal leader_identity, tracked_tree_valid, tracked_group_valid
             if not Path("/proc").is_dir():
                 return
             members, complete = self._process_tree_members(process.pid)
@@ -1719,6 +1724,11 @@ class CommandRunner:
             group_members, group_complete = self._process_group_identities(process.pid)
             if not group_complete or not group_members:
                 return
+            if leader_identity is None:
+                leader_identity = next(
+                    (identity for identity in group_members if identity[0] == process.pid),
+                    None,
+                )
             if leader_identity is None:
                 return
             for pid, starttime in group_members:

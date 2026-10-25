@@ -166,9 +166,6 @@ def persist_recovery_state(
         return False
     if result.get("state") == "absent":
         return False
-    last_error = result.get("last_error")
-    if not isinstance(last_error, Mapping) or last_error.get("operation_id") != operation_id:
-        return False
     if (
         isinstance(expected_generation, bool)
         or not isinstance(expected_generation, int)
@@ -181,7 +178,16 @@ def persist_recovery_state(
         return False
     if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
         return False
-    if generation != expected_generation + 1:
+    recovery_operation_id = result.get("recovery_operation_id")
+    last_error = result.get("last_error")
+    committed_operation = recovery_operation_id == operation_id
+    partial_operation = isinstance(last_error, Mapping) and last_error.get("operation_id") == operation_id
+    if not committed_operation and not partial_operation:
+        return False
+    if committed_operation:
+        if generation not in {expected_generation, expected_generation + 1}:
+            return False
+    elif generation != expected_generation + 1:
         return False
     try:
         state = {
@@ -204,7 +210,7 @@ def recover_acquire_state(
     expected_generation: int,
 ) -> bool:
     try:
-        response = control_request("status", session=session)
+        response = control_request("status", session=session, operation_id=operation_id)
     except CliError:
         return False
     return persist_recovery_state(
@@ -707,6 +713,7 @@ def control_request(action: str, *, session: str | None, generation: int | None 
     if session is not None: request["session_id"] = session
     if generation is not None: request["generation"] = generation
     if write: request["operation_id"] = operation_id or str(uuid.uuid4())
+    elif operation_id is not None: request["operation_id"] = operation_id
     if fields: request.update(fields)
     metadata, local_warnings = load_client_release_metadata()
     request["compatibility"] = client_capability(action, metadata)
@@ -887,6 +894,8 @@ def control_request(action: str, *, session: str | None, generation: int | None 
     if response.get("ok") is not True or not isinstance(response.get("result"), dict) or not isinstance(response.get("server_time"), str):
         fail("invalid_remote_response", "invalid control response envelope")
     if write and response.get("operation_id") != request["operation_id"]:
+        fail("protocol_mismatch", "operation identity differs")
+    if not write and operation_id is not None and response.get("operation_id") != operation_id:
         fail("protocol_mismatch", "operation identity differs")
     response_warning = _validate_response_compatibility(
         response.get("response"), action, compatibility.get("accepted_response")

@@ -1384,6 +1384,16 @@ class LifecycleTests(Fixture):
         self.assertTrue(failure["cleanup"]["performed"])
         self.assertEqual(failure["error"]["detail"]["phase"], "filesystem-grow")
 
+    def test_status_proves_committed_acquire_operation_for_recovery(self):
+        self.acquire()
+        request = self.request("status")
+        request["operation_id"] = "op-1"
+
+        result = self.control.dispatch(request)["result"]
+
+        self.assertEqual(result["state"], "active")
+        self.assertEqual(result["recovery_operation_id"], "op-1")
+
     def test_acquire_guest_growth_failure_is_structured_and_closed(self):
         self.runner.guest_growth_results = [self.guest_growth_failure()]
         self.error("guest_resize_unverified", self.acquire)
@@ -2136,11 +2146,13 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
     ):
         target = 20 * GIB
         threshold = target * 95 // 100
+        source_device = source_output.strip()
+        parent_device = "/dev/" + parent_output.strip()
         state = {
             "partition": initial_partition if initial_partition is not None else target // 2,
             "filesystem": initial_filesystem if initial_filesystem is not None else target // 4,
         }
-        marker = "/sys/class/block/sda2/partition"
+        marker = "/sys/class/block/" + os.path.basename(source_device) + "/partition"
         calls = []
         growpart_calls = 0
         resize_calls = 0
@@ -2168,10 +2180,10 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
                 output = parent_output.encode()
                 timeout = False
             elif command[:4] == ["lsblk", "-n", "-o", "TYPE"]:
-                output = (source_type_output if command[-1] == "/dev/sda2" else disk_type_output).encode()
+                output = (source_type_output if command[-1] == source_device else disk_type_output).encode()
                 timeout = False
             elif command[:2] == ["blockdev", "--getsize64"]:
-                value = target if command[-1] == "/dev/sda" else state["partition"]
+                value = target if command[-1] == parent_device else state["partition"]
                 output = f"{value}\n".encode()
                 timeout = False
             elif command[:2] == ["blockdev", "--rereadpt"]:
@@ -2343,6 +2355,22 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         self.assertTrue(payload["capacity"]["verified"])
         self.assertIn(["lsblk", "-n", "-o", "TYPE", "/dev/sda2"], calls)
         self.assertIn(["lsblk", "-n", "-o", "TYPE", "/dev/sda"], calls)
+
+    def test_guest_root_growth_script_accepts_digit_ending_parent_name(self):
+        exit_code, stdout, stderr, calls = self.execute_script(
+            initial_partition=20 * GIB,
+            initial_filesystem=20 * GIB,
+            source_output="/dev/nvme0n1p2\n",
+            parent_output="nvme0n1\n",
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        payload = json.loads(stdout)
+        self.assertEqual(payload["source"], "/dev/nvme0n1p2")
+        self.assertEqual(payload["parent"], "/dev/nvme0n1")
+        self.assertIn(["lsblk", "-n", "-o", "TYPE", "/dev/nvme0n1p2"], calls)
+        self.assertIn(["lsblk", "-n", "-o", "TYPE", "/dev/nvme0n1"], calls)
 
     def test_guest_root_growth_script_retries_stale_partition_and_grows(self):
         exit_code, stdout, stderr, calls = self.execute_script()
@@ -2995,6 +3023,26 @@ class ReclaimTests(Fixture):
         self.assertFalse(failure.exception.detail["outcome_verified"])
         self.assertEqual(self.store.operation(request["operation_id"])["outcome"], "pending")
         self.assertEqual(self.store.get_task(task_id=cached["task_id"])["state"], "deleting")
+
+    def test_public_destroy_retries_deleting_cache(self):
+        cached = self.acquire("cached")
+        self.call("release", "cached")
+        failed = [True]
+
+        def fail_once(args):
+            if failed[0] and args[3:4] == ["delete"]:
+                failed[0] = False
+                return True
+            return False
+
+        self.runner.failure = fail_once
+        self.error("command_failed", self.call, "destroy", "cached")
+        self.assertEqual(self.store.get_task(task_id=cached["task_id"])["state"], "deleting")
+        self.runner.failure = None
+
+        result = self.call("destroy", "cached")
+
+        self.assertEqual(result["state"], "absent")
 
     def test_manual_gc_previews_and_deletes_all_eligible_caches(self):
         old = self.acquire("old")

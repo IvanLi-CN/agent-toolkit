@@ -4599,10 +4599,11 @@ class Control:
             if layer["free"] - demand < layer[threshold]: return False
         return True
 
-    def _eligible_cache(self, snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    def _eligible_cache(self, snapshot: Mapping[str, Any], *, allow_deleting: bool = False) -> dict[str, Any]:
         """Caller holds the session lock. Age selects candidates, not eligibility."""
         task = self.store.get_task(task_id=snapshot["task_id"])
-        if task is None or task["state"] != "cached" or not task.get("inactive_since"):
+        allowed_states = {"cached", "deleting"} if allow_deleting else {"cached"}
+        if task is None or task["state"] not in allowed_states or not task.get("inactive_since"):
             raise ControlError("cache_ineligible", "not an eligible stopped cache")
         if task["generation"] != snapshot["generation"] or task["session_id"] != snapshot["session_id"]:
             raise ControlError("cache_ineligible", "cache ownership or generation changed")
@@ -4618,9 +4619,10 @@ class Control:
 
     def _delete_cache(self, task: Mapping[str, Any]) -> None:
         """Caller owns the session lock; global lock covers only state transitions."""
-        task = self._eligible_cache(task)
-        with self._global_lock():
-            self.store.update_task(task["task_id"], state="deleting")
+        task = self._eligible_cache(task, allow_deleting=task.get("state") == "deleting")
+        if task["state"] == "cached":
+            with self._global_lock():
+                self.store.update_task(task["task_id"], state="deleting")
         try:
             self.incus.delete(task["instance_name"])
             # Native deletion must be confirmed before releasing ownership.
@@ -6173,10 +6175,28 @@ class Control:
 
     def status(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:
         assert session_id is not None
+        recovery_operation_id = request.get("operation_id")
+        if recovery_operation_id is not None:
+            recovery_operation_id = require_nonempty_string(
+                recovery_operation_id, "operation_id", SESSION_ID_RE
+            )
         with self._global_lock():
             task = self.store.get_task(session_id=session_id)
         result = self._runtime_summary(task) if task else {"state": "absent", "generation": 0, "effective_lease": False,
                                                            "native_status": "absent", "guest_available": False}
+        if recovery_operation_id is not None and task is not None:
+            operation = self.store.operation(recovery_operation_id)
+            operation_generation = operation.get("generation") if operation else None
+            if (
+                operation
+                and operation.get("outcome") == "success"
+                and operation.get("action") == "acquire"
+                and operation.get("session_id") == session_id
+                and isinstance(operation_generation, int)
+                and not isinstance(operation_generation, bool)
+                and int(task["generation"]) in {operation_generation, operation_generation + 1}
+            ):
+                result["recovery_operation_id"] = recovery_operation_id
         admission = self._resource_diagnostics()
         admission["instances"] = self._instance_diagnostics()
         return {**result, "admission": admission}
@@ -6591,12 +6611,10 @@ class Control:
         self._validate_task_state(task)
         self._check_generation(task, request)
         if task["state"] == "absent": return self._state_summary(task)
-        if task["state"] == "deleting":
-            raise ControlError("task_transition", "deletion requires reconciliation")
-        if task["state"] != "cached":
+        if task["state"] not in {"cached", "deleting"}:
             self._release_task(task)
             task = self.store.get_task(task_id=task["task_id"])
-        if task["state"] == "cached": self._delete_cache(task)
+        if task["state"] in {"cached", "deleting"}: self._delete_cache(task)
         return self._state_summary(self.store.get_task(task_id=task["task_id"]))
 
 

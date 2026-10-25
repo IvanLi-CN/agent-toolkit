@@ -125,6 +125,41 @@ class SessionContractTests(unittest.TestCase):
                     CLI.read_session_state(session)
         self.assertEqual(failure.exception.code, "local_state_missing")
 
+    def test_failed_response_recovers_a_committed_active_acquire(self):
+        session = "committed-acquire"
+        task = {
+            "task_id": "avm-committed123",
+            "session_id": session,
+            "generation": 1,
+            "state": "active",
+            "effective_lease": True,
+            "recovery_operation_id": "committed-acquire-operation",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private_key = root / "id_ed25519"
+            args = CLI.build_parser().parse_args([
+                "acquire",
+                "--session-id",
+                session,
+                "--operation-id",
+                "committed-acquire-operation",
+            ])
+            status_responses = [
+                {"result": {"generation": 0}},
+                {"result": task},
+            ]
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", root / "state"):
+                with mock.patch.object(CLI, "make_ssh_key", return_value=(private_key, "ssh-ed25519 AAAA")), \
+                     mock.patch.object(CLI, "control_request", side_effect=status_responses), \
+                     mock.patch.object(CLI, "mutation", side_effect=CLI.CliError("protocol_mismatch", "response validation failed")):
+                    with self.assertRaises(CLI.CliError):
+                        CLI.command_acquire(args)
+                state = CLI.read_session_state(session)
+
+        self.assertEqual(state["task_id"], "avm-committed123")
+        self.assertEqual(state["generation"], 1)
+
     def test_sync_passes_selected_identity_to_helper(self):
         args = CLI.build_parser().parse_args(["sync", "--name", "repo", "--session-id", "explicit"])
         with mock.patch.object(CLI, "run_command", return_value=0) as run_command:

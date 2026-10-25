@@ -819,7 +819,6 @@ def run(command, phase, *, check=True):
                 owner_killed = False
                 owner_cleanup_error = owner_tracking_error or "process_owner_boundary_unavailable"
             if not owner_killed:
-                process_group_killed = False
                 process_group_cleanup_error = (
                     f"{process_group_cleanup_error}:{owner_cleanup_error}"
                     if process_group_cleanup_error else owner_cleanup_error
@@ -2266,7 +2265,6 @@ class CommandRunner:
                     owner_killed = False
                     owner_cleanup_error = owner_tracking_error or "process_owner_boundary_unavailable"
                 if not owner_killed:
-                    process_group_killed = False
                     process_group_cleanup_error = (
                         f"{process_group_cleanup_error}:{owner_cleanup_error}"
                         if process_group_cleanup_error else owner_cleanup_error
@@ -3624,7 +3622,7 @@ class Control:
         value = record.get("native_init_cleanup_verified")
         return value if isinstance(value, bool) else None
 
-    def _pending_native_init_for_task(self, task: Mapping[str, Any]) -> bool:
+    def _pending_native_init_for_task(self, task: Mapping[str, Any]) -> Mapping[str, Any] | None:
         try:
             pending = self.store.pending_operations()
         except ControlError as exc:
@@ -3633,22 +3631,81 @@ class Control:
                 "pending acquire operations cannot be verified",
                 {"task_id": task["task_id"], "cause": exc.as_dict()},
             ) from exc
-        return any(
-            item.get("action") == "acquire"
+        matches = [
+            item for item in pending
+            if item.get("action") == "acquire"
             and item.get("session_id") == task.get("session_id")
-            and item.get("generation") == task.get("generation")
-            for item in pending
-        )
+            and item.get("generation") in {
+                task.get("generation"),
+                task.get("generation") - 1
+                if isinstance(task.get("generation"), int) and not isinstance(task.get("generation"), bool)
+                else None,
+            }
+        ]
+        if len(matches) > 1:
+            raise ControlError(
+                "operation_unverified",
+                "multiple pending native initialization operations match the task",
+                {"task_id": task["task_id"]},
+            )
+        return matches[0] if matches else None
+
+    def _recovered_native_init_operation(
+        self,
+        task: Mapping[str, Any],
+        pending: Mapping[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        operation_id = pending.get("operation_id")
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ControlError("operation_unverified", "pending acquire operation ID is invalid")
+        record = self.store.operation(operation_id)
+        digest = record.get("_request_digest") if isinstance(record, Mapping) else None
+        if not isinstance(digest, str) or not digest:
+            raise ControlError(
+                "operation_unverified",
+                "pending acquire request digest is invalid",
+                {"operation_id": operation_id},
+            )
+        retry_record = self._native_init_absence_retry_record(task) or {}
+        original = retry_record.get("error")
+        if isinstance(original, Mapping) and isinstance(original.get("code"), str) and original.get("code"):
+            code = original["code"]
+            message = original.get("message")
+            detail = original.get("detail")
+            if not isinstance(message, str) or not message:
+                message = "native initialization did not complete"
+            recovered_detail = dict(detail) if isinstance(detail, Mapping) else {}
+        else:
+            code = "acquire_partial"
+            message = "native initialization did not complete"
+            recovered_detail = {}
+        recovered_detail.update({
+            "phase": "native-init",
+            "operation_phase": "native-init",
+            "native_init_recovered_absent": True,
+            "outcome_verified": True,
+        })
+        return operation_id, {
+            "outcome": "error",
+            "error": {"code": code, "message": message, "detail": recovered_detail},
+            "_request_digest": digest,
+        }
 
     @staticmethod
     def _native_init_timeout_cleanup_verified(error: ControlError) -> bool | None:
-        if error.code != "command_timeout":
-            return True
         detail = error.detail if isinstance(error.detail, Mapping) else {}
-        return all(
-            detail.get(key) is True
-            for key in ("reaped", "pipes_drained", "process_group_killed")
-        ) and not detail.get("process_group_cleanup_error")
+        cleanup_fields = (
+            "process_group_killed",
+            "process_group_cleanup_error",
+            "reaped",
+            "pipes_drained",
+        )
+        if not any(key in detail for key in cleanup_fields):
+            return True
+        required = ("process_group_killed",)
+        if error.code == "command_timeout":
+            required += ("reaped", "pipes_drained")
+        return all(detail.get(key) is True for key in required) and not detail.get("process_group_cleanup_error")
 
     @staticmethod
     def _operation_outcome_uncertain(action: str, error: ControlError) -> bool:
@@ -6271,11 +6328,13 @@ class Control:
                     "readiness": readiness, "stage_timings": stage_timings}
         except ControlError as exc:
             cleanup = {"ok": False, "error": {"code": "not_attempted", "message": "cleanup was not attempted"}}
-            native_init_uncertain = phase == "native-init" and exc.code == "command_timeout"
             native_init_cleanup_verified = (
                 self._native_init_timeout_cleanup_verified(exc)
                 if phase == "native-init"
                 else None
+            )
+            native_init_uncertain = phase == "native-init" and (
+                exc.code == "command_timeout" or native_init_cleanup_verified is False
             )
             try:
                 cleanup["result"] = self._release_task(
@@ -6396,7 +6455,7 @@ class Control:
                 pending_acquire = (
                     self._pending_native_init_for_task(task)
                     if recover_pending_acquire
-                    else False
+                    else None
                 )
             except ControlError as exc:
                 detail = {"native_absence": "unverified", "cause": exc.as_dict()}
@@ -6408,19 +6467,73 @@ class Control:
                     detail,
                 ) from exc
             delayed_absence = self._native_init_absence_retry_pending(task)
-            retry_required = require_native_init_absence_retry or delayed_absence or pending_acquire
+            retry_required = require_native_init_absence_retry or delayed_absence or pending_acquire is not None
             retry_ready = self._native_init_absence_retry_ready(task)
             cleanup_verified = (
                 native_init_cleanup_verified
                 if native_init_cleanup_verified is not None
                 else self._native_init_cleanup_verified(task)
             )
+            native_init_retry_required = require_native_init_absence_retry or delayed_absence
+            if native_init_retry_required and not absent:
+                if cleanup_verified is True:
+                    try:
+                        with self._native_lock(task):
+                            current = self._cleanup_current(task)
+                            if current is None:
+                                raise ControlError("generation_mismatch", "cleanup generation changed")
+                            self._ownership(current)
+                            self.incus.delete(current["instance_name"])
+                            if any(
+                                item.get("name") == current["instance_name"]
+                                for item in self.incus.list_instances()
+                            ):
+                                raise ControlError(
+                                    "cleanup_incomplete",
+                                    "uncertain native init instance deletion is not confirmed",
+                                )
+                        absent = True
+                    except ControlError as exc:
+                        detail = {
+                            "native_init_absence_retry": True,
+                            "outcome_verified": False,
+                            "native_absence": "present",
+                            "native_init_cleanup_verified": cleanup_verified,
+                            "cause": exc.as_dict(),
+                        }
+                        prior = self._native_init_absence_retry_record(task) or {}
+                        if isinstance(prior.get("error"), Mapping):
+                            detail["error"] = prior["error"]
+                        self.store.update_task(task["task_id"], last_error=json.dumps(detail))
+                        self.systemd.retry_cleanup(task["task_id"], task["generation"])
+                        raise ControlError(
+                            "cleanup_incomplete",
+                            "uncertain native init instance cannot be removed; delayed reconciliation is required",
+                            detail,
+                        ) from exc
+                else:
+                    detail = {
+                        "native_init_absence_retry": True,
+                        "outcome_verified": False,
+                        "native_absence": "present",
+                        "native_init_cleanup_verified": cleanup_verified,
+                    }
+                    prior = self._native_init_absence_retry_record(task) or {}
+                    if isinstance(prior.get("error"), Mapping):
+                        detail["error"] = prior["error"]
+                    self.store.update_task(task["task_id"], last_error=json.dumps(detail))
+                    self.systemd.retry_cleanup(task["task_id"], task["generation"])
+                    raise ControlError(
+                        "cleanup_incomplete",
+                        "native init cleanup is unverified; delayed reconciliation is required",
+                        detail,
+                    )
             absence_checks = self._native_init_absence_checks(task)
             if absent and retry_required:
                 absence_checks += 1
             stable_absence = retry_ready and absence_checks >= 2
             absence_verified = cleanup_verified is True or (
-                cleanup_verified is None and pending_acquire and stable_absence
+                cleanup_verified is None and pending_acquire is not None and stable_absence
             )
             if absent and retry_required and not (stable_absence and absence_verified):
                 retry_after = self._native_init_retry_after(task)
@@ -6432,6 +6545,9 @@ class Control:
                     "native_init_absence_checks": absence_checks,
                     "native_init_cleanup_verified": cleanup_verified,
                 }
+                prior = self._native_init_absence_retry_record(task) or {}
+                if isinstance(prior.get("error"), Mapping):
+                    detail["error"] = prior["error"]
                 self.store.update_task(task["task_id"], last_error=json.dumps(detail))
                 self.systemd.retry_cleanup(task["task_id"], task["generation"])
                 raise ControlError(
@@ -6439,6 +6555,23 @@ class Control:
                     "native init result remains unresolved; delayed reconciliation is required",
                     detail,
                 )
+            recovered_operation = None
+            if absent and pending_acquire is not None and stable_absence and absence_verified:
+                try:
+                    recovered_operation = self._recovered_native_init_operation(task, pending_acquire)
+                except ControlError as exc:
+                    detail = {
+                        "native_absence": "verified",
+                        "outcome_verified": False,
+                        "cause": exc.as_dict(),
+                    }
+                    self.store.update_task(task["task_id"], last_error=json.dumps(detail))
+                    self.systemd.retry_cleanup(task["task_id"], task["generation"])
+                    raise ControlError(
+                        "cleanup_incomplete",
+                        "native init operation cannot be finalized; delayed reconciliation is required",
+                        detail,
+                    ) from exc
             self.systemd.remove_expiry(task["task_id"], task["generation"])
             if not absent and task.get("previous_generation") is not None:
                 self._ownership(task)
@@ -6453,6 +6586,15 @@ class Control:
             with self._global_lock(), self.store.transaction():
                 for port in self.store.get_ports(task["task_id"]):
                     self.store.remove_port(task["task_id"], port["port_name"], port["protocol"])
+                if recovered_operation is not None:
+                    operation_id, operation = recovered_operation
+                    self.store.record_operation(
+                        operation_id,
+                        "acquire",
+                        task["session_id"],
+                        task["generation"],
+                        operation,
+                    )
                 task = self.store.update_task(task["task_id"], state="absent" if absent else "cached",
                                              ssh_host_port=None, reservation_bytes=0, last_error=None, previous_generation=None, resource_reservation_json='{}',
                                              resources_json=json.dumps(resources),

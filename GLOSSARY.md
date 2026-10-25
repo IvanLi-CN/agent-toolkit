@@ -55,6 +55,30 @@ _Avoid_: Guest image, runtime cache
 A maintenance state in which new lease acquisition and restart admission are blocked while observation, retrieval, release, and required cleanup remain available.
 _Avoid_: VM shutdown, lease revocation
 
+**Logical reservation ceiling**:
+The maximum aggregate resource reservation permitted by an overcommit policy. It is a policy boundary, not a guarantee that the underlying runtime can provide the reserved resources without contention.
+_Avoid_: Physical capacity, runtime guarantee
+
+**CT-visible capacity**:
+The resource capacity visible to the Agent VM control environment through its assigned execution boundary. It is a runtime boundary used to describe current scheduling and memory conditions, not the logical reservation ceiling.
+_Avoid_: Logical reservation ceiling, host capacity
+
+**Logical reservation headroom**:
+The difference between a logical reservation ceiling and the resources currently allocated or durably reserved by managed VM tasks.
+_Avoid_: Runtime available memory, physical free space
+
+**Runtime pressure**:
+An observation that the control environment is experiencing resource contention or reduced runtime headroom. It describes current operating conditions and does not change logical reservation headroom by itself.
+_Avoid_: Allocation usage, admission ceiling
+
+**Startup admission**:
+The decision to allow a new or restarting VM to change native runtime state after the applicable reservation, capacity, pressure, drain, and integrity checks have passed.
+_Avoid_: Lease existence, guest readiness
+
+**CPU scheduler pressure**:
+A measure of how much runnable work is delayed waiting for CPU service. It is a contention observation, not CPU utilization or a count of allocated virtual CPUs.
+_Avoid_: CPU usage, CPU allocation
+
 **Release manifest**:
 The authoritative description of a control-plane release's identity, artifacts, integrity evidence, and declared compatibility.
 _Avoid_: Deployment configuration, state database

@@ -301,7 +301,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "sum(agent_vm_operations_total{job=\"$controller_job\",outcome=\"failure\"}) + sum(agent_vm_image_unpack_failures_total{job=\"$controller_job\"})",
+          "expr": "(sum(agent_vm_operations_total{job=\"$controller_job\",outcome=\"failure\"}) + sum(agent_vm_image_unpack_failures_total{job=\"$controller_job\"})) or vector(0)",
           "instant": true,
           "legendFormat": "Failures",
           "refId": "A"
@@ -467,7 +467,20 @@
               "environment": true,
               "instance": true,
               "job": true,
-              "service": true
+              "service": true,
+              "Value #A": true,
+              "state 2": true,
+              "state 3": true,
+              "state 4": true
+            },
+            "renameByName": {
+              "state 1": "state",
+              "Value #B": "CPU vCPU",
+              "Value #C": "RAM bytes",
+              "Value #D": "Disk bytes",
+              "Value #E": "Lease expiry",
+              "Value #F": "SSH mapping",
+              "Value #G": "Last error"
             }
           }
         }

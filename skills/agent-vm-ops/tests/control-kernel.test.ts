@@ -721,6 +721,15 @@ describe("control-store: legacy schema and durable transaction behavior", () => 
         "state_unverified",
       );
       expect(error.detail).toMatchObject({ key: "state_epoch" });
+
+      store.connection
+        .query("UPDATE meta SET value = ? WHERE key = ?")
+        .run("9".repeat(10_000), "state_epoch");
+      const oversized = controlFailure(
+        () => store.state_epoch(),
+        "state_unverified",
+      );
+      expect(oversized.detail).toMatchObject({ key: "state_epoch" });
     });
   });
 

@@ -509,6 +509,13 @@ export class StateStore {
     const text = value.trim();
     if (/^[0-9a-f]{32}$/.test(text)) return text;
     if (/^(?:0|[1-9][0-9]*)$/.test(text)) {
+      if (text.length > 19) {
+        throw new ControlError(
+          "state_unverified",
+          "state database epoch is out of range",
+          { key: STATE_EPOCH_KEY },
+        );
+      }
       if (BigInt(text) > MAX_SQLITE_INTEGER) {
         throw new ControlError(
           "state_unverified",

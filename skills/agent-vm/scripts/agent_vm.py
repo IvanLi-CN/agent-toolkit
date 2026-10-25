@@ -251,8 +251,8 @@ def persist_recovery_state(
         "session_id": session,
         "task_id": task_id,
         "generation": generation,
-        "private_key": str(private_key),
     }
+    state["private_key"] = str(private_key)
     try:
         return write_session_state(session, state)
     except OSError:

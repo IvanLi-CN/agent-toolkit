@@ -808,6 +808,24 @@ class AdmissionTests(Fixture):
         self.runner.on_version = probe_lock
         self.control.admin_status(self.request("admin-status"), None)
 
+    def test_admin_status_redacts_raw_task_error_details(self):
+        active = self.acquire()
+        self.store.update_task(
+            active["task_id"],
+            last_error=json.dumps({
+                "code": "command_failed",
+                "phase": "guest-exec",
+                "message": "private command output",
+                "detail": {"stderr": "private stderr", "operation_phase": "guest-exec"},
+            }),
+        )
+
+        result = self.control.admin_status(self.request("admin-status"), None)
+        task = next(item for item in result["tasks"] if item["task_id"] == active["task_id"])
+        self.assertEqual(task["last_error"], {"code": "command_failed", "phase": "guest-exec"})
+        self.assertNotIn("message", task["last_error"])
+        self.assertNotIn("detail", task["last_error"])
+
     def test_drain_exit_keeps_admission_closed_with_pending_operation(self):
         self.store.set_meta("draining", "1")
         self.store.record_operation(

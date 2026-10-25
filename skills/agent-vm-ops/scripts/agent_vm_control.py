@@ -4381,6 +4381,22 @@ class Control:
         result["effective_lease"] = task["state"] == "active" and expiry is not None and expiry > self.now()
         return result
 
+    @staticmethod
+    def _public_error_summary(error: Mapping[str, Any]) -> dict[str, str]:
+        nested_error = error.get("error")
+        nested = nested_error if isinstance(nested_error, Mapping) else {}
+        detail = error.get("detail")
+        detail_mapping = detail if isinstance(detail, Mapping) else {}
+        code = error.get("code") or nested.get("code") or "unknown_error"
+        phase = (
+            error.get("phase")
+            or detail_mapping.get("phase")
+            or detail_mapping.get("operation_phase")
+            or nested.get("phase")
+            or "unknown"
+        )
+        return {"code": str(code), "phase": str(phase)}
+
     def _runtime_summary(self, task: Mapping[str, Any]) -> dict[str, Any]:
         result = self._state_summary(task)
         result["guest_available"] = False
@@ -4398,6 +4414,14 @@ class Control:
             result["native_status"] = "unverified"
             result["guest_error"] = exc.as_dict()
         # CT-wide OOM counters cannot attribute an event to this VM.
+        return result
+
+    def _public_runtime_summary(self, task: Mapping[str, Any]) -> dict[str, Any]:
+        result = self._runtime_summary(task)
+        if "last_error" in result:
+            result["last_error"] = self._public_error_summary(result["last_error"])
+        if "guest_error" in result:
+            result["guest_error"] = self._public_error_summary(result["guest_error"])
         return result
 
     @staticmethod
@@ -7389,7 +7413,7 @@ class Control:
         with self._global_lock():
             draining = self.store.get_meta("draining") == "1"
             task_snapshots = self.store.list_tasks()
-        tasks = [self._runtime_summary(task) for task in task_snapshots]
+        tasks = [self._public_runtime_summary(task) for task in task_snapshots]
         return {"draining": draining, "tasks": tasks, "doctor": self.doctor(request, session_id)}
 
     def admin_metrics(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:

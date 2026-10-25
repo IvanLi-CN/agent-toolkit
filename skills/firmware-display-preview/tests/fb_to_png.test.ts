@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test";
 import { inflateSync } from "node:zlib";
-import { readFileSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, mkdtempSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { convert, type Format, type Options } from "../scripts/fb_to_png.ts";
+import { convert, MAX_INPUT_BYTES, readBoundedInput, type Format, type Options } from "../scripts/fb_to_png.ts";
 
 function decode(png: Buffer) {
   expect(png.subarray(0, 8).toString("hex")).toBe("89504e470d0a1a0a");
@@ -62,6 +62,18 @@ test("bad dimensions, stride, format/options and truncated buffers fail", () => 
   for (const format of ["ssd1306", "mono1", "gray8", "rgb565", "rgb888"] as const) expect(() => convert(new Uint8Array(), format, { width: 2, height: 9 })).toThrow("too short");
   for (const options of [{ width: 0, height: 1 }, { width: 1.5, height: 1 }, { width: 1, height: NaN }, { width: 2, height: 2, strideBytes: 1 }, { width: 1, height: 1, endian: "bad" }]) expect(() => convert(new Uint8Array(20), "gray8", options as Options)).toThrow();
   expect(() => convert(new Uint8Array(20), "bad" as Format, { width: 1, height: 1 })).toThrow("format");
+});
+test("bounded regular-file reads preserve required bytes and reject oversized/non-regular input", () => {
+  const root = mkdtempSync(join(tmpdir(), "firmware-input-"));
+  try {
+    const input = join(root, "framebuffer.bin");
+    writeFileSync(input, Buffer.from([1, 2, 3]));
+    expect(readBoundedInput(input, 2)).toEqual(Buffer.from([1, 2]));
+    truncateSync(input, MAX_INPUT_BYTES + 1);
+    expect(() => readBoundedInput(input, 1)).toThrow(`input exceeds ${MAX_INPUT_BYTES} bytes`);
+    const directory = join(root, "directory"); mkdirSync(directory);
+    expect(() => readBoundedInput(directory, 1)).toThrow();
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 test("retained C harness compiles natively and fails closed until firmware accessor is supplied", () => {
   const root = mkdtempSync(join(tmpdir(), "firmware-native-"));

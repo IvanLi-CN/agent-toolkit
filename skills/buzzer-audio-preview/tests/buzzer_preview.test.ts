@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { encodeMidi, encodeWav, main, MAX_EVENTS, MAX_INPUT_BYTES, noteToMidi, parseScore, readBoundedInput } from "../scripts/buzzer_preview.ts";
@@ -104,6 +104,8 @@ describe("VER-FOUNDATION-HELPERS-01: independent media decoding", () => {
       expect(readBoundedInput(input)).toEqual(valid);
       writeFileSync(input, Buffer.alloc(MAX_INPUT_BYTES + 1, 0x20));
       expect(() => readBoundedInput(input)).toThrow(`input exceeds ${MAX_INPUT_BYTES} bytes`);
+      const directory = join(root, "directory"); mkdirSync(directory);
+      expect(() => readBoundedInput(directory)).toThrow("input must be a regular file");
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
   test("rejects excessive zero-duration events before mapping", () => {

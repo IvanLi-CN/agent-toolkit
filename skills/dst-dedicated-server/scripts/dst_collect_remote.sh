@@ -15,11 +15,13 @@ case "$mode" in
       [ "$shard" = both ] || [ "$shard" = "$name" ] || continue
       file="$root/$cluster/$name/modoverrides.lua"
       if [ ! -f "$file" ]; then printf '%s\tmissing\n' "$name"; continue; fi
-      size=$(wc -c < "$file" | tr -d '[:space:]')
+      # Probe at most 1 MiB plus one drift byte; avoid an unbounded size scan.
+      size=$(dd if="$file" bs=1024 count=1025 2>/dev/null | wc -c | tr -d '[:space:]')
       [ "$size" -le 1048576 ] || exit 4
       printf '%s\t%s\n' "$name" "$size"
-      # POSIX dd caps transfer at 1 MiB plus one drift byte; local framing rejects drift.
-      dd if="$file" bs=1 count=1048577 2>/dev/null
+      # Emit 1 MiB plus one drift byte with block-sized reads; local framing rejects drift.
+      dd if="$file" bs=1024 count=1024 2>/dev/null
+      dd if="$file" bs=1024 skip=1024 count=1 2>/dev/null | dd bs=1 count=1 2>/dev/null
     done
     ;;
   snapshot)

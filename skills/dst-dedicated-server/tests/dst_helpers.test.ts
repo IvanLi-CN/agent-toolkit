@@ -21,7 +21,7 @@ function cluster(path: string) {
 function fakeSsh(mode = "native") {
   const bin = join(root, "bin"); mkdirSync(bin, { recursive: true });
   const path = join(bin, "ssh");
-  writeFileSync(path, `#!/bin/sh\nprintf '%s\\n' "$@" > "$SSH_ARGS_FILE"\ncase "$SSH_TEST_MODE" in\nfail) echo SECRET_STDERR >&2; exit 255;;\nlarge) dd if=/dev/zero bs=1 count=3200000 2>/dev/null; exit 0;;\nstall) exec sleep 30;;\nesac\nfor arg do command=$arg; done\nexec sh -c "$command"\n`);
+  writeFileSync(path, `#!/bin/sh\nprintf '%s\\n' "$@" > "$SSH_ARGS_FILE"\ncase "$SSH_TEST_MODE" in\nfail) echo SECRET_STDERR >&2; exit 255;;\nlarge) dd if=/dev/zero bs=1024 count=3125 2>/dev/null; exit 0;;\noversized-file) mkdir -p "$HOME/.klei/DoNotStarveTogether/Cluster_1/Master" "$HOME/.klei/DoNotStarveTogether/Cluster_1/Caves"; dd if=/dev/zero bs=1024 count=1025 of="$HOME/.klei/DoNotStarveTogether/Cluster_1/Master/modoverrides.lua" 2>/dev/null;;\nstall) exec sleep 30;;\nesac\nfor arg do command=$arg; done\nexec sh -c "$command"\n`);
   chmodSync(path, 0o755);
   if (mode === "no-head") {
     const head = join(bin, "head");
@@ -87,6 +87,10 @@ describe("VER-FOUNDATION-HELPERS-03: DST snapshots and local/remote reports", ()
     const env = fakeSsh("no-head"); cluster(join(env.HOME, ".klei/DoNotStarveTogether/Cluster_1"));
     const remote = run("dst_mods_from_modoverrides.ts", ["--host", "dst.example", "--user", "operator", "--cluster", "Cluster_1"], env);
     expect(remote.exitCode).toBe(0); expect(remote.stderr.toString()).toBe(""); expect(remote.stdout.toString()).toContain("- mods: 3");
+  });
+  test("native remote bounded size probe rejects oversized mod files", () => {
+    const result = run("dst_mods_from_modoverrides.ts", ["--host", "dst.example", "--user", "operator", "--cluster", "Cluster_1"], fakeSsh("oversized-file"));
+    expect(result.exitCode).toBe(2); expect(result.stderr.toString()).toContain("Remote SSH failed (exit 4)");
   });
   test("oversized SSH and files are bounded and malformed frames fail closed", () => {
     const oversized = run("dst_mods_from_modoverrides.ts", ["--host", "dst.example", "--user", "operator", "--cluster", "Cluster_1"], fakeSsh("large"));

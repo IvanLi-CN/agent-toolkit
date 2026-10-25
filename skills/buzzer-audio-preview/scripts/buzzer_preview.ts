@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /** Portable score validation and MIDI/PCM encoding; no physical buzzer model. */
-import { closeSync, constants, mkdirSync, openSync, readSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, mkdirSync, openSync, readSync, statSync, writeFileSync } from "node:fs";
 import { basename, extname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 
@@ -15,8 +15,11 @@ export interface Score {
 export const MAX_INPUT_BYTES = 1_048_576;
 export const MAX_EVENTS = 65_536;
 export function readBoundedInput(path: string): Buffer {
-  const fd = openSync(path, constants.O_RDONLY);
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
   try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) throw new Error("input must be a regular file");
+    if (stat.size > MAX_INPUT_BYTES) throw new Error(`input exceeds ${MAX_INPUT_BYTES} bytes`);
     const buffer = Buffer.alloc(MAX_INPUT_BYTES + 1);
     let offset = 0;
     while (offset < buffer.length) {
@@ -25,6 +28,7 @@ export function readBoundedInput(path: string): Buffer {
       offset += count;
     }
     if (offset > MAX_INPUT_BYTES) throw new Error(`input exceeds ${MAX_INPUT_BYTES} bytes`);
+    if (fstatSync(fd).size > MAX_INPUT_BYTES) throw new Error(`input exceeds ${MAX_INPUT_BYTES} bytes`);
     return buffer.subarray(0, offset);
   } finally { closeSync(fd); }
 }

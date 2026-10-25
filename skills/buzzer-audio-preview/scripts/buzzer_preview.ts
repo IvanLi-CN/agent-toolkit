@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /** Portable score validation and MIDI/PCM encoding; no physical buzzer model. */
-import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, constants, mkdirSync, openSync, readSync, statSync, writeFileSync } from "node:fs";
 import { basename, extname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 
@@ -14,6 +14,20 @@ export interface Score {
 }
 export const MAX_INPUT_BYTES = 1_048_576;
 export const MAX_EVENTS = 65_536;
+export function readBoundedInput(path: string): Buffer {
+  const fd = openSync(path, constants.O_RDONLY);
+  try {
+    const buffer = Buffer.alloc(MAX_INPUT_BYTES + 1);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const count = readSync(fd, buffer, offset, buffer.length - offset, null);
+      if (count === 0) break;
+      offset += count;
+    }
+    if (offset > MAX_INPUT_BYTES) throw new Error(`input exceeds ${MAX_INPUT_BYTES} bytes`);
+    return buffer.subarray(0, offset);
+  } finally { closeSync(fd); }
+}
 function object(value: unknown, label: string): ObjectValue {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
   return value as ObjectValue;
@@ -146,8 +160,7 @@ export function main(args = process.argv.slice(2)): void {
   const inputStat = statSync(input);
   if (!inputStat.isFile()) throw new Error("input must be a regular file");
   if (inputStat.size > MAX_INPUT_BYTES) throw new Error(`input exceeds ${MAX_INPUT_BYTES} bytes`);
-  const source = readFileSync(input);
-  if (source.length > MAX_INPUT_BYTES) throw new Error(`input exceeds ${MAX_INPUT_BYTES} bytes`);
+  const source = readBoundedInput(input);
   const score = parseScore(JSON.parse(source.toString("utf8")));
   const midi = encodeMidi(score), wav = encodeWav(score);
   const out = resolve(values["out-dir"]!);

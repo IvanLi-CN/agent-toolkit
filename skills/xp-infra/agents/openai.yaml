@@ -1,4 +1,4 @@
 interface:
   display_name: "XP Infra"
-  short_description: "Deploy, audit, and operate XP cluster nodes"
-  default_prompt: "Use $xp-infra to initialize, deploy, join, upgrade, audit, or troubleshoot an XP cluster node with the confirmed policy."
+  short_description: "Validate XP policy and audit nodes with Bun"
+  default_prompt: "Use $xp-infra with Bun to validate protected policy, run read-only preflight and audit, and guide separately authorized XP deployment or recovery. Keep private inventory outside the public source."

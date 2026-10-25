@@ -5,6 +5,12 @@ description: "Diagnose Git remote and auth issues."
 
 # Git remote troubleshoot
 
+## Prerequisites and boundary
+
+This is text-only guidance using installed Git and the existing SSH or HTTPS tools on Linux/macOS. It owns no production executable and requires no Bun/Python runtime for diagnosis. Start with `git remote -v`, `git status -sb` and the exact failing command/error; these identify the configured target and transport without changing local configuration. The result is a diagnosis, supporting read-only observations and a proposed minimal fix. Any config change or push follows the explicit authorization rules below.
+
+Repository maintainers can run `bun test ./tests/helper_sources.test.ts` to exercise linked-source helper entrypoints and retained runtime boundaries. Bun is a developer/test prerequisite only for this text Skill; those smoke tests make no live connectivity or authentication claim.
+
 ## Hard rules (strict)
 
 - Never “work around” SSH failures by pushing via an explicit HTTPS URL (forbidden): `git push -u https://github.com/<owner>/<repo>.git <branch>`

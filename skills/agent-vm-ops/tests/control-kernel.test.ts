@@ -678,8 +678,23 @@ describe("control-store: legacy schema and durable transaction behavior", () => 
       store.put_task(task());
       expect(store.state_epoch()).toBe(task_epoch);
 
+      const cleanup_task = task();
+      cleanup_task.cleanup_after = "2026-01-01T02:00:00+00:00";
+      store.put_task(cleanup_task);
+      const cleanup_epoch = store.state_epoch();
+      expect(cleanup_epoch).not.toBe(task_epoch);
+      expect(store.get_task({ task_id: "task-a" })?.cleanup_after).toBe(
+        cleanup_task.cleanup_after,
+      );
+      store.put_task(cleanup_task);
+      expect(store.state_epoch()).toBe(cleanup_epoch);
+
+      store.update_task("task-a", { state: "active" });
+      expect(store.state_epoch()).toBe(cleanup_epoch);
+      expect(store.get_task({ task_id: "task-a" })?.updated_at).toBe(NOW);
+
       store.remove_port("missing-task", "ssh", "tcp");
-      expect(store.state_epoch()).toBe(task_epoch);
+      expect(store.state_epoch()).toBe(cleanup_epoch);
 
       const original = new ControlError("native_failed", "native failed");
       expect(caught(() => store.transaction(() => {
@@ -687,7 +702,25 @@ describe("control-store: legacy schema and durable transaction behavior", () => 
         throw original;
       }))).toBe(original);
       expect(store.get_meta("rolled-back")).toBeNull();
-      expect(store.state_epoch()).toBe(task_epoch);
+      expect(store.state_epoch()).toBe(cleanup_epoch);
+    });
+  });
+
+  test("rejects malformed persisted state epochs", async () => {
+    await withStore((store) => {
+      store.connection
+        .query("INSERT INTO meta(key, value) VALUES (?, ?)")
+        .run("state_epoch", "7");
+      expect(store.state_epoch()).toBe("7");
+
+      store.connection
+        .query("UPDATE meta SET value = ? WHERE key = ?")
+        .run("not-an-epoch", "state_epoch");
+      const error = controlFailure(
+        () => store.state_epoch(),
+        "state_unverified",
+      );
+      expect(error.detail).toMatchObject({ key: "state_epoch" });
     });
   });
 

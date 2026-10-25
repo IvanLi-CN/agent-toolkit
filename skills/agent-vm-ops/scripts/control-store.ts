@@ -507,15 +507,22 @@ export class StateStore {
   private _state_epoch_value(value: string | null): string {
     if (value === null) return "initial";
     const text = value.trim();
-    if (!text || text.length > 256) {
-      throw new ControlError(
-        "state_unverified",
-        "state database epoch is invalid",
-        { key: STATE_EPOCH_KEY },
-      );
+    if (/^[0-9a-f]{32}$/.test(text)) return text;
+    if (/^(?:0|[1-9][0-9]*)$/.test(text)) {
+      if (BigInt(text) > MAX_SQLITE_INTEGER) {
+        throw new ControlError(
+          "state_unverified",
+          "state database epoch is out of range",
+          { key: STATE_EPOCH_KEY },
+        );
+      }
+      return text;
     }
-
-    return text;
+    throw new ControlError(
+      "state_unverified",
+      "state database epoch is invalid",
+      { key: STATE_EPOCH_KEY },
+    );
   }
 
   private _advance_state_epoch(): void {
@@ -792,6 +799,7 @@ export class StateStore {
             tasks.ssh_host_port IS NOT excluded.ssh_host_port OR
             tasks.lease_expires_at IS NOT excluded.lease_expires_at OR
             tasks.inactive_since IS NOT excluded.inactive_since OR
+            tasks.cleanup_after IS NOT excluded.cleanup_after OR
             tasks.updated_at IS NOT excluded.updated_at OR
             tasks.last_error IS NOT excluded.last_error OR
             tasks.image_fingerprint IS NOT excluded.image_fingerprint OR
@@ -814,22 +822,28 @@ export class StateStore {
       return task;
     }
 
-    const updates: Data = { ...changes, updated_at: iso_time() };
-    const update_values = Object.values(updates);
-    const update_keys = Object.keys(updates);
-    const assignments = update_keys
-      .map((key) => `${key} = ?`)
-      .join(", ");
-    const changed = update_keys
+    const change_keys = Object.keys(changes);
+    const change_values = Object.values(changes);
+    const update_values = [...change_values, iso_time()];
+    const assignments = [
+      ...change_keys.map((key) => `${key} = ?`),
+      "updated_at = ?",
+    ].join(", ");
+    const changed = change_keys
       .map((key) => `${key} IS NOT ?`)
       .join(" OR ");
 
+    const task_update = [
+      ...update_values,
+      task_id,
+      ...change_values,
+    ];
+
     this.transaction(() => {
-      this._run(`UPDATE tasks SET ${assignments} WHERE task_id = ? AND (${changed})`, [
-        ...update_values,
-        task_id,
-        ...update_values,
-      ]);
+      this._run(
+        `UPDATE tasks SET ${assignments} WHERE task_id = ? AND (${changed})`,
+        task_update,
+      );
     });
 
     const task = this.get_task({ task_id });

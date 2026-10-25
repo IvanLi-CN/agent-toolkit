@@ -160,9 +160,44 @@ def _write_session_state_unlocked(directory: Path, state: dict[str, Any]) -> Non
     os.replace(temp, path)
 
 
-def write_session_state(value: str, state: dict[str, Any]) -> None:
+def _state_write_allowed(value: str, current: Any, candidate: Mapping[str, Any]) -> bool:
+    if candidate.get("session_id") != value:
+        return False
+    candidate_task = candidate.get("task_id")
+    candidate_generation = candidate.get("generation")
+    if (
+        not isinstance(candidate_task, str)
+        or isinstance(candidate_generation, bool)
+        or not isinstance(candidate_generation, int)
+        or candidate_generation < 1
+    ):
+        return False
+    if current is None:
+        return True
+    if not isinstance(current, Mapping) or current.get("session_id") != value:
+        return False
+    current_generation = current.get("generation")
+    if isinstance(current_generation, bool) or not isinstance(current_generation, int):
+        return False
+    if current_generation > candidate_generation:
+        return False
+    return current_generation != candidate_generation or current.get("task_id") == candidate_task
+
+
+def write_session_state(value: str, state: dict[str, Any]) -> bool:
     with session_state_lock(value) as directory:
+        path = directory / "state.json"
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                current = json.load(handle)
+        except FileNotFoundError:
+            current = None
+        except (OSError, json.JSONDecodeError):
+            return False
+        if not _state_write_allowed(value, current, state):
+            return False
         _write_session_state_unlocked(directory, state)
+    return True
 
 
 def current_generation(value: str) -> int:
@@ -198,9 +233,13 @@ def persist_recovery_state(
     if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
         return False
     recovery_operation_id = result.get("recovery_operation_id")
+    partial_operation_id = result.get("partial_operation_id")
     last_error = result.get("last_error")
     committed_operation = recovery_operation_id == operation_id
-    partial_operation = isinstance(last_error, Mapping) and last_error.get("operation_id") == operation_id
+    partial_operation = (
+        partial_operation_id == operation_id
+        or isinstance(last_error, Mapping) and last_error.get("operation_id") == operation_id
+    )
     if not committed_operation and not partial_operation:
         return False
     if committed_operation:
@@ -208,36 +247,16 @@ def persist_recovery_state(
             return False
     elif generation != expected_generation + 1:
         return False
+    state = {
+        "session_id": session,
+        "task_id": task_id,
+        "generation": generation,
+        "private_key": str(private_key),
+    }
     try:
-        state = {
-            "session_id": session,
-            "task_id": task_id,
-            "generation": generation,
-        }
-        state["private_key"] = str(private_key)
-        with session_state_lock(session) as directory:
-            path = directory / "state.json"
-            try:
-                with path.open("r", encoding="utf-8") as handle:
-                    current = json.load(handle)
-            except FileNotFoundError:
-                current = None
-            except (OSError, json.JSONDecodeError):
-                return False
-            if current is not None:
-                if not isinstance(current, dict):
-                    return False
-                current_generation = current.get("generation")
-                if isinstance(current_generation, bool) or not isinstance(current_generation, int):
-                    return False
-                if current_generation > generation:
-                    return False
-                if current_generation == generation and current.get("task_id") != task_id:
-                    return False
-            _write_session_state_unlocked(directory, state)
+        return write_session_state(session, state)
     except OSError:
         return False
-    return True
 
 
 def recover_acquire_state(
@@ -1271,8 +1290,9 @@ def command_acquire(args: argparse.Namespace) -> int:
                 expected_generation=generation,
             )
         fail("lease_unavailable", "replayed allocation no longer has an active lease; inspect status")
-    write_session_state(session, {"session_id": session, "task_id": result["task_id"],
-                                 "generation": result["generation"], "private_key": str(private_key)})
+    if not write_session_state(session, {"session_id": session, "task_id": result["task_id"],
+                                         "generation": result["generation"], "private_key": str(private_key)}):
+        fail("local_state_conflict", "successful acquire response conflicts with newer local session state")
     json_output(response)
     return 0
 

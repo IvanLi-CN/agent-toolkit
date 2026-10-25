@@ -203,6 +203,33 @@ class SessionContractTests(unittest.TestCase):
         self.assertEqual(recovery_request.args[0], "status")
         self.assertEqual(recovery_request.kwargs["operation_id"], "replayed-acquire-operation")
 
+    def test_pending_acquire_status_proof_persists_cleanup_handle(self):
+        session = "pending-acquire-proof"
+        result = {
+            "task_id": "avm-pending123",
+            "session_id": session,
+            "generation": 1,
+            "state": "cached",
+            "partial_operation_id": "pending-acquire-operation",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private_key = root / "id_ed25519"
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", root / "state"):
+                self.assertTrue(
+                    CLI.persist_recovery_state(
+                        session,
+                        private_key,
+                        result,
+                        operation_id="pending-acquire-operation",
+                        expected_generation=0,
+                    )
+                )
+                state = CLI.read_session_state(session)
+
+        self.assertEqual(state["task_id"], "avm-pending123")
+        self.assertEqual(state["generation"], 1)
+
     def test_recovery_status_response_must_echo_operation_identity(self):
         response = {
             "ok": True,
@@ -292,6 +319,38 @@ class SessionContractTests(unittest.TestCase):
                 )
                 state = CLI.read_session_state(session)
 
+        self.assertEqual(state["task_id"], "avm-newer123")
+        self.assertEqual(state["generation"], 2)
+
+    def test_successful_acquire_cannot_overwrite_a_newer_local_generation(self):
+        session = "late-success-state"
+        task = {
+            "task_id": "avm-older123",
+            "session_id": session,
+            "generation": 1,
+            "state": "active",
+            "effective_lease": True,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private_key = root / "id_ed25519"
+            args = CLI.build_parser().parse_args(["acquire", "--session-id", session])
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", root / "state"):
+                CLI.write_session_state(session, {
+                    "session_id": session,
+                    "task_id": "avm-newer123",
+                    "generation": 2,
+                    "private_key": str(root / "newer-key"),
+                })
+                with mock.patch.object(CLI, "make_ssh_key", return_value=(private_key, "ssh-ed25519 AAAA")), \
+                     mock.patch.object(CLI, "control_request", return_value={"result": {"generation": 0}}), \
+                     mock.patch.object(CLI, "mutation", return_value={"result": task}), \
+                     mock.patch.object(CLI, "json_output"):
+                    with self.assertRaises(CLI.CliError) as failure:
+                        CLI.command_acquire(args)
+                state = CLI.read_session_state(session)
+
+        self.assertEqual(failure.exception.code, "local_state_conflict")
         self.assertEqual(state["task_id"], "avm-newer123")
         self.assertEqual(state["generation"], 2)
 

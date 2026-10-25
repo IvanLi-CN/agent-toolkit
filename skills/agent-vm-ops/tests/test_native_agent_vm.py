@@ -1394,6 +1394,23 @@ class LifecycleTests(Fixture):
         self.assertEqual(result["state"], "active")
         self.assertEqual(result["recovery_operation_id"], "op-1")
 
+    def test_status_proves_pending_acquire_operation_for_cleanup_recovery(self):
+        self.acquire()
+        self.store.record_operation(
+            "pending-recovery",
+            "acquire",
+            "thread-a",
+            0,
+            {"outcome": "pending", "_request_digest": "pending-acquire"},
+        )
+        request = self.request("status")
+        request["operation_id"] = "pending-recovery"
+
+        result = self.control.dispatch(request)["result"]
+
+        self.assertEqual(result["state"], "active")
+        self.assertEqual(result["partial_operation_id"], "pending-recovery")
+
     def test_status_rejects_unrelated_or_unverified_recovery_operations(self):
         self.acquire()
         original = self.store.operation("op-1")
@@ -1462,6 +1479,41 @@ class LifecycleTests(Fixture):
 
         self.assertEqual(self.call("release")["state"], "cached")
         self.assertEqual(self.call("destroy")["state"], "absent")
+
+    def test_background_cleanup_preserves_failed_acquire_recovery_handle(self):
+        task = self.acquire()
+        self.store.record_operation(
+            "op-1",
+            "acquire",
+            "thread-a",
+            0,
+            {"outcome": "pending", "_request_digest": "pending-acquire"},
+        )
+        self.store.update_task(
+            task["task_id"],
+            state="closing",
+            lease_expires_at=None,
+            last_error=json.dumps({
+                "code": "acquire_partial",
+                "operation_id": "op-1",
+                "phase": "guest-post-check",
+            }),
+        )
+        self.runner.instances[task["instance_name"]]["status"] = "Stopped"
+
+        with mock.patch.object(self.control, "_cleanup_task", return_value=([], [])):
+            result = self.control._release_task(
+                self.store.get_task(task_id=task["task_id"]),
+                recover_pending_acquire=False,
+            )
+
+        self.assertEqual(result["state"], "cached")
+        current = self.store.get_task(task_id=task["task_id"])
+        self.assertEqual(json.loads(current["last_error"])["operation_id"], "op-1")
+        request = self.request("status")
+        request["operation_id"] = "op-1"
+        status = self.control.dispatch(request)["result"]
+        self.assertEqual(status["partial_operation_id"], "op-1")
 
     def test_native_init_timeout_keeps_absence_pending_for_delayed_reconciliation(self):
         task = self.control._base_task("thread-a", 1)
@@ -1551,6 +1603,35 @@ class LifecycleTests(Fixture):
         self.assertGreater(task["reservation_bytes"], 0)
         self.assertTrue(json.loads(task["last_error"])["native_init_absence_retry"])
         self.assertEqual(self.store.operation("op-1")["outcome"], "pending")
+
+    def test_native_init_retry_proof_survives_a_later_cleanup_error(self):
+        task = self.control._base_task("thread-a", 1)
+        task.update(
+            state="closing",
+            lease_expires_at=None,
+            resources_json=json.dumps({"cpu": 2, "memory_mib": 4096, "disk_gib": 20}),
+            resource_reservation_json=json.dumps({"cpu": 2, "memory_mib": 4096, "disk_gib": 20}),
+            reservation_bytes=4 * GIB,
+            last_error=json.dumps({
+                "native_init_absence_retry": True,
+                "native_init_cleanup_verified": False,
+                "native_init_absence_retry_after": CONTROL.iso_time(self.now),
+                "native_init_absence_checks": 1,
+            }),
+        )
+        self.store.put_task(task)
+
+        with mock.patch.object(self.control, "_cleanup_task", return_value=(["stop:command_failed"], [])), \
+             mock.patch.object(self.systemd, "retry_cleanup"):
+            with self.assertRaises(CONTROL.ControlError) as error:
+                self.control._release_task(task)
+
+        self.assertEqual(error.exception.code, "cleanup_incomplete")
+        current = self.store.get_task(task_id=task["task_id"])
+        retained = json.loads(current["last_error"])
+        self.assertTrue(retained["native_init_absence_retry"])
+        self.assertFalse(retained["native_init_cleanup_verified"])
+        self.assertEqual(current["state"], "closing")
 
     def test_native_init_failure_with_residual_instance_is_never_cached(self):
         failure = CONTROL.ControlError("command_failed", "image unpack failed")

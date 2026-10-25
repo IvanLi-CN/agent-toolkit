@@ -3512,6 +3512,57 @@ class Control:
             return None
         return error
 
+    def _pending_acquire_recovery_operation_id(self, task: Mapping[str, Any]) -> str | None:
+        raw_error = task.get("last_error")
+        if not isinstance(raw_error, str) or not raw_error:
+            return None
+        try:
+            error = json.loads(raw_error)
+        except (TypeError, ValueError):
+            return None
+        operation_id = error.get("operation_id") if isinstance(error, Mapping) else None
+        if not isinstance(operation_id, str) or SESSION_ID_RE.fullmatch(operation_id) is None:
+            return None
+        try:
+            pending = self.store.pending_operations()
+        except ControlError:
+            return None
+        task_generation = task.get("generation")
+        generations = {task_generation}
+        if isinstance(task_generation, int) and not isinstance(task_generation, bool):
+            generations.add(task_generation - 1)
+        for item in pending:
+            if (
+                item.get("operation_id") == operation_id
+                and item.get("action") == "acquire"
+                and item.get("session_id") == task.get("session_id")
+                and item.get("generation") in generations
+            ):
+                return operation_id
+        return None
+
+    @staticmethod
+    def _cleanup_error_record(
+        detail: Any,
+        recovery_operation_id: str | None,
+        task: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        record = dict(detail) if isinstance(detail, Mapping) else {}
+        if recovery_operation_id:
+            record.setdefault("operation_id", recovery_operation_id)
+        retry_record = Control._native_init_absence_retry_record(task) if task is not None else None
+        if retry_record is not None:
+            record["native_init_absence_retry"] = True
+            for key in (
+                "native_init_absence_retry_after",
+                "native_init_absence_checks",
+                "native_init_cleanup_verified",
+                "error",
+            ):
+                if key in retry_record:
+                    record.setdefault(key, retry_record[key])
+        return record
+
     @classmethod
     def _native_init_absence_retry_pending(cls, task: Mapping[str, Any]) -> bool:
         return cls._native_init_absence_retry_record(task) is not None
@@ -3697,6 +3748,7 @@ class Control:
                 current = self._cleanup_current(task)
                 if current is None:
                     return
+                recovery_operation_id = self._pending_acquire_recovery_operation_id(current)
                 errors, completed = self._cleanup_task(current)
                 if errors:
                     with self._global_lock(), self.store.transaction():
@@ -3704,13 +3756,23 @@ class Control:
                         if latest and latest["generation"] == generation and latest["state"] == "closing":
                             self.store.update_task(
                                 task_id,
-                                last_error=json.dumps({"errors": errors, "completed": completed}),
+                                last_error=json.dumps(self._cleanup_error_record(
+                                    {"errors": errors, "completed": completed},
+                                    recovery_operation_id,
+                                    current,
+                                )),
                             )
         except ControlError as exc:
             with self._global_lock(), self.store.transaction():
                 latest = self.store.get_task(task_id=task_id)
                 if latest and latest["generation"] == generation and latest["state"] == "closing":
-                    self.store.update_task(task_id, last_error=json.dumps(exc.as_dict()))
+                    recovery_operation_id = self._pending_acquire_recovery_operation_id(latest)
+                    self.store.update_task(
+                        task_id,
+                        last_error=json.dumps(self._cleanup_error_record(
+                            exc.as_dict(), recovery_operation_id, latest
+                        )),
+                    )
 
     def _validate_cached_success(
         self,
@@ -6239,6 +6301,22 @@ class Control:
                 and operation_generation == int(task["generation"])
             ):
                 result["recovery_operation_id"] = recovery_operation_id
+            elif operation and operation.get("outcome") == "pending":
+                pending = [
+                    item for item in self.store.pending_operations()
+                    if item.get("operation_id") == recovery_operation_id
+                    and item.get("action") == "acquire"
+                    and item.get("session_id") == session_id
+                    and item.get("generation") is not None
+                ]
+                if (
+                    len(pending) == 1
+                    and task.get("state") != "absent"
+                    and isinstance(pending[0].get("generation"), int)
+                    and not isinstance(pending[0].get("generation"), bool)
+                    and int(task["generation"]) == pending[0]["generation"] + 1
+                ):
+                    result["partial_operation_id"] = recovery_operation_id
         admission = self._resource_diagnostics()
         admission["instances"] = self._instance_diagnostics()
         return {**result, "admission": admission}
@@ -6475,6 +6553,7 @@ class Control:
             task = current
             if task["state"] in {"cached", "absent"} and requested_state != "closing":
                 return self._state_summary(task)
+            recovery_operation_id = self._pending_acquire_recovery_operation_id(task)
             expiry = parse_time(task.get("lease_expires_at"))
             inactive = parse_time(task.get("inactive_since")) or min(self.now(), expiry or self.now())
             with self._global_lock(), self.store.transaction():
@@ -6483,14 +6562,21 @@ class Control:
                                              cleanup_after=iso_time(inactive + dt.timedelta(seconds=self.config["cache_seconds"])))
             errors, completed = self._cleanup_task(task)
             if errors:
-                self.store.update_task(task["task_id"], last_error=json.dumps({"errors": errors, "completed": completed}))
+                self.store.update_task(
+                    task["task_id"],
+                    last_error=json.dumps(self._cleanup_error_record(
+                        {"errors": errors, "completed": completed}, recovery_operation_id, task
+                    )),
+                )
                 # Reuse the native expiry oneshot's bounded Restart=on-failure path.
                 self.systemd.retry_cleanup(task["task_id"], task["generation"])
                 raise ControlError("cleanup_incomplete", "entry/port reservations remain closed until reconciliation succeeds", errors)
             try:
                 instances = self.incus.list_instances()
             except ControlError as exc:
-                detail = {"native_absence": "unverified", "cause": exc.as_dict()}
+                detail = self._cleanup_error_record(
+                    {"native_absence": "unverified", "cause": exc.as_dict()}, recovery_operation_id, task
+                )
                 self.store.update_task(task["task_id"], last_error=json.dumps(detail))
                 self.systemd.retry_cleanup(task["task_id"], task["generation"])
                 raise ControlError(
@@ -6506,7 +6592,9 @@ class Control:
                     else None
                 )
             except ControlError as exc:
-                detail = {"native_absence": "unverified", "cause": exc.as_dict()}
+                detail = self._cleanup_error_record(
+                    {"native_absence": "unverified", "cause": exc.as_dict()}, recovery_operation_id, task
+                )
                 self.store.update_task(task["task_id"], last_error=json.dumps(detail))
                 self.systemd.retry_cleanup(task["task_id"], task["generation"])
                 raise ControlError(
@@ -6546,13 +6634,13 @@ class Control:
                                 )
                         absent = True
                     except ControlError as exc:
-                        detail = {
+                        detail = self._cleanup_error_record({
                             "native_init_absence_retry": True,
                             "outcome_verified": False,
                             "native_absence": "present",
                             "native_init_cleanup_verified": cleanup_verified,
                             "cause": exc.as_dict(),
-                        }
+                        }, recovery_operation_id, task)
                         prior = self._native_init_absence_retry_record(task) or {}
                         if isinstance(prior.get("error"), Mapping):
                             detail["error"] = prior["error"]
@@ -6564,12 +6652,12 @@ class Control:
                             detail,
                         ) from exc
                 else:
-                    detail = {
+                    detail = self._cleanup_error_record({
                         "native_init_absence_retry": True,
                         "outcome_verified": False,
                         "native_absence": "present",
                         "native_init_cleanup_verified": cleanup_verified,
-                    }
+                    }, recovery_operation_id, task)
                     prior = self._native_init_absence_retry_record(task) or {}
                     if isinstance(prior.get("error"), Mapping):
                         detail["error"] = prior["error"]
@@ -6589,14 +6677,14 @@ class Control:
             )
             if absent and retry_required and not (stable_absence and absence_verified):
                 retry_after = self._native_init_retry_after(task)
-                detail = {
+                detail = self._cleanup_error_record({
                     "native_init_absence_retry": True,
                     "outcome_verified": False,
                     "native_absence": "pending",
                     "native_init_absence_retry_after": retry_after,
                     "native_init_absence_checks": absence_checks,
                     "native_init_cleanup_verified": cleanup_verified,
-                }
+                }, recovery_operation_id, task)
                 prior = self._native_init_absence_retry_record(task) or {}
                 if isinstance(prior.get("error"), Mapping):
                     detail["error"] = prior["error"]
@@ -6612,11 +6700,11 @@ class Control:
                 try:
                     recovered_operation = self._recovered_native_init_operation(task, pending_acquire)
                 except ControlError as exc:
-                    detail = {
+                    detail = self._cleanup_error_record({
                         "native_absence": "verified",
                         "outcome_verified": False,
                         "cause": exc.as_dict(),
-                    }
+                    }, recovery_operation_id, task)
                     self.store.update_task(task["task_id"], last_error=json.dumps(detail))
                     self.systemd.retry_cleanup(task["task_id"], task["generation"])
                     raise ControlError(
@@ -6635,6 +6723,14 @@ class Control:
                     raise ControlError("resource_unverified", "absent task resources cannot be verified") from exc
             else:
                 resources = self._native_resources(task)
+            retained_recovery_error = None
+            if recovery_operation_id is not None and recovered_operation is None:
+                retained_recovery_error = json.dumps({
+                    "code": "acquire_partial",
+                    "phase": "cleanup",
+                    "operation_id": recovery_operation_id,
+                    "outcome_verified": True,
+                })
             with self._global_lock(), self.store.transaction():
                 for port in self.store.get_ports(task["task_id"]):
                     self.store.remove_port(task["task_id"], port["port_name"], port["protocol"])
@@ -6648,7 +6744,7 @@ class Control:
                         operation,
                     )
                 task = self.store.update_task(task["task_id"], state="absent" if absent else "cached",
-                                             ssh_host_port=None, reservation_bytes=0, last_error=None, previous_generation=None, resource_reservation_json='{}',
+                                             ssh_host_port=None, reservation_bytes=0, last_error=retained_recovery_error, previous_generation=None, resource_reservation_json='{}',
                                              resources_json=json.dumps(resources),
                                              vm_ip=None if absent else task["vm_ip"])
             return self._state_summary(task)

@@ -40,7 +40,7 @@ The statuses below describe language migration coverage, not deployment status. 
 | Requirement | 文档入口与实现 | 证据边界 |
 | --- | --- | --- |
 | DOC-01 | README 首屏的五个能力组、全部 13 个可点击 Skill、用途/场景、前置条件和输出；指南索引提供逐 Skill 的唯一目标。 | 对 allowlist、README、guide headings 和 canonical source 做 completeness 与本地路径/锚点静态核对，不推断站点路由。 |
-| DOC-02 | [安装与更新](../../guides/installation.md)：HTTPS checkout、直接 source links、每个 link 的隐藏 ownership record、带唯一 owner token 的 consumer-root lock、collision、enable/disable、update、上游删除 reconciliation、uninstall；skills-switch 明确为可选外部工具。 | 使用 disposable upstream/consumer 的真实 Git、symlink、record 格式/source identity、realpath 及内容 identity 验证直接链接流程；原子 lock 已存在时停止且不删除未知状态；token 缺失/内容或 identity 改变、lock directory replacement、unexpected contents 和 `rmdir` failure 都必须保留 lock 并报告；marker 缺失/foreign/malformed、target changed、signal interruption 和 marker-write rollback 必须保留 entry 或不留下新 link；ambiguous link outcome 必须保留 record 供复核。外部管理器命令只核对已安装工具的帮助，不宣称真实用户 catalog 生命周期已运行。 |
+| DOC-02 | [安装与更新](../../guides/installation.md)：HTTPS checkout、直接 source links、每个 link 的隐藏 ownership record、带唯一 owner token 的 consumer-root lock、collision、enable/disable、update、上游删除 reconciliation、uninstall；skills-switch 明确为可选外部工具。 | Disposable upstream/consumer 验证直接链接流程；record 同时保存 canonical source path、source 与 link 的设备号/inode。原子 lock 已存在时停止，token/lock identity 异常仍保留并报告。Disable 先将 record 移入 ledger 私有 pending directory，再捕获并核对 link，最终只在已进入的私有目录内 unlink；中断和删除失败可重跑恢复，不留下陈旧 active record。异常被捕获对象保留供人工核对；不保证抵御同身份/高权限外部写入、inode 复用或断电持久性。外部管理器命令只核对帮助，不宣称真实用户 catalog 生命周期已运行。 |
 | DOC-03 | [隔离执行](../../guides/isolated-execution.md)、[服务运维](../../guides/service-operations.md)、[Git 与文档](../../guides/git-and-docs.md)、[媒体预览](../../guides/media-previews.md)、[CAD](../../guides/cad-repair.md)：逐 Skill 列出何时使用、平台/前提、配置、最小例子、输出与读写边界。 | 离线例子使用 temporary fixtures；remote/service、可信 imagegen 模块和 CAD/native 应用例子明确所需真实前提与授权，不以 source inspection 代替应用执行。 |
 | DOC-04 | [Protected configuration](../../guides/configuration.md)覆盖 XP、Agent VM、imagegen、Tavily、DST、Linux、Git 与 CAD/native；维护性 source inventory 对照留在 CONTRIBUTING。 | 中性 env/模板路径及公共安全/coupling 检查；不包含私有 inventory、个人路径、凭据或部署观察。 |
 
@@ -49,10 +49,18 @@ Guides 场景与验证层级如下。当前候选的 OS/runtime、实际运行�
 | Scenario | 可复查的场景与方法 | 不包含的证据 |
 | --- | --- | --- |
 | GUIDES-01 | 逐一比较 allowlist 与五组指南的 Skill heading、README/索引入口；检查 purpose、prerequisites、configuration、example、output、boundaries 及所有相对链接/锚点。 | Website render/search/navigation。 |
-| GUIDES-02 | Temporary consumer 直接链接选定源码；验证共享 consumer-root 原子 lock、唯一 owner token、已有 lock 停止、lock replacement/token loss 保留新 lock、隐藏 record 的五行格式、Skill/source target/source identity/target identity、record-before-link 顺序、marker-write rollback、信号停止与 ambiguous outcome、普通目录与第三方/dangling link collision 均不覆盖或产生 untracked link。 | 修改主人真实 consumer root 或安装外部工具。 |
-| GUIDES-03 | Disposable local bare upstream 与 checkout 执行 fast-forward update；删除上游 Skill 后 reconciliation 使用共享 lock，只在 valid record + exact current link target + source identity 最终检查下 unlink；marker 缺失/foreign/malformed、source identity changed、target changed、已有 lock、token loss/replacement 或 signal interruption 均保留并报告；验证 disable/re-enable/uninstall 不误删替换后的 foreign link，并保留 source checkout 和其它 entries。 | 声称手工流程自动清理，或将 source update 等同于外部管理器 prune；symlink target 单独不能证明 ownership，外部管理器状态也不属于清理范围。 |
+| GUIDES-02 | Temporary consumer 直接链接选定源码；验证共享 consumer-root 原子 lock、唯一 owner token、已有 lock 停止、lock replacement/token loss 保留新 lock、隐藏 record 的七行格式、source canonical path 与 source/link 文件身份、record-before-link 顺序及 collision 不覆盖。可执行 smoke 直接提取指南代码块，不维护第二份安装器。 | 修改主人真实 consumer root 或安装外部工具。 |
+| GUIDES-03 | Disposable local bare upstream 与 checkout 的 fast-forward update；source 删除后按同一 disable 流程 reconciliation。可执行 smoke 验证 source 同路径重建拒绝、owned dangling link 清理、五个状态转换后的 TERM 恢复、record unlink 失败后重跑、capture 前同 target 字符串的新 inode 被保留，以及 capture 后公开 target 替换不被删除；missing/foreign/malformed/legacy record 与 foreign link/目录均保留。 | 不把 source update 等同于自动 prune；不证明 Linux、真实管理器执行或系统级对抗并发；SIGKILL 遗留 lock 须人工核对，不自动破锁。 |
 | GUIDES-04 | 实际 Bun audio/PNG/local DST、local VM version/XP/Tavily help 与隔离 Git 示例 smoke；CVM 使用 synthetic fallback dry-run，并对 canonical entrypoints 与 prerequisites 做 contract review。 | Live image API、真实 Incus/远端主机、真实 firmware renderer、FreeCAD/Gmsh/Blender 与实物输出。 |
 | GUIDES-05 | Standalone newcomer path、protected configuration、链接与 public boundary checks；核对 root/Skill test discovery 和 CI 中实际 commands。 | 私有 runtime/task 集成、复制 consumer tree、生产部署与发布。 |
+
+直接 source-link 的 shell/link/anchor smoke 使用安装好的 Bun 与原生 Bash/macOS/Linux 工具，从仓库根目录执行：
+
+```bash
+bun test ./docs/guides/installation.test.ts
+```
+
+[可执行 smoke](../../guides/installation.test.ts)检查指南与相关 README/contract 的相对链接、锚点、13 个 membership 入口，并在临时目录执行 enable/disable 原文和故障注入。它证明所运行 OS 上的 fixture 行为，不证明另一 OS 或真实消费者安装；当前候选结果与 VM 阻塞只记入执行报告。
 
 ### Helper behavior evidence
 

@@ -59,7 +59,7 @@ The first reads `admin-metrics`; the second reads `admin-status`. A read-only br
 
 ## Deployment implementation
 
-1. In the owning deployment repository, copy [the public observability config example](../../../skills/agent-vm/references/observability/observability.config.json.example), fill its deployment-owned values, and render the two dashboard/provisioning outputs with `render_observability_dashboard.ts` or the deployment's documented split-render wrapper.
+1. In the owning deployment repository, copy [the public observability config example](../../../skills/agent-vm/references/observability/observability.config.json.example), fill its deployment-owned values, set `dashboard_path` to the stable `current` directory inside the Grafana container, and render the two dashboard/provisioning outputs with `render_observability_dashboard.ts` or the deployment's documented split-render wrapper. The renderer publishes the dashboard pair through an atomic `current` symlink; install the provisioning YAML with a single temporary-file-plus-rename operation.
 2. Add the native read-only scrape bridge or textfile collector and expose the metric families in the observability contract. Do not add a resident HTTP broker to the one-shot controller solely for dashboard access.
 3. Add CT root and `/var/lib/incus/images` filesystem series to the Prometheus target. Do not derive them from `incus_project_limit`, guest rootfs size or pool free space.
 4. Run `validate_observability_dashboard.ts` against the rendered files, then review the generated diff. Deployment-specific panels may be added in the owning repository when their data authority is documented.

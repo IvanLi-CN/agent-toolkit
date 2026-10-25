@@ -4,7 +4,7 @@ This directory contains the portable Grafana source for the Agent VM observabili
 
 ## Render
 
-Copy [the example configuration](observability.config.json.example), replace every placeholder with values owned by the deployment, and render the bundle into a staging directory:
+Copy [the example configuration](observability.config.json.example), replace every placeholder with values owned by the deployment, and render the bundle into a bundle root:
 
 ```bash
 bun skills/agent-vm/scripts/render_observability_dashboard.ts \
@@ -13,7 +13,7 @@ bun skills/agent-vm/scripts/render_observability_dashboard.ts \
   --force
 ```
 
-The renderer writes the parameterized capacity dashboard, inventory dashboard, and Grafana file-provider definition. The deployment implementation must render the approved `Agent VM / Capacity & Admission` and `Agent VM / Inventory & Operations` views; the YAML path must be visible inside the Grafana container.
+The renderer writes the parameterized capacity dashboard, inventory dashboard, and Grafana file-provider definition. Dashboard JSON files are published below `generated/current`, which is replaced as one atomic symlink; previous releases remain below `generated/.releases`. The deployment implementation must set `dashboard_path` to the container-visible `current` directory and copy the provisioning YAML as one atomic file replacement. This prevents Grafana from observing a half-published dashboard bundle.
 
 The deployment repository should review and commit the rendered files together with its Prometheus scrape configuration and read-only controller metrics bridge. The public repository does not receive those rendered files, datasource credentials, hostnames, collector paths, or live inventory.
 
@@ -28,7 +28,7 @@ The deployment repository should review and commit the rendered files together w
 | `dashboard_folder` | Grafana folder for the dashboard. |
 | `prometheus_datasource_uid` | Existing Prometheus datasource UID. |
 | `controller_job` | Prometheus `job` label for the read-only Agent VM controller bridge. |
-| `dashboard_path` | Container-visible directory that Grafana scans for JSON dashboards. |
+| `dashboard_path` | Container-visible `current` directory that Grafana scans for JSON dashboards; it must point at the stable active-bundle path, not the release parent. |
 | `dashboard_filename` | Optional rendered filename; defaults to `agent-vm-observability.json`. |
 | `inventory_dashboard_uid` | Optional stable UID for the inventory dashboard; defaults to `<dashboard_uid>-inventory`. |
 | `inventory_dashboard_title` | Optional inventory dashboard title; defaults to `<dashboard_title> / Inventory & Operations`. |

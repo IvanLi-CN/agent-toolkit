@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -187,22 +187,20 @@ export function renderBundle(config: ObservabilityConfig, templateDir: string = 
 export function writeBundle(bundle: RenderedBundle, outputDir: string, force = false): { dashboardPath: string; inventoryDashboardPath: string; provisioningPath: string } {
   const directory = resolve(outputDir);
   mkdirSync(directory, { recursive: true });
-  const dashboardPath = resolve(directory, bundle.dashboardFilename);
-  const inventoryDashboardPath = resolve(directory, bundle.inventoryDashboardFilename);
+  const activeDirectory = join(directory, "current");
+  const releasesDirectory = join(directory, ".releases");
+  const dashboardPath = resolve(activeDirectory, bundle.dashboardFilename);
+  const inventoryDashboardPath = resolve(activeDirectory, bundle.inventoryDashboardFilename);
   const provisioningPath = resolve(directory, "agent-vm-observability.yml");
   if (new Set([dashboardPath, inventoryDashboardPath, provisioningPath]).size !== 3) {
     throw new Error("dashboard output paths must be unique");
   }
-  const outputs = [
-    { path: dashboardPath, text: bundle.dashboardText },
-    { path: inventoryDashboardPath, text: bundle.inventoryDashboardText },
-    { path: provisioningPath, text: bundle.provisioningText },
-  ];
   const lockPath = join(directory, ".agent-vm-observability.lock");
   let lockAcquired = false;
   let staging: string | undefined;
-  const backups: Array<{ path: string; backup: string }> = [];
-  const installed: string[] = [];
+  let releasePath: string | undefined;
+  let currentNextPath: string | undefined;
+  let provisioningTempPath: string | undefined;
   try {
     try {
       mkdirSync(lockPath);
@@ -210,24 +208,42 @@ export function writeBundle(bundle: RenderedBundle, outputDir: string, force = f
     } catch (error) {
       throw new Error(`output directory is locked: ${directory}: ${String(error)}`);
     }
-    if (!force && (existsSync(dashboardPath) || existsSync(inventoryDashboardPath) || existsSync(provisioningPath))) {
-      throw new Error(`output exists; pass --force to replace ${basename(dashboardPath)}, ${basename(inventoryDashboardPath)} or agent-vm-observability.yml`);
+    const activeStat = existsSync(activeDirectory) ? lstatSync(activeDirectory) : undefined;
+    if (activeStat && !activeStat.isSymbolicLink()) {
+      throw new Error(`active bundle path must be a symlink: ${activeDirectory}; migrate the existing dashboard directory before rendering`);
     }
-    staging = mkdtempSync(join(directory, ".agent-vm-observability-"));
-    for (const [index, output] of outputs.entries()) writeFileSync(join(staging, String(index)), output.text, "utf8");
-    for (const [index, output] of outputs.entries()) {
-      const stagedPath = join(staging, String(index));
-      if (existsSync(output.path)) {
-        const backup = join(staging, `.backup-${index}`);
-        renameSync(output.path, backup);
-        backups.push({ path: output.path, backup });
-      }
-      renameSync(stagedPath, output.path);
-      installed.push(output.path);
+    const legacyPaths = [join(directory, bundle.dashboardFilename), join(directory, bundle.inventoryDashboardFilename)];
+    if (legacyPaths.some((path) => existsSync(path))) {
+      throw new Error(`legacy dashboard files exist beside the atomic bundle path; migrate ${directory} before rendering`);
     }
+    if (!force && (activeStat || existsSync(provisioningPath))) {
+      throw new Error(`output exists; pass --force to replace the active bundle or agent-vm-observability.yml`);
+    }
+    mkdirSync(releasesDirectory, { recursive: true });
+    staging = mkdtempSync(join(releasesDirectory, ".bundle-"));
+    writeFileSync(join(staging, bundle.dashboardFilename), bundle.dashboardText, "utf8");
+    writeFileSync(join(staging, bundle.inventoryDashboardFilename), bundle.inventoryDashboardText, "utf8");
+    releasePath = join(releasesDirectory, basename(staging).replace(/^\.bundle-/, "bundle-"));
+    renameSync(staging, releasePath);
+    staging = undefined;
+
+    // The dashboard provider points at the stable `current` symlink. Replacing
+    // that one directory entry makes both dashboards switch as one bundle.
+    currentNextPath = join(directory, `.current-${basename(releasePath)}`);
+    symlinkSync(join(".releases", basename(releasePath)), currentNextPath);
+
+    // Provisioning is a separate single-file artifact. Its provider path is
+    // stable, so an atomic file rename cannot expose a mixed dashboard path.
+    provisioningTempPath = join(directory, `.agent-vm-observability.yml.${basename(releasePath)}.tmp`);
+    writeFileSync(provisioningTempPath, bundle.provisioningText, "utf8");
+    renameSync(provisioningTempPath, provisioningPath);
+    provisioningTempPath = undefined;
+    renameSync(currentNextPath, activeDirectory);
+    currentNextPath = undefined;
   } catch (error) {
-    for (const path of installed) if (existsSync(path)) rmSync(path, { force: true });
-    for (const { path, backup } of backups.reverse()) if (existsSync(backup)) renameSync(backup, path);
+    if (provisioningTempPath && existsSync(provisioningTempPath)) rmSync(provisioningTempPath, { force: true });
+    if (currentNextPath && existsSync(currentNextPath)) rmSync(currentNextPath, { force: true });
+    if (releasePath && existsSync(releasePath)) rmSync(releasePath, { recursive: true, force: true });
     throw error;
   } finally {
     if (staging && existsSync(staging)) rmSync(staging, { recursive: true, force: true });

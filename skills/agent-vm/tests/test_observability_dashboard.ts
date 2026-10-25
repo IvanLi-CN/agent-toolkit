@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { renderBundle, readConfig, writeBundle, type ObservabilityConfig } from "../scripts/render_observability_dashboard.ts";
 import {
@@ -17,7 +17,7 @@ const config: ObservabilityConfig = {
   dashboard_folder: "Observability",
   prometheus_datasource_uid: "prometheus-test",
   controller_job: "controller-test",
-  dashboard_path: "/var/lib/grafana/dashboards/agent-vm",
+  dashboard_path: "/var/lib/grafana/dashboards/agent-vm/current",
 };
 
 test("renders a portable dashboard and provisioning bundle", () => {
@@ -65,7 +65,7 @@ test("renders a portable dashboard and provisioning bundle", () => {
   expect(bundle.dashboardText).not.toContain("16 cores");
   expect(bundle.dashboardText).not.toContain("64 GiB");
   expect(bundle.dashboardText).not.toContain("32 GiB");
-  expect(bundle.provisioningText).toContain('path: "/var/lib/grafana/dashboards/agent-vm"');
+  expect(bundle.provisioningText).toContain('path: "/var/lib/grafana/dashboards/agent-vm/current"');
   expect(bundle.provisioningText).toContain("orgId: 2");
   expect(bundle.provisioningText).not.toContain("__DASHBOARD_PATH__");
   expect(validateDashboard(bundle.inventoryDashboard, "prometheus-test", {
@@ -89,12 +89,31 @@ test("requires dashboard metrics in PromQL expressions", () => {
   })).toContain("missing required metric: agent_vm_up");
 });
 
+test("does not count metric names that only occur inside PromQL strings", () => {
+  const bundle = renderBundle(config);
+  const dashboard = structuredClone(bundle.inventoryDashboard) as Record<string, unknown>;
+  const panels = dashboard.panels as Array<Record<string, unknown>>;
+  const healthPanel = panels.find((panel) => panel.title === "Controller scrape health") as Record<string, unknown>;
+  const targets = healthPanel.targets as Array<Record<string, unknown>>;
+  const controllerTarget = targets.find((target) => target.refId === "A") as Record<string, unknown>;
+  controllerTarget.expr = 'label_replace(vector(1), "name", "agent_vm_up", "", "")';
+  expect(validateDashboard(dashboard, "prometheus-test", {
+    requiredPanelTitles: INVENTORY_REQUIRED_PANEL_TITLES,
+    requiredMetrics: INVENTORY_REQUIRED_METRICS,
+  })).toContain("missing required metric: agent_vm_up");
+});
+
 test("requires the rendered provisioning path", () => {
   const bundle = renderBundle(config);
   expect(validateProvisioning(bundle.provisioningText, config.dashboard_path)).toEqual([]);
   expect(validateProvisioning(bundle.provisioningText.replace(config.dashboard_path, "/wrong/path"), config.dashboard_path)).toContain(
     `provisioning provider path must be ${config.dashboard_path}`,
   );
+});
+
+test("rejects a provisioning mapping where a provider list is required", () => {
+  const invalid = `apiVersion: 1\n\nproviders:\n  type: file\n  path: "/var/lib/grafana/dashboards/agent-vm/current"\n`;
+  expect(validateProvisioning(invalid)).toContain("provisioning providers must contain exactly one provider list item");
 });
 
 test("rejects packet-rate expressions that convert counts to bits", () => {
@@ -183,6 +202,11 @@ test("writes both outputs and refuses accidental replacement", () => {
     const paths = writeBundle(bundle, root);
     expect(readFileSync(paths.dashboardPath, "utf8")).toContain('"refresh": "auto"');
     expect(readFileSync(paths.inventoryDashboardPath, "utf8")).toContain('"title": "Agent VM / Incus / Inventory & Operations"');
+    expect(lstatSync(join(root, "current")).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(join(root, "current"))).toMatch(/^\.releases\/bundle-/);
+    expect(readFileSync(join(root, "agent-vm-observability.yml"), "utf8")).toContain(
+      'path: "/var/lib/grafana/dashboards/agent-vm/current"',
+    );
     expect(() => writeBundle(bundle, root)).toThrow("pass --force");
     expect(writeBundle(bundle, root, true).dashboardPath).toBe(paths.dashboardPath);
   } finally {

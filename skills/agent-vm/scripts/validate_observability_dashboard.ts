@@ -145,6 +145,46 @@ function targetRecords(dashboard: JsonRecord): JsonRecord[] {
   return targets;
 }
 
+function stripPromqlStrings(expression: string): string {
+  let result = "";
+  let quote: string | undefined;
+  let escaped = false;
+  let comment = false;
+  for (const character of expression) {
+    if (comment) {
+      if (character === "\n") comment = false;
+      result += character === "\n" ? "\n" : " ";
+      continue;
+    }
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === quote) {
+        quote = undefined;
+      }
+      result += character === "\n" ? "\n" : " ";
+      continue;
+    }
+    if (character === "#") {
+      comment = true;
+      result += " ";
+    } else if (character === '"' || character === "'" || character === "`") {
+      quote = character;
+      result += " ";
+    } else {
+      result += character;
+    }
+  }
+  return result;
+}
+
+function expressionReferencesMetric(expression: string, metric: string): boolean {
+  const escapedMetric = metric.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[^A-Za-z0-9_:])${escapedMetric}(?=$|[^A-Za-z0-9_:])`).test(stripPromqlStrings(expression));
+}
+
 function panelIds(dashboard: JsonRecord): Map<number, number> {
   const counts = new Map<number, number>();
   walk(dashboard.panels, (value) => {
@@ -183,10 +223,11 @@ export function validateDashboard(dashboard: unknown, expectedDatasourceUid?: st
   const expressions = targets
     .map((target) => target.expr)
     .filter((expr): expr is string => typeof expr === "string");
-  const allExpressions = expressions.join("\n");
 
   for (const metric of options.requiredMetrics ?? REQUIRED_METRICS) {
-    if (!allExpressions.includes(metric)) findings.push(`missing required metric: ${metric}`);
+    if (!expressions.some((expression) => expressionReferencesMetric(expression, metric))) {
+      findings.push(`missing required metric: ${metric}`);
+    }
   }
 
   for (const [index, expression] of expressions.entries()) {
@@ -220,11 +261,23 @@ export function validateDashboard(dashboard: unknown, expectedDatasourceUid?: st
 
 export function validateProvisioning(provisioning: string, expectedDashboardPath?: string): string[] {
   const findings: string[] = [];
-  if (!/^apiVersion:\s*1\s*$/m.test(provisioning)) findings.push("provisioning must declare apiVersion 1");
-  if (!/^providers:\s*$/m.test(provisioning)) findings.push("provisioning must declare providers");
-  if (!/^\s+type:\s+file\s*$/m.test(provisioning)) findings.push("provisioning provider must use the file type");
-  const paths = [...provisioning.matchAll(/^\s+path:\s+\"([^\"]+)\"\s*$/gm)].map((match) => match[1]);
+  const lines = provisioning.replace(/\r\n?/g, "\n").split("\n").map((line) => line.trimEnd());
+  if (!lines.some((line) => /^apiVersion:\s*1\s*$/.test(line))) findings.push("provisioning must declare apiVersion 1");
+  if (!lines.some((line) => /^providers:\s*$/.test(line))) findings.push("provisioning must declare providers");
+  const providerStarts = lines.filter((line) => /^  - name:\s+\"[^\"]+\"\s*$/.test(line));
+  if (providerStarts.length !== 1) findings.push("provisioning providers must contain exactly one provider list item");
+  if (!lines.some((line) => /^    orgId:\s*[1-9][0-9]*\s*$/.test(line))) findings.push("provisioning provider must declare a positive orgId");
+  if (!lines.some((line) => /^    folder:\s+\"[^\"]*\"\s*$/.test(line))) findings.push("provisioning provider must declare a quoted folder");
+  if (!lines.some((line) => /^    type:\s+file\s*$/.test(line))) findings.push("provisioning provider must use the file type");
+  if (!lines.some((line) => /^    disableDeletion:\s+(?:true|false)\s*$/.test(line))) findings.push("provisioning provider must declare disableDeletion");
+  if (!lines.some((line) => /^    editable:\s+(?:true|false)\s*$/.test(line))) findings.push("provisioning provider must declare editable");
+  if (!lines.some((line) => /^    updateIntervalSeconds:\s*[1-9][0-9]*\s*$/.test(line))) findings.push("provisioning provider must declare updateIntervalSeconds");
+  if (!lines.some((line) => /^    options:\s*$/.test(line))) findings.push("provisioning provider must declare options");
+  const paths = lines.filter((line) => /^      path:\s+\"([^\"]+)\"\s*$/.test(line)).map((line) => line.replace(/^      path:\s+\"([^\"]+)\"\s*$/, "$1"));
   if (paths.length !== 1) findings.push("provisioning provider must declare exactly one quoted path");
+  if (!lines.some((line) => /^      foldersFromFilesStructure:\s+(?:true|false)\s*$/.test(line))) {
+    findings.push("provisioning provider must declare foldersFromFilesStructure");
+  }
   if (expectedDashboardPath && paths.length === 1 && paths[0] !== expectedDashboardPath) {
     findings.push(`provisioning provider path must be ${expectedDashboardPath}`);
   }

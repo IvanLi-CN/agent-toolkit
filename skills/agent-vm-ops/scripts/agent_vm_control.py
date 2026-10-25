@@ -2557,6 +2557,58 @@ class StateStore:
             finally:
                 self.depth -= 1
 
+    @contextmanager
+    def read_transaction(self):
+        """Keep one consistent SQLite snapshot without blocking native probes."""
+        with self._lock:
+            self._ensure_usable(phase="connection", sql_operation="read")
+            outer = self.depth == 0
+            if outer:
+                try:
+                    self.connection.execute("BEGIN")
+                except sqlite3.Error as exc:
+                    raise self._sqlite_failure(exc, phase="begin", sql_operation="read", state_committed=None) from exc
+            self.depth += 1
+            try:
+                yield
+            except sqlite3.Error as exc:
+                if outer:
+                    rollback_error = None
+                    try:
+                        self.connection.rollback()
+                    except sqlite3.Error as rollback_exc:
+                        rollback_error = rollback_exc
+                        self._unusable = True
+                    raise self._sqlite_failure(
+                        exc,
+                        phase="read",
+                        sql_operation="read",
+                        state_committed=None,
+                        rollback_error=rollback_error,
+                    ) from exc
+                raise
+            except BaseException:
+                if outer:
+                    try:
+                        self.connection.rollback()
+                    except sqlite3.Error:
+                        self._unusable = True
+                raise
+            else:
+                if outer:
+                    try:
+                        self.connection.commit()
+                    except sqlite3.Error as exc:
+                        self._unusable = True
+                        raise self._sqlite_failure(
+                            exc,
+                            phase="read",
+                            sql_operation="read",
+                            state_committed=None,
+                        ) from exc
+            finally:
+                self.depth -= 1
+
     def _row(self, query: str, args: Sequence[Any] = ()) -> sqlite3.Row | None:
         with self._lock:
             self._ensure_usable(phase="read", sql_operation="read")
@@ -7417,8 +7469,9 @@ class Control:
         return {"draining": draining, "tasks": tasks, "doctor": self.doctor(request, session_id)}
 
     def admin_metrics(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:
-        doctor = self.doctor(request, session_id)
-        with self._global_lock():
+        observation_epoch = uuid.uuid4().hex
+        with self.store.read_transaction():
+            doctor = self.doctor(request, session_id)
             tasks = self.store.list_tasks()
             task_states = Counter(str(task["state"]) for task in tasks)
             resources = doctor.get("resources", {})
@@ -7429,6 +7482,7 @@ class Control:
             if not isinstance(disk_admission, Mapping):
                 disk_admission = self._disk_admission_diagnostics(doctor.get("capacity"))
             return {
+                "observation_epoch": observation_epoch,
                 "observed_at": iso_time(self.now()),
                 "up": True,
                 "draining": self.store.get_meta("draining") == "1",

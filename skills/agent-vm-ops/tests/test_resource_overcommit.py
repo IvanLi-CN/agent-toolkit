@@ -493,11 +493,12 @@ class AdmissionTests(Fixture):
         result = self.call("admin-metrics")
         self.assertEqual(CONTROL.parse_time(result["observed_at"]), self.now)
         self.assertTrue({
-            "observed_at", "up", "draining", "admission_ready", "reclaim_required", "resources",
+            "observation_epoch", "observed_at", "up", "draining", "admission_ready", "reclaim_required", "resources",
             "capacity", "disk_admission", "default_admission", "ct_cpu", "ct_memory", "instances", "task_states", "operations",
             "pending_operations", "image_unpack_failures", "warnings", "warning_counts", "doctor",
         }.issubset(result))
         self.assertTrue(result["up"])
+        self.assertTrue(result["observation_epoch"])
         self.assertTrue(result["admission_ready"])
         self.assertTrue(result["ct_memory"]["pressure"])
         self.assertEqual(result["ct_memory"]["capacity_bytes"], 32 * GIB)

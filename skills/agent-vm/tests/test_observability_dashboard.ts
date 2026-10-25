@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { renderBundle, readConfig, writeBundle, type ObservabilityConfig } from "../scripts/render_observability_dashboard.ts";
 import {
@@ -262,6 +262,11 @@ test("fails closed when rollback cannot restore the prior link", () => {
     const injectedRename: typeof renameSync = (oldPath, newPath) => {
       if (String(newPath) === paths.provisioningPath) throw new Error("injected provisioning rename failure");
       if (String(oldPath).includes(".current-rollback-")) throw new Error("injected rollback rename failure");
+      if (String(oldPath).includes(".current-quarantine-")) {
+        rmSync(join(root, "current"), { force: true });
+        symlinkSync(".releases/missing-release", join(root, "current"));
+        throw new Error("injected quarantine rename failure");
+      }
       renameSync(oldPath, newPath);
     };
 

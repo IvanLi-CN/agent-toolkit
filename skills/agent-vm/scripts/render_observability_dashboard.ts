@@ -343,7 +343,8 @@ export function writeBundle(
           rmSync(quarantinePath, { force: true });
         } catch (quarantineError) {
           try {
-            if (existsSync(activeDirectory)) unlinkSync(activeDirectory);
+            // rmSync removes the link itself even when its target is dangling.
+            rmSync(activeDirectory, { force: true });
           } catch (unlinkError) {
             failClosedError = new Error(
               `failed to disable the mixed dashboard bundle: ${String(unlinkError)}; quarantine error: ${String(quarantineError)}`,

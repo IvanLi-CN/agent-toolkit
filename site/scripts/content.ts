@@ -56,12 +56,23 @@ export const references: Record<string, string[]> = {
 
 export async function readPublic(root: string, name: string): Promise<string> {
   const target = path.resolve(root, name);
-  const canonical = await realpath(target);
-  if (!canonical.startsWith(`${await realpath(root)}${path.sep}`) || (await lstat(target)).isSymbolicLink()) {
+  const relative = path.relative(path.resolve(root), target);
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
     throw new Error(`Public source must be a regular file within the checkout: ${name}`);
   }
-  if (!(await lstat(target)).isFile()) throw new Error(`Not a regular public file: ${name}`);
-  return readFile(target, 'utf8');
+  // Resolve the checkout itself, then inspect every source component. An in-checkout
+  // symlink must not redirect an allowlisted path into an excluded directory.
+  let current = await realpath(root);
+  const components = relative.split(path.sep);
+  for (const [index, component] of components.entries()) {
+    current = path.join(current, component);
+    const entry = await lstat(current);
+    if (entry.isSymbolicLink()) throw new Error(`Symlink in public source path: ${name}`);
+    if (index < components.length - 1 ? !entry.isDirectory() : !entry.isFile()) {
+      throw new Error(`Not a regular public source path: ${name}`);
+    }
+  }
+  return readFile(current, 'utf8');
 }
 
 export async function membership(root: string): Promise<string[]> {

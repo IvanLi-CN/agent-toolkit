@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { copyFile, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { parse, type DefaultTreeAdapterTypes } from 'parse5';
 import { unified } from 'unified';
@@ -8,7 +8,8 @@ import remarkGfm from 'remark-gfm';
 import remarkFrontmatter from 'remark-frontmatter';
 import { visit } from 'unist-util-visit';
 import { parse as parseYaml } from 'yaml';
-import { base, inventory, repoRoot, siteRoot, sourceUrl, type Inventory } from './content';
+import { base, generate, inventory, readPublic, repoRoot, siteRoot, sourceUrl, type Inventory } from './content';
+import { cssUrls, localTarget, srcsetUrls } from './resources';
 
 type Node = DefaultTreeAdapterTypes.Node;
 function elements(node: Node): DefaultTreeAdapterTypes.Element[] {
@@ -23,6 +24,36 @@ function attribute(node: DefaultTreeAdapterTypes.Element, name: string) {
 }
 async function files(root: string) {
   return Array.fromAsync(new Bun.Glob('**/*').scan({ cwd: root, onlyFiles: true, dot: true }));
+}
+
+async function checkResources(output: string, paths: string[], parsed: Map<string, DefaultTreeAdapterTypes.Document>) {
+  const available = new Set(paths);
+  let checked = 0;
+  const check = (url: string, from: string) => {
+    const target = localTarget(url, from, base);
+    if (!target) return;
+    assert(available.has(target.file), `Missing built target: ${from}: ${url}`);
+    if (target.hash && target.file.endsWith('.html')) {
+      const id = decodeURIComponent(target.hash.slice(1));
+      assert(elements(parsed.get(target.file)!).some(node => attribute(node, 'id') === id), `Missing built anchor: ${from}: ${url}`);
+    }
+    checked++;
+  };
+  for (const [name, document] of parsed) {
+    for (const element of elements(document)) {
+      for (const key of ['href', 'src']) {
+        const url = attribute(element, key);
+        if (url !== undefined) check(url, name);
+      }
+      for (const url of srcsetUrls(attribute(element, 'srcset') || '')) check(url, name);
+      for (const url of cssUrls(attribute(element, 'style') || '')) check(url, name);
+      if (element.tagName === 'style') for (const url of cssUrls(text(element))) check(url, name);
+    }
+  }
+  for (const name of paths.filter(name => name.endsWith('.css'))) {
+    for (const url of cssUrls(await readFile(path.join(output, name), 'utf8'))) check(url, name);
+  }
+  return checked;
 }
 
 // Recognize concrete secrets and private integration signatures, not words such as
@@ -57,24 +88,7 @@ async function checkOutput(root: string, generated: string, output: string) {
   assert.equal(search.length, expected.pages.length, 'Duplicate search entry');
   const parsed = new Map<string, DefaultTreeAdapterTypes.Document>();
   for (const name of htmlFiles) parsed.set(name, parse(await readFile(path.join(output, name), 'utf8')));
-  let checkedLinks = 0;
-  for (const [name, document] of parsed) {
-    for (const element of elements(document)) {
-      const url = attribute(element, 'href') || attribute(element, 'src');
-      if (!url || /^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(url)) continue;
-      const current = new URL(base + name.replace(/index\.html$/, ''), 'https://site.invalid');
-      const target = new URL(url, current);
-      assert(target.pathname.startsWith(base), `Link escapes repository base: ${name}: ${url}`);
-      const local = decodeURIComponent(target.pathname.slice(base.length));
-      const targetFile = !local || local.endsWith('/') ? `${local}index.html` : local;
-      assert(paths.includes(targetFile), `Missing built target: ${name}: ${url}`);
-      if (target.hash && targetFile.endsWith('.html')) {
-        const id = decodeURIComponent(target.hash.slice(1));
-        assert(elements(parsed.get(targetFile)!).some(node => attribute(node, 'id') === id), `Missing built anchor: ${name}: ${url}`);
-      }
-      checkedLinks++;
-    }
-  }
+  const checkedLinks = await checkResources(output, paths, parsed);
   for (const page of expected.pages) {
     const document = parsed.get(`${page.route.slice(1)}index.html`)!;
     const nodes = elements(document);
@@ -139,6 +153,40 @@ const cache = path.join(siteRoot, '.cache');
 await mkdir(cache, { recursive: true });
 const fixture = await mkdtemp(path.join(cache, 'content-check-'));
 try {
+  const resources = path.join(fixture, 'resources');
+  await mkdir(path.join(resources, 'static'), { recursive: true });
+  const resourcePaths = ['index.html', 'static/style.css', 'static/image.svg', 'static/image two.svg'];
+  const validHtml = `<h1 id="anchor">Resources</h1>
+    <a href="?version=1#anchor">Anchor</a>
+    <img href="static/image.svg" src="static/image.svg?size=2#icon"
+      srcset="data:image/svg+xml,%3Csvg%3E 1x, static/image.svg?size=2 2x"
+      style="background: url('static/image%20two.svg?size=2#icon')">
+    <style>/* url(missing-comment.svg) */ p::before { content: "url(missing-string.svg)" }
+      p { background: u\\72l(static/image.svg) }</style>
+    <img src="https://example.invalid/image.svg" srcset="//example.invalid/a.svg 1x, blob:example 2x"
+      style="background: url(data:image/svg+xml;base64,PHN2Zz4=)">`;
+  const validCss = `a { background: url('../static/image\\20 two.svg?size=2#icon') }
+    b { mask: url(${base}static/image.svg#icon) } c { mask: url(//example.invalid/icon.svg) }`;
+  for (const name of resourcePaths.filter(name => name.endsWith('.svg'))) await writeFile(path.join(resources, name), '<svg/>');
+  const resourceCheck = async (html = validHtml, css = validCss) => {
+    await writeFile(path.join(resources, 'static/style.css'), css);
+    return checkResources(resources, resourcePaths, new Map([['index.html', parse(html)]]));
+  };
+  assert.equal(await resourceCheck(), 8, 'Resource positive controls were not all checked');
+  for (const html of [
+    '<img href="static/image.svg" src="missing.svg">',
+    '<img srcset="static/image.svg 1x, missing.svg 2x">',
+    '<img style="background:url(missing.svg)">',
+    '<style>a { background:url(missing.svg) }</style>',
+    '<img src="/outside.svg">', '<a href="#missing">Missing anchor</a>',
+  ]) await assert.rejects(() => resourceCheck(html), /Missing built|escapes repository base/);
+  for (const css of [
+    'a { background:url(missing.svg) }',
+    'a { background:url(../../outside.svg) }',
+    'a { background:url("../static/missing.svg?size=2#icon") }',
+    'a { background:url("unterminated.svg) }',
+  ]) await assert.rejects(() => resourceCheck(validHtml, css), /Missing built|escapes repository base|Unterminated CSS/);
+  console.log('Resource controls: href/src independently, srcset, inline/style-sheet CSS, escaped URLs, relative/base/query/fragment, external schemes, missing targets and anchors');
   const source = path.join(fixture, 'source');
   const generated = path.join(fixture, 'generated');
   const output = path.join(fixture, 'dist');
@@ -182,6 +230,22 @@ try {
   };
   const before = await run();
   assert.equal(before.skills, 13);
+  const guides = path.join(source, 'docs/guides');
+  const excludedGuides = path.join(source, 'private/redirected-guides');
+  await rename(guides, excludedGuides);
+  await symlink(excludedGuides, guides, 'dir');
+  try {
+    await assert.rejects(() => readPublic(source, 'docs/guides/README.md'), /Symlink in public source path/);
+    await assert.rejects(() => generate(source, generated), /Symlink in public source path/);
+  } finally {
+    await rm(guides);
+    await rename(excludedGuides, guides);
+  }
+  const linkedFile = path.join(source, 'linked-source.md');
+  await symlink(path.join(source, 'README.md'), linkedFile);
+  await assert.rejects(() => readPublic(source, 'linked-source.md'), /Symlink in public source path/);
+  await assert.rejects(() => readPublic(source, '../outside.md'), /within the checkout/);
+  console.log('Source controls: in-checkout symlink ancestor and final symlink rejected; generation fails closed; checkout escape rejected');
   const removed = 'docs-no-revision-markers';
   const manifest = path.join(source, 'PUBLIC_SKILLS.txt');
   await writeFile(manifest, (await readFile(manifest, 'utf8')).split('\n').filter(line => line.trim() !== removed).join('\n'));

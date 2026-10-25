@@ -2495,10 +2495,16 @@ class StateStore:
 
     @contextmanager
     def transaction(self, *, mutating: bool = True):
-        """Nestable short transactions; never wrap native operations/waits."""
+        """Nestable short transactions; never wrap native operations/waits.
+
+        The observation epoch advances only when the transaction changed durable
+        SQLite state. Successful read/no-op transactions must not invalidate a
+        concurrent metrics snapshot.
+        """
         with self._lock:
             self._ensure_usable(phase="connection", sql_operation="write")
             outer = self.depth == 0
+            initial_total_changes = getattr(self.connection, "total_changes", None) if outer else None
             if outer:
                 try:
                     self.connection.execute("BEGIN IMMEDIATE")
@@ -2543,7 +2549,8 @@ class StateStore:
             else:
                 if outer:
                     try:
-                        if mutating:
+                        current_total_changes = getattr(self.connection, "total_changes", None)
+                        if mutating and (initial_total_changes is None or current_total_changes != initial_total_changes):
                             self.connection.execute(
                                 "UPDATE meta SET value = ? WHERE key = 'state_epoch'",
                                 (uuid.uuid4().hex,),

@@ -15,6 +15,20 @@ from test_native_agent_vm import CONTROL, CLI, Fixture, GIB, KEY
 
 
 class SQLiteStateTests(unittest.TestCase):
+    def test_state_epoch_does_not_advance_for_a_successful_noop_transaction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = CONTROL.StateStore(Path(directory) / "state.sqlite3")
+            try:
+                before = store.get_meta("state_epoch")
+                with store.transaction():
+                    pass
+                self.assertEqual(store.get_meta("state_epoch"), before)
+                with store.transaction():
+                    store.set_meta("epoch-marker", "changed")
+                self.assertNotEqual(store.get_meta("state_epoch"), before)
+            finally:
+                store.close()
+
     def test_corrupt_database_initialization_is_structured(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.sqlite3"

@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 
+import { randomUUID } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -185,6 +186,72 @@ export function renderBundle(config: ObservabilityConfig, templateDir: string = 
 }
 
 type RenameFile = typeof renameSync;
+type OutputLock = { path: string; token: string };
+
+function readLockOwner(lockPath: string): { pid: number; token: string } | undefined {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(join(lockPath, "owner.json"), "utf8"));
+    if (!isRecord(parsed) || typeof parsed.pid !== "number" || !Number.isSafeInteger(parsed.pid) || parsed.pid <= 0 || typeof parsed.token !== "string" || parsed.token === "") {
+      return undefined;
+    }
+    return { pid: parsed.pid, token: parsed.token };
+  } catch {
+    return undefined;
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const code = isRecord(error) && typeof error.code === "string" ? error.code : undefined;
+    return code !== "ESRCH";
+  }
+}
+
+function acquireOutputLock(directory: string): OutputLock {
+  const lockPath = join(directory, ".agent-vm-observability.lock");
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const token = randomUUID();
+    try {
+      mkdirSync(lockPath);
+      try {
+        writeFileSync(
+          join(lockPath, "owner.json"),
+          `${JSON.stringify({ pid: process.pid, token, started_at: new Date().toISOString() })}\n`,
+          "utf8",
+        );
+      } catch (error) {
+        rmSync(lockPath, { recursive: true, force: true });
+        throw new Error(`cannot initialize output directory lock: ${directory}: ${String(error)}`);
+      }
+      return { path: lockPath, token };
+    } catch (error) {
+      const code = isRecord(error) && typeof error.code === "string" ? error.code : undefined;
+      if (code !== "EEXIST") {
+        if (String(error).includes("cannot initialize output directory lock")) throw error;
+        throw new Error(`cannot acquire output directory lock: ${directory}: ${String(error)}`);
+      }
+    }
+
+    const owner = readLockOwner(lockPath);
+    if (!owner) throw new Error(`output directory is locked: ${directory}; owner metadata is unavailable`);
+    if (isProcessAlive(owner.pid)) throw new Error(`output directory is locked: ${directory}; owner pid ${owner.pid} is alive`);
+    try {
+      rmSync(lockPath, { recursive: true, force: false });
+    } catch (error) {
+      throw new Error(`output directory is locked: ${directory}; stale lock cannot be reclaimed: ${String(error)}`);
+    }
+  }
+  throw new Error(`output directory is locked: ${directory}; stale-lock recovery did not converge`);
+}
+
+function releaseOutputLock(lock: OutputLock): void {
+  const owner = readLockOwner(lock.path);
+  if (owner?.pid !== process.pid || owner.token !== lock.token) return;
+  rmSync(lock.path, { recursive: true, force: false });
+}
 
 export function writeBundle(
   bundle: RenderedBundle,
@@ -202,21 +269,17 @@ export function writeBundle(
   if (new Set([dashboardPath, inventoryDashboardPath, provisioningPath]).size !== 3) {
     throw new Error("dashboard output paths must be unique");
   }
-  const lockPath = join(directory, ".agent-vm-observability.lock");
-  let lockAcquired = false;
+  let outputLock: OutputLock | undefined;
   let staging: string | undefined;
   let releasePath: string | undefined;
   let currentNextPath: string | undefined;
+  let rollbackCurrentNextPath: string | undefined;
   let provisioningTempPath: string | undefined;
   let activeDirectoryReplaced = false;
   let previousCurrentTarget: string | undefined;
+  let preserveActiveRelease = false;
   try {
-    try {
-      mkdirSync(lockPath);
-      lockAcquired = true;
-    } catch (error) {
-      throw new Error(`output directory is locked: ${directory}: ${String(error)}`);
-    }
+    outputLock = acquireOutputLock(directory);
     const activeStat = existsSync(activeDirectory) ? lstatSync(activeDirectory) : undefined;
     if (activeStat && !activeStat.isSymbolicLink()) {
       throw new Error(`active bundle path must be a symlink: ${activeDirectory}; migrate the existing dashboard directory before rendering`);
@@ -255,21 +318,36 @@ export function writeBundle(
     renameFile(provisioningTempPath, provisioningPath);
     provisioningTempPath = undefined;
   } catch (error) {
+    let rollbackFailure: Error | undefined;
     if (activeDirectoryReplaced) {
       try {
-        unlinkSync(activeDirectory);
-        if (previousCurrentTarget !== undefined) symlinkSync(previousCurrentTarget, activeDirectory);
+        if (previousCurrentTarget !== undefined) {
+          rollbackCurrentNextPath = join(directory, `.current-rollback-${randomUUID()}`);
+          symlinkSync(previousCurrentTarget, rollbackCurrentNextPath);
+          renameFile(rollbackCurrentNextPath, activeDirectory);
+          rollbackCurrentNextPath = undefined;
+        } else {
+          unlinkSync(activeDirectory);
+        }
       } catch (rollbackError) {
-        throw new Error(`failed to restore active dashboard bundle after provisioning failure: ${String(rollbackError)}; original error: ${String(error)}`);
+        preserveActiveRelease = true;
+        rollbackFailure = new Error(
+          `failed to restore active dashboard bundle after provisioning failure: ${String(rollbackError)}; original error: ${String(error)}`,
+        );
       }
+    }
+    if (activeDirectoryReplaced) {
+      activeDirectoryReplaced = false;
     }
     if (provisioningTempPath && existsSync(provisioningTempPath)) rmSync(provisioningTempPath, { force: true });
     if (currentNextPath && existsSync(currentNextPath)) rmSync(currentNextPath, { force: true });
-    if (releasePath && existsSync(releasePath)) rmSync(releasePath, { recursive: true, force: true });
+    if (rollbackCurrentNextPath && existsSync(rollbackCurrentNextPath)) rmSync(rollbackCurrentNextPath, { force: true });
+    if (!preserveActiveRelease && releasePath && existsSync(releasePath)) rmSync(releasePath, { recursive: true, force: true });
+    if (rollbackFailure) throw rollbackFailure;
     throw error;
   } finally {
     if (staging && existsSync(staging)) rmSync(staging, { recursive: true, force: true });
-    if (lockAcquired && existsSync(lockPath)) rmSync(lockPath, { recursive: true, force: true });
+    if (outputLock) releaseOutputLock(outputLock);
   }
   return { dashboardPath, inventoryDashboardPath, provisioningPath };
 }

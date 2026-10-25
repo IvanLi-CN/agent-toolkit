@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { renderBundle, readConfig, writeBundle, type ObservabilityConfig } from "../scripts/render_observability_dashboard.ts";
 import {
@@ -229,6 +229,42 @@ test("restores the previous bundle when provisioning activation fails", () => {
     expect(() => writeBundle(bundle, root, true, injectedRename)).toThrow("injected provisioning rename failure");
     expect(readlinkSync(join(root, "current"))).toBe(previousTarget);
     expect(readFileSync(paths.provisioningPath, "utf8")).toBe(previousProvisioning);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("keeps the active release when rollback cannot restore the prior link", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-vm-observability-rollback-failure-"));
+  try {
+    const bundle = renderBundle(config);
+    const paths = writeBundle(bundle, root);
+    const previousTarget = readlinkSync(join(root, "current"));
+    const previousProvisioning = readFileSync(paths.provisioningPath, "utf8");
+    const injectedRename: typeof renameSync = (oldPath, newPath) => {
+      if (String(newPath) === paths.provisioningPath) throw new Error("injected provisioning rename failure");
+      if (String(oldPath).includes(".current-rollback-")) throw new Error("injected rollback rename failure");
+      renameSync(oldPath, newPath);
+    };
+
+    expect(() => writeBundle(bundle, root, true, injectedRename)).toThrow("failed to restore active dashboard bundle");
+    const activeTarget = readlinkSync(join(root, "current"));
+    expect(activeTarget).not.toBe(previousTarget);
+    expect(existsSync(join(root, activeTarget))).toBe(true);
+    expect(readFileSync(paths.provisioningPath, "utf8")).toBe(previousProvisioning);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("reclaims a stale output-directory lock", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-vm-observability-stale-lock-"));
+  try {
+    const lockPath = join(root, ".agent-vm-observability.lock");
+    mkdirSync(lockPath);
+    writeFileSync(join(lockPath, "owner.json"), JSON.stringify({ pid: 2147483647, token: "stale", started_at: "2000-01-01T00:00:00Z" }));
+    const paths = writeBundle(renderBundle(config), root);
+    expect(readFileSync(paths.dashboardPath, "utf8")).toContain('"refresh": "auto"');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

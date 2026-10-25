@@ -82,6 +82,7 @@ class SessionContractTests(unittest.TestCase):
                 self.assertEqual(mutation.call_args.kwargs["operation_id_value"], "failed-acquire-operation")
                 self.assertEqual(CLI.read_session_state(session)["generation"], 1)
                 self.assertEqual(CLI.read_session_state(session)["task_id"], "avm-recovery123")
+                self.assertTrue(CLI.read_session_state(session)["cleanup_only"])
 
                 for command in ("release", "destroy"):
                     cleanup_args = CLI.build_parser().parse_args([command, "--session-id", session])
@@ -229,6 +230,31 @@ class SessionContractTests(unittest.TestCase):
 
         self.assertEqual(state["task_id"], "avm-pending123")
         self.assertEqual(state["generation"], 1)
+        self.assertTrue(state["cleanup_only"])
+
+    def test_cleanup_only_recovery_state_blocks_ssh_and_lease_mutations(self):
+        session = "cleanup-only-state"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", root / "state"):
+                CLI.write_session_state(session, {
+                    "session_id": session,
+                    "task_id": "avm-cleanup123",
+                    "generation": 1,
+                    "private_key": str(root / "id_ed25519"),
+                    "cleanup_only": True,
+                })
+                with mock.patch.object(CLI, "control_request") as request:
+                    with self.assertRaises(CLI.CliError) as ssh_failure:
+                        CLI.fetch_ssh_info(session)
+                self.assertEqual(ssh_failure.exception.code, "lease_unavailable")
+                request.assert_not_called()
+
+                args = CLI.build_parser().parse_args(["renew", "--session-id", session])
+                with self.assertRaises(CLI.CliError) as renew_failure:
+                    CLI.dispatch(args)
+
+        self.assertEqual(renew_failure.exception.code, "lease_unavailable")
 
     def test_recovery_status_response_must_echo_operation_identity(self):
         response = {

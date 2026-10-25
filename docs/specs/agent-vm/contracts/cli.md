@@ -42,6 +42,8 @@ Unknown flags and command layouts must be rejected; callers should use `--help` 
 
 ## Request and response
 
+Pending operation entries may include the exact task ID bound to an acquire; recovery proofs require that binding in addition to session and generation identity.
+
 For `admin-metrics`, `up` is `true` only when the action and its initial Incus version/instance probe succeeded; it is separate from `admission_ready` and runtime pressure.
 
 `observed_at` is the start of the final bounded native sampling window, not the response serialization time; scrape bridges must preserve it when evaluating freshness.
@@ -61,7 +63,7 @@ Acquire, restart and restart-capable resize use a longer bounded transport timeo
 Guest filesystem growth reports `guest_filesystem` evidence including `status` (`grown`, `grown_after_retry` or `already_grown`, including when a bounded retry confirms that a prior mutation completed), virtual capacity, filesystem capacity, the verification threshold, filesystem type and direct device topology. A guest growth failure is `guest_resize_unverified` with bounded stdout/stderr, the failing phase, command, return code, truncation flags when applicable, process-group cleanup evidence on command timeout, capacity evidence and a bounded attempt/retry chain; acquire cleanup must leave no active lease or exposed SSH mapping, while the durable partial state remains inspectable and retryable.
 
 When acquire returns an error after the control side has created a durable task, the client performs one status read and persists the task ID, generation and private-key path only when the status carries either the failed acquire's operation ID in partial-failure evidence or a controller-verified committed acquire operation with the matching generation. The controller records partial-failure operation IDs durably and proves committed operations from its operation journal. This recovery state is a cleanup handle only: acquire does not print a lease or expose SSH unless the successful result contains an effective lease. Public `release` and `destroy` remain usable with that state so cached, transitional and partially cleaned tasks can be retried, including retrying a durable cache deletion. An absent, stale, concurrent or mismatched status does not create guessed local state.
-When background cleanup advances a failed acquire to a cached task before that status read, the controller retains a task- and generation-bound partial-failure marker until a later acquire or explicit destruction supersedes it, so the same cleanup handle remains verifiable.
+Recovery state created from partial-failure evidence is cleanup-only: it cannot be used for SSH or lease mutations until a successful acquire replaces it. When background cleanup advances a failed acquire to a cached task before that status read, the controller retains a task-, generation-, and operation-bound partial-failure marker until a later acquire or explicit destruction supersedes it, so the same cleanup handle remains verifiable.
 
 ## SSH and ports
 

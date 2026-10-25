@@ -1395,13 +1395,13 @@ class LifecycleTests(Fixture):
         self.assertEqual(result["recovery_operation_id"], "op-1")
 
     def test_status_proves_pending_acquire_operation_for_cleanup_recovery(self):
-        self.acquire()
+        task = self.acquire()
         self.store.record_operation(
             "pending-recovery",
             "acquire",
             "thread-a",
             0,
-            {"outcome": "pending", "_request_digest": "pending-acquire"},
+            {"outcome": "pending", "_request_digest": "pending-acquire", "task_id": task["task_id"]},
         )
         request = self.request("status")
         request["operation_id"] = "pending-recovery"
@@ -1430,7 +1430,14 @@ class LifecycleTests(Fixture):
                 operation_id="wrong-result-task",
                 result=dict(original["result"], task_id="avm-other123"),
             ),
-            "pending": {"outcome": "pending", "_request_digest": "pending-digest"},
+            "wrong-request-generation": dict(original, operation_id="wrong-request-generation", generation=99),
+            "pending": {"outcome": "pending", "_request_digest": "pending-digest", "generation": 0},
+            "pending-wrong-task": {
+                "outcome": "pending",
+                "_request_digest": "pending-digest",
+                "generation": 0,
+                "task_id": "avm-other123",
+            },
             "error": {
                 "outcome": "error",
                 "error": {"code": "guest_resize_unverified", "message": "growth failed"},
@@ -1444,6 +1451,7 @@ class LifecycleTests(Fixture):
             with self.subTest(operation_id=operation_id):
                 result = self.control.dispatch(request)["result"]
                 self.assertNotIn("recovery_operation_id", result)
+                self.assertNotIn("partial_operation_id", result)
 
     def test_status_rejects_an_old_acquire_after_a_new_generation(self):
         self.acquire()
@@ -1487,7 +1495,7 @@ class LifecycleTests(Fixture):
             "acquire",
             "thread-a",
             0,
-            {"outcome": "pending", "_request_digest": "pending-acquire"},
+            {"outcome": "pending", "_request_digest": "pending-acquire", "task_id": task["task_id"]},
         )
         self.store.update_task(
             task["task_id"],
@@ -1658,6 +1666,46 @@ class LifecycleTests(Fixture):
         self.assertEqual(task["reservation_bytes"], 0)
         self.assertNotIn(task["instance_name"], self.runner.instances)
         self.assertEqual(self.store.operation("op-1")["outcome"], "error")
+
+    def test_deterministic_native_init_cleanup_failure_preserves_absence_retry(self):
+        failure = CONTROL.ControlError("command_failed", "image unpack failed")
+
+        def init_with_residue(_image, name, metadata):
+            self.runner.instances[name] = {
+                "name": name,
+                "status": "Stopped",
+                "config": dict(metadata),
+                "devices": {},
+                "expanded_devices": {
+                    "eth0": {"type": "nic", "network": "agentsbr0"},
+                    "root": {"type": "disk", "size": "20GiB"},
+                },
+            }
+            raise failure
+
+        self.runner.failure = lambda args: "delete" in args
+        with mock.patch.object(self.control.incus, "init", side_effect=init_with_residue):
+            with self.assertRaises(CONTROL.ControlError) as error:
+                self.acquire()
+        self.assertEqual(error.exception.code, "command_failed")
+        task = self.store.get_task(session_id="thread-a")
+        self.assertEqual(task["state"], "closing")
+        self.assertGreater(task["reservation_bytes"], 0)
+        self.assertTrue(json.loads(task["last_error"])["native_init_absence_retry"])
+        self.assertEqual(self.store.operation("op-1")["outcome"], "pending")
+
+        self.runner.failure = None
+        with self.assertRaises(CONTROL.ControlError) as retry:
+            self.control._release_task(task)
+        self.assertEqual(retry.exception.code, "cleanup_incomplete")
+        self.assertNotIn(task["instance_name"], self.runner.instances)
+
+        self.now += dt.timedelta(seconds=CONTROL.NATIVE_INIT_ABSENCE_RETRY_SECONDS)
+        self.control._release_task(self.store.get_task(task_id=task["task_id"]))
+        current = self.store.get_task(session_id="thread-a")
+        self.assertEqual(current["state"], "absent")
+        self.assertEqual(current["reservation_bytes"], 0)
+        self.assertNotIn(task["instance_name"], self.runner.instances)
 
     def test_native_init_cleanup_failure_never_caches_visible_instance(self):
         task = self.control._base_task("thread-a", 1)

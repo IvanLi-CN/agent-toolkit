@@ -200,8 +200,10 @@ def write_session_state(value: str, state: dict[str, Any]) -> bool:
     return True
 
 
-def current_generation(value: str) -> int:
+def current_generation(value: str, *, allow_cleanup_only: bool = False) -> int:
     state = read_session_state(value)
+    if state.get("cleanup_only") is True and not allow_cleanup_only:
+        fail("lease_unavailable", "local recovery state is cleanup-only; release or destroy the session first")
     generation = state.get("generation")
     if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
         fail("local_state_invalid", "local session state has no valid generation")
@@ -245,12 +247,16 @@ def persist_recovery_state(
     if committed_operation:
         if generation not in {expected_generation, expected_generation + 1}:
             return False
+    elif partial_operation_id == operation_id:
+        if generation not in {expected_generation, expected_generation + 1}:
+            return False
     elif generation != expected_generation + 1:
         return False
     state = {
         "session_id": session,
         "task_id": task_id,
         "generation": generation,
+        "cleanup_only": not committed_operation,
     }
     state["private_key"] = str(private_key)
     try:
@@ -1065,11 +1071,13 @@ def ssh_config_path(path: Path) -> str:
 
 
 def fetch_ssh_info(session: str) -> tuple[dict[str, Any], dict[str, Any], Path]:
+    state = read_session_state(session)
+    if state.get("cleanup_only") is True:
+        fail("lease_unavailable", "local recovery state is cleanup-only; release or destroy the session first")
     response = control_request("ssh-info", session=session)
     info = response["result"]
     if not isinstance(info, dict):
         fail("invalid_remote_response", "ssh-info result is not an object")
-    state = read_session_state(session)
     private_key = Path(str(state["private_key"]))
     if state.get("task_id") != info["task_id"] or state.get("generation") != info["generation"]:
         fail("generation_mismatch", "connection material belongs to another lease; acquire the current lease first")
@@ -1227,7 +1235,7 @@ def mutation(
     session = session if session is not None else session_id(getattr(args, "session_id", None))
     if generation is None and action not in {"acquire", "drain-enter", "drain-exit", "admin-reconcile", "admin-gc"}:
         assert session is not None
-        generation = current_generation(session)
+        generation = current_generation(session, allow_cleanup_only=action in {"release", "destroy"})
     return control_request(
         action,
         session=session,
@@ -1291,7 +1299,8 @@ def command_acquire(args: argparse.Namespace) -> int:
             )
         fail("lease_unavailable", "replayed allocation no longer has an active lease; inspect status")
     if not write_session_state(session, {"session_id": session, "task_id": result["task_id"],
-                                         "generation": result["generation"], "private_key": str(private_key)}):
+                                         "generation": result["generation"], "private_key": str(private_key),
+                                         "cleanup_only": False}):
         fail("local_state_conflict", "successful acquire response conflicts with newer local session state")
     json_output(response)
     return 0

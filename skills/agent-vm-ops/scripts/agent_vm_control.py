@@ -2972,6 +2972,8 @@ class StateStore:
                 "generation": row["generation"],
                 "created_at": row["created_at"],
             })
+            if isinstance(response.get("task_id"), str):
+                pending[-1]["task_id"] = response["task_id"]
         return pending
 
     def get_meta(self, key: str) -> str | None:
@@ -3616,6 +3618,7 @@ class Control:
             item for item in pending
             if item.get("action") == "acquire"
             and item.get("session_id") == task.get("session_id")
+            and item.get("task_id") in {None, task.get("task_id")}
             and item.get("generation") in {
                 task.get("generation"),
                 task.get("generation") - 1
@@ -3630,6 +3633,27 @@ class Control:
                 {"task_id": task["task_id"]},
             )
         return matches[0] if matches else None
+
+    def _bind_pending_acquire_operation(self, request: Mapping[str, Any], task: Mapping[str, Any]) -> None:
+        operation_id = require_nonempty_string(request.get("operation_id"), "operation_id", SESSION_ID_RE)
+        operation = self.store.operation(operation_id)
+        if operation is None or operation.get("outcome") != "pending":
+            return
+        existing_task_id = operation.get("task_id")
+        if existing_task_id is not None and existing_task_id != task["task_id"]:
+            raise ControlError(
+                "operation_unverified",
+                "pending acquire operation is bound to a different task",
+                {"operation_id": operation_id},
+            )
+        operation["task_id"] = task["task_id"]
+        self.store.record_operation(
+            operation_id,
+            "acquire",
+            task["session_id"],
+            request["generation"],
+            operation,
+        )
 
     def _recovered_native_init_operation(
         self,
@@ -5234,7 +5258,8 @@ class Control:
                            *, memory_reduction: bool = False,
                            startup_required: bool = True,
                            startup_cpu: int | None = None,
-                           admission_epoch: str | None = None) -> dict[str, Any]:
+                           admission_epoch: str | None = None,
+                           acquire_operation: Mapping[str, Any] | None = None) -> dict[str, Any]:
         # Only a verified, memory-only reduction may bypass new-demand gates.
         # Its old allocation stays reserved until native completion is verified.
         if memory_reduction:
@@ -5279,6 +5304,8 @@ class Control:
             if not record.get("resources_json"):
                 record["resources_json"] = json.dumps(dict(resources), sort_keys=True)
             self.store.put_task(record)
+            if acquire_operation is not None:
+                self._bind_pending_acquire_operation(acquire_operation, record)
             return record
 
     def _reserve_resources_with_transition_wait(
@@ -5288,6 +5315,7 @@ class Control:
         *,
         startup_cpu: int | None = None,
         admission_epoch: str | None = None,
+        acquire_operation: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Wait for an unrelated native cleanup to leave the admission fence.
 
@@ -5306,6 +5334,7 @@ class Control:
                     resources,
                     startup_cpu=startup_cpu,
                     admission_epoch=admission_epoch,
+                    acquire_operation=acquire_operation,
                 )
             except ControlError as exc:
                 if (exc.code != "resource_unverified"
@@ -6288,6 +6317,7 @@ class Control:
             operation_task_id = operation_result.get("task_id") if isinstance(operation_result, Mapping) else None
             operation_session_id = operation_result.get("session_id") if isinstance(operation_result, Mapping) else None
             operation_generation = operation_result.get("generation") if isinstance(operation_result, Mapping) else None
+            request_generation = operation.get("generation") if isinstance(operation, Mapping) else None
             if (
                 operation
                 and operation.get("outcome") == "success"
@@ -6296,6 +6326,9 @@ class Control:
                 and operation.get("session_id") == session_id
                 and operation_session_id == session_id
                 and operation_task_id == task["task_id"]
+                and isinstance(request_generation, int)
+                and not isinstance(request_generation, bool)
+                and request_generation in {int(task["generation"]), int(task["generation"]) - 1}
                 and isinstance(operation_generation, int)
                 and not isinstance(operation_generation, bool)
                 and operation_generation == int(task["generation"])
@@ -6312,9 +6345,13 @@ class Control:
                 if (
                     len(pending) == 1
                     and task.get("state") != "absent"
+                    and pending[0].get("task_id") == task["task_id"]
                     and isinstance(pending[0].get("generation"), int)
                     and not isinstance(pending[0].get("generation"), bool)
-                    and int(task["generation"]) == pending[0]["generation"] + 1
+                    and int(task["generation"]) in {
+                        pending[0]["generation"],
+                        pending[0]["generation"] + 1,
+                    }
                 ):
                     result["partial_operation_id"] = recovery_operation_id
         admission = self._resource_diagnostics()
@@ -6329,6 +6366,7 @@ class Control:
             self._check_generation(existing, request)
             self._require_active(existing)
             self._ownership(existing)
+            self._bind_pending_acquire_operation(request, existing)
             resources = self._durable_resources(existing, "resources_json", allow_empty=False)
             target = self._requested_resources(request, resources, active_reuse=True)
             if target != resources:
@@ -6377,6 +6415,7 @@ class Control:
             reserved,
             startup_cpu=resources["cpu"],
             admission_epoch=admission_epoch,
+            acquire_operation=request,
         )
         completed = []
         phase = "reservation"
@@ -6484,7 +6523,19 @@ class Control:
                         "native_init_cleanup_verified", native_init_cleanup_verified
                     )
             elif phase == "native-init":
-                detail["native_init_absence_retry"] = False
+                cleanup_error = cleanup.get("error") if isinstance(cleanup, Mapping) else None
+                cleanup_detail = cleanup_error.get("detail") if isinstance(cleanup_error, Mapping) else None
+                if isinstance(cleanup_detail, Mapping) and cleanup_detail.get("native_init_absence_retry") is True:
+                    detail["native_init_absence_retry"] = True
+                    for key in (
+                        "native_init_absence_retry_after",
+                        "native_init_absence_checks",
+                        "native_init_cleanup_verified",
+                    ):
+                        if key in cleanup_detail:
+                            detail[key] = cleanup_detail[key]
+                else:
+                    detail["native_init_absence_retry"] = False
             if readiness is not None:
                 detail["readiness"] = readiness
             error = {"code": "acquire_partial", **detail, "error": exc.as_dict()}

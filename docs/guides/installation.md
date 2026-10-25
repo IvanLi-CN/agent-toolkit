@@ -26,7 +26,7 @@ target=<absolute-consumer-target>
 
 `source_target` 是 symlink 的精确 target 字符串，`source_identity` 是启用时对 source directory 执行 `cd ... && pwd -P` 得到的 canonical identity；`target` 是 consumer 中 link 的精确路径。启用、禁用和清理都把 Skill 名称、source target、source identity、target 与 record 一起作为 ownership 事实。单独匹配 symlink target 不足以取得 ownership。
 
-enable、disable 和 upstream deletion reconciliation 共享 `"$CONSUMER_SKILLS/.agent-toolkit-links.lock"`。它们用原子 `mkdir` 获取这个 consumer-root lock，并在锁内完成 ownership record、exact symlink target 与 source identity 的最终检查，以及 link/record 的创建或 unlink。已有 lock 路径（包括目录、文件或 symlink）都视为 busy/foreign：停止并报告，不删除未知状态或外部管理器状态。正常退出只用 `rmdir` 移除本次取得且仍为空的 lock；若 lock 已改变或不为空，则保留并报告。
+enable、disable 和 upstream deletion reconciliation 共享 `"$CONSUMER_SKILLS/.agent-toolkit-links.lock"`。它们用原子 `mkdir` 获取这个 consumer-root lock，成功后立即在 lock 内创建唯一的 `.owner.*` token，并记录 lock 目录与 token 的 identity。只有 token 路径、token 内容、目录 identity、token identity 和预期目录内容仍与本次实例一致时，cleanup/release 才会先删除自己的 token，再尝试 `rmdir`；token 缺失、路径或目录被替换、目录含有未知内容或 `rmdir` 失败都会保留 lock 并报告。已有 lock 路径（包括目录、文件或 symlink）都视为 busy/foreign：停止并报告，不删除未知状态或外部管理器状态。
 
 在你批准使用的消费者目录内启用一个 allowlisted Skill。示例先写 ownership record，再创建 link；record 通过同目录 hard link 安装以避免覆盖已有 record。若 record 写入或 link 创建失败，退出清理会移除本次创建的临时状态，绝不会留下没有 ownership record 的新 link：
 
@@ -43,21 +43,141 @@ LOCK_DIR="$CONSUMER_SKILLS/.agent-toolkit-links.lock"
 ledger_created=0
 marker_tmp=''
 lock_held=0
+lock_token=''
+lock_owner=''
+lock_dir_identity=''
+lock_token_identity=''
+lock_release_started=0
+lock_token_removed=0
 
 die() { printf 'Not changed: %s\n' "$*" >&2; exit 1; }
 case "$TOOLKIT_SOURCE" in /*) ;; *) die 'TOOLKIT_SOURCE must be an absolute path' ;; esac
 case "$CONSUMER_SKILLS" in /*) ;; *) die 'CONSUMER_SKILLS must be an absolute path' ;; esac
 case "$SKILL_NAME" in ''|*[!a-z0-9-]*) die 'SKILL_NAME is not a safe Skill name' ;; esac
 [ -d "$CONSUMER_SKILLS" ] || die 'consumer Skill root is missing'
+path_identity() {
+  case "$(uname -s)" in
+    Darwin) stat -f '%d:%i' "$1" ;;
+    Linux) stat -c '%d:%i' "$1" ;;
+    *) return 1 ;;
+  esac
+}
+preserve_lock() {
+  printf 'Consumer-root lock ownership could not be proven; leaving it untouched: %s\n' "$*" >&2
+  lock_held=0
+  return 1
+}
+release_empty_lock_dir() {
+  if [ ! -d "$LOCK_DIR" ] || [ -L "$LOCK_DIR" ]; then
+    preserve_lock 'lock path changed or is not a regular directory'
+    return 1
+  fi
+  current_lock_identity="$(path_identity "$LOCK_DIR" 2>/dev/null || true)"
+  if [ -z "$current_lock_identity" ] || [ "$current_lock_identity" != "$lock_dir_identity" ]; then
+    preserve_lock 'lock directory identity changed'
+    return 1
+  fi
+  lock_entry_count=0
+  lock_entry=''
+  for candidate in "$LOCK_DIR"/.[!.]* "$LOCK_DIR"/..?* "$LOCK_DIR"/*; do
+    if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+      lock_entry_count=$((lock_entry_count + 1))
+      lock_entry="$candidate"
+    fi
+  done
+  if [ "$lock_entry_count" -ne 0 ]; then
+    preserve_lock 'lock directory is not empty after token removal'
+    return 1
+  fi
+  if ! rmdir "$LOCK_DIR" 2>/dev/null; then
+    preserve_lock 'lock directory could not be removed'
+    return 1
+  fi
+  lock_held=0
+}
+release_lock() {
+  [ "$lock_held" -eq 1 ] || return 0
+  if [ "$lock_release_started" -eq 1 ]; then
+    if [ "$lock_token_removed" -ne 1 ]; then
+      preserve_lock 'lock release was interrupted before token removal'
+      return 1
+    fi
+    release_empty_lock_dir
+    return $?
+  fi
+  lock_release_started=1
+  if [ -z "$lock_token" ]; then preserve_lock 'ownership token is missing'; return 1; fi
+  if [ -z "$lock_owner" ]; then preserve_lock 'ownership token identity is missing'; return 1; fi
+  if [ -z "$lock_dir_identity" ]; then preserve_lock 'lock directory identity is missing'; return 1; fi
+  if [ -z "$lock_token_identity" ]; then preserve_lock 'lock token identity is missing'; return 1; fi
+  if [ ! -d "$LOCK_DIR" ] || [ -L "$LOCK_DIR" ]; then
+    preserve_lock 'lock path changed or is not a regular directory'
+    return 1
+  fi
+  current_lock_identity="$(path_identity "$LOCK_DIR" 2>/dev/null || true)"
+  if [ -z "$current_lock_identity" ] || [ "$current_lock_identity" != "$lock_dir_identity" ]; then
+    preserve_lock 'lock directory identity changed'
+    return 1
+  fi
+  case "$lock_token" in
+    "$LOCK_DIR"/.owner.*) ;;
+    *) preserve_lock 'lock token path changed'; return 1 ;;
+  esac
+  if [ ! -f "$lock_token" ] || [ -L "$lock_token" ]; then
+    preserve_lock 'ownership token is missing or foreign'
+    return 1
+  fi
+  current_token_identity="$(path_identity "$lock_token" 2>/dev/null || true)"
+  if [ -z "$current_token_identity" ] || [ "$current_token_identity" != "$lock_token_identity" ]; then
+    preserve_lock 'lock token identity changed'
+    return 1
+  fi
+  token_contents="$(cat "$lock_token" 2>/dev/null || true)"
+  if [ "$token_contents" != "$lock_owner" ]; then
+    preserve_lock 'ownership token content changed'
+    return 1
+  fi
+  lock_entry_count=0
+  lock_entry=''
+  for candidate in "$LOCK_DIR"/.[!.]* "$LOCK_DIR"/..?* "$LOCK_DIR"/*; do
+    if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+      lock_entry_count=$((lock_entry_count + 1))
+      lock_entry="$candidate"
+    fi
+  done
+  if [ "$lock_entry_count" -ne 1 ] || [ "$lock_entry" != "$lock_token" ]; then
+    preserve_lock 'lock directory contains unexpected state'
+    return 1
+  fi
+  if ! unlink "$lock_token"; then
+    preserve_lock 'ownership token could not be removed'
+    return 1
+  fi
+  lock_token_removed=1
+  lock_token=''
+  release_empty_lock_dir
+}
+acquire_lock() {
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    die 'consumer-root lock is already held or unavailable; no state was changed'
+  fi
+  lock_held=1
+  lock_dir_identity="$(path_identity "$LOCK_DIR" 2>/dev/null || true)"
+  [ -n "$lock_dir_identity" ] || die 'could not record lock directory identity; lock retained for review'
+  lock_token="$(mktemp "$LOCK_DIR/.owner.XXXXXX")" || die 'could not create lock ownership token; lock retained for review'
+  lock_owner="pid=$$ token=$lock_token"
+  if ! printf '%s\n' "$lock_owner" > "$lock_token"; then
+    die 'could not write lock ownership token; lock retained for review'
+  fi
+  chmod 600 "$lock_token" || die 'could not protect lock ownership token; lock retained for review'
+  lock_token_identity="$(path_identity "$lock_token" 2>/dev/null || true)"
+  [ -n "$lock_token_identity" ] || die 'could not record lock token identity; lock retained for review'
+}
 cleanup() {
   if [ -n "$marker_tmp" ]; then rm -f "$marker_tmp" 2>/dev/null || true; fi
   if [ "$ledger_created" -eq 1 ]; then rmdir "$LEDGER_DIR" 2>/dev/null || true; fi
   if [ "$lock_held" -eq 1 ]; then
-    if ! rmdir "$LOCK_DIR" 2>/dev/null; then
-      printf 'Consumer-root lock changed or is not empty; leaving it untouched: %s\n' "$LOCK_DIR" >&2
-    else
-      lock_held=0
-    fi
+    release_lock || true
   fi
 }
 stop_on_signal() {
@@ -68,10 +188,7 @@ trap cleanup EXIT
 trap 'stop_on_signal HUP 129' HUP
 trap 'stop_on_signal INT 130' INT
 trap 'stop_on_signal TERM 143' TERM
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  die 'consumer-root lock is already held or unavailable; no state was changed'
-fi
-lock_held=1
+acquire_lock
 [ -d "$SOURCE_TARGET" ] || die 'source Skill directory is missing'
 if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
   die 'Collision: inspect the existing consumer entry; nothing was replaced.'
@@ -114,10 +231,9 @@ if ! rm -f "$marker_tmp"; then
   die 'temporary ownership record cleanup failed; the link remains paired with its record for review'
 fi
 marker_tmp=''
-if ! rmdir "$LOCK_DIR" 2>/dev/null; then
-  die 'consumer-root lock could not be released; leaving it untouched for review'
+if ! release_lock; then
+  die 'consumer-root lock could not be released safely; leaving it untouched for review'
 fi
-lock_held=0
 trap - EXIT HUP INT TERM
 printf 'Enabled %s with ownership record %s\n' "$SKILL_NAME" "$RECORD"
 ```
@@ -152,15 +268,135 @@ LEDGER_DIR="$CONSUMER_SKILLS/.agent-toolkit-links"
 RECORD="$LEDGER_DIR/$SKILL_NAME.record"
 LOCK_DIR="$CONSUMER_SKILLS/.agent-toolkit-links.lock"
 lock_held=0
+lock_token=''
+lock_owner=''
+lock_dir_identity=''
+lock_token_identity=''
+lock_release_started=0
+lock_token_removed=0
 
 report() { printf 'Not disabling %s: %s; leaving entry and record untouched.\n' "$SKILL_NAME" "$*" >&2; exit 1; }
+path_identity() {
+  case "$(uname -s)" in
+    Darwin) stat -f '%d:%i' "$1" ;;
+    Linux) stat -c '%d:%i' "$1" ;;
+    *) return 1 ;;
+  esac
+}
+preserve_lock() {
+  printf 'Consumer-root lock ownership could not be proven; leaving it untouched: %s\n' "$*" >&2
+  lock_held=0
+  return 1
+}
+release_empty_lock_dir() {
+  if [ ! -d "$LOCK_DIR" ] || [ -L "$LOCK_DIR" ]; then
+    preserve_lock 'lock path changed or is not a regular directory'
+    return 1
+  fi
+  current_lock_identity="$(path_identity "$LOCK_DIR" 2>/dev/null || true)"
+  if [ -z "$current_lock_identity" ] || [ "$current_lock_identity" != "$lock_dir_identity" ]; then
+    preserve_lock 'lock directory identity changed'
+    return 1
+  fi
+  lock_entry_count=0
+  lock_entry=''
+  for candidate in "$LOCK_DIR"/.[!.]* "$LOCK_DIR"/..?* "$LOCK_DIR"/*; do
+    if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+      lock_entry_count=$((lock_entry_count + 1))
+      lock_entry="$candidate"
+    fi
+  done
+  if [ "$lock_entry_count" -ne 0 ]; then
+    preserve_lock 'lock directory is not empty after token removal'
+    return 1
+  fi
+  if ! rmdir "$LOCK_DIR" 2>/dev/null; then
+    preserve_lock 'lock directory could not be removed'
+    return 1
+  fi
+  lock_held=0
+}
+release_lock() {
+  [ "$lock_held" -eq 1 ] || return 0
+  if [ "$lock_release_started" -eq 1 ]; then
+    if [ "$lock_token_removed" -ne 1 ]; then
+      preserve_lock 'lock release was interrupted before token removal'
+      return 1
+    fi
+    release_empty_lock_dir
+    return $?
+  fi
+  lock_release_started=1
+  if [ -z "$lock_token" ]; then preserve_lock 'ownership token is missing'; return 1; fi
+  if [ -z "$lock_owner" ]; then preserve_lock 'ownership token identity is missing'; return 1; fi
+  if [ -z "$lock_dir_identity" ]; then preserve_lock 'lock directory identity is missing'; return 1; fi
+  if [ -z "$lock_token_identity" ]; then preserve_lock 'lock token identity is missing'; return 1; fi
+  if [ ! -d "$LOCK_DIR" ] || [ -L "$LOCK_DIR" ]; then
+    preserve_lock 'lock path changed or is not a regular directory'
+    return 1
+  fi
+  current_lock_identity="$(path_identity "$LOCK_DIR" 2>/dev/null || true)"
+  if [ -z "$current_lock_identity" ] || [ "$current_lock_identity" != "$lock_dir_identity" ]; then
+    preserve_lock 'lock directory identity changed'
+    return 1
+  fi
+  case "$lock_token" in
+    "$LOCK_DIR"/.owner.*) ;;
+    *) preserve_lock 'lock token path changed'; return 1 ;;
+  esac
+  if [ ! -f "$lock_token" ] || [ -L "$lock_token" ]; then
+    preserve_lock 'ownership token is missing or foreign'
+    return 1
+  fi
+  current_token_identity="$(path_identity "$lock_token" 2>/dev/null || true)"
+  if [ -z "$current_token_identity" ] || [ "$current_token_identity" != "$lock_token_identity" ]; then
+    preserve_lock 'lock token identity changed'
+    return 1
+  fi
+  token_contents="$(cat "$lock_token" 2>/dev/null || true)"
+  if [ "$token_contents" != "$lock_owner" ]; then
+    preserve_lock 'ownership token content changed'
+    return 1
+  fi
+  lock_entry_count=0
+  lock_entry=''
+  for candidate in "$LOCK_DIR"/.[!.]* "$LOCK_DIR"/..?* "$LOCK_DIR"/*; do
+    if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+      lock_entry_count=$((lock_entry_count + 1))
+      lock_entry="$candidate"
+    fi
+  done
+  if [ "$lock_entry_count" -ne 1 ] || [ "$lock_entry" != "$lock_token" ]; then
+    preserve_lock 'lock directory contains unexpected state'
+    return 1
+  fi
+  if ! unlink "$lock_token"; then
+    preserve_lock 'ownership token could not be removed'
+    return 1
+  fi
+  lock_token_removed=1
+  lock_token=''
+  release_empty_lock_dir
+}
+acquire_lock() {
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    report 'consumer-root lock is already held or unavailable; no state was changed'
+  fi
+  lock_held=1
+  lock_dir_identity="$(path_identity "$LOCK_DIR" 2>/dev/null || true)"
+  [ -n "$lock_dir_identity" ] || report 'could not record lock directory identity; lock retained for review'
+  lock_token="$(mktemp "$LOCK_DIR/.owner.XXXXXX")" || report 'could not create lock ownership token; lock retained for review'
+  lock_owner="pid=$$ token=$lock_token"
+  if ! printf '%s\n' "$lock_owner" > "$lock_token"; then
+    report 'could not write lock ownership token; lock retained for review'
+  fi
+  chmod 600 "$lock_token" || report 'could not protect lock ownership token; lock retained for review'
+  lock_token_identity="$(path_identity "$lock_token" 2>/dev/null || true)"
+  [ -n "$lock_token_identity" ] || report 'could not record lock token identity; lock retained for review'
+}
 cleanup_lock() {
   if [ "$lock_held" -eq 1 ]; then
-    if ! rmdir "$LOCK_DIR" 2>/dev/null; then
-      printf 'Consumer-root lock changed or is not empty; leaving it untouched: %s\n' "$LOCK_DIR" >&2
-    else
-      lock_held=0
-    fi
+    release_lock || true
   fi
 }
 stop_on_signal() {
@@ -172,10 +408,7 @@ trap 'stop_on_signal HUP 129' HUP
 trap 'stop_on_signal INT 130' INT
 trap 'stop_on_signal TERM 143' TERM
 [ -d "$CONSUMER_SKILLS" ] || report 'consumer Skill root is missing'
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  report 'consumer-root lock is already held or unavailable; no state was changed'
-fi
-lock_held=1
+acquire_lock
 [ -d "$LEDGER_DIR" ] && [ ! -L "$LEDGER_DIR" ] || report 'ownership ledger is missing or foreign'
 [ -f "$RECORD" ] && [ ! -L "$RECORD" ] || report 'ownership record is missing or foreign'
 [ -L "$TARGET" ] || report 'consumer entry is not the owned symlink'
@@ -208,17 +441,16 @@ if ! unlink "$RECORD"; then
   exit 1
 fi
 rmdir "$LEDGER_DIR" 2>/dev/null || true
-if ! rmdir "$LOCK_DIR" 2>/dev/null; then
-  report 'consumer-root lock could not be released; leaving it untouched for review'
+if ! release_lock; then
+  report 'consumer-root lock could not be released safely; leaving it untouched for review'
 fi
-lock_held=0
 trap - EXIT HUP INT TERM
 printf 'Disabled %s after ownership verification.\n' "$SKILL_NAME"
 ```
 
-当 source 目录已被上游删除时，`[ -e "$SOURCE_TARGET" ] || [ -L "$SOURCE_TARGET" ]` 为假，record 中的 canonical identity 仍作为历史 source identity；target 仍必须精确匹配 record。disable 的 lock、record、source identity 与 target 最终检查都完成后才 unlink；若 lock 已存在、信号中断或最终 target 已变为 foreign link，则停止并保留现状。只对已确认的 allowlisted 名称使用变量，不使用宽泛 glob。重新启用仍走 collision 检查，并且不能复用缺失、foreign 或 malformed record。
+当 source 目录已被上游删除时，`[ -e "$SOURCE_TARGET" ] || [ -L "$SOURCE_TARGET" ]` 为假，record 中的 canonical identity 仍作为历史 source identity；target 仍必须精确匹配 record。disable 的 lock、record、source identity 与 target 最终检查都完成后才 unlink；若 lock 已存在、token 丢失/改变、lock directory 被替换、信号中断或最终 target 已变为 foreign link，则停止并保留现状。只对已确认的 allowlisted 名称使用变量，不使用宽泛 glob。重新启用仍走 collision 检查，并且不能复用缺失、foreign 或 malformed record。
 
-卸载消费关系时，对你启用的每个条目逐一取得相同 consumer-root lock，执行 marker+exact-target+source-identity 最终检查和 unlink，再移除消费者自己的 source-root 配置。若 lock 已存在，或 marker 缺失、foreign、malformed、source identity changed 或 target changed，停止、报告并保留该 entry、record 与 checkout，等待人工核对；不要仅凭 target 删除，也不要触碰外部管理器状态。所有已验证的 link 清理后，只有空的 `.agent-toolkit-links` ledger 才可移除。不要删除整个消费者 root、checkout、私有目录或第三方条目。源码 checkout 若确需删除，应另行确认备份、本地修改和所有消费者引用；这不是禁用或清理孤儿链接的隐含动作。
+卸载消费关系时，对你启用的每个条目逐一取得相同 consumer-root lock，执行 marker+exact-target+source-identity 最终检查和 unlink，再移除消费者自己的 source-root 配置。若 lock 已存在，或 token 缺失/改变、lock directory 被替换/含未知内容、marker 缺失、foreign、malformed、source identity changed 或 target changed，停止、报告并保留该 entry、record 与 checkout，等待人工核对；不要仅凭 target 删除，也不要触碰外部管理器状态。所有已验证的 link 清理后，只有空的 `.agent-toolkit-links` ledger 才可移除。不要删除整个消费者 root、checkout、私有目录或第三方条目。源码 checkout 若确需删除，应另行确认备份、本地修改和所有消费者引用；这不是禁用或清理孤儿链接的隐含动作。
 
 ## skills-switch
 

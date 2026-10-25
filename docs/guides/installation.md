@@ -26,7 +26,9 @@ target=<absolute-consumer-target>
 
 `source_target` 是 symlink 的精确 target 字符串，`source_identity` 是启用时对 source directory 执行 `cd ... && pwd -P` 得到的 canonical identity；`target` 是 consumer 中 link 的精确路径。启用、禁用和清理都把 Skill 名称、source target、source identity、target 与 record 一起作为 ownership 事实。单独匹配 symlink target 不足以取得 ownership。
 
-在你批准使用的消费者目录内启用一个 allowlisted Skill。示例先写 ownership record，再创建 link；record 通过同目录 hard link 安装以避免覆盖已有 record。若 record 写入或 link 创建失败，trap 会清理本次创建的 record/ledger，绝不会留下没有 ownership record 的新 link：
+enable、disable 和 upstream deletion reconciliation 共享 `"$CONSUMER_SKILLS/.agent-toolkit-links.lock"`。它们用原子 `mkdir` 获取这个 consumer-root lock，并在锁内完成 ownership record、exact symlink target 与 source identity 的最终检查，以及 link/record 的创建或 unlink。已有 lock 路径（包括目录、文件或 symlink）都视为 busy/foreign：停止并报告，不删除未知状态或外部管理器状态。正常退出只用 `rmdir` 移除本次取得且仍为空的 lock；若 lock 已改变或不为空，则保留并报告。
+
+在你批准使用的消费者目录内启用一个 allowlisted Skill。示例先写 ownership record，再创建 link；record 通过同目录 hard link 安装以避免覆盖已有 record。若 record 写入或 link 创建失败，退出清理会移除本次创建的临时状态，绝不会留下没有 ownership record 的新 link：
 
 ```bash
 set -eu
@@ -37,19 +39,42 @@ SOURCE_TARGET="$TOOLKIT_SOURCE/skills/$SKILL_NAME"
 TARGET="$CONSUMER_SKILLS/$SKILL_NAME"
 LEDGER_DIR="$CONSUMER_SKILLS/.agent-toolkit-links"
 RECORD="$LEDGER_DIR/$SKILL_NAME.record"
+LOCK_DIR="$CONSUMER_SKILLS/.agent-toolkit-links.lock"
 ledger_created=0
 marker_tmp=''
+lock_held=0
 
 die() { printf 'Not changed: %s\n' "$*" >&2; exit 1; }
 case "$TOOLKIT_SOURCE" in /*) ;; *) die 'TOOLKIT_SOURCE must be an absolute path' ;; esac
 case "$CONSUMER_SKILLS" in /*) ;; *) die 'CONSUMER_SKILLS must be an absolute path' ;; esac
 case "$SKILL_NAME" in ''|*[!a-z0-9-]*) die 'SKILL_NAME is not a safe Skill name' ;; esac
+[ -d "$CONSUMER_SKILLS" ] || die 'consumer Skill root is missing'
+cleanup() {
+  if [ -n "$marker_tmp" ]; then rm -f "$marker_tmp" 2>/dev/null || true; fi
+  if [ "$ledger_created" -eq 1 ]; then rmdir "$LEDGER_DIR" 2>/dev/null || true; fi
+  if [ "$lock_held" -eq 1 ]; then
+    if ! rmdir "$LOCK_DIR" 2>/dev/null; then
+      printf 'Consumer-root lock changed or is not empty; leaving it untouched: %s\n' "$LOCK_DIR" >&2
+    else
+      lock_held=0
+    fi
+  fi
+}
+stop_on_signal() {
+  printf 'Interrupted by %s; link outcome may be ambiguous. No further link/record changes will be attempted; inspect %s and %s.\n' "$1" "$TARGET" "$RECORD" >&2
+  exit "$2"
+}
+trap cleanup EXIT
+trap 'stop_on_signal HUP 129' HUP
+trap 'stop_on_signal INT 130' INT
+trap 'stop_on_signal TERM 143' TERM
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  die 'consumer-root lock is already held or unavailable; no state was changed'
+fi
+lock_held=1
 [ -d "$SOURCE_TARGET" ] || die 'source Skill directory is missing'
 if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
   die 'Collision: inspect the existing consumer entry; nothing was replaced.'
-fi
-if [ -e "$RECORD" ] || [ -L "$RECORD" ]; then
-  die 'Collision: an ownership record already exists; nothing was replaced.'
 fi
 
 if [ -e "$LEDGER_DIR" ] || [ -L "$LEDGER_DIR" ]; then
@@ -58,14 +83,12 @@ else
   mkdir "$LEDGER_DIR" || die 'could not create the ownership ledger'
   ledger_created=1
 fi
+if [ -e "$RECORD" ] || [ -L "$RECORD" ]; then
+  die 'Collision: an ownership record already exists; nothing was replaced.'
+fi
 
 SOURCE_IDENTITY="$(cd "$SOURCE_TARGET" && pwd -P)" || die 'could not resolve source identity'
 marker_tmp="$(mktemp "$LEDGER_DIR/.$SKILL_NAME.record.XXXXXX")" || die 'could not create a temporary ownership record'
-cleanup() {
-  [ -z "$marker_tmp" ] || rm -f "$marker_tmp"
-  if [ "$ledger_created" -eq 1 ]; then rmdir "$LEDGER_DIR" 2>/dev/null || true; fi
-}
-trap cleanup EXIT HUP INT TERM
 chmod 600 "$marker_tmp" || die 'could not protect the temporary ownership record'
 if ! printf '%s\n' \
   'format=agent-toolkit-link-ownership/1' \
@@ -79,14 +102,22 @@ if ! ln "$marker_tmp" "$RECORD"; then
   die 'ownership record collision; no link was created'
 fi
 if ! ln -s "$SOURCE_TARGET" "$TARGET"; then
-  if [ -L "$TARGET" ] && [ "$(readlink "$TARGET")" = "$SOURCE_TARGET" ]; then
+  current_target=''
+  if [ -L "$TARGET" ]; then current_target="$(readlink "$TARGET" 2>/dev/null || true)"; fi
+  if [ "$current_target" = "$SOURCE_TARGET" ]; then
     die 'link creation outcome is ambiguous; ownership record was retained for review'
   fi
   if cmp -s "$marker_tmp" "$RECORD"; then rm -f "$RECORD"; fi
   die 'link creation failed; no untracked link was left'
 fi
-rm -f "$marker_tmp"
+if ! rm -f "$marker_tmp"; then
+  die 'temporary ownership record cleanup failed; the link remains paired with its record for review'
+fi
 marker_tmp=''
+if ! rmdir "$LOCK_DIR" 2>/dev/null; then
+  die 'consumer-root lock could not be released; leaving it untouched for review'
+fi
+lock_held=0
 trap - EXIT HUP INT TERM
 printf 'Enabled %s with ownership record %s\n' "$SKILL_NAME" "$RECORD"
 ```
@@ -102,9 +133,9 @@ git -C /path/to/agent-toolkit status --short --branch
 git -C /path/to/agent-toolkit pull --ff-only
 ```
 
-`pull` 更新源码与 remote-tracking refs，需要网络；不能快进时停止并处理差异。直接链接立即看到更新，不需复制或重新安装。更新后重读 allowlist、所用 Skill 的 prerequisites/contracts，并检查 source link identity 与 ownership record 是否仍相互匹配。
+`pull` 更新源码与 remote-tracking refs，需要网络；不能快进时停止并处理差异。直接链接立即看到更新，不需复制或重新安装。更新后重读 allowlist、所用 Skill 的 prerequisites/contracts，并检查 source link identity 与 ownership record 是否仍相互匹配。不要在 lock 已存在时绕过它，也不要删除未知或外部管理器状态。
 
-上游删除或移出 allowlist 的 Skill 不会被手工链接流程自动清理。逐项比较原来启用列表与当前 allowlist，检查消费者中的链接、隐藏 ledger 和 record，包括 dangling symlink。对已删除的 source，仍可使用 record 中保存的 `source_target`/`source_identity` 做人工 reconciliation；只有 record 格式、Skill、source target、source identity、target 均匹配且当前 link 的 `readlink` 仍精确等于 record 的 `source_target` 时才可清理。record 缺失、foreign、malformed，ledger 路径异常，或 target 已被改指其它 source 时，报告并保留 entry 与 record，不能从 symlink target 单独推断 ownership。
+上游删除或移出 allowlist 的 Skill 不会被手工链接流程自动清理。逐项比较原来启用列表与当前 allowlist，先用与 enable/disable 相同的 `LOCK_DIR` 原子 `mkdir` 获得 consumer-root lock；已有 lock 时停止并报告，不删除未知或外部管理器状态。持锁期间检查消费者中的链接、隐藏 ledger 和 record，包括 dangling symlink，并在 unlink 前再次完成 record 格式、Skill、source target、source identity、target 及当前 `readlink` 的最终核对。对已删除的 source，仍可使用 record 中保存的 `source_target`/`source_identity` 做人工 reconciliation；只有所有事实匹配时才可清理。record 缺失、foreign、malformed，ledger 路径异常，或 target 已被改指其它 source 时，报告并保留 entry 与 record，不能从 symlink target 单独推断 ownership。信号或失败发生在最终核对与 unlink 之间时，保留 record/entry 供人工复核；共享 lock 只协调遵循本流程的操作，不授权触碰外部管理器状态。
 
 ## Disable and uninstall
 
@@ -119,12 +150,37 @@ SOURCE_TARGET="$TOOLKIT_SOURCE/skills/$SKILL_NAME"
 TARGET="$CONSUMER_SKILLS/$SKILL_NAME"
 LEDGER_DIR="$CONSUMER_SKILLS/.agent-toolkit-links"
 RECORD="$LEDGER_DIR/$SKILL_NAME.record"
+LOCK_DIR="$CONSUMER_SKILLS/.agent-toolkit-links.lock"
+lock_held=0
 
 report() { printf 'Not disabling %s: %s; leaving entry and record untouched.\n' "$SKILL_NAME" "$*" >&2; exit 1; }
+cleanup_lock() {
+  if [ "$lock_held" -eq 1 ]; then
+    if ! rmdir "$LOCK_DIR" 2>/dev/null; then
+      printf 'Consumer-root lock changed or is not empty; leaving it untouched: %s\n' "$LOCK_DIR" >&2
+    else
+      lock_held=0
+    fi
+  fi
+}
+stop_on_signal() {
+  printf 'Interrupted by %s; no further unlink will be attempted. Inspect %s and %s.\n' "$1" "$TARGET" "$RECORD" >&2
+  exit "$2"
+}
+trap cleanup_lock EXIT
+trap 'stop_on_signal HUP 129' HUP
+trap 'stop_on_signal INT 130' INT
+trap 'stop_on_signal TERM 143' TERM
+[ -d "$CONSUMER_SKILLS" ] || report 'consumer Skill root is missing'
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  report 'consumer-root lock is already held or unavailable; no state was changed'
+fi
+lock_held=1
 [ -d "$LEDGER_DIR" ] && [ ! -L "$LEDGER_DIR" ] || report 'ownership ledger is missing or foreign'
 [ -f "$RECORD" ] && [ ! -L "$RECORD" ] || report 'ownership record is missing or foreign'
 [ -L "$TARGET" ] || report 'consumer entry is not the owned symlink'
-[ "$(readlink "$TARGET")" = "$SOURCE_TARGET" ] || report 'current link target changed'
+current_target="$(readlink "$TARGET" 2>/dev/null || true)"
+[ "$current_target" = "$SOURCE_TARGET" ] || report 'current link target changed'
 
 format_seen=0; skill_seen=0; source_seen=0; identity_seen=0; target_seen=0; recorded_identity=''
 while IFS= read -r line || [ -n "$line" ]; do
@@ -143,15 +199,26 @@ if [ -e "$SOURCE_TARGET" ] || [ -L "$SOURCE_TARGET" ]; then
   current_identity="$(cd "$SOURCE_TARGET" && pwd -P)" || report 'source identity cannot be resolved'
   [ "$recorded_identity" = "$current_identity" ] || report 'source identity changed'
 fi
+[ -L "$TARGET" ] || report 'consumer entry changed during final verification'
+current_target="$(readlink "$TARGET" 2>/dev/null || true)"
+[ "$current_target" = "$SOURCE_TARGET" ] || report 'current link target changed during final verification'
 unlink "$TARGET" || report 'could not remove the verified link'
-unlink "$RECORD" || report 'link removed; ownership record needs manual cleanup'
+if ! unlink "$RECORD"; then
+  printf 'Disabled link but could not remove ownership record; manual cleanup required: %s\n' "$RECORD" >&2
+  exit 1
+fi
 rmdir "$LEDGER_DIR" 2>/dev/null || true
+if ! rmdir "$LOCK_DIR" 2>/dev/null; then
+  report 'consumer-root lock could not be released; leaving it untouched for review'
+fi
+lock_held=0
+trap - EXIT HUP INT TERM
 printf 'Disabled %s after ownership verification.\n' "$SKILL_NAME"
 ```
 
-当 source 目录已被上游删除时，`[ -e "$SOURCE_TARGET" ] || [ -L "$SOURCE_TARGET" ]` 为假，record 中的 canonical identity 仍作为历史 source identity；target 仍必须精确匹配 record。只对已确认的 allowlisted 名称使用变量，不使用宽泛 glob。重新启用仍走 collision 检查，并且不能复用缺失、foreign 或 malformed record。
+当 source 目录已被上游删除时，`[ -e "$SOURCE_TARGET" ] || [ -L "$SOURCE_TARGET" ]` 为假，record 中的 canonical identity 仍作为历史 source identity；target 仍必须精确匹配 record。disable 的 lock、record、source identity 与 target 最终检查都完成后才 unlink；若 lock 已存在、信号中断或最终 target 已变为 foreign link，则停止并保留现状。只对已确认的 allowlisted 名称使用变量，不使用宽泛 glob。重新启用仍走 collision 检查，并且不能复用缺失、foreign 或 malformed record。
 
-卸载消费关系时，对你启用的每个条目逐一执行相同的 marker+exact-target 检查和 unlink，再移除消费者自己的 source-root 配置。若 marker 缺失、foreign、malformed 或 target changed，报告并保留该 entry、record 与 checkout，等待人工核对；不要仅凭 target 删除。所有已验证的 link 清理后，只有空的 `.agent-toolkit-links` ledger 才可移除。不要删除整个消费者 root、checkout、私有目录或第三方条目。源码 checkout 若确需删除，应另行确认备份、本地修改和所有消费者引用；这不是禁用或清理孤儿链接的隐含动作。
+卸载消费关系时，对你启用的每个条目逐一取得相同 consumer-root lock，执行 marker+exact-target+source-identity 最终检查和 unlink，再移除消费者自己的 source-root 配置。若 lock 已存在，或 marker 缺失、foreign、malformed、source identity changed 或 target changed，停止、报告并保留该 entry、record 与 checkout，等待人工核对；不要仅凭 target 删除，也不要触碰外部管理器状态。所有已验证的 link 清理后，只有空的 `.agent-toolkit-links` ledger 才可移除。不要删除整个消费者 root、checkout、私有目录或第三方条目。源码 checkout 若确需删除，应另行确认备份、本地修改和所有消费者引用；这不是禁用或清理孤儿链接的隐含动作。
 
 ## skills-switch
 

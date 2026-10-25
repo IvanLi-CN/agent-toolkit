@@ -551,6 +551,20 @@ class AdmissionTests(Fixture):
         self.assertFalse(result["doctor"]["ready"])
         self.assertIn("command_failed", result["doctor"]["issues"])
 
+    def test_admin_metrics_timestamp_is_start_of_final_probe_window(self):
+        started_at = self.now
+        original_doctor = self.control.doctor
+
+        def slow_doctor(request, session_id):
+            self.now += dt.timedelta(seconds=30)
+            return original_doctor(request, session_id)
+
+        with mock.patch.object(self.control, "doctor", side_effect=slow_doctor):
+            result = self.call("admin-metrics")
+
+        self.assertEqual(CONTROL.parse_time(result["observed_at"]), started_at)
+        self.assertEqual(self.now, started_at + dt.timedelta(seconds=30))
+
     def test_admin_metrics_does_not_hold_store_lock_during_native_probe(self):
         probe_started = threading.Event()
         probe_release = threading.Event()

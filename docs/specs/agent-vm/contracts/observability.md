@@ -98,6 +98,8 @@ The default-request and slot-estimate families are derived bridge observations, 
 
 For `admin-metrics`, `up` is `true` only when the action was read successfully and its initial Incus version/instance probe succeeded. Readiness, admission gates and runtime pressure remain separate fields; a reachable controller with an unavailable image or an admission denial may therefore have `up=true` and `admission_ready=false`.
 
+`observed_at` records the start of the final bounded sampling window, so a slow native probe cannot make an older capacity or pressure sample appear fresh. A collector must calculate freshness from this timestamp and must not replace it with scrape completion time.
+
 The provisioned dashboards enable automatic refresh by default with `refresh: "auto"`, while retaining explicit user-selectable intervals. Grafana may choose an interval based on the current time range; the rendered control must show `Auto selected` after a reload.
 
 The deployment renders two views. `Agent VM / Capacity & Admission` is the aggregate capacity view; `Agent VM / Inventory & Operations` is the per-task table and lifecycle view. The first uses `admin-metrics`; the second uses `admin-status`. Both are read-only and must expose scrape failure and freshness rather than silently retaining stale task rows.

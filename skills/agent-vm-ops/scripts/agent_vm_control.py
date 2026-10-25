@@ -7505,10 +7505,14 @@ class Control:
         observation_consistent = False
         state_epoch_before = "initial"
         state_epoch_after = "initial"
+        observation_started_at = iso_time(self.now())
         doctor: dict[str, Any] | None = None
         snapshot: dict[str, Any] | None = None
         for attempt in range(max_attempts):
             observation_attempts = attempt + 1
+            # Use the start of the final sampling window so a slow native
+            # probe cannot make an old pressure/capacity sample look fresh.
+            observation_started_at = iso_time(self.now())
             # Native probes must run outside the SQLite lock. The epoch check
             # below rejects a durable-state change that overlaps the probe.
             with self.store.read_transaction():
@@ -7549,7 +7553,7 @@ class Control:
             "observation_epoch": state_epoch_after,
             "observation_consistent": observation_consistent,
             "observation_attempts": observation_attempts,
-            "observed_at": iso_time(self.now()),
+            "observed_at": observation_started_at,
             "up": doctor.get("native_probe_ok") is True,
             "draining": snapshot["draining"],
             "admission_ready": bool(doctor.get("admission_ready")),

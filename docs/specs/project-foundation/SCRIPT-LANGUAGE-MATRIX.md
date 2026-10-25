@@ -2,6 +2,8 @@
 
 Status: accepted target allocation. This document classifies every public Skill and its owned executable responsibilities; it describes target implementations, not completed conversions or proven Bun equivalence. [SPEC.md](SPEC.md) defines the requirements and verification, and [IMPLEMENTATION.md](IMPLEMENTATION.md) records verified implementation coverage. Recording the allocation does not establish that a conversion or production deployment has happened.
 
+Public membership: 13 Skills, defined by [PUBLIC_SKILLS.txt](../../../PUBLIC_SKILLS.txt). Only manifest-listed Skills receive allocations here; application and remote prerequisites describe their own execution boundaries.
+
 ## Decision rules
 
 Complexity means relationships between states, requests, errors, configuration, and modules, not source-file length. Prefer TypeScript with Bun when those relationships dominate the work: discriminated unions, narrowing, explicit module contracts, and exhaustive handling can make invalid combinations and incomplete changes visible during type checking. Python can also model and statically check these relationships; the recommendation is specific to this project's selected Bun toolchain, not a claim that Python cannot support complex software.
@@ -16,7 +18,6 @@ Local Bun follows the installed host runtime; CI follows the latest stable Bun a
 
 | Skill | Current owned code | Recommended target | Concrete reason |
 | --- | --- | --- | --- |
-| `agent-requirements` | Markdown and template only | No script/runtime | Produces an agent brief; there is no executable implementation to migrate. |
 | `agent-vm` | Python client and source-sync helper, including an embedded guest transaction action | TypeScript + Bun for the client, local sync, and guest transaction | Request identity, generation, retry journal, manifests, ownership, transaction phases, and recovery dominate the work. Native directory exchange and locks are necessary mechanisms, not a Python-only domain. |
 | `agent-vm-ops` | Python one-shot controller, embedded guest disk-growth action, systemd launch assets | TypeScript + Bun for the controller and guest action | Lease/port state machines, idempotence, admission, conservative accounting, expiration, and reconciliation benefit from explicit typed contracts. Use SQLite and native process/lock mechanisms directly; preserve one-shot execution. |
 | `buzzer-audio-preview` | `scripts/buzzer_preview.py` | TypeScript + Bun | Score/config/event models and MIDI/WAV encoding require no Python-host API. Typed score variants and byte-level output checks are a suitable fit. |
@@ -27,7 +28,6 @@ Local Bun follows the installed host runtime; CI follows the latest stable Bun a
 | `git-remote-troubleshoot` | Markdown only | No script/runtime | Uses the user's existing Git/SSH/platform tools; no owned executable needs a language choice. |
 | `git-sync` | Markdown workflow and a Python detached-alignment contract test | Keep the text workflow; TypeScript + Bun for the owned test | The test creates Git fixtures and checks observable command behavior. It has no Python-specific domain dependency. Do not introduce a new production Git CLI merely to use TS. |
 | `linux-server-init` | Markdown/reference guidance only | No script/runtime | Native administration commands are workflow instructions, not an owned Python or TS application. |
-| `requirements-analysis` | Markdown and template only | No script/runtime | Requirements drafting has no owned executable. |
 | `step-stl-print-repair` | Five Python FreeCAD, Blender, and Gmsh scripts | Python for all five domain scripts | FreeCAD/Blender run through their application Python APIs; Gmsh has an official Python binding. TS would require replacing domain interfaces or maintaining native bindings without a corresponding benefit. |
 | `tavily-hikari-infra` | A short Bash inventory/status/log helper | Shell | Direct role selection and SSH command forwarding have little domain-model complexity. A TS or Python application would add a runtime prerequisite without a clear functional benefit. |
 | `xp-infra` | Bash orchestration, Ruby policy/audit interpretation, POSIX remote probes | TypeScript + Bun for local orchestration, policy, normalization, and decisions; POSIX Shell for remote probes | Policy schema, audit observations, identity revalidation, public target validation, and port-preflight conclusions are complex structured logic. Remote probes retain bounded, authorized native observation without requiring Bun on inspected nodes. |

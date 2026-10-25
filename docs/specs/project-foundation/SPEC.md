@@ -9,8 +9,8 @@ The public source owns shared instructions and executable resources. Operators o
 ## Terms and Interfaces
 
 - Domain terms are defined in [GLOSSARY.md](../../../GLOSSARY.md).
-- Public membership is declared by PUBLIC_SKILLS.txt and Skill metadata; consumer discovery uses a direct checkout or source links.
-- [The script language matrix](SCRIPT-LANGUAGE-MATRIX.md) allocates the executable responsibilities of all 16 public Skills.
+- Public membership: 13 Skills, defined by [PUBLIC_SKILLS.txt](../../../PUBLIC_SKILLS.txt). Skill metadata and the catalog describe that membership; consumer discovery uses a direct checkout or source links.
+- [The script language matrix](SCRIPT-LANGUAGE-MATRIX.md) allocates the executable responsibilities of every public Skill. Target allocation is distinct from completed migration, which is recorded in [IMPLEMENTATION.md](IMPLEMENTATION.md).
 - General tools use installed Bun with explicit type checking; application-host Python, native C rendering, and bounded remote Shell retain their concrete interface roles.
 - The documentation presentation uses Bun/Rspress and the /agent-toolkit/ repository subpath. A successful build does not establish external publication.
 
@@ -82,7 +82,7 @@ The project MUST preserve the accepted Python module/CAD, C rendering, remote Sh
 
 ### REQ-FOUNDATION-DOC-01
 
-The project MUST put project purpose, five capability groups, 16 clickable Skill entries, prerequisites, outputs, and representative scenarios within easy reach of the root README.
+The project MUST put project purpose, five capability groups, a clickable entry for each public Skill, prerequisites, outputs, and representative scenarios within easy reach of the root README.
 
 ### REQ-FOUNDATION-DOC-02
 
@@ -114,7 +114,7 @@ The project MUST prepare GitHub Pages publication with the repository base path 
 
 ### REQ-FOUNDATION-COMMON-01
 
-The project MUST maintain one public Skill source and the same 16 public Skills unless a separate membership change is approved. Consumers use direct source links. No adapter, runtime wrapper, copied consumer Skill tree, synchronization service, or second source repository is introduced.
+The project MUST maintain one public Skill source and the membership declared in PUBLIC_SKILLS.txt unless a separate membership change is approved. The catalog, Skill language matrix, and implementation coverage MUST describe that exact membership once each; the Spec membership count MUST agree. Consumers use direct source links. No adapter, runtime wrapper, copied consumer Skill tree, synchronization service, or second source repository is introduced.
 
 ### REQ-FOUNDATION-COMMON-02
 
@@ -208,31 +208,31 @@ Verification requirements describe evidence that must be produced, rather than c
 
 - covers: `REQ-FOUNDATION-LANG-06`
 - Method: inspect the maintained implementation and exercise its applicable consumer or test scenario.
-- Pass condition: All 16 Skills appear exactly once in the matrix; text-only Skills acquire no runtime requirement; VM Bun prerequisites and Python/Shell/C exceptions have concrete reasons; targets are distinguished from completed changes.
+- Pass condition: All manifest-listed Skills appear exactly once in the matrix; text-only Skills acquire no runtime requirement; VM Bun prerequisites and Python/Shell/C exceptions have concrete reasons; targets are distinguished from completed changes.
 
 ### VER-FOUNDATION-REQUIREMENT-MIG-01
 
 - covers: `REQ-FOUNDATION-MIG-01`
 - Method: inspect the maintained implementation and exercise its applicable consumer or test scenario.
-- Pass condition: PR 3's format, parsing, report, transport, Git recoverability, and consumer-source scenarios pass.
+- Pass condition: The HELPERS format, parsing, report, transport, Git recoverability, and consumer-source scenarios pass.
 
 ### VER-FOUNDATION-REQUIREMENT-MIG-02
 
 - covers: `REQ-FOUNDATION-MIG-02`
 - Method: inspect the maintained implementation and exercise its applicable consumer or test scenario.
-- Pass condition: PR 4's strict-input, policy, identity, network/output-boundary, and read-only scenarios pass without local Ruby.
+- Pass condition: The XP strict-input, policy, identity, network/output-boundary, and read-only scenarios pass without local Ruby.
 
 ### VER-FOUNDATION-REQUIREMENT-MIG-03
 
 - covers: `REQ-FOUNDATION-MIG-03`
 - Method: inspect the maintained implementation and exercise its applicable consumer or test scenario.
-- Pass condition: PR 5's protocol/digest, prior-state, native multi-process, precision, recovery, and current-client interoperability scenarios pass.
+- Pass condition: The VM-CONTROL protocol/digest, prior-state, native multi-process, precision, recovery, and current-client interoperability scenarios pass.
 
 ### VER-FOUNDATION-REQUIREMENT-MIG-04
 
 - covers: `REQ-FOUNDATION-MIG-04`
 - Method: inspect the maintained implementation and exercise its applicable consumer or test scenario.
-- Pass condition: PR 6's session precedence, transport/state, byte-path/ownership, atomicity, concurrency, and lost-ack scenarios pass.
+- Pass condition: The VM-CLIENT session precedence, transport/state, byte-path/ownership, atomicity, concurrency, and lost-ack scenarios pass.
 
 ### VER-FOUNDATION-REQUIREMENT-MIG-05
 
@@ -274,7 +274,7 @@ Verification requirements describe evidence that must be produced, rather than c
 
 - covers: `REQ-FOUNDATION-SITE-02`
 - Method: inspect the maintained implementation and exercise its applicable consumer or test scenario.
-- Pass condition: All 16 Skill routes and public contract links work; keyboard and mobile navigation are usable; consumers need no Rspress/React syntax to read a Skill.
+- Pass condition: All manifest-listed Skill routes and public contract links work; keyboard and mobile navigation are usable; consumers need no Rspress/React syntax to read a Skill.
 
 ### VER-FOUNDATION-REQUIREMENT-SITE-03
 
@@ -292,7 +292,7 @@ Verification requirements describe evidence that must be produced, rather than c
 
 - covers: `REQ-FOUNDATION-COMMON-01`
 - Method and required evidence: Public inventory, link/entrypoint inspection, and affected consumer-source scenarios.
-- Pass condition: Maintain one public Skill source and the same 16 public Skills unless a separate membership change is approved. Consumers use direct source links. No adapter, runtime wrapper, copied consumer Skill tree, synchronization service, or second source repository is introduced.
+- Pass condition: The public manifest, Skill tree, catalog, language matrix, Spec membership count, and implementation coverage agree. Missing, duplicate, stale, and malformed entries fail the root checks. Consumers use direct source links without adapters, runtime wrappers, copied consumer Skill trees, synchronization services, or a second source repository.
 
 ### VER-FOUNDATION-COMMON-02
 
@@ -303,7 +303,7 @@ Verification requirements describe evidence that must be produced, rather than c
 ### VER-FOUNDATION-COMMON-03
 
 - covers: `REQ-FOUNDATION-COMMON-03`
-- Method and required evidence: Public safety/coupling checks and changed-source inspection; site artifacts are additionally checked in PR 8.
+- Method and required evidence: Public safety/coupling checks and changed-source inspection; site artifact checks apply when the documentation presentation is implemented.
 - Pass condition: Keep real inventory, credentials, deployment addresses, personal paths, and private task/runtime integrations outside public source and site artifacts. Synthetic test fixtures and neutral examples carry no real deployment information.
 
 ### VER-FOUNDATION-COMMON-04
@@ -358,13 +358,13 @@ Verification requirements describe evidence that must be produced, rather than c
 
 - covers: `REQ-FOUNDATION-COMMON-01`, `REQ-FOUNDATION-COMMON-05`
 - Method and required evidence: Public inventory comparison and exact changed-path review.
-- Pass condition: All 16 public Skill directories remain intact and the private source receives no unrelated edits.
+- Pass condition: All manifest-listed public Skill directories remain intact and the private source receives no unrelated edits.
 
 ### VER-FOUNDATION-TOOLING-01
 
 - covers: `REQ-FOUNDATION-LANG-02`
 - Method and required evidence: Repository-check fixtures on Linux/macOS.
-- Pass condition: Missing, duplicate, extra, and stale Skill index entries are detected; the valid 16-Skill tree passes.
+- Pass condition: Missing, duplicate, extra, and stale Skill index entries are detected; the valid manifest-listed tree passes. Membership, matrix, Spec/implementation coverage, and local/CI command drift fail executable checks on Linux/macOS.
 
 ### VER-FOUNDATION-TOOLING-02
 
@@ -556,7 +556,7 @@ Verification requirements describe evidence that must be produced, rather than c
 
 - covers: `REQ-FOUNDATION-DOC-01`, `REQ-FOUNDATION-DOC-03`
 - Method and required evidence: Catalog/metadata completeness and source-link validation.
-- Pass condition: All 16 Skills appear exactly once in the detailed catalog and every entry has purpose, prerequisites, configuration, a useful example, outputs, and usage boundaries.
+- Pass condition: All manifest-listed Skills appear exactly once in the detailed catalog and every entry has purpose, prerequisites, configuration, a useful example, outputs, and usage boundaries.
 
 ### VER-FOUNDATION-GUIDES-02
 
@@ -592,7 +592,7 @@ Verification requirements describe evidence that must be produced, rather than c
 
 - covers: `REQ-FOUNDATION-SITE-02`
 - Method and required evidence: Catalog-to-route/search assertions and representative browser rendering observations.
-- Pass condition: All 16 Skill pages and public guide/contract routes are navigable/searchable; frontmatter, code blocks, literal command placeholders, headings, and links preserve their intended content.
+- Pass condition: All manifest-listed Skill pages and public guide/contract routes are navigable/searchable; frontmatter, code blocks, literal command placeholders, headings, and links preserve their intended content.
 
 ### VER-FOUNDATION-SITE-03
 
@@ -621,6 +621,7 @@ Verification requirements describe evidence that must be produced, rather than c
 ## Related ADRs
 
 - [Language and runtime policy](../../adr/0028-language-and-runtime-policy.md)
+- [Project foundation membership rebaseline](../../adr/0032-project-foundation-rebaseline.md)
 
 ## References
 

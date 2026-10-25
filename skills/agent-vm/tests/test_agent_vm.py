@@ -75,10 +75,11 @@ class SessionContractTests(unittest.TestCase):
             with mock.patch.object(CLI, "LOCAL_STATE_ROOT", root / "state"):
                 with mock.patch.object(CLI, "make_ssh_key", return_value=(private_key, "ssh-ed25519 AAAA")), \
                      mock.patch.object(CLI, "control_request", side_effect=status_responses), \
-                     mock.patch.object(CLI, "mutation", side_effect=CLI.CliError("guest_resize_unverified", "guest growth failed")):
+                     mock.patch.object(CLI, "mutation", side_effect=CLI.CliError("guest_resize_unverified", "guest growth failed")) as mutation:
                     with self.assertRaises(CLI.CliError) as failure:
                         CLI.command_acquire(args)
                 self.assertEqual(failure.exception.code, "guest_resize_unverified")
+                self.assertEqual(mutation.call_args.kwargs["operation_id_value"], "failed-acquire-operation")
                 self.assertEqual(CLI.read_session_state(session)["generation"], 1)
                 self.assertEqual(CLI.read_session_state(session)["task_id"], "avm-recovery123")
 

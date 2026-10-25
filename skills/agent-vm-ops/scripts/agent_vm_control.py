@@ -3577,6 +3577,10 @@ class Control:
             ):
                 if key in retry_record:
                     record.setdefault(key, retry_record[key])
+        cancellation = Control._pending_acquire_cancellation_marker(task) if task is not None else None
+        if cancellation is not None:
+            record["pending_acquire_cancellation"] = True
+            record["pending_acquire_operation_ids"] = list(cancellation["pending_acquire_operation_ids"])
         return record
 
     @staticmethod
@@ -3592,6 +3596,7 @@ class Control:
         if not isinstance(previous, Mapping):
             return record
         marker = previous
+        matched_operation_id = None
         while isinstance(marker, Mapping):
             operation_id = marker.get("operation_id")
             if (
@@ -3600,14 +3605,12 @@ class Control:
                 and marker.get("task_id") == task.get("task_id")
                 and marker.get("task_generation") == task.get("generation")
             ):
+                matched_operation_id = operation_id
                 break
             marker = marker.get("detail")
-        if (
-            not isinstance(operation_id, str)
-            or SESSION_ID_RE.fullmatch(operation_id) is None
-        ):
+        if matched_operation_id is None:
             return record
-        record.setdefault("operation_id", operation_id)
+        record.setdefault("operation_id", matched_operation_id)
         record.setdefault("task_id", task.get("task_id"))
         record.setdefault("task_generation", task.get("generation"))
         return record
@@ -3689,7 +3692,13 @@ class Control:
             )
         return matches[0] if matches else None
 
-    def _bind_pending_acquire_operation(self, request: Mapping[str, Any], task: Mapping[str, Any]) -> None:
+    def _bind_pending_acquire_operation(
+        self,
+        request: Mapping[str, Any],
+        task: Mapping[str, Any],
+        *,
+        requested_resources: Mapping[str, int] | None = None,
+    ) -> None:
         operation_id = require_nonempty_string(request.get("operation_id"), "operation_id", SESSION_ID_RE)
         operation = self.store.operation(operation_id)
         if operation is None or operation.get("outcome") != "pending":
@@ -3701,8 +3710,16 @@ class Control:
                 "pending acquire operation is bound to a different task",
                 {"operation_id": operation_id},
             )
+        if requested_resources is None:
+            base = self._durable_resources(task, "resources_json", allow_empty=False)
+            requested_resources = self._requested_resources(
+                request,
+                base,
+                active_reuse=task.get("state") == "active",
+            )
         operation["task_id"] = task["task_id"]
         operation["task_generation"] = int(task["generation"])
+        operation["acquire_resources"] = dict(requested_resources)
         self.store.record_operation(
             operation_id,
             "acquire",
@@ -3710,6 +3727,34 @@ class Control:
             request["generation"],
             operation,
         )
+
+    def _verify_pending_acquire_resources(
+        self,
+        pending: Iterable[Mapping[str, Any]],
+        expected: Mapping[str, int],
+    ) -> None:
+        for item in pending:
+            operation_id = require_nonempty_string(item.get("operation_id"), "operation_id", SESSION_ID_RE)
+            operation = self.store.operation(operation_id)
+            evidence = operation.get("acquire_resources") if isinstance(operation, Mapping) else None
+            try:
+                actual = parse_resource_mapping(
+                    json.dumps(evidence, sort_keys=True),
+                    "pending acquire resources",
+                    allow_empty=False,
+                )
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ControlError(
+                    "operation_conflict",
+                    "pending acquire request lacks verified resource evidence",
+                    {"operation_id": operation_id},
+                ) from exc
+            if actual != dict(expected):
+                raise ControlError(
+                    "operation_conflict",
+                    "pending acquire request differs from the active lease",
+                    {"operation_id": operation_id, "requested": actual, "active": dict(expected)},
+                )
 
     def _complete_pending_acquire_operation(
         self,
@@ -3736,6 +3781,14 @@ class Control:
                 "pending acquire operation cannot be completed",
                 {"operation_id": operation_id},
             )
+        expected_resources = result.get("resources")
+        if not isinstance(expected_resources, Mapping):
+            raise ControlError(
+                "operation_unverified",
+                "active acquire result lacks resource evidence",
+                {"operation_id": operation_id},
+            )
+        self._verify_pending_acquire_resources([pending], expected_resources)
         warnings = operation.get("warnings")
         if not isinstance(warnings, list):
             warnings = []
@@ -3848,11 +3901,61 @@ class Control:
         }
         return bool(phases & native_phases)
 
-    def _pending_cleanup_retry_allowed(self, action: str, session_id: str | None) -> bool:
-        if action not in {"release", "destroy"} or session_id is None:
+    def _pending_cleanup_retry_allowed(
+        self,
+        action: str,
+        session_id: str | None,
+        operation_id: str | None = None,
+        request: Mapping[str, Any] | None = None,
+    ) -> bool:
+        if session_id is None:
             return False
         task = self.store.get_task(session_id=session_id)
-        return task is not None and task.get("state") in {"closing", "cached", "deleting", "absent"}
+        if action in {"release", "destroy"}:
+            return task is not None and task.get("state") in {"closing", "cached", "deleting", "absent"}
+        if action != "acquire" or operation_id is None or task is None or task.get("state") != "active":
+            return False
+        return self._pending_acquire_retry_item(operation_id, session_id, request, task) is not None
+
+    def _pending_acquire_retry_item(
+        self,
+        operation_id: str,
+        session_id: str,
+        request: Mapping[str, Any] | None,
+        task: Mapping[str, Any],
+    ) -> Mapping[str, Any] | None:
+        if request is None:
+            return None
+        try:
+            pending = [
+                item for item in self.store.pending_operations()
+                if item.get("operation_id") == operation_id
+            ]
+        except ControlError:
+            return None
+        if len(pending) != 1:
+            return None
+        item = pending[0]
+        request_generation = request.get("generation")
+        current_generation = task.get("generation")
+        if request_generation not in {current_generation, current_generation - 1}:
+            return None
+        same_generation = request_generation == current_generation
+        identity_matches = (
+            item.get("task_id") == task.get("task_id")
+            and item.get("task_generation") == current_generation
+        )
+        if same_generation:
+            identity_matches = item.get("task_id") in {None, task.get("task_id")} and item.get("task_generation") in {None, current_generation}
+        if not identity_matches:
+            return None
+        if not (
+            item.get("action") == "acquire"
+            and item.get("session_id") == session_id
+            and item.get("generation") == request_generation
+        ):
+            return None
+        return item
 
     def _expire_preempt(self, request: Mapping[str, Any]) -> None:
         """Close the admission fence and perform a confirmed native withdrawal.
@@ -3869,9 +3972,19 @@ class Control:
             expiry = parse_time(task.get("lease_expires_at"))
             if task["state"] not in {"active", "preparing"} or (expiry and expiry > self.now()): return
             inactive = parse_time(task.get("inactive_since")) or min(self.now(), expiry or self.now())
-            task = self.store.update_task(task_id, state="closing", lease_expires_at=None,
-                                         inactive_since=iso_time(inactive),
-                                         cleanup_after=iso_time(inactive + dt.timedelta(seconds=self.config["cache_seconds"])))
+            pending_acquires = (
+                self._pending_acquire_operations_for_task(task)
+                if task["state"] == "active"
+                else []
+            )
+            task = self.store.update_task(
+                task_id,
+                state="closing",
+                lease_expires_at=None,
+                inactive_since=iso_time(inactive),
+                cleanup_after=iso_time(inactive + dt.timedelta(seconds=self.config["cache_seconds"])),
+                last_error=self._pending_acquire_cancellation_error(task, pending_acquires),
+            )
         # Generation/ownership is checked on every native cleanup. Do not free
         # reservations here: the in-flight operation may still finish later.
         try:
@@ -4387,13 +4500,15 @@ class Control:
             operation_id = require_nonempty_string(operation_id, "operation_id", SESSION_ID_RE)
             digest = hashlib.sha256(json.dumps(dict(request), sort_keys=True).encode()).hexdigest()
             cached = self.store.operation(operation_id)
+            cached_pending_retry = False
             if cached is not None:
                 if cached.get("_request_digest") != digest:
                     raise ControlError("operation_conflict", "operation ID belongs to a different request")
                 if cached.get("outcome") == "pending":
-                    if not self._pending_cleanup_retry_allowed(action, session_id):
+                    if not self._pending_cleanup_retry_allowed(action, session_id, operation_id, request):
                         raise ControlError("operation_incomplete", "previous execution has an uncertain outcome; inspect status and reconcile before another mutation",
                                            {"operation_id": operation_id})
+                    cached_pending_retry = True
                 elif cached.get("outcome") == "error":
                     error = cached["error"]
                     raise ControlError(error["code"], error["message"], error.get("detail"))
@@ -4419,7 +4534,7 @@ class Control:
             if "generation" not in request:
                 raise ControlError("invalid_request", "write request requires generation")
             require_int(request["generation"], "generation", 0)
-            if action != "renew":
+            if action != "renew" and not cached_pending_retry:
                 self.store.record_operation(operation_id, action, session_id, request["generation"],
                                             {"outcome": "pending", "_request_digest": digest})
         try:
@@ -5514,6 +5629,88 @@ class Control:
 
 
 
+    @staticmethod
+    def _pending_acquire_cancellation_marker(task: Mapping[str, Any], *, strict: bool = False) -> dict[str, Any] | None:
+        raw_error = task.get("last_error")
+        if not isinstance(raw_error, str) or not raw_error:
+            return None
+        try:
+            error = json.loads(raw_error)
+        except (TypeError, ValueError) as exc:
+            if strict:
+                raise ControlError("operation_unverified", "pending acquire cancellation marker is invalid") from exc
+            return None
+        if not isinstance(error, Mapping) or error.get("pending_acquire_cancellation") is not True:
+            return None
+        if error.get("task_id") != task.get("task_id") or error.get("task_generation") != task.get("generation"):
+            if strict:
+                raise ControlError(
+                    "operation_unverified",
+                    "pending acquire cancellation marker does not match the task",
+                    {"task_id": task.get("task_id")},
+                )
+            return None
+        operation_ids = error.get("pending_acquire_operation_ids")
+        if (
+            not isinstance(operation_ids, list)
+            or not operation_ids
+            or any(
+                not isinstance(operation_id, str)
+                or SESSION_ID_RE.fullmatch(operation_id) is None
+                for operation_id in operation_ids
+            )
+            or len(set(operation_ids)) != len(operation_ids)
+        ):
+            if strict:
+                raise ControlError(
+                    "operation_unverified",
+                    "pending acquire cancellation operation IDs are invalid",
+                    {"task_id": task.get("task_id")},
+                )
+            return None
+        return {"pending_acquire_operation_ids": list(operation_ids)}
+
+    @staticmethod
+    def _pending_acquire_cancellation_error(
+        task: Mapping[str, Any],
+        pending: Iterable[Mapping[str, Any]],
+    ) -> str | None:
+        pending = list(pending)
+        if not pending:
+            return task.get("last_error") if isinstance(task.get("last_error"), str) else None
+        operation_ids = [
+            require_nonempty_string(item.get("operation_id"), "operation_id", SESSION_ID_RE)
+            for item in pending
+        ]
+        raw_error = task.get("last_error")
+        try:
+            previous = json.loads(raw_error) if isinstance(raw_error, str) and raw_error else {}
+        except (TypeError, ValueError):
+            previous = {}
+        record = dict(previous) if isinstance(previous, Mapping) else {}
+        record.update({
+            "pending_acquire_cancellation": True,
+            "pending_acquire_operation_ids": operation_ids,
+            "task_id": task.get("task_id"),
+            "task_generation": task.get("generation"),
+        })
+        return json.dumps(record, sort_keys=True)
+
+    def _pending_acquire_cancellation_operations(self, task: Mapping[str, Any]) -> list[dict[str, Any]]:
+        marker = self._pending_acquire_cancellation_marker(task, strict=True)
+        if marker is None:
+            return []
+        pending = self._pending_acquire_operations_for_task(task)
+        expected = set(marker["pending_acquire_operation_ids"])
+        unexpected = [item["operation_id"] for item in pending if item.get("operation_id") not in expected]
+        if unexpected:
+            raise ControlError(
+                "operation_unverified",
+                "unexpected pending acquire operation belongs to cancellation marker",
+                {"task_id": task["task_id"], "operation_ids": unexpected},
+            )
+        return pending
+
     def _pending_acquire_operations_for_task(self, task: Mapping[str, Any]) -> list[dict[str, Any]]:
         try:
             pending = self.store.pending_operations()
@@ -6553,16 +6750,42 @@ class Control:
         existing = self.store.get_task(session_id=session_id)
         if existing and existing["state"] == "active":
             pending_acquires = self._pending_acquire_operations_for_task(existing)
-            self._check_generation(existing, request)
+            try:
+                self._check_generation(existing, request)
+            except ControlError as exc:
+                if (
+                    exc.code != "generation_mismatch"
+                    or self._pending_acquire_retry_item(
+                        str(request.get("operation_id")),
+                        session_id,
+                        request,
+                        existing,
+                    ) is None
+                ):
+                    raise
             self._require_active(existing, allow_pending_acquire=True)
             self._ownership(existing)
-            self._bind_pending_acquire_operation(request, existing)
             resources = self._durable_resources(existing, "resources_json", allow_empty=False)
             target = self._requested_resources(request, resources, active_reuse=True)
             if target != resources:
                 raise ControlError("resource_config_mismatch", "active lease configuration differs; use resize explicitly",
                                    {"current": resources, "requested": target,
                                     "differences": [key for key in resources if resources[key] != target[key]]})
+            if any(item.get("operation_id") == request["operation_id"] for item in pending_acquires):
+                self._bind_pending_acquire_operation(
+                    request,
+                    existing,
+                    requested_resources=target,
+                )
+                pending_acquires = self._pending_acquire_operations_for_task(existing)
+            self._verify_pending_acquire_resources(pending_acquires, resources)
+            self._bind_pending_acquire_operation(
+                request,
+                existing,
+                requested_resources=target,
+            )
+            pending_acquires = self._pending_acquire_operations_for_task(existing)
+            self._verify_pending_acquire_resources(pending_acquires, resources)
             result = self._runtime_summary(existing)
             if pending_acquires:
                 with self.store.transaction():
@@ -6801,18 +7024,27 @@ class Control:
             task = current
             if task["state"] in {"cached", "absent"} and requested_state != "closing":
                 return self._state_summary(task)
+            pending_acquire_cancellation = (
+                self._pending_acquire_cancellation_marker(task, strict=True) is not None
+            )
             pending_acquires_to_cancel = (
                 self._pending_acquire_operations_for_task(task)
                 if requested_state == "active"
-                else []
+                else self._pending_acquire_cancellation_operations(task)
             )
+            pending_acquire_cancellation = pending_acquire_cancellation or bool(pending_acquires_to_cancel)
             recovery_operation_id = self._pending_acquire_recovery_operation_id(task)
             expiry = parse_time(task.get("lease_expires_at"))
             inactive = parse_time(task.get("inactive_since")) or min(self.now(), expiry or self.now())
             with self._global_lock(), self.store.transaction():
-                task = self.store.update_task(task["task_id"], state="closing", lease_expires_at=None,
-                                             inactive_since=iso_time(inactive),
-                                             cleanup_after=iso_time(inactive + dt.timedelta(seconds=self.config["cache_seconds"])))
+                task = self.store.update_task(
+                    task["task_id"],
+                    state="closing",
+                    lease_expires_at=None,
+                    inactive_since=iso_time(inactive),
+                    cleanup_after=iso_time(inactive + dt.timedelta(seconds=self.config["cache_seconds"])),
+                    last_error=self._pending_acquire_cancellation_error(task, pending_acquires_to_cancel),
+                )
             errors, completed = self._cleanup_task(task)
             if errors:
                 self.store.update_task(
@@ -6841,7 +7073,7 @@ class Control:
             try:
                 pending_acquire = (
                     self._pending_native_init_for_task(task)
-                    if recover_pending_acquire and requested_state != "active"
+                    if recover_pending_acquire and not pending_acquire_cancellation
                     else None
                 )
             except ControlError as exc:

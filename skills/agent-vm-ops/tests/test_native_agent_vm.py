@@ -1448,6 +1448,7 @@ class LifecycleTests(Fixture):
                 "_request_digest": digest,
                 "task_id": task["task_id"],
                 "task_generation": task["generation"],
+                "acquire_resources": {"cpu": 2, "memory_mib": 4096, "disk_gib": 20},
             },
         )
 
@@ -1461,6 +1462,53 @@ class LifecycleTests(Fixture):
         self.assertEqual(self.control.dispatch(pending_request)["outcome"], "replayed")
         self.call("renew")
         self.call("ssh-info")
+
+    def test_original_pending_acquire_retry_converges_active_lease(self):
+        task = self.acquire()
+        original_request = self.request("acquire", operation="original-acquire", public_key=KEY)
+        original_request["generation"] = 0
+        digest = CONTROL.hashlib.sha256(json.dumps(original_request, sort_keys=True).encode()).hexdigest()
+        self.store.record_operation(
+            original_request["operation_id"],
+            "acquire",
+            "thread-a",
+            original_request["generation"],
+            {
+                "outcome": "pending",
+                "_request_digest": digest,
+                "task_id": task["task_id"],
+                "task_generation": task["generation"],
+            },
+        )
+
+        response = self.control.dispatch(original_request)
+
+        self.assertEqual(response["outcome"], "success")
+        self.assertEqual(self.store.operation("original-acquire")["outcome"], "success")
+        self.assertEqual(self.call("ssh-info")["task_id"], task["task_id"])
+
+    def test_active_acquire_rejects_unverified_old_request_evidence(self):
+        task = self.acquire()
+        pending_request = self.request("acquire", operation="mismatched-pending", cpu=8, public_key=KEY)
+        digest = CONTROL.hashlib.sha256(json.dumps(pending_request, sort_keys=True).encode()).hexdigest()
+        self.store.record_operation(
+            pending_request["operation_id"],
+            "acquire",
+            "thread-a",
+            pending_request["generation"],
+            {
+                "outcome": "pending",
+                "_request_digest": digest,
+                "task_id": task["task_id"],
+                "task_generation": task["generation"],
+                "acquire_resources": {"cpu": 8, "memory_mib": 4096, "disk_gib": 20},
+            },
+        )
+
+        self.error("operation_conflict", self.acquire)
+        self.assertEqual(self.store.operation("mismatched-pending")["outcome"], "pending")
+        self.call("release")
+        self.error("lease_released", self.control.dispatch, pending_request)
 
     def test_release_cancels_multiple_pending_active_acquires(self):
         task = self.acquire()
@@ -1492,6 +1540,34 @@ class LifecycleTests(Fixture):
                 self.control.dispatch(pending_request)
             self.assertEqual(failure.exception.code, "lease_released")
         self.assertEqual(self.call("destroy")["state"], "absent")
+
+    def test_pending_active_acquires_are_canceled_after_cleanup_retry(self):
+        task = self.acquire()
+        pending_request = self.request("acquire", operation="retry-cancel-pending", public_key=KEY)
+        digest = CONTROL.hashlib.sha256(json.dumps(pending_request, sort_keys=True).encode()).hexdigest()
+        self.store.record_operation(
+            pending_request["operation_id"],
+            "acquire",
+            "thread-a",
+            pending_request["generation"],
+            {
+                "outcome": "pending",
+                "_request_digest": digest,
+                "task_id": task["task_id"],
+                "task_generation": task["generation"],
+            },
+        )
+        release_request = self.request("release")
+        with mock.patch.object(CONTROL.shutil, "which", side_effect=[None, "/usr/bin/conntrack"]), \
+             mock.patch.object(self.systemd, "retry_cleanup"):
+            self.error("cleanup_incomplete", self.control.dispatch, release_request)
+            current = self.store.get_task(task_id=task["task_id"])
+            self.assertTrue(json.loads(current["last_error"])["pending_acquire_cancellation"])
+            response = self.control.dispatch(release_request)
+
+        self.assertEqual(response["outcome"], "success")
+        self.assertEqual(self.store.get_task(task_id=task["task_id"])["state"], "cached")
+        self.assertEqual(self.store.pending_operations(), [])
 
     def test_status_rejects_unrelated_or_unverified_recovery_operations(self):
         self.acquire()
@@ -1562,8 +1638,7 @@ class LifecycleTests(Fixture):
                 "task_generation": task["generation"],
             },
         )
-        self.call("release")
-        self.acquire()
+        self.store.update_task(task["task_id"], generation=task["generation"] + 1)
 
         request = self.request("status")
         request["operation_id"] = "stale-pending"
@@ -3357,6 +3432,31 @@ class ReclaimTests(Fixture):
 
         self.runner.failure = None
         self.assertEqual(self.call("destroy", "cached")["state"], "absent")
+
+    def test_reclaim_failure_does_not_rebind_a_foreign_recovery_marker(self):
+        cached = self.acquire("cached")
+        self.call("release", "cached")
+        task = self.store.get_task(task_id=cached["task_id"])
+        self.store.update_task(
+            task["task_id"],
+            last_error=json.dumps({
+                "detail": {
+                    "operation_id": "foreign-recovery-marker",
+                    "task_id": "avm-foreign123",
+                    "task_generation": task["generation"],
+                },
+            }),
+        )
+        self.runner.free = 10 * GIB
+        self.runner.failure = lambda args: args[3:4] == ["delete"]
+        request = self.request("acquire", "new", operation="reclaim-foreign-marker", public_key=KEY)
+
+        self.error("reclaim_failed", self.control.dispatch, request)
+
+        current = self.store.get_task(task_id=task["task_id"])
+        marker = json.loads(current["last_error"])
+        self.assertNotIn("operation_id", marker)
+        self.assertNotIn("operation_id", marker.get("detail", {}))
 
     def test_public_destroy_retries_deleting_cache(self):
         cached = self.acquire("cached")

@@ -400,7 +400,11 @@ class SessionContractTests(unittest.TestCase):
                             "task_id": "avm-older123",
                             "generation": 1,
                             "state": "cached",
-                            "last_error": {"operation_id": "older-operation"},
+                            "last_error": {
+                                "operation_id": "older-operation",
+                                "task_id": "avm-older123",
+                                "task_generation": 1,
+                            },
                         },
                         operation_id="older-operation",
                         expected_generation=0,

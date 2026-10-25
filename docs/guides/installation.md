@@ -12,23 +12,86 @@ git clone https://github.com/IvanLi-CN/agent-toolkit.git /path/to/agent-toolkit
 
 ## Direct source links
 
-下面使用 POSIX shell 与目录 symlink，适合 Linux/macOS。消费者决定自己的 root；其他平台可配置原生 source directory 或等价的目录链接能力，不必生成复制树。
+下面使用 Bash-compatible shell 与目录 symlink，适合 Linux/macOS。消费者决定自己的 root；其他平台可配置原生 source directory 或等价的目录链接能力，不必生成复制树。直接链接流程在 consumer root 下维护一个隐藏的 metadata ledger；它只记录 ownership，不包含 Skill 文件，也不是 consumer Skill tree。
 
-在你批准使用的消费者目录内启用一个 allowlisted Skill：
+启用流程创建 `"$CONSUMER_SKILLS/.agent-toolkit-links/<skill>.record"`。记录必须完整匹配下面的五行格式：
+
+```text
+format=agent-toolkit-link-ownership/1
+skill=<skill-name>
+source_target=<absolute-source-target-used-by-the-link>
+source_identity=<canonical-source-directory-at-enable-time>
+target=<absolute-consumer-target>
+```
+
+`source_target` 是 symlink 的精确 target 字符串，`source_identity` 是启用时对 source directory 执行 `cd ... && pwd -P` 得到的 canonical identity；`target` 是 consumer 中 link 的精确路径。启用、禁用和清理都把 Skill 名称、source target、source identity、target 与 record 一起作为 ownership 事实。单独匹配 symlink target 不足以取得 ownership。
+
+在你批准使用的消费者目录内启用一个 allowlisted Skill。示例先写 ownership record，再创建 link；record 通过同目录 hard link 安装以避免覆盖已有 record。若 record 写入或 link 创建失败，trap 会清理本次创建的 record/ledger，绝不会留下没有 ownership record 的新 link：
 
 ```bash
+set -eu
 TOOLKIT_SOURCE=/path/to/agent-toolkit
 CONSUMER_SKILLS=/path/to/consumer/skills
 SKILL_NAME=docs-no-revision-markers
-mkdir -p "$CONSUMER_SKILLS"
-if [ -e "$CONSUMER_SKILLS/$SKILL_NAME" ] || [ -L "$CONSUMER_SKILLS/$SKILL_NAME" ]; then
-  printf '%s\n' 'Collision: inspect the existing entry; nothing was replaced.'
-else
-  ln -s "$TOOLKIT_SOURCE/skills/$SKILL_NAME" "$CONSUMER_SKILLS/$SKILL_NAME"
+SOURCE_TARGET="$TOOLKIT_SOURCE/skills/$SKILL_NAME"
+TARGET="$CONSUMER_SKILLS/$SKILL_NAME"
+LEDGER_DIR="$CONSUMER_SKILLS/.agent-toolkit-links"
+RECORD="$LEDGER_DIR/$SKILL_NAME.record"
+ledger_created=0
+marker_tmp=''
+
+die() { printf 'Not changed: %s\n' "$*" >&2; exit 1; }
+case "$TOOLKIT_SOURCE" in /*) ;; *) die 'TOOLKIT_SOURCE must be an absolute path' ;; esac
+case "$CONSUMER_SKILLS" in /*) ;; *) die 'CONSUMER_SKILLS must be an absolute path' ;; esac
+case "$SKILL_NAME" in ''|*[!a-z0-9-]*) die 'SKILL_NAME is not a safe Skill name' ;; esac
+[ -d "$SOURCE_TARGET" ] || die 'source Skill directory is missing'
+if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
+  die 'Collision: inspect the existing consumer entry; nothing was replaced.'
 fi
+if [ -e "$RECORD" ] || [ -L "$RECORD" ]; then
+  die 'Collision: an ownership record already exists; nothing was replaced.'
+fi
+
+if [ -e "$LEDGER_DIR" ] || [ -L "$LEDGER_DIR" ]; then
+  [ -d "$LEDGER_DIR" ] && [ ! -L "$LEDGER_DIR" ] || die 'ownership ledger path is not a regular directory'
+else
+  mkdir "$LEDGER_DIR" || die 'could not create the ownership ledger'
+  ledger_created=1
+fi
+
+SOURCE_IDENTITY="$(cd "$SOURCE_TARGET" && pwd -P)" || die 'could not resolve source identity'
+marker_tmp="$(mktemp "$LEDGER_DIR/.$SKILL_NAME.record.XXXXXX")" || die 'could not create a temporary ownership record'
+cleanup() {
+  [ -z "$marker_tmp" ] || rm -f "$marker_tmp"
+  if [ "$ledger_created" -eq 1 ]; then rmdir "$LEDGER_DIR" 2>/dev/null || true; fi
+}
+trap cleanup EXIT HUP INT TERM
+chmod 600 "$marker_tmp" || die 'could not protect the temporary ownership record'
+if ! printf '%s\n' \
+  'format=agent-toolkit-link-ownership/1' \
+  "skill=$SKILL_NAME" \
+  "source_target=$SOURCE_TARGET" \
+  "source_identity=$SOURCE_IDENTITY" \
+  "target=$TARGET" > "$marker_tmp"; then
+  die 'ownership record write failed; no link was created'
+fi
+if ! ln "$marker_tmp" "$RECORD"; then
+  die 'ownership record collision; no link was created'
+fi
+if ! ln -s "$SOURCE_TARGET" "$TARGET"; then
+  if [ -L "$TARGET" ] && [ "$(readlink "$TARGET")" = "$SOURCE_TARGET" ]; then
+    die 'link creation outcome is ambiguous; ownership record was retained for review'
+  fi
+  if cmp -s "$marker_tmp" "$RECORD"; then rm -f "$RECORD"; fi
+  die 'link creation failed; no untracked link was left'
+fi
+rm -f "$marker_tmp"
+marker_tmp=''
+trap - EXIT HUP INT TERM
+printf 'Enabled %s with ownership record %s\n' "$SKILL_NAME" "$RECORD"
 ```
 
-将 `TOOLKIT_SOURCE` 设为稳定的绝对 checkout 路径；若路径本身含链接，先在该 checkout 运行 `pwd -P` 确认真实来源。对每个选定 Skill 重复此流程，不链接 allowlist 外内容。验证 `readlink "$CONSUMER_SKILLS/$SKILL_NAME"` 的目标，并从消费者路径读取 `SKILL.md`；源码 identity 应与 checkout 内同一文件一致。不要以强制链接、复制或 adopt 覆盖已有条目。空消费者也可把整个 `skills/` 作为直接 source root，但逐目录链接更便于保留私有 Skills 和处理 membership 变化。
+将 `TOOLKIT_SOURCE` 设为稳定的绝对 checkout 路径；若路径本身含链接，record 会保存 `pwd -P` 得到的 source identity。对每个选定 Skill 重复此流程，不链接 allowlist 外内容。启用后检查 link 的 `readlink`、record 的五行内容和 `SKILL.md` 可读性。不要以强制链接、复制或 adopt 覆盖已有条目。空消费者也可把整个 `skills/` 作为直接 source root，但逐目录链接更便于保留私有 Skills 和处理 membership 变化。
 
 ## Update and reconciliation
 
@@ -39,26 +102,56 @@ git -C /path/to/agent-toolkit status --short --branch
 git -C /path/to/agent-toolkit pull --ff-only
 ```
 
-`pull` 更新源码与 remote-tracking refs，需要网络；不能快进时停止并处理差异。直接链接立即看到更新，不需复制或重新安装。更新后重读 allowlist、所用 Skill 的 prerequisites/contracts，并检查 source link identity。
+`pull` 更新源码与 remote-tracking refs，需要网络；不能快进时停止并处理差异。直接链接立即看到更新，不需复制或重新安装。更新后重读 allowlist、所用 Skill 的 prerequisites/contracts，并检查 source link identity 与 ownership record 是否仍相互匹配。
 
-上游删除或移出 allowlist 的 Skill 不会被手工链接流程自动清理。逐项比较原来启用列表与当前 allowlist，检查消费者中的链接，包括 dangling symlink；只移除你创建且目标仍精确匹配旧来源的条目。遇到同名普通目录、第三方链接或重新指向的条目时保留并报告冲突。不要仅因 `test -e` 为假就认为条目不存在，它可能是 dangling symlink。
+上游删除或移出 allowlist 的 Skill 不会被手工链接流程自动清理。逐项比较原来启用列表与当前 allowlist，检查消费者中的链接、隐藏 ledger 和 record，包括 dangling symlink。对已删除的 source，仍可使用 record 中保存的 `source_target`/`source_identity` 做人工 reconciliation；只有 record 格式、Skill、source target、source identity、target 均匹配且当前 link 的 `readlink` 仍精确等于 record 的 `source_target` 时才可清理。record 缺失、foreign、malformed，ledger 路径异常，或 target 已被改指其它 source 时，报告并保留 entry 与 record，不能从 symlink target 单独推断 ownership。
 
 ## Disable and uninstall
 
-禁用一个 Skill 只 unlink 自己创建的直接链接；保留 checkout：
+禁用一个 Skill 只 unlink 自己创建的直接链接；必须同时验证隐藏 record 和当前 link target。下面的检查把 malformed/foreign marker、source identity 变化、target 改指和 dangling target 都当作不安全，任何失败都报告并保持 entry 与 record 不变：
 
 ```bash
-if [ -L "$CONSUMER_SKILLS/$SKILL_NAME" ] &&
-   [ "$(readlink "$CONSUMER_SKILLS/$SKILL_NAME")" = "$TOOLKIT_SOURCE/skills/$SKILL_NAME" ]; then
-  unlink "$CONSUMER_SKILLS/$SKILL_NAME"
-else
-  printf '%s\n' 'Entry is not the expected owned link; leave it untouched.'
+set -eu
+TOOLKIT_SOURCE=/path/to/agent-toolkit
+CONSUMER_SKILLS=/path/to/consumer/skills
+SKILL_NAME=docs-no-revision-markers
+SOURCE_TARGET="$TOOLKIT_SOURCE/skills/$SKILL_NAME"
+TARGET="$CONSUMER_SKILLS/$SKILL_NAME"
+LEDGER_DIR="$CONSUMER_SKILLS/.agent-toolkit-links"
+RECORD="$LEDGER_DIR/$SKILL_NAME.record"
+
+report() { printf 'Not disabling %s: %s; leaving entry and record untouched.\n' "$SKILL_NAME" "$*" >&2; exit 1; }
+[ -d "$LEDGER_DIR" ] && [ ! -L "$LEDGER_DIR" ] || report 'ownership ledger is missing or foreign'
+[ -f "$RECORD" ] && [ ! -L "$RECORD" ] || report 'ownership record is missing or foreign'
+[ -L "$TARGET" ] || report 'consumer entry is not the owned symlink'
+[ "$(readlink "$TARGET")" = "$SOURCE_TARGET" ] || report 'current link target changed'
+
+format_seen=0; skill_seen=0; source_seen=0; identity_seen=0; target_seen=0; recorded_identity=''
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in
+    format=agent-toolkit-link-ownership/1) [ "$format_seen" -eq 0 ] || report 'ownership record is malformed'; format_seen=1 ;;
+    skill=*) [ "$skill_seen" -eq 0 ] || report 'ownership record is malformed'; [ "${line#skill=}" = "$SKILL_NAME" ] || report 'ownership record is foreign'; skill_seen=1 ;;
+    source_target=*) [ "$source_seen" -eq 0 ] || report 'ownership record is malformed'; [ "${line#source_target=}" = "$SOURCE_TARGET" ] || report 'ownership record is foreign'; source_seen=1 ;;
+    source_identity=*) [ "$identity_seen" -eq 0 ] || report 'ownership record is malformed'; recorded_identity="${line#source_identity=}"; case "$recorded_identity" in /*) ;; *) report 'ownership record is malformed' ;; esac; identity_seen=1 ;;
+    target=*) [ "$target_seen" -eq 0 ] || report 'ownership record is malformed'; [ "${line#target=}" = "$TARGET" ] || report 'ownership record is foreign'; target_seen=1 ;;
+    *) report 'ownership record is malformed' ;;
+  esac
+done < "$RECORD"
+[ "$format_seen" -eq 1 ] && [ "$skill_seen" -eq 1 ] && [ "$source_seen" -eq 1 ] && [ "$identity_seen" -eq 1 ] && [ "$target_seen" -eq 1 ] || report 'ownership record is incomplete'
+if [ -e "$SOURCE_TARGET" ] || [ -L "$SOURCE_TARGET" ]; then
+  [ -d "$SOURCE_TARGET" ] || report 'source target is no longer a directory'
+  current_identity="$(cd "$SOURCE_TARGET" && pwd -P)" || report 'source identity cannot be resolved'
+  [ "$recorded_identity" = "$current_identity" ] || report 'source identity changed'
 fi
+unlink "$TARGET" || report 'could not remove the verified link'
+unlink "$RECORD" || report 'link removed; ownership record needs manual cleanup'
+rmdir "$LEDGER_DIR" 2>/dev/null || true
+printf 'Disabled %s after ownership verification.\n' "$SKILL_NAME"
 ```
 
-这段检查也适用于上游删除后的孤儿链接。只对已确认的 allowlisted 名称使用变量，不使用宽泛 glob。重新启用仍走 collision 检查。
+当 source 目录已被上游删除时，`[ -e "$SOURCE_TARGET" ] || [ -L "$SOURCE_TARGET" ]` 为假，record 中的 canonical identity 仍作为历史 source identity；target 仍必须精确匹配 record。只对已确认的 allowlisted 名称使用变量，不使用宽泛 glob。重新启用仍走 collision 检查，并且不能复用缺失、foreign 或 malformed record。
 
-卸载消费关系时，对你启用的条目逐一执行相同的检查与 unlink，再移除消费者自己的 source-root 配置。不要删除整个消费者 root、checkout、私有目录或第三方条目。源码 checkout 若确需删除，应另行确认备份、本地修改和所有消费者引用；这不是禁用或清理孤儿链接的隐含动作。
+卸载消费关系时，对你启用的每个条目逐一执行相同的 marker+exact-target 检查和 unlink，再移除消费者自己的 source-root 配置。若 marker 缺失、foreign、malformed 或 target changed，报告并保留该 entry、record 与 checkout，等待人工核对；不要仅凭 target 删除。所有已验证的 link 清理后，只有空的 `.agent-toolkit-links` ledger 才可移除。不要删除整个消费者 root、checkout、私有目录或第三方条目。源码 checkout 若确需删除，应另行确认备份、本地修改和所有消费者引用；这不是禁用或清理孤儿链接的隐含动作。
 
 ## skills-switch
 

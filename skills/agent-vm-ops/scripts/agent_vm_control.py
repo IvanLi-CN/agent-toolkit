@@ -859,10 +859,15 @@ def inspect_layout():
 
     parent_command = ["lsblk", "-n", "-o", "PKNAME", source]
     parent_lines = [line.strip() for line in run(parent_command, "topology-parent").stdout.splitlines() if line.strip()]
-    if len(parent_lines) != 1 or "/" in parent_lines[0]:
+    if len(parent_lines) != 1:
         raise GuestFailure("topology-check", parent_command, cause="ambiguous_root_disk")
     parent = parent_lines[0]
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", parent) is None:
+        raise GuestFailure("topology-check", parent_command, cause="invalid_parent_name")
     disk = "/dev/" + parent
+    expected_source = disk + ("p" if parent[-1:].isdigit() else "") + number
+    if source != expected_source:
+        raise GuestFailure("topology-check", parent_command, cause="root_partition_mismatch")
     source_type_command = ["lsblk", "-n", "-o", "TYPE", source]
     topology_types(run(source_type_command, "topology-type"), "topology-type", source_type_command,
                    require_partition=True)
@@ -6315,7 +6320,8 @@ class Control:
             detail = dict(exc.detail) if isinstance(exc.detail, Mapping) else {"cause": exc.as_dict()}
             failure_phase = detail.get("phase", phase)
             detail.update({"phase": failure_phase, "operation_phase": phase, "completed": completed,
-                           "requested": resources, "cleanup": cleanup})
+                           "requested": resources, "cleanup": cleanup,
+                           "operation_id": request.get("operation_id")})
             if native_init_uncertain:
                 detail["native_init_absence_retry"] = True
                 detail["native_init_cleanup_verified"] = native_init_cleanup_verified

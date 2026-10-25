@@ -56,11 +56,18 @@ class SessionContractTests(unittest.TestCase):
             "generation": 1,
             "state": "cached",
             "effective_lease": False,
+            "last_error": {"operation_id": "failed-acquire-operation"},
         }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             private_key = root / "id_ed25519"
-            args = CLI.build_parser().parse_args(["acquire", "--session-id", session])
+            args = CLI.build_parser().parse_args([
+                "acquire",
+                "--session-id",
+                session,
+                "--operation-id",
+                "failed-acquire-operation",
+            ])
             status_responses = [
                 {"result": {"generation": 0}},
                 {"result": task},
@@ -82,6 +89,40 @@ class SessionContractTests(unittest.TestCase):
                         self.assertEqual(CLI.dispatch(cleanup_args), 0)
                     self.assertEqual(request.call_args.args[0], command)
                     self.assertEqual(request.call_args.kwargs["generation"], 1)
+
+    def test_failed_acquire_does_not_bind_a_concurrent_operation_state(self):
+        session = "failed-acquire-race"
+        task = {
+            "task_id": "avm-winner123",
+            "session_id": session,
+            "generation": 1,
+            "state": "active",
+            "effective_lease": True,
+            "last_error": {"operation_id": "winner-operation"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private_key = root / "id_ed25519"
+            args = CLI.build_parser().parse_args([
+                "acquire",
+                "--session-id",
+                session,
+                "--operation-id",
+                "failed-acquire-operation",
+            ])
+            status_responses = [
+                {"result": {"generation": 0}},
+                {"result": task},
+            ]
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", root / "state"):
+                with mock.patch.object(CLI, "make_ssh_key", return_value=(private_key, "ssh-ed25519 AAAA")), \
+                     mock.patch.object(CLI, "control_request", side_effect=status_responses), \
+                     mock.patch.object(CLI, "mutation", side_effect=CLI.CliError("guest_resize_unverified", "guest growth failed")):
+                    with self.assertRaises(CLI.CliError):
+                        CLI.command_acquire(args)
+                with self.assertRaises(CLI.CliError) as failure:
+                    CLI.read_session_state(session)
+        self.assertEqual(failure.exception.code, "local_state_missing")
 
     def test_sync_passes_selected_identity_to_helper(self):
         args = CLI.build_parser().parse_args(["sync", "--name", "repo", "--session-id", "explicit"])

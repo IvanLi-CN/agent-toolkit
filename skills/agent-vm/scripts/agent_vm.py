@@ -154,16 +154,34 @@ def current_generation(value: str) -> int:
     return generation
 
 
-def persist_recovery_state(session: str, private_key: Path, result: Any) -> bool:
+def persist_recovery_state(
+    session: str,
+    private_key: Path,
+    result: Any,
+    *,
+    operation_id: str,
+    expected_generation: int,
+) -> bool:
     if not isinstance(result, Mapping) or result.get("session_id") != session:
         return False
     if result.get("state") == "absent":
+        return False
+    last_error = result.get("last_error")
+    if not isinstance(last_error, Mapping) or last_error.get("operation_id") != operation_id:
+        return False
+    if (
+        isinstance(expected_generation, bool)
+        or not isinstance(expected_generation, int)
+        or expected_generation < 0
+    ):
         return False
     task_id = result.get("task_id")
     generation = result.get("generation")
     if not isinstance(task_id, str) or re.fullmatch(r"avm-[a-z0-9-]+", task_id) is None:
         return False
     if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+        return False
+    if generation != expected_generation + 1:
         return False
     try:
         state = {
@@ -178,12 +196,24 @@ def persist_recovery_state(session: str, private_key: Path, result: Any) -> bool
     return True
 
 
-def recover_acquire_state(session: str, private_key: Path) -> bool:
+def recover_acquire_state(
+    session: str,
+    private_key: Path,
+    *,
+    operation_id: str,
+    expected_generation: int,
+) -> bool:
     try:
         response = control_request("status", session=session)
     except CliError:
         return False
-    return persist_recovery_state(session, private_key, response.get("result"))
+    return persist_recovery_state(
+        session,
+        private_key,
+        response.get("result"),
+        operation_id=operation_id,
+        expected_generation=expected_generation,
+    )
 
 
 def control_timeout(action: str, fields: dict[str, Any] | None = None) -> int:
@@ -1126,6 +1156,7 @@ def mutation(
     fields: dict[str, Any] | None = None,
     generation: int | None = None,
     session: str | None = None,
+    operation_id_value: str | None = None,
 ) -> dict[str, Any]:
     session = session if session is not None else session_id(getattr(args, "session_id", None))
     if generation is None and action not in {"acquire", "drain-enter", "drain-exit", "admin-reconcile", "admin-gc"}:
@@ -1136,7 +1167,7 @@ def mutation(
         session=session,
         generation=0 if generation is None and action == "acquire" else generation,
         write=True,
-        operation_id=operation_id(args),
+        operation_id=operation_id_value or operation_id(args),
         fields=fields,
     )
 
@@ -1144,6 +1175,7 @@ def mutation(
 def command_acquire(args: argparse.Namespace) -> int:
     session = session_id(args.session_id)
     private_key, public_key = make_ssh_key(session)
+    acquire_operation_id = operation_id(args)
     # Observation never renews. Reuse a saved operation's original generation
     # when retrying after a lost acknowledgement.
     generation = control_request("status", session=session)["result"]["generation"]
@@ -1157,15 +1189,33 @@ def command_acquire(args: argparse.Namespace) -> int:
     if args.memory is not None: fields["memory_mib"] = parse_memory(args.memory)
     if args.disk is not None: fields["disk_gib"] = parse_disk(args.disk)
     try:
-        response = mutation("acquire", args, generation=generation, session=session, fields=fields)
+        response = mutation(
+            "acquire",
+            args,
+            generation=generation,
+            session=session,
+            fields=fields,
+            operation_id_value=acquire_operation_id,
+        )
     except CliError:
         # Acquire cleanup remains a public operation even when the mutation
         # fails after the control side has created a durable task.
-        recover_acquire_state(session, private_key)
+        recover_acquire_state(
+            session,
+            private_key,
+            operation_id=acquire_operation_id,
+            expected_generation=generation,
+        )
         raise
     result = response.get("current_state", response["result"])
     if result is None or not isinstance(result, Mapping) or not result.get("effective_lease"):
-        persist_recovery_state(session, private_key, result)
+        persist_recovery_state(
+            session,
+            private_key,
+            result,
+            operation_id=acquire_operation_id,
+            expected_generation=generation,
+        )
         fail("lease_unavailable", "replayed allocation no longer has an active lease; inspect status")
     write_session_state(session, {"session_id": session, "task_id": result["task_id"],
                                  "generation": result["generation"], "private_key": str(private_key)})

@@ -1396,6 +1396,7 @@ class LifecycleTests(Fixture):
         self.assertEqual(self.runner.instances[task["instance_name"]]["status"], "Stopped")
         failure = json.loads(task["last_error"])
         self.assertEqual(failure["code"], "acquire_partial")
+        self.assertEqual(failure["operation_id"], "op-1")
         self.assertEqual(failure["phase"], "filesystem-grow")
         self.assertEqual(failure["command"], ["resize2fs", "/dev/sda2"])
         self.assertEqual(failure["returncode"], 1)
@@ -2126,6 +2127,7 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         escaped_child_pid_path=None,
         root_exits_before_timeout=False,
         source_output="/dev/sda2\n",
+        parent_output="sda\n",
         source_type_output="disk\npart\npart\n",
         disk_type_output="disk\npart\npart\n",
         partition_marker_exists=True,
@@ -2163,7 +2165,7 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
                 output = (filesystem_type + "\n").encode()
                 timeout = False
             elif command[:4] == ["lsblk", "-n", "-o", "PKNAME"]:
-                output = b"sda\n"
+                output = parent_output.encode()
                 timeout = False
             elif command[:4] == ["lsblk", "-n", "-o", "TYPE"]:
                 output = (source_type_output if command[-1] == "/dev/sda2" else disk_type_output).encode()
@@ -2327,7 +2329,7 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         self.assertNotIn(["blockdev", "--rereadpt", "/dev/sda"], calls)
 
     def test_guest_root_growth_script_accepts_partition_topology_rows(self):
-        exit_code, stdout, stderr, _ = self.execute_script(
+        exit_code, stdout, stderr, calls = self.execute_script(
             initial_partition=20 * GIB,
             initial_filesystem=20 * GIB,
         )
@@ -2339,6 +2341,8 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         self.assertEqual(payload["parent"], "/dev/sda")
         self.assertEqual(payload["filesystem"], "ext4")
         self.assertTrue(payload["capacity"]["verified"])
+        self.assertIn(["lsblk", "-n", "-o", "TYPE", "/dev/sda2"], calls)
+        self.assertIn(["lsblk", "-n", "-o", "TYPE", "/dev/sda"], calls)
 
     def test_guest_root_growth_script_retries_stale_partition_and_grows(self):
         exit_code, stdout, stderr, calls = self.execute_script()
@@ -2620,6 +2624,36 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         error = json.loads(stderr)["error"]
         self.assertEqual(error["phase"], "topology-type")
         self.assertEqual(error["cause"], "invalid_topology")
+
+    def test_guest_root_growth_script_rejects_invalid_parent_disk_topology(self):
+        exit_code, stdout, stderr, calls = self.execute_script(disk_type_output="disk\npart\ncrypt\n")
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout, "")
+        error = json.loads(stderr)["error"]
+        self.assertEqual(error["phase"], "topology-type")
+        self.assertEqual(error["cause"], "invalid_topology")
+        self.assertNotIn(["growpart", "/dev/sda", "2"], calls)
+
+    def test_guest_root_growth_script_rejects_mismatched_parent_before_growth(self):
+        exit_code, stdout, stderr, calls = self.execute_script(parent_output="sdb\n")
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout, "")
+        error = json.loads(stderr)["error"]
+        self.assertEqual(error["phase"], "topology-check")
+        self.assertEqual(error["cause"], "root_partition_mismatch")
+        self.assertNotIn(["growpart", "/dev/sdb", "2"], calls)
+
+    def test_guest_root_growth_script_rejects_unsafe_parent_name(self):
+        exit_code, stdout, stderr, calls = self.execute_script(parent_output="sda name\n")
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout, "")
+        error = json.loads(stderr)["error"]
+        self.assertEqual(error["phase"], "topology-check")
+        self.assertEqual(error["cause"], "invalid_parent_name")
+        self.assertFalse(any(command[0] == "growpart" for command in calls))
 
 
 class CommandRunnerTests(unittest.TestCase):

@@ -154,10 +154,6 @@ function panelIds(dashboard: JsonRecord): Map<number, number> {
   return counts;
 }
 
-function stringsInTargets(targets: JsonRecord[]): string[] {
-  return targets.flatMap((target) => Object.values(target).filter((value): value is string => typeof value === "string"));
-}
-
 export function validateDashboard(dashboard: unknown, expectedDatasourceUid?: string, options: DashboardValidationOptions = {}): string[] {
   const findings: string[] = [];
   if (!isRecord(dashboard)) return ["dashboard must be a JSON object"];
@@ -184,14 +180,13 @@ export function validateDashboard(dashboard: unknown, expectedDatasourceUid?: st
   }
 
   const targets = targetRecords(dashboard);
-  const targetStrings = stringsInTargets(targets);
   const expressions = targets
     .map((target) => target.expr)
     .filter((expr): expr is string => typeof expr === "string");
-  const allTargetText = targetStrings.join("\n");
+  const allExpressions = expressions.join("\n");
 
   for (const metric of options.requiredMetrics ?? REQUIRED_METRICS) {
-    if (!allTargetText.includes(metric)) findings.push(`missing required metric: ${metric}`);
+    if (!allExpressions.includes(metric)) findings.push(`missing required metric: ${metric}`);
   }
 
   for (const [index, expression] of expressions.entries()) {
@@ -223,12 +218,16 @@ export function validateDashboard(dashboard: unknown, expectedDatasourceUid?: st
   return findings;
 }
 
-export function validateProvisioning(provisioning: string): string[] {
+export function validateProvisioning(provisioning: string, expectedDashboardPath?: string): string[] {
   const findings: string[] = [];
   if (!/^apiVersion:\s*1\s*$/m.test(provisioning)) findings.push("provisioning must declare apiVersion 1");
   if (!/^providers:\s*$/m.test(provisioning)) findings.push("provisioning must declare providers");
   if (!/^\s+type:\s+file\s*$/m.test(provisioning)) findings.push("provisioning provider must use the file type");
-  if (!/^\s+path:\s+\"[^\"]+\"\s*$/m.test(provisioning)) findings.push("provisioning provider must declare a quoted path");
+  const paths = [...provisioning.matchAll(/^\s+path:\s+\"([^\"]+)\"\s*$/gm)].map((match) => match[1]);
+  if (paths.length !== 1) findings.push("provisioning provider must declare exactly one quoted path");
+  if (expectedDashboardPath && paths.length === 1 && paths[0] !== expectedDashboardPath) {
+    findings.push(`provisioning provider path must be ${expectedDashboardPath}`);
+  }
   if (/__[A-Z0-9_]+__/.test(provisioning)) findings.push("provisioning contains an unresolved placeholder");
   return findings;
 }

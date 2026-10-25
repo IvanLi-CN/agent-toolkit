@@ -6,6 +6,7 @@ import {
   INVENTORY_REQUIRED_METRICS,
   INVENTORY_REQUIRED_PANEL_TITLES,
   validateDashboard,
+  validateProvisioning,
 } from "../scripts/validate_observability_dashboard.ts";
 
 const config: ObservabilityConfig = {
@@ -35,6 +36,8 @@ test("renders a portable dashboard and provisioning bundle", () => {
   expect(bundle.inventoryDashboardText).toContain('"state_order": true');
   expect(bundle.inventoryDashboardText).toContain('"task_id 1": true');
   expect(bundle.inventoryDashboardText).toContain('"options": "Scrape age (s)"');
+  expect(bundle.inventoryDashboardText).not.toContain('agent_vm_operations_total{job=\\"$controller_job\\",outcome=\\"failure\\"}) + sum(agent_vm_image_unpack_failures_total');
+  expect(bundle.inventoryDashboardText).toContain('"legendFormat": "Image unpack failures"');
   expect(bundle.inventoryDashboardText).toContain('"text": [\n            "active",\n            "preparing",\n            "closing",\n            "deleting",\n            "failed"');
   expect(bundle.inventoryDashboardText).not.toContain("or vector(0)");
   expect(bundle.inventoryDashboardText).toContain("time() - agent_vm_scrape_timestamp_seconds");
@@ -69,6 +72,29 @@ test("renders a portable dashboard and provisioning bundle", () => {
     requiredPanelTitles: INVENTORY_REQUIRED_PANEL_TITLES,
     requiredMetrics: INVENTORY_REQUIRED_METRICS,
   })).toEqual([]);
+});
+
+test("requires dashboard metrics in PromQL expressions", () => {
+  const bundle = renderBundle(config);
+  const dashboard = structuredClone(bundle.inventoryDashboard) as Record<string, unknown>;
+  const panels = dashboard.panels as Array<Record<string, unknown>>;
+  const healthPanel = panels.find((panel) => panel.title === "Controller scrape health") as Record<string, unknown>;
+  const targets = healthPanel.targets as Array<Record<string, unknown>>;
+  const controllerTarget = targets.find((target) => target.refId === "A") as Record<string, unknown>;
+  controllerTarget.expr = "vector(1)";
+  controllerTarget.legendFormat = "agent_vm_up";
+  expect(validateDashboard(dashboard, "prometheus-test", {
+    requiredPanelTitles: INVENTORY_REQUIRED_PANEL_TITLES,
+    requiredMetrics: INVENTORY_REQUIRED_METRICS,
+  })).toContain("missing required metric: agent_vm_up");
+});
+
+test("requires the rendered provisioning path", () => {
+  const bundle = renderBundle(config);
+  expect(validateProvisioning(bundle.provisioningText, config.dashboard_path)).toEqual([]);
+  expect(validateProvisioning(bundle.provisioningText.replace(config.dashboard_path, "/wrong/path"), config.dashboard_path)).toContain(
+    `provisioning provider path must be ${config.dashboard_path}`,
+  );
 });
 
 test("rejects packet-rate expressions that convert counts to bits", () => {

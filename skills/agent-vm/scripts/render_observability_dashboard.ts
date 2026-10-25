@@ -170,7 +170,7 @@ export function renderBundle(config: ObservabilityConfig, templateDir: string = 
       requiredPanelTitles: INVENTORY_REQUIRED_PANEL_TITLES,
       requiredMetrics: INVENTORY_REQUIRED_METRICS,
     }),
-    ...validateProvisioning(provisioningText),
+    ...validateProvisioning(provisioningText, config.dashboard_path),
   ];
   if (findings.length > 0) throw new Error(`rendered observability bundle failed validation:\n${findings.join("\n")}`);
   return {
@@ -193,9 +193,6 @@ export function writeBundle(bundle: RenderedBundle, outputDir: string, force = f
   if (new Set([dashboardPath, inventoryDashboardPath, provisioningPath]).size !== 3) {
     throw new Error("dashboard output paths must be unique");
   }
-  if (!force && (existsSync(dashboardPath) || existsSync(inventoryDashboardPath) || existsSync(provisioningPath))) {
-    throw new Error(`output exists; pass --force to replace ${basename(dashboardPath)}, ${basename(inventoryDashboardPath)} or agent-vm-observability.yml`);
-  }
   const outputs = [
     { path: dashboardPath, text: bundle.dashboardText },
     { path: inventoryDashboardPath, text: bundle.inventoryDashboardText },
@@ -212,6 +209,9 @@ export function writeBundle(bundle: RenderedBundle, outputDir: string, force = f
       lockAcquired = true;
     } catch (error) {
       throw new Error(`output directory is locked: ${directory}: ${String(error)}`);
+    }
+    if (!force && (existsSync(dashboardPath) || existsSync(inventoryDashboardPath) || existsSync(provisioningPath))) {
+      throw new Error(`output exists; pass --force to replace ${basename(dashboardPath)}, ${basename(inventoryDashboardPath)} or agent-vm-observability.yml`);
     }
     staging = mkdtempSync(join(directory, ".agent-vm-observability-"));
     for (const [index, output] of outputs.entries()) writeFileSync(join(staging, String(index)), output.text, "utf8");

@@ -325,10 +325,21 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "sum(agent_vm_operations_total{job=\"$controller_job\",outcome=\"failure\"}) + sum(agent_vm_image_unpack_failures_total{job=\"$controller_job\"})",
+          "expr": "sum(agent_vm_operations_total{job=\"$controller_job\",outcome=\"failure\"})",
           "instant": true,
-          "legendFormat": "Failures",
+          "legendFormat": "Operation failures",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "editorMode": "code",
+          "expr": "sum(agent_vm_image_unpack_failures_total{job=\"$controller_job\"})",
+          "instant": true,
+          "legendFormat": "Image unpack failures",
+          "refId": "B"
         }
       ],
       "title": "Operation failures & image unpack",

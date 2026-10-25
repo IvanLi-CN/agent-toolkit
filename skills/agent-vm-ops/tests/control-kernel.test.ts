@@ -658,6 +658,27 @@ describe("control-store: legacy schema and durable transaction behavior", () => 
     });
   });
 
+  test("state epoch advances only for committed writes", async () => {
+    await withStore((store) => {
+      expect(store.state_epoch()).toBe(0);
+      store.transaction(() => {
+        expect(store.get_meta("missing")).toBeNull();
+      });
+      expect(store.state_epoch()).toBe(0);
+
+      store.set_meta("epoch-test", "1");
+      expect(store.state_epoch()).toBe(1);
+
+      const original = new ControlError("native_failed", "native failed");
+      expect(caught(() => store.transaction(() => {
+        store.set_meta("rolled-back", "1");
+        throw original;
+      }))).toBe(original);
+      expect(store.get_meta("rolled-back")).toBeNull();
+      expect(store.state_epoch()).toBe(1);
+    });
+  });
+
   test("rolls back all nested task, port, journal and audit writes", async () => {
     await withStore((store) => {
       const original = new ControlError("native_failed", "native failed");

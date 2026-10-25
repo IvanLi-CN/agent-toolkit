@@ -41,6 +41,7 @@ const MAX_SAFE_INTEGER = BigInt(Number.MAX_SAFE_INTEGER);
 const MIN_SAFE_INTEGER = BigInt(Number.MIN_SAFE_INTEGER);
 const MAX_SQLITE_INTEGER = (1n << 63n) - 1n;
 const MIN_SQLITE_INTEGER = -(1n << 63n);
+const STATE_EPOCH_KEY = "state_epoch";
 
 const TASK_FIELDS = [
   "task_id",
@@ -377,6 +378,7 @@ export class StateStore {
   connection!: Database;
   depth = 0;
   _unusable = false;
+  private transaction_mutated = false;
 
   constructor(path: string) {
     this.path = path;
@@ -496,6 +498,82 @@ export class StateStore {
     sqlite_call(() => {
       this.connection.query(sql).run(...values);
     });
+    if (this.depth > 0) this.transaction_mutated = true;
+  }
+
+  private _state_epoch_value(value: string | null): Integer {
+    if (value === null) return 0;
+    const text = value.trim();
+    if (!/^(?:0|[1-9][0-9]*)$/.test(text)) {
+      throw new ControlError(
+        "state_unverified",
+        "state database epoch is invalid",
+        { key: STATE_EPOCH_KEY },
+      );
+    }
+
+    const epoch = BigInt(text);
+    if (epoch > MAX_SQLITE_INTEGER) {
+      throw new ControlError(
+        "state_unverified",
+        "state database epoch is out of range",
+        { key: STATE_EPOCH_KEY },
+      );
+    }
+    return normalize_integer(epoch);
+  }
+
+  private _advance_state_epoch(): void {
+    const next = BigInt(this._state_epoch_value(this.get_meta(STATE_EPOCH_KEY))) + 1n;
+    if (next > MAX_SQLITE_INTEGER) {
+      throw new ControlError(
+        "state_unverified",
+        "state database epoch overflowed",
+        { key: STATE_EPOCH_KEY },
+      );
+    }
+    this._run(
+      "INSERT INTO meta(key, value) VALUES (?, ?) " +
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      [STATE_EPOCH_KEY, next.toString()],
+    );
+  }
+
+  private _rollback_application(error: unknown): never {
+    let rollback_error: unknown = undefined;
+    try {
+      this._rollback();
+    } catch (failure) {
+      if (!is_sqlite_error(failure)) throw failure;
+      rollback_error = failure;
+      this._unusable = true;
+    }
+
+    if (is_sqlite_error(error)) {
+      const failure = StateStore._sqlite_failure(error, {
+        phase: "write",
+        sql_operation: "write",
+        state_committed: rollback_error === undefined ? false : null,
+        rollback_error,
+      });
+      throw failure;
+    }
+
+    if (rollback_error !== undefined) {
+      const failure = StateStore._sqlite_failure(rollback_error, {
+        phase: "rollback",
+        sql_operation: "write",
+        state_committed: null,
+      });
+      failure.detail.original_error = {
+        type: error_type(error),
+        message: error_message(error),
+      };
+      failure.cause = error;
+      throw failure;
+    }
+
+    throw error;
   }
 
   private _commit(): void {
@@ -552,6 +630,7 @@ export class StateStore {
           state_committed: false,
         });
       }
+      this.transaction_mutated = false;
     }
 
     this.depth += 1;
@@ -588,57 +667,41 @@ export class StateStore {
           });
         }
 
-        if (outer) {
-          try {
-            this._rollback();
-          } catch (rollback_error) {
-            if (!is_sqlite_error(rollback_error)) throw rollback_error;
-
-            this._unusable = true;
-            const failure = StateStore._sqlite_failure(rollback_error, {
-              phase: "rollback",
-              sql_operation: "write",
-              state_committed: null,
-            });
-            failure.detail.original_error = {
-              type: error_type(error),
-              message: error_message(error),
-            };
-            failure.cause = error;
-            throw failure;
-          }
-        }
-
+        if (outer) this._rollback_application(error);
         throw error;
       }
 
       if (outer) {
         try {
+          if (this.transaction_mutated) this._advance_state_epoch();
           this._commit();
         } catch (error) {
-          if (!is_sqlite_error(error)) throw error;
+          if (is_sqlite_error(error)) {
+            let rollback_error: unknown = undefined;
+            try {
+              this._rollback();
+            } catch (rollback_failure) {
+              if (!is_sqlite_error(rollback_failure)) throw rollback_failure;
+              rollback_error = rollback_failure;
+              this._unusable = true;
+            }
 
-          let rollback_error: unknown = undefined;
-          try {
-            this._rollback();
-          } catch (rollback_failure) {
-            if (!is_sqlite_error(rollback_failure)) throw rollback_failure;
-            rollback_error = rollback_failure;
-            this._unusable = true;
+            throw StateStore._sqlite_failure(error, {
+              phase: "commit",
+              sql_operation: "write",
+              state_committed: null,
+              rollback_error,
+            });
           }
-
-          throw StateStore._sqlite_failure(error, {
-            phase: "commit",
-            sql_operation: "write",
-            state_committed: null,
-            rollback_error,
-          });
+          if (this.connection.inTransaction) this._rollback_application(error);
+          throw error;
         }
       }
 
       return result;
     } finally {
       this.depth -= 1;
+      if (outer) this.transaction_mutated = false;
     }
   }
 
@@ -1110,6 +1173,10 @@ export class StateStore {
   get_meta(key: string): string | null {
     const row = this._row("SELECT value FROM meta WHERE key = ?", [key]);
     return row === null ? null : python_string(row.value);
+  }
+
+  state_epoch(): Integer {
+    return this._state_epoch_value(this.get_meta(STATE_EPOCH_KEY));
   }
 
   set_meta(key: string, value: string): void {

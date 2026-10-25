@@ -834,7 +834,11 @@ class ReleasePublisher:
             states = last.get("task_states")
             if last.get("draining") is not True:
                 _fail("drain_unverified", "admission drain was not confirmed during convergence", {"draining": last.get("draining")})
-            if last.get("observation_consistent") is not True:
+            # The active controller may be an older protocol-4 release that
+            # predates the durable observation contract. Drain and task-state
+            # checks remain mandatory; the candidate is checked strictly
+            # after activation by _health().
+            if "observation_consistent" in last and last.get("observation_consistent") is not True:
                 _fail(
                     "observation_unverified",
                     "control returned an inconsistent metrics snapshot during convergence",

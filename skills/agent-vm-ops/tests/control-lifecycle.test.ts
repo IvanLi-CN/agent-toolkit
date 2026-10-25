@@ -174,6 +174,54 @@ scenario("missing guest Bun blocks disk action and SSH exposure without a Python
   expect(task(f).state).toBe("cached");
 });
 
+scenario("admin metrics reports a stable durable observation window", async f => {
+  const result = await f.call("admin-metrics", { session: null });
+
+  expect(result.observation_consistent).toBe(true);
+  expect(result.observation_attempts).toBe(1);
+  expect(result.observation_epoch).toBe(0);
+  expect(result.default_admission).not.toBeNull();
+  expect(result.warnings).not.toContainEqual({
+    code: "observation_inconsistent",
+    message: "durable state changed while collecting metrics",
+  });
+});
+
+scenario("admin metrics retries when durable state changes during native sampling", async f => {
+  let probes = 0;
+  f.resources.on_memory = async () => {
+    probes += 1;
+    if (probes === 1) f.store.set_meta("observation-race", "1");
+    return f.resources.memory_value;
+  };
+
+  const result = await f.call("admin-metrics", { session: null });
+
+  expect(probes).toBeGreaterThanOrEqual(2);
+  expect(result.observation_consistent).toBe(true);
+  expect(result.observation_attempts).toBe(2);
+  expect(result.observation_epoch).toBe(1);
+});
+
+scenario("admin metrics bounds an unstable observation and reports a warning", async f => {
+  let probes = 0;
+  f.resources.on_memory = async () => {
+    probes += 1;
+    f.store.set_meta(`observation-race-${probes}`, "1");
+    return f.resources.memory_value;
+  };
+
+  const result = await f.call("admin-metrics", { session: null });
+
+  expect(probes).toBeGreaterThanOrEqual(3);
+  expect(result.observation_consistent).toBe(false);
+  expect(result.observation_attempts).toBe(3);
+  expect(result.warnings).toContainEqual({
+    code: "observation_inconsistent",
+    message: "durable state changed while collecting metrics",
+  });
+});
+
 scenario("activation fence prevents drain exit and leaves admission closed", async f => {
   await f.call("drain-enter", { session: null });
   writeFileSync(f.config.release_fence_path, "activation");

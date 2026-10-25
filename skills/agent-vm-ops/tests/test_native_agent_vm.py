@@ -2128,7 +2128,7 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         root_exits_before_timeout=False,
         source_output="/dev/sda2\n",
         parent_output="sda\n",
-        source_type_output="disk\npart\npart\n",
+        source_type_output="part\n",
         disk_type_output="disk\npart\npart\n",
         partition_marker_exists=True,
         udevadm_available=False,

@@ -791,15 +791,18 @@ def one_line(result, phase, command):
     return lines[0]
 
 
-def topology_types(result, phase, command, *, require_partition):
+def topology_types(result, phase, command, *, expected):
     lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    if (
-        not lines
-        or lines[0] != "disk"
-        or lines.count("disk") != 1
-        or any(line != "part" and line != "disk" for line in lines)
-        or (require_partition and "part" not in lines)
-    ):
+    valid_partition = expected == "part" and lines == ["part"]
+    valid_disk = (
+        expected == "disk"
+        and lines
+        and lines[0] == "disk"
+        and lines.count("disk") == 1
+        and "part" in lines
+        and all(line in {"disk", "part"} for line in lines)
+    )
+    if not (valid_partition or valid_disk):
         raise GuestFailure(phase, command, result.returncode, result.stdout, result.stderr,
                            cause="invalid_topology",
                            stdout_truncated=getattr(result, "stdout_truncated", False),
@@ -870,10 +873,10 @@ def inspect_layout():
         raise GuestFailure("topology-check", parent_command, cause="root_partition_mismatch")
     source_type_command = ["lsblk", "-n", "-o", "TYPE", source]
     topology_types(run(source_type_command, "topology-type"), "topology-type", source_type_command,
-                   require_partition=True)
+                   expected="part")
     disk_type_command = ["lsblk", "-n", "-o", "TYPE", disk]
     topology_types(run(disk_type_command, "topology-type"), "topology-type", disk_type_command,
-                   require_partition=False)
+                   expected="disk")
 
     filesystem_tool = "resize2fs" if fstype == "ext4" else "xfs_growfs"
     required_tools = ["findmnt", "lsblk", "blockdev", "growpart", filesystem_tool]

@@ -18,8 +18,8 @@ case "$mode" in
       size=$(wc -c < "$file" | tr -d '[:space:]')
       [ "$size" -le 1048576 ] || exit 4
       printf '%s\t%s\n' "$name" "$size"
-      # Cap transfer if the file changes after stat; the local framing check rejects drift.
-      head -c 1048577 "$file"
+      # POSIX dd caps transfer at 1 MiB plus one drift byte; local framing rejects drift.
+      dd if="$file" bs=1 count=1048577 2>/dev/null
     done
     ;;
   snapshot)

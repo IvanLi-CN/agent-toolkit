@@ -9,7 +9,7 @@ Use this Skill for a configured server whose SSH alias, user and local client di
 
 ## Prerequisites and smallest examples
 
-Local entrypoints require installed Bun on Linux/macOS. Remote collection additionally requires OpenSSH locally, an already trusted host key and non-interactive key access, and POSIX `sh` plus standard native utilities on the server. No Bun or Lua interpreter is required remotely. Generation and tests do not install or update server software. The scripts work directly from a checkout or a directory symlink without package installation.
+Local entrypoints require installed Bun on Linux/macOS. Remote collection additionally requires OpenSSH locally, an already trusted host key and non-interactive key access, and POSIX `sh`, `dd`, `wc`, `tr` and `head` on the server, plus ordinary filesystem utilities. The mod byte cap uses POSIX `dd`; snapshot line caps use POSIX `head -n`. No Bun or Lua interpreter is required remotely. Generation and tests do not install or update server software. The scripts work directly from a checkout or a directory symlink without package installation.
 
 ```bash
 SKILL_DIR=/path/to/agent-toolkit/skills/dst-dedicated-server

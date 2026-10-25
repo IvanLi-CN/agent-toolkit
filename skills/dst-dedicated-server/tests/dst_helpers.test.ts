@@ -21,8 +21,13 @@ function cluster(path: string) {
 function fakeSsh(mode = "native") {
   const bin = join(root, "bin"); mkdirSync(bin, { recursive: true });
   const path = join(bin, "ssh");
-  writeFileSync(path, `#!/bin/sh\nprintf '%s\\n' "$@" > "$SSH_ARGS_FILE"\ncase "$SSH_TEST_MODE" in\nfail) echo SECRET_STDERR >&2; exit 255;;\nlarge) head -c 3200000 /dev/zero; exit 0;;\nstall) exec sleep 30;;\nesac\nfor arg do command=$arg; done\nexec sh -c "$command"\n`);
+  writeFileSync(path, `#!/bin/sh\nprintf '%s\\n' "$@" > "$SSH_ARGS_FILE"\ncase "$SSH_TEST_MODE" in\nfail) echo SECRET_STDERR >&2; exit 255;;\nlarge) dd if=/dev/zero bs=1 count=3200000 2>/dev/null; exit 0;;\nstall) exec sleep 30;;\nesac\nfor arg do command=$arg; done\nexec sh -c "$command"\n`);
   chmodSync(path, 0o755);
+  if (mode === "no-head") {
+    const head = join(bin, "head");
+    writeFileSync(head, "#!/bin/sh\nprintf 'head must not be called\\n' >&2\nexit 127\n");
+    chmodSync(head, 0o755);
+  }
   return { PATH: `${bin}:${process.env.PATH}`, HOME: join(root, "remote"), SSH_ARGS_FILE: join(root, "ssh-args"), SSH_TEST_MODE: mode };
 }
 describe("VER-FOUNDATION-HELPERS-03: DST snapshots and local/remote reports", () => {
@@ -77,6 +82,11 @@ describe("VER-FOUNDATION-HELPERS-03: DST snapshots and local/remote reports", ()
     expect(missing.exitCode).toBe(0); expect(missing.stdout.toString()).toContain("modoverrides.lua: missing"); expect(missing.stdout.toString()).not.toContain("## Diff");
     const nonexistent = run("dst_mods_from_modoverrides.ts", ["--host", "dst.example", "--user", "operator", "--cluster", "Absent"], env);
     expect(nonexistent.exitCode).toBe(2);
+  });
+  test("native mod framing uses POSIX byte capping without head", () => {
+    const env = fakeSsh("no-head"); cluster(join(env.HOME, ".klei/DoNotStarveTogether/Cluster_1"));
+    const remote = run("dst_mods_from_modoverrides.ts", ["--host", "dst.example", "--user", "operator", "--cluster", "Cluster_1"], env);
+    expect(remote.exitCode).toBe(0); expect(remote.stderr.toString()).toBe(""); expect(remote.stdout.toString()).toContain("- mods: 3");
   });
   test("oversized SSH and files are bounded and malformed frames fail closed", () => {
     const oversized = run("dst_mods_from_modoverrides.ts", ["--host", "dst.example", "--user", "operator", "--cluster", "Cluster_1"], fakeSsh("large"));

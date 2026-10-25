@@ -181,7 +181,13 @@ def _state_write_allowed(value: str, current: Any, candidate: Mapping[str, Any])
         return False
     if current_generation > candidate_generation:
         return False
-    return current_generation != candidate_generation or current.get("task_id") == candidate_task
+    if current_generation == candidate_generation:
+        if current.get("task_id") != candidate_task:
+            return False
+        if current.get("cleanup_only", False) is False and candidate.get("cleanup_only", False) is True:
+            return False
+        return True
+    return True
 
 
 def write_session_state(value: str, state: dict[str, Any]) -> bool:
@@ -238,25 +244,29 @@ def persist_recovery_state(
     partial_operation_id = result.get("partial_operation_id")
     last_error = result.get("last_error")
     committed_operation = recovery_operation_id == operation_id
+    matching_partial_error = (
+        isinstance(last_error, Mapping)
+        and last_error.get("operation_id") == operation_id
+        and last_error.get("task_id") == task_id
+        and last_error.get("task_generation") == generation
+    )
     partial_operation = (
         partial_operation_id == operation_id
-        or isinstance(last_error, Mapping) and last_error.get("operation_id") == operation_id
+        or matching_partial_error
     )
     if not committed_operation and not partial_operation:
         return False
     if committed_operation:
         if generation not in {expected_generation, expected_generation + 1}:
             return False
-    elif partial_operation_id == operation_id:
+    elif partial_operation_id == operation_id or matching_partial_error:
         if generation not in {expected_generation, expected_generation + 1}:
             return False
-    elif generation != expected_generation + 1:
-        return False
     state = {
         "session_id": session,
         "task_id": task_id,
         "generation": generation,
-        "cleanup_only": not committed_operation,
+        "cleanup_only": True,
     }
     state["private_key"] = str(private_key)
     try:

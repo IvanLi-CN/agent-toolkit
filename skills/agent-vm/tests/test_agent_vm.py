@@ -56,7 +56,11 @@ class SessionContractTests(unittest.TestCase):
             "generation": 1,
             "state": "cached",
             "effective_lease": False,
-            "last_error": {"operation_id": "failed-acquire-operation"},
+            "last_error": {
+                "operation_id": "failed-acquire-operation",
+                "task_id": "avm-recovery123",
+                "task_generation": 1,
+            },
         }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -161,6 +165,7 @@ class SessionContractTests(unittest.TestCase):
 
         self.assertEqual(state["task_id"], "avm-committed123")
         self.assertEqual(state["generation"], 1)
+        self.assertTrue(state["cleanup_only"])
         self.assertEqual(recovery_request.args[0], "status")
         self.assertEqual(recovery_request.kwargs["operation_id"], "committed-acquire-operation")
 
@@ -231,6 +236,63 @@ class SessionContractTests(unittest.TestCase):
         self.assertEqual(state["task_id"], "avm-pending123")
         self.assertEqual(state["generation"], 1)
         self.assertTrue(state["cleanup_only"])
+
+    def test_delayed_recovery_cannot_downgrade_same_generation_success(self):
+        session = "same-generation-state"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", root / "state"):
+                CLI.write_session_state(session, {
+                    "session_id": session,
+                    "task_id": "avm-same-generation",
+                    "generation": 1,
+                    "private_key": str(root / "current-key"),
+                    "cleanup_only": False,
+                })
+                self.assertFalse(
+                    CLI.persist_recovery_state(
+                        session,
+                        root / "delayed-key",
+                        {
+                            "session_id": session,
+                            "task_id": "avm-same-generation",
+                            "generation": 1,
+                            "state": "active",
+                            "partial_operation_id": "delayed-operation",
+                        },
+                        operation_id="delayed-operation",
+                        expected_generation=1,
+                    )
+                )
+                state = CLI.read_session_state(session)
+
+        self.assertFalse(state["cleanup_only"])
+        self.assertEqual(state["private_key"], str(root / "current-key"))
+
+    def test_recovery_error_proof_rejects_a_different_task(self):
+        result = {
+            "task_id": "avm-current123",
+            "session_id": "recovery-error-task",
+            "generation": 1,
+            "state": "cached",
+            "last_error": {
+                "operation_id": "failed-operation",
+                "task_id": "avm-other123",
+                "task_generation": 1,
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", root / "state"):
+                self.assertFalse(
+                    CLI.persist_recovery_state(
+                        "recovery-error-task",
+                        root / "id_ed25519",
+                        result,
+                        operation_id="failed-operation",
+                        expected_generation=0,
+                    )
+                )
 
     def test_cleanup_only_recovery_state_blocks_ssh_and_lease_mutations(self):
         session = "cleanup-only-state"

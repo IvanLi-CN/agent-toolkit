@@ -2974,6 +2974,8 @@ class StateStore:
             })
             if isinstance(response.get("task_id"), str):
                 pending[-1]["task_id"] = response["task_id"]
+            if isinstance(response.get("task_generation"), int) and not isinstance(response["task_generation"], bool):
+                pending[-1]["task_generation"] = response["task_generation"]
         return pending
 
     def get_meta(self, key: str) -> str | None:
@@ -3538,7 +3540,16 @@ class Control:
                 item.get("operation_id") == operation_id
                 and item.get("action") == "acquire"
                 and item.get("session_id") == task.get("session_id")
-                and item.get("generation") in generations
+                and (
+                    (
+                        item.get("task_id") == task.get("task_id")
+                        and item.get("task_generation") == task_generation
+                    )
+                    or (
+                        item.get("task_id") is None
+                        and item.get("generation") in generations
+                    )
+                )
             ):
                 return operation_id
         return None
@@ -3552,6 +3563,9 @@ class Control:
         record = dict(detail) if isinstance(detail, Mapping) else {}
         if recovery_operation_id:
             record.setdefault("operation_id", recovery_operation_id)
+        if task is not None:
+            record.setdefault("task_id", task.get("task_id"))
+            record.setdefault("task_generation", task.get("generation"))
         retry_record = Control._native_init_absence_retry_record(task) if task is not None else None
         if retry_record is not None:
             record["native_init_absence_retry"] = True
@@ -3618,13 +3632,21 @@ class Control:
             item for item in pending
             if item.get("action") == "acquire"
             and item.get("session_id") == task.get("session_id")
-            and item.get("task_id") in {None, task.get("task_id")}
-            and item.get("generation") in {
-                task.get("generation"),
-                task.get("generation") - 1
-                if isinstance(task.get("generation"), int) and not isinstance(task.get("generation"), bool)
-                else None,
-            }
+            and (
+                (
+                    item.get("task_id") == task.get("task_id")
+                    and item.get("task_generation") == task.get("generation")
+                )
+                or (
+                    item.get("task_id") is None
+                    and item.get("generation") in {
+                        task.get("generation"),
+                        task.get("generation") - 1
+                        if isinstance(task.get("generation"), int) and not isinstance(task.get("generation"), bool)
+                        else None,
+                    }
+                )
+            )
         ]
         if len(matches) > 1:
             raise ControlError(
@@ -3647,6 +3669,7 @@ class Control:
                 {"operation_id": operation_id},
             )
         operation["task_id"] = task["task_id"]
+        operation["task_generation"] = int(task["generation"])
         self.store.record_operation(
             operation_id,
             "acquire",
@@ -5405,12 +5428,45 @@ class Control:
 
 
 
-    def _require_active(self, task: Mapping[str, Any]) -> None:
+    def _pending_acquire_for_task(self, task: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        try:
+            pending = self.store.pending_operations()
+        except ControlError as exc:
+            raise ControlError(
+                "operation_unverified",
+                "pending acquire operations cannot be verified",
+                {"task_id": task["task_id"]},
+            ) from exc
+        matches = [
+            item for item in pending
+            if item.get("action") == "acquire"
+            and item.get("session_id") == task.get("session_id")
+            and item.get("task_id") == task.get("task_id")
+            and item.get("task_generation") == task.get("generation")
+        ]
+        if len(matches) > 1:
+            raise ControlError(
+                "operation_unverified",
+                "multiple pending acquire operations match the active task",
+                {"task_id": task["task_id"]},
+            )
+        return matches[0] if matches else None
+
+    def _require_active(self, task: Mapping[str, Any], *, allow_pending_acquire: bool = False) -> None:
         if task["state"] != "active":
             raise ControlError("task_not_active", "the VM lease is not active")
         expiry = parse_time(task.get("lease_expires_at"))
         if expiry is None or expiry <= self.now():
             raise ControlError("lease_expired", "the VM lease has expired")
+        if not allow_pending_acquire:
+            pending = self._pending_acquire_for_task(task)
+            if pending is not None:
+                raise ControlError(
+                    "lease_unavailable",
+                    "acquire operation remains unresolved; release or retry acquire",
+                    {"operation_id": pending["operation_id"], "task_id": task["task_id"],
+                     "generation": int(task["generation"])},
+                )
 
     def _native_resources(self, task: Mapping[str, Any]) -> dict[str, int]:
         info = self._ownership(task)
@@ -6350,11 +6406,12 @@ class Control:
                     len(pending) == 1
                     and task.get("state") != "absent"
                     and pending[0].get("task_id") == task["task_id"]
+                    and pending[0].get("task_generation") == int(task["generation"])
                     and isinstance(pending[0].get("generation"), int)
                     and not isinstance(pending[0].get("generation"), bool)
-                    and int(task["generation"]) in {
-                        pending[0]["generation"],
-                        pending[0]["generation"] + 1,
+                    and pending[0]["generation"] in {
+                        int(task["generation"]),
+                        int(task["generation"]) - 1,
                     }
                 ):
                     result["partial_operation_id"] = recovery_operation_id
@@ -6368,7 +6425,7 @@ class Control:
         existing = self.store.get_task(session_id=session_id)
         if existing and existing["state"] == "active":
             self._check_generation(existing, request)
-            self._require_active(existing)
+            self._require_active(existing, allow_pending_acquire=True)
             self._ownership(existing)
             self._bind_pending_acquire_operation(request, existing)
             resources = self._durable_resources(existing, "resources_json", allow_empty=False)
@@ -6507,7 +6564,9 @@ class Control:
             failure_phase = detail.get("phase", phase)
             detail.update({"phase": failure_phase, "operation_phase": phase, "completed": completed,
                            "requested": resources, "cleanup": cleanup,
-                           "operation_id": request.get("operation_id")})
+                           "operation_id": request.get("operation_id"),
+                           "task_id": task["task_id"],
+                           "task_generation": int(task["generation"])})
             if native_init_uncertain:
                 detail["native_init_absence_retry"] = True
                 detail["native_init_cleanup_verified"] = native_init_cleanup_verified
@@ -6784,6 +6843,8 @@ class Control:
                     "code": "acquire_partial",
                     "phase": "cleanup",
                     "operation_id": recovery_operation_id,
+                    "task_id": task["task_id"],
+                    "task_generation": int(task["generation"]),
                     "outcome_verified": True,
                 })
             with self._global_lock(), self.store.transaction():

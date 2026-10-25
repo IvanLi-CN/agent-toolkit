@@ -1401,7 +1401,12 @@ class LifecycleTests(Fixture):
             "acquire",
             "thread-a",
             0,
-            {"outcome": "pending", "_request_digest": "pending-acquire", "task_id": task["task_id"]},
+            {
+                "outcome": "pending",
+                "_request_digest": "pending-acquire",
+                "task_id": task["task_id"],
+                "task_generation": task["generation"],
+            },
         )
         request = self.request("status")
         request["operation_id"] = "pending-recovery"
@@ -1410,6 +1415,24 @@ class LifecycleTests(Fixture):
 
         self.assertEqual(result["state"], "active")
         self.assertEqual(result["partial_operation_id"], "pending-recovery")
+
+    def test_pending_acquire_blocks_old_client_active_mutations(self):
+        task = self.acquire()
+        self.store.record_operation(
+            "pending-active-mutation",
+            "acquire",
+            "thread-a",
+            task["generation"],
+            {
+                "outcome": "pending",
+                "_request_digest": "pending-acquire",
+                "task_id": task["task_id"],
+                "task_generation": task["generation"],
+            },
+        )
+
+        self.error("lease_unavailable", self.call, "renew")
+        self.error("lease_unavailable", self.call, "ssh-info")
 
     def test_status_rejects_unrelated_or_unverified_recovery_operations(self):
         self.acquire()
@@ -1466,6 +1489,30 @@ class LifecycleTests(Fixture):
         self.assertEqual(result["generation"], 2)
         self.assertNotIn("recovery_operation_id", result)
 
+    def test_status_rejects_a_pending_acquire_after_task_generation_changes(self):
+        task = self.acquire()
+        self.store.record_operation(
+            "stale-pending",
+            "acquire",
+            "thread-a",
+            task["generation"],
+            {
+                "outcome": "pending",
+                "_request_digest": "pending-acquire",
+                "task_id": task["task_id"],
+                "task_generation": task["generation"],
+            },
+        )
+        self.call("release")
+        self.acquire()
+
+        request = self.request("status")
+        request["operation_id"] = "stale-pending"
+        result = self.control.dispatch(request)["result"]
+
+        self.assertEqual(result["generation"], 2)
+        self.assertNotIn("partial_operation_id", result)
+
     def test_acquire_guest_growth_failure_is_structured_and_closed(self):
         self.runner.guest_growth_results = [self.guest_growth_failure()]
         self.error("guest_resize_unverified", self.acquire)
@@ -1495,7 +1542,12 @@ class LifecycleTests(Fixture):
             "acquire",
             "thread-a",
             0,
-            {"outcome": "pending", "_request_digest": "pending-acquire", "task_id": task["task_id"]},
+            {
+                "outcome": "pending",
+                "_request_digest": "pending-acquire",
+                "task_id": task["task_id"],
+                "task_generation": task["generation"],
+            },
         )
         self.store.update_task(
             task["task_id"],

@@ -5329,12 +5329,16 @@ class Control:
         attempts = 0
         while True:
             try:
+                reserve_kwargs = {
+                    "startup_cpu": startup_cpu,
+                    "admission_epoch": admission_epoch,
+                }
+                if acquire_operation is not None:
+                    reserve_kwargs["acquire_operation"] = acquire_operation
                 return self._reserve_resources(
                     task,
                     resources,
-                    startup_cpu=startup_cpu,
-                    admission_epoch=admission_epoch,
-                    acquire_operation=acquire_operation,
+                    **reserve_kwargs,
                 )
             except ControlError as exc:
                 if (exc.code != "resource_unverified"

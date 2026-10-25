@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { parseMods } from "../scripts/mod_parser.ts";
 import { decodeFiles, reportMods } from "../scripts/dst_mods_from_modoverrides.ts";
+import { collectBoundedEntries, MAX_DIRECTORY_SCAN_ENTRIES } from "../scripts/dst_snapshot.ts";
 
 let root: string;
 const scripts = new URL("../scripts/", import.meta.url).pathname;
@@ -31,6 +32,27 @@ function fakeSsh(mode = "native") {
   return { PATH: `${bin}:${process.env.PATH}`, HOME: join(root, "remote"), SSH_ARGS_FILE: join(root, "ssh-args"), SSH_TEST_MODE: mode };
 }
 describe("VER-FOUNDATION-HELPERS-03: DST snapshots and local/remote reports", () => {
+  test("account and cluster directory scans stop before sorting hostile entry sets", () => {
+    const names = Array.from({ length: MAX_DIRECTORY_SCAN_ENTRIES }, (_, index) => `z-${index.toString().padStart(4, "0")}`);
+    names.push("a-late-entry");
+    let offset = 0;
+    const rootEntries = collectBoundedEntries(() => {
+      const name = names[offset++];
+      return name === undefined ? null : { name, isDirectory: () => true, isFile: () => false };
+    });
+    expect(rootEntries).toHaveLength(MAX_DIRECTORY_SCAN_ENTRIES);
+    expect(rootEntries.some(entry => entry.name === "a-late-entry")).toBe(false);
+    expect(offset).toBe(MAX_DIRECTORY_SCAN_ENTRIES);
+
+    offset = 0;
+    const nestedEntries = collectBoundedEntries(() => {
+      const name = names[offset++];
+      return name === undefined ? null : { name: `Cluster_${name}`, isDirectory: () => true, isFile: () => false };
+    });
+    expect(nestedEntries).toHaveLength(MAX_DIRECTORY_SCAN_ENTRIES);
+    expect(nestedEntries.some(entry => entry.name === "Cluster_a-late-entry")).toBe(false);
+    expect(offset).toBe(MAX_DIRECTORY_SCAN_ENTRIES);
+  });
   test("local snapshot omits all log/config secrets and bounds directory output", () => {
     const local = join(root, "client"); cluster(join(local, "account/Cluster_1"));
     writeFileSync(join(local, "client_log.txt"), "SECRET_LOG cluster_token=SECRET\n");

@@ -1,27 +1,50 @@
 #!/usr/bin/env bun
-import { existsSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, opendirSync, statSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { diagnostic, options, sshCollect } from "./dst_common.ts";
 
+export const MAX_ROOT_ENTRIES = 200;
+export const MAX_CLUSTER_ENTRIES = 100;
+export const MAX_DIRECTORY_SCAN_ENTRIES = 1024;
+type DirectoryEntry = { name: string; isDirectory(): boolean; isFile(): boolean };
+
+export function collectBoundedEntries(read: () => DirectoryEntry | null, limit = MAX_DIRECTORY_SCAN_ENTRIES): DirectoryEntry[] {
+  if (!Number.isSafeInteger(limit) || limit < 0) throw new Error("invalid directory scan limit");
+  const entries: DirectoryEntry[] = [];
+  for (let count = 0; count < limit; count++) {
+    const entry = read();
+    if (!entry) break;
+    entries.push(entry);
+  }
+  return entries;
+}
+
+function readDirectoryEntries(directory: string): DirectoryEntry[] {
+  const handle = opendirSync(directory);
+  try { return collectBoundedEntries(() => handle.readSync()); }
+  finally { handle.closeSync(); }
+}
+
 export function localReport(directory?: string): string {
   const lines = ["## Local", "", `- Host: ${hostname()}`, `- Collected at: ${new Date().toISOString()}`, `- Client data dir: ${directory ?? "<unset>"}`, ""];
   if (!directory || !existsSync(directory) || !statSync(directory).isDirectory()) return lines.concat("> Local dir not found. Skipping local collection.", "").join("\n");
-  const entries = readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name)).slice(0, 200);
+  const entries = readDirectoryEntries(directory).sort((a, b) => a.name.localeCompare(b.name)).slice(0, MAX_ROOT_ENTRIES);
   lines.push("### Directory overview (names only; first 200)", "", ...entries.map(e => `- ${e.name}${e.isDirectory() ? "/" : ""}`), "", "### Known log files (metadata only)", "");
   for (const entry of entries) if (entry.isFile() && /log.*\.txt$/.test(entry.name)) lines.push(`- ${entry.name}: present (contents omitted)`);
   lines.push("", "### Local clusters (paths only; secrets redacted)", "");
   let count = 0;
   for (const parent of entries.filter(e => e.isDirectory())) {
     const parentPath = join(directory, parent.name);
-    const clusters = parent.name.startsWith("Cluster_") ? [parentPath] : readdirSync(parentPath, { withFileTypes: true }).filter(e => e.isDirectory() && e.name.startsWith("Cluster_")).slice(0, 100).map(e => join(parentPath, e.name));
+    const nested = parent.name.startsWith("Cluster_") ? [] : readDirectoryEntries(parentPath);
+    const clusters = parent.name.startsWith("Cluster_") ? [parentPath] : nested.filter(e => e.isDirectory() && e.name.startsWith("Cluster_")).slice(0, MAX_CLUSTER_ENTRIES).map(e => join(parentPath, e.name));
     for (const cluster of clusters) {
-      if (++count > 100) break;
+      if (++count > MAX_CLUSTER_ENTRIES) break;
       lines.push(`- ${cluster}`);
       for (const name of ["cluster_token.txt", "cluster.ini"]) if (existsSync(join(cluster, name))) lines.push(`  - ${name}: present (redacted)`);
       for (const shard of ["Master", "Caves"]) if (existsSync(join(cluster, shard))) lines.push(`  - ${shard}/: present`);
     }
-    if (count >= 100) break;
+    if (count >= MAX_CLUSTER_ENTRIES) break;
   }
   return lines.join("\n") + "\n";
 }

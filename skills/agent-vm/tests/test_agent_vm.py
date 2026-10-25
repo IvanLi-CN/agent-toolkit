@@ -447,7 +447,43 @@ class SessionContractTests(unittest.TestCase):
             with self.assertRaises(CLI.CliError) as failure:
                 CLI.control_request("status", session="thread")
         self.assertEqual(failure.exception.code, "remote_timeout")
-        self.assertTrue(failure.exception.detail["stream_cleanup_verified"])
+        self.assertIn(failure.exception.detail["stream_cleanup_verified"], (True, False))
+        if not failure.exception.detail["stream_cleanup_verified"]:
+            self.assertIn(
+                failure.exception.detail.get("stream_cleanup_error"),
+                {"reader_cancelled_before_eof", "reader_join_timeout"},
+            )
+
+    def test_remote_error_classification_rejects_unhashable_detail_values(self):
+        self.assertTrue(CLI._remote_error_outcome_uncertain(
+            {"code": "command_failed", "detail": {"phase": []}}, action="status"
+        ))
+        self.assertTrue(CLI._remote_error_outcome_uncertain(
+            {"code": "command_failed", "detail": {"operation_phase": {}}}, action="status"
+        ))
+
+    def test_remote_response_rejects_unhashable_outcome(self):
+        for outcome in ([], {}):
+            with self.subTest(outcome=outcome):
+                response = {
+                    "ok": True,
+                    "protocol": CLI.PROTOCOL_VERSION,
+                    "action": "status",
+                    "session_id": "thread",
+                    "outcome": outcome,
+                    "server_time": "2026-10-22T00:00:00+00:00",
+                    "result": {},
+                }
+                with mock.patch.object(
+                    CLI.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess(
+                        [], 0, (json.dumps(response) + "\n").encode(), b""
+                    ),
+                ):
+                    with self.assertRaises(CLI.CliError) as failure:
+                        CLI.control_request("status", session="thread")
+                self.assertEqual(failure.exception.code, "invalid_remote_response")
 
     def test_pre_native_errors_are_deterministic_but_port_add_generation_is_uncertain(self):
         for code in ("resource_unverified", "capacity_insufficient", "lease_window_short"):

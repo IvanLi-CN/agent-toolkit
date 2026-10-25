@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from contextlib import ExitStack, contextmanager, nullcontext
+import ctypes
 import datetime as dt
 from decimal import Decimal
 import fcntl
@@ -106,7 +107,7 @@ TASK_STATES = frozenset(("absent", "cached", "preparing", "active", "closing", "
 
 
 GUEST_ROOT_GROWTH_SCRIPT = r"""
-import json, os, re, selectors, shutil, signal, subprocess, sys, time
+import ctypes, json, os, re, selectors, shutil, signal, subprocess, sys, time
 
 TARGET_BYTES = int(sys.argv[1]) * 1024**3
 MINIMUM_FILESYSTEM_RATIO = 95
@@ -365,7 +366,7 @@ def run(command, phase, *, check=True):
                 except (OSError, ValueError):
                     complete = False
         if root_pid not in parents:
-            return [], False
+            return [], complete
         members = {root_pid}
         frontier = [root_pid]
         while frontier:
@@ -397,6 +398,70 @@ def run(command, phase, *, check=True):
             except (OSError, ValueError):
                 complete = False
         return live, complete
+
+    def process_identity(pid):
+        try:
+            with open(os.path.join("/proc", str(pid), "stat"), encoding="utf-8") as handle:
+                raw_stat = handle.read()
+            close_paren = raw_stat.rfind(")")
+            fields = raw_stat[close_paren + 2:].split()
+            if close_paren < 0 or len(fields) < 20 or fields[0] == "Z":
+                return None
+            return pid, int(fields[19])
+        except (FileNotFoundError, OSError, ValueError):
+            return None
+
+    def enable_child_subreaper():
+        if not os.path.isdir("/proc"):
+            return False
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            prctl = libc.prctl
+            prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+            prctl.restype = ctypes.c_int
+            return prctl(36, 1, 0, 0, 0) == 0
+        except (AttributeError, OSError, TypeError):
+            return False
+
+    def discover_owned_processes(owner_pid, baseline, tracked):
+        members, complete = process_tree_members(owner_pid)
+        if not complete:
+            return [], False, "process_owner_tree_inspection_failed"
+        for pid, starttime in members:
+            if pid == owner_pid:
+                continue
+            baseline_starttime = baseline.get(pid)
+            if baseline_starttime is not None:
+                if baseline_starttime != starttime:
+                    return [], False, "process_owner_identity_unverified"
+                continue
+            previous = tracked.get(pid)
+            if previous is not None and previous != starttime:
+                return [], False, "process_owner_identity_unverified"
+            tracked[pid] = starttime
+        return sorted(tracked.items()), True, None
+
+    def kill_owned_processes(owner_pid, baseline, tracked):
+        cleanup_error = None
+        for _ in range(5):
+            identities, complete, discovery_error = discover_owned_processes(owner_pid, baseline, tracked)
+            if not complete:
+                return False, discovery_error
+            live, live_complete = live_processes(identities)
+            if not live_complete:
+                return False, "process_owner_identity_unverified"
+            if not live:
+                return True, cleanup_error
+            killed, cleanup_error = kill_process_identities(live)
+            if not killed:
+                return False, cleanup_error
+        identities, complete, discovery_error = discover_owned_processes(owner_pid, baseline, tracked)
+        if not complete:
+            return False, discovery_error
+        live, live_complete = live_processes(identities)
+        if live_complete and not live:
+            return True, cleanup_error
+        return False, cleanup_error or "process_owner_members_remain"
 
     def open_verified_pidfd(identity):
         opener = getattr(os, "pidfd_open", None)
@@ -488,6 +553,24 @@ def run(command, phase, *, check=True):
             return True, cleanup_error
         return False, cleanup_error or "process_tree_members_remain"
 
+    procfs_available = os.path.isdir("/proc")
+    owner_pid = os.getpid()
+    owner_baseline = {}
+    tracked_owned_members = {}
+    owner_tracking_enabled = False
+    owner_tracking_error = None
+    if procfs_available:
+        owner_tracking_enabled = enable_child_subreaper()
+        if not owner_tracking_enabled:
+            owner_tracking_error = "process_owner_boundary_unavailable"
+        else:
+            baseline_members, baseline_complete = process_tree_members(owner_pid)
+            if not baseline_complete:
+                owner_tracking_enabled = False
+                owner_tracking_error = "process_owner_tree_inspection_failed"
+            else:
+                owner_baseline = dict(baseline_members)
+
     process = None
     selector = selectors.DefaultSelector()
     try:
@@ -504,19 +587,23 @@ def run(command, phase, *, check=True):
         tracked_tree_valid = False
         tracked_group_members = {}
         tracked_group_valid = False
-        leader_identity = None
-        if os.path.isdir("/proc"):
-            group_members, group_complete, _ = process_group_identities(process.pid)
-            if group_complete:
-                leader_identity = next(
-                    (identity for identity in group_members if identity[0] == process.pid),
-                    None,
-                )
+        leader_identity = process_identity(process.pid) if procfs_available else None
 
+        # Keep detached descendants in the one-shot guest process's owner tree.
         def track_process_tree():
             nonlocal leader_identity, tracked_tree_valid, tracked_group_valid
-            if not os.path.isdir("/proc"):
+            nonlocal owner_tracking_enabled, owner_tracking_error
+            if not procfs_available:
                 return
+            if owner_tracking_enabled:
+                _, owner_complete, discovery_error = discover_owned_processes(
+                    owner_pid, owner_baseline, tracked_owned_members
+                )
+                if not owner_complete:
+                    owner_tracking_enabled = False
+                    owner_tracking_error = discovery_error
+            if leader_identity is None and process.poll() is None:
+                leader_identity = process_identity(process.pid)
             members, complete = process_tree_members(process.pid)
             if complete and members:
                 for pid, starttime in members:
@@ -529,11 +616,6 @@ def run(command, phase, *, check=True):
             group_members, group_complete, _ = process_group_identities(process.pid)
             if not group_complete or not group_members:
                 return
-            if leader_identity is None:
-                leader_identity = next(
-                    (identity for identity in group_members if identity[0] == process.pid),
-                    None,
-                )
             if leader_identity is None:
                 return
             for pid, starttime in group_members:
@@ -554,6 +636,50 @@ def run(command, phase, *, check=True):
         remaining = max(0, deadline - time.monotonic())
         try:
             returncode = process.wait(timeout=remaining)
+            if procfs_available:
+                if not owner_tracking_enabled:
+                    raise GuestFailure(
+                        phase,
+                        command,
+                        returncode,
+                        cause="command_cleanup_failed",
+                        process_group_killed=False,
+                        process_group_cleanup_error=owner_tracking_error or "process_owner_boundary_unavailable",
+                    )
+                owned_members, owner_complete, discovery_error = discover_owned_processes(
+                    owner_pid, owner_baseline, tracked_owned_members
+                )
+                if not owner_complete:
+                    raise GuestFailure(
+                        phase,
+                        command,
+                        returncode,
+                        cause="command_cleanup_failed",
+                        process_group_killed=False,
+                        process_group_cleanup_error=discovery_error or "process_owner_tree_inspection_failed",
+                    )
+                owned_live, live_complete = live_processes(owned_members)
+                if not live_complete:
+                    raise GuestFailure(
+                        phase,
+                        command,
+                        returncode,
+                        cause="command_cleanup_failed",
+                        process_group_killed=False,
+                        process_group_cleanup_error="process_owner_identity_unverified",
+                    )
+                if owned_live:
+                    owner_killed, owner_cleanup_error = kill_owned_processes(
+                        owner_pid, owner_baseline, tracked_owned_members
+                    )
+                    raise GuestFailure(
+                        phase,
+                        command,
+                        returncode,
+                        cause="command_cleanup_failed",
+                        process_group_killed=owner_killed,
+                        process_group_cleanup_error=owner_cleanup_error or "process_owner_members_remain",
+                    )
         except subprocess.TimeoutExpired:
             raise
     except subprocess.TimeoutExpired as error:
@@ -573,9 +699,6 @@ def run(command, phase, *, check=True):
                     continue
                 merged[pid] = starttime
             tree_members = sorted(merged.items())
-        if os.path.isdir("/proc") and leader_identity is None:
-            tree_members = []
-            tree_complete = False
         root_identity = (
             leader_identity
             if os.path.isdir("/proc")
@@ -644,6 +767,20 @@ def run(command, phase, *, check=True):
                 process_group_cleanup_error + ":" + tree_error
                 if process_group_cleanup_error else tree_error
             )
+        if procfs_available:
+            if owner_tracking_enabled:
+                owner_killed, owner_cleanup_error = kill_owned_processes(
+                    owner_pid, owner_baseline, tracked_owned_members
+                )
+            else:
+                owner_killed = False
+                owner_cleanup_error = owner_tracking_error or "process_owner_boundary_unavailable"
+            if not owner_killed:
+                process_group_killed = False
+                process_group_cleanup_error = (
+                    f"{process_group_cleanup_error}:{owner_cleanup_error}"
+                    if process_group_cleanup_error else owner_cleanup_error
+                )
         reaped = False
         try:
             process.wait(timeout=2)
@@ -1416,6 +1553,95 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
 class CommandRunner:
     """Small subprocess boundary that never invokes a shell implicitly."""
 
+    _PR_SET_CHILD_SUBREAPER = 36
+
+    @staticmethod
+    def _process_identity(pid: int) -> tuple[int, int] | None:
+        try:
+            raw_stat = (Path("/proc") / str(pid) / "stat").read_text()
+            close_paren = raw_stat.rfind(")")
+            fields = raw_stat[close_paren + 2 :].split()
+            if close_paren < 0 or len(fields) < 20 or fields[0] == "Z":
+                return None
+            return pid, int(fields[19])
+        except (FileNotFoundError, OSError, ValueError):
+            return None
+
+    @classmethod
+    def _enable_child_subreaper(cls) -> bool:
+        if not Path("/proc").is_dir():
+            return False
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            prctl = libc.prctl
+            prctl.argtypes = [
+                ctypes.c_int,
+                ctypes.c_ulong,
+                ctypes.c_ulong,
+                ctypes.c_ulong,
+                ctypes.c_ulong,
+            ]
+            prctl.restype = ctypes.c_int
+            return prctl(cls._PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0
+        except (AttributeError, OSError, TypeError):
+            return False
+
+    @classmethod
+    def _discover_owned_processes(
+        cls,
+        owner_pid: int,
+        baseline: Mapping[int, int],
+        tracked: dict[int, int],
+    ) -> tuple[list[tuple[int, int]], bool, str | None]:
+        members, complete = cls._process_tree_members(owner_pid)
+        if not complete:
+            return [], False, "process_owner_tree_inspection_failed"
+        for pid, starttime in members:
+            if pid == owner_pid:
+                continue
+            baseline_starttime = baseline.get(pid)
+            if baseline_starttime is not None:
+                if baseline_starttime != starttime:
+                    return [], False, "process_owner_identity_unverified"
+                continue
+            previous = tracked.get(pid)
+            if previous is not None and previous != starttime:
+                return [], False, "process_owner_identity_unverified"
+            tracked[pid] = starttime
+        return sorted(tracked.items()), True, None
+
+    @classmethod
+    def _kill_owned_processes(
+        cls,
+        owner_pid: int,
+        baseline: Mapping[int, int],
+        tracked: dict[int, int],
+    ) -> tuple[bool, str | None]:
+        cleanup_error = None
+        for _ in range(5):
+            identities, complete, discovery_error = cls._discover_owned_processes(
+                owner_pid, baseline, tracked
+            )
+            if not complete:
+                return False, discovery_error
+            live, live_complete = cls._live_processes(identities)
+            if not live_complete:
+                return False, "process_owner_identity_unverified"
+            if not live:
+                return True, cleanup_error
+            killed, cleanup_error = cls._kill_process_identities(live)
+            if not killed:
+                return False, cleanup_error
+        identities, complete, discovery_error = cls._discover_owned_processes(
+            owner_pid, baseline, tracked
+        )
+        if not complete:
+            return False, discovery_error
+        live, live_complete = cls._live_processes(identities)
+        if live_complete and not live:
+            return True, cleanup_error
+        return False, cleanup_error or "process_owner_members_remain"
+
     def run(
         self,
         argv: Sequence[str],
@@ -1509,7 +1735,7 @@ class CommandRunner:
             except (OSError, ValueError):
                 complete = False
         if root_pid not in parents:
-            return [], False
+            return [], complete
         members = {root_pid}
         frontier = [root_pid]
         while frontier:
@@ -1675,6 +1901,23 @@ class CommandRunner:
         check: bool = True,
     ) -> subprocess.CompletedProcess[bytes]:
         """Run a command while draining pipes but retaining bounded output."""
+        procfs_available = Path("/proc").is_dir()
+        owner_pid = os.getpid()
+        owner_baseline: dict[int, int] = {}
+        tracked_owned_members: dict[int, int] = {}
+        owner_tracking_enabled = False
+        owner_tracking_error: str | None = None
+        if procfs_available:
+            owner_tracking_enabled = self._enable_child_subreaper()
+            if not owner_tracking_enabled:
+                owner_tracking_error = "process_owner_boundary_unavailable"
+            else:
+                baseline_members, baseline_complete = self._process_tree_members(owner_pid)
+                if not baseline_complete:
+                    owner_tracking_enabled = False
+                    owner_tracking_error = "process_owner_tree_inspection_failed"
+                else:
+                    owner_baseline = dict(baseline_members)
         try:
             process = subprocess.Popen(
                 list(argv),
@@ -1700,18 +1943,25 @@ class CommandRunner:
         tracked_group_members: dict[int, int] = {}
         tracked_group_valid = False
         leader_identity: tuple[int, int] | None = None
-        if Path("/proc").is_dir():
-            group_members, group_complete = self._process_group_identities(process.pid)
-            if group_complete:
-                leader_identity = next(
-                    (identity for identity in group_members if identity[0] == process.pid),
-                    None,
-                )
+        if procfs_available:
+            leader_identity = self._process_identity(process.pid)
 
+        # The subreaper owner tree is the containment boundary for descendants
+        # that leave the original process group or outlive the command leader.
         def track_process_tree() -> None:
             nonlocal leader_identity, tracked_tree_valid, tracked_group_valid
-            if not Path("/proc").is_dir():
+            nonlocal owner_tracking_enabled, owner_tracking_error
+            if not procfs_available:
                 return
+            if owner_tracking_enabled:
+                _, owner_complete, discovery_error = self._discover_owned_processes(
+                    owner_pid, owner_baseline, tracked_owned_members
+                )
+                if not owner_complete:
+                    owner_tracking_enabled = False
+                    owner_tracking_error = discovery_error
+            if leader_identity is None and process.poll() is None:
+                leader_identity = self._process_identity(process.pid)
             members, complete = self._process_tree_members(process.pid)
             if complete and members:
                 for pid, starttime in members:
@@ -1724,11 +1974,6 @@ class CommandRunner:
             group_members, group_complete = self._process_group_identities(process.pid)
             if not group_complete or not group_members:
                 return
-            if leader_identity is None:
-                leader_identity = next(
-                    (identity for identity in group_members if identity[0] == process.pid),
-                    None,
-                )
             if leader_identity is None:
                 return
             for pid, starttime in group_members:
@@ -1786,6 +2031,54 @@ class CommandRunner:
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(argv[0], timeout)
             returncode = process.wait(timeout=remaining)
+            if procfs_available:
+                if not owner_tracking_enabled:
+                    raise ControlError(
+                        "command_failed",
+                        f"command ownership could not be verified: {argv[0]}",
+                        {
+                            "returncode": returncode,
+                            "process_group_killed": False,
+                            "process_group_cleanup_error": owner_tracking_error or "process_owner_boundary_unavailable",
+                        },
+                    )
+                owned_members, owner_complete, discovery_error = self._discover_owned_processes(
+                    owner_pid, owner_baseline, tracked_owned_members
+                )
+                if not owner_complete:
+                    raise ControlError(
+                        "command_failed",
+                        f"command ownership could not be verified: {argv[0]}",
+                        {
+                            "returncode": returncode,
+                            "process_group_killed": False,
+                            "process_group_cleanup_error": discovery_error or "process_owner_tree_inspection_failed",
+                        },
+                    )
+                owned_live, live_complete = self._live_processes(owned_members)
+                if not live_complete:
+                    raise ControlError(
+                        "command_failed",
+                        f"command ownership could not be verified: {argv[0]}",
+                        {
+                            "returncode": returncode,
+                            "process_group_killed": False,
+                            "process_group_cleanup_error": "process_owner_identity_unverified",
+                        },
+                    )
+                if owned_live:
+                    owner_killed, owner_cleanup_error = self._kill_owned_processes(
+                        owner_pid, owner_baseline, tracked_owned_members
+                    )
+                    raise ControlError(
+                        "command_failed",
+                        f"command left child processes behind: {argv[0]}",
+                        {
+                            "returncode": returncode,
+                            "process_group_killed": owner_killed,
+                            "process_group_cleanup_error": owner_cleanup_error or "process_owner_members_remain",
+                        },
+                    )
         except subprocess.TimeoutExpired as exc:
             reaped = False
             process_group_killed = False
@@ -1804,9 +2097,6 @@ class CommandRunner:
                         continue
                     merged[pid] = starttime
                 tree_members = sorted(merged.items())
-            if Path("/proc").is_dir() and leader_identity is None:
-                tree_members = []
-                tree_complete = False
             root_identity = (
                 leader_identity
                 if Path("/proc").is_dir()
@@ -1875,6 +2165,20 @@ class CommandRunner:
                     f"{process_group_cleanup_error}:{tree_error}"
                     if process_group_cleanup_error else tree_error
                 )
+            if procfs_available:
+                if owner_tracking_enabled:
+                    owner_killed, owner_cleanup_error = self._kill_owned_processes(
+                        owner_pid, owner_baseline, tracked_owned_members
+                    )
+                else:
+                    owner_killed = False
+                    owner_cleanup_error = owner_tracking_error or "process_owner_boundary_unavailable"
+                if not owner_killed:
+                    process_group_killed = False
+                    process_group_cleanup_error = (
+                        f"{process_group_cleanup_error}:{owner_cleanup_error}"
+                        if process_group_cleanup_error else owner_cleanup_error
+                    )
             pipes_drained = False
             try:
                 process.wait(timeout=1)

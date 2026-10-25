@@ -534,10 +534,14 @@ def _remote_error_outcome_uncertain(error: Mapping[str, Any], *, action: str | N
         return not detail["outcome_verified"]
     if code in {"acquire_partial", "resize_partial", "restart_partial", "cleanup_incomplete", "operation_unverified"}:
         return True
-    if isinstance(detail, Mapping) and any(detail.get(key) in {
-        "native-generation", "native-init", "native-config", "native-stop", "native-start",
-        "guest-readiness", "guest-post-check", "access-exposure", "port-add", "port-remove", "cache-delete",
-    } for key in ("phase", "operation_phase")):
+    if isinstance(detail, Mapping) and any(
+        isinstance(detail.get(key), str)
+        and detail.get(key) in {
+            "native-generation", "native-init", "native-config", "native-stop", "native-start",
+            "guest-readiness", "guest-post-check", "access-exposure", "port-add", "port-remove", "cache-delete",
+        }
+        for key in ("phase", "operation_phase")
+    ):
         return True
     if action == "port-add" and code in {"generation_mismatch", "task_not_active"}:
         # Older protocol-4 controllers do not report the native phase. Keep
@@ -780,7 +784,7 @@ def control_request(action: str, *, session: str | None, generation: int | None 
                 action,
             ),
         )
-    elif response.get("outcome") not in {"success", "replayed"}:
+    elif not isinstance(response.get("outcome"), str) or response["outcome"] not in {"success", "replayed"}:
         fail("invalid_remote_response", "control response outcome is missing or invalid")
     if response.get("ok") is not True or not isinstance(response.get("result"), dict) or not isinstance(response.get("server_time"), str):
         fail("invalid_remote_response", "invalid control response envelope")

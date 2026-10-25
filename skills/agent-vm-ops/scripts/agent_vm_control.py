@@ -74,6 +74,7 @@ TRANSITIONAL_ADMISSION_ERROR_MESSAGE = "transitional native instance blocks admi
 GUEST_READINESS_BUDGET_SECONDS = 300
 GUEST_READINESS_DIAGNOSTIC_SECONDS = 120
 DIAGNOSTIC_COMMAND_TIMEOUT_SECONDS = 5
+NATIVE_INIT_TIMEOUT_SECONDS = 300
 DIAGNOSTIC_LOG_LIMIT = 8192
 DIAGNOSTIC_LOG_TRUNCATION_MARKER = "\n[TRUNCATED BY DIAGNOSTIC LIMIT]"
 DEFAULT_CONFIG_PATH = Path("/etc/agent-vm-native/config.json")
@@ -2298,7 +2299,8 @@ class IncusClient:
                 "--config",
                 "boot.autostart=false",
                 *[part for key, value in (metadata or {}).items() for part in ("--config", f"{key}={value}")],
-            ]
+            ],
+            timeout=NATIVE_INIT_TIMEOUT_SECONDS,
         )
 
     def start(self, name: str) -> None:

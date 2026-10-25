@@ -2548,7 +2548,7 @@ class CommandRunnerTests(unittest.TestCase):
 class IncusWaitTests(unittest.TestCase):
     def setUp(self):
         self.runner = mock.Mock(spec=CONTROL.CommandRunner)
-        self.config = {"project": "agents"}
+        self.config = {"project": "agents", "profile": "agent-vm"}
         self.client = CONTROL.IncusClient(self.runner, self.config)
 
     def test_native_timeout_is_distinguished_from_explicit_failure(self):
@@ -2570,6 +2570,17 @@ class IncusWaitTests(unittest.TestCase):
         self.runner.run.side_effect = CONTROL.ControlError("command_timeout", "wait transport timed out")
         with self.assertRaises(CONTROL.GuestWaitTimeout):
             self.client.wait("vm", "agent", 1)
+
+    def test_native_init_uses_a_long_bounded_timeout_for_image_unpack(self):
+        self.runner.run.return_value = subprocess.CompletedProcess([], 0, b"", b"")
+
+        self.client.init("a" * 64, "vm", {"user.agent-vm.managed": "native-v1"})
+
+        self.runner.run.assert_called_once()
+        self.assertEqual(
+            self.runner.run.call_args.kwargs["timeout"],
+            CONTROL.NATIVE_INIT_TIMEOUT_SECONDS,
+        )
 
     def test_bounded_exec_uses_process_group_safe_runner(self):
         self.runner.run_bounded.return_value = subprocess.CompletedProcess([], 0, b"ok", b"")

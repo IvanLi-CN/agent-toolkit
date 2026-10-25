@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { renderBundle, readConfig, writeBundle, type ObservabilityConfig } from "../scripts/render_observability_dashboard.ts";
 import {
@@ -251,13 +251,14 @@ test("restores the previous bundle when provisioning activation fails", () => {
   }
 });
 
-test("keeps the active release when rollback cannot restore the prior link", () => {
+test("fails closed when rollback cannot restore the prior link", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-vm-observability-rollback-failure-"));
   try {
     const bundle = renderBundle(config);
     const paths = writeBundle(bundle, root);
     const previousTarget = readlinkSync(join(root, "current"));
     const previousProvisioning = readFileSync(paths.provisioningPath, "utf8");
+    const releaseCount = readdirSync(join(root, ".releases")).length;
     const injectedRename: typeof renameSync = (oldPath, newPath) => {
       if (String(newPath) === paths.provisioningPath) throw new Error("injected provisioning rename failure");
       if (String(oldPath).includes(".current-rollback-")) throw new Error("injected rollback rename failure");
@@ -265,9 +266,9 @@ test("keeps the active release when rollback cannot restore the prior link", () 
     };
 
     expect(() => writeBundle(bundle, root, true, injectedRename)).toThrow("failed to restore active dashboard bundle");
-    const activeTarget = readlinkSync(join(root, "current"));
-    expect(activeTarget).not.toBe(previousTarget);
-    expect(existsSync(join(root, activeTarget))).toBe(true);
+    expect(existsSync(join(root, "current"))).toBe(false);
+    expect(readdirSync(join(root, ".releases"))).toHaveLength(releaseCount + 1);
+    expect(previousTarget).toMatch(/^\.releases\/bundle-/);
     expect(readFileSync(paths.provisioningPath, "utf8")).toBe(previousProvisioning);
   } finally {
     rmSync(root, { recursive: true, force: true });

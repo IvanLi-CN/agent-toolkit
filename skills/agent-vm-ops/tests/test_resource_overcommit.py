@@ -540,6 +540,17 @@ class AdmissionTests(Fixture):
         self.assertEqual(result["task_states"]["active"], 1)
         self.assertEqual(self.store.list_tasks(), before)
 
+    def test_admin_metrics_reports_native_probe_failure_as_down(self):
+        def fail_version_probe():
+            raise CONTROL.ControlError("command_failed", "incus is unavailable")
+
+        self.runner.on_version = fail_version_probe
+        result = self.call("admin-metrics")
+
+        self.assertFalse(result["up"])
+        self.assertFalse(result["doctor"]["ready"])
+        self.assertIn("command_failed", result["doctor"]["issues"])
+
     def test_admin_metrics_does_not_hold_store_lock_during_native_probe(self):
         probe_started = threading.Event()
         probe_release = threading.Event()

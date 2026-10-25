@@ -17,6 +17,8 @@ The renderer writes the parameterized capacity dashboard, inventory dashboard, a
 
 The deployment repository should review and commit the rendered files together with its Prometheus scrape configuration and read-only controller metrics bridge. The public repository does not receive those rendered files, datasource credentials, hostnames, collector paths, or live inventory.
 
+If provisioning activation fails and the previous `current` link cannot be restored, the renderer removes the stable link and retains the staged release for recovery rather than serving a mixed dashboard/provisioning pair.
+
 ## Configuration
 
 | Field | Meaning |

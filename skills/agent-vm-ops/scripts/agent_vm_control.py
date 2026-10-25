@@ -6074,10 +6074,12 @@ class Control:
         session_id: str | None,
     ) -> dict[str, Any]:
         issues = []
+        native_probe_ok = True
         try:
             version = self.runner.run(["incus", "version"], timeout=15).stdout.decode().strip()
             self.incus.list_instances()
         except ControlError as exc:
+            native_probe_ok = False
             issues.append(exc.code)
             version = None
         try: self._image_guard()
@@ -6136,7 +6138,8 @@ class Control:
         admission = self._default_admission_diagnostics(
             resources, capacity, instance_policy
         )
-        return {"ready": not issues, "issues": issues, "incus_version": version, "capacity": capacity,
+        return {"ready": not issues, "issues": issues, "native_probe_ok": native_probe_ok,
+                "incus_version": version, "capacity": capacity,
                 "resources": resources, "instances": instance_policy, "default_admission": admission,
                 "admission_ready": not issues and admission["ready"],
                 "release": self._release_metadata(),
@@ -7547,7 +7550,7 @@ class Control:
             "observation_consistent": observation_consistent,
             "observation_attempts": observation_attempts,
             "observed_at": iso_time(self.now()),
-            "up": True,
+            "up": doctor.get("native_probe_ok") is True,
             "draining": snapshot["draining"],
             "admission_ready": bool(doctor.get("admission_ready")),
             "reclaim_required": doctor.get("default_admission", {}).get("reclaim_required"),

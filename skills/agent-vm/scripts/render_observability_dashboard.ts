@@ -333,8 +333,25 @@ export function writeBundle(
         }
       } catch (rollbackError) {
         preserveActiveRelease = true;
+        let failClosedError: Error | undefined;
+        try {
+          // Never leave the new current link beside the old provisioning file.
+          // If rollback cannot restore the prior link, remove the stable link
+          // so Grafana is unavailable rather than serving a mixed release.
+          const quarantinePath = join(directory, `.current-quarantine-${randomUUID()}`);
+          renameFile(activeDirectory, quarantinePath);
+          rmSync(quarantinePath, { force: true });
+        } catch (quarantineError) {
+          try {
+            if (existsSync(activeDirectory)) unlinkSync(activeDirectory);
+          } catch (unlinkError) {
+            failClosedError = new Error(
+              `failed to disable the mixed dashboard bundle: ${String(unlinkError)}; quarantine error: ${String(quarantineError)}`,
+            );
+          }
+        }
         rollbackFailure = new Error(
-          `failed to restore active dashboard bundle after provisioning failure: ${String(rollbackError)}; original error: ${String(error)}`,
+          `failed to restore active dashboard bundle after provisioning failure: ${String(rollbackError)}; original error: ${String(error)}${failClosedError ? `; ${failClosedError.message}` : "; active dashboard link was removed to avoid a mixed release"}`,
         );
       }
     }

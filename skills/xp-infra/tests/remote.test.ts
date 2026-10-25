@@ -79,6 +79,23 @@ async function run(mode: string, container = false, allow = false) {
   const calls = readFileSync(join(f.dir, "calls"), "utf8");
   return { code, out, err, calls };
 }
+test("remote probe rejects malformed arguments on every supported host", async () => {
+  const source = readFileSync(join(import.meta.dir, "../scripts/xp-infra-audit-vless-remote"), "utf8");
+  const invalidCases = [
+    ["fixture-ep.example.test/invalid", "4443", "false", "host", "", "", "123", "456", ""],
+    ["fixture-ep.example.test", "4443/tcp", "false", "host", "", "", "123", "456", ""],
+    ["fixture-ep.example.test", "4443", "maybe", "host", "", "", "123", "456", ""],
+    ["fixture-ep.example.test", "4443", "false", "unknown", "", "", "123", "456", ""],
+  ];
+  for (const args of invalidCases) {
+    const child = Bun.spawn(["sh", "-s", "--", ...args], {
+      env: { PATH: "/usr/bin:/bin" },
+      stdin: new Blob([source]), stdout: "pipe", stderr: "pipe",
+    });
+    const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    expect({ code, out, err }).toEqual({ code: 2, out: "", err: "" });
+  }
+});
 native("VER-FOUNDATION-XP-03 isolated Linux native probe", () => {
   test("native preflight collects kernel bounds and rejects changing listener snapshots", async () => {
     for (const [drift, container] of [[false, false], [true, false], [false, true], [true, true]]) {

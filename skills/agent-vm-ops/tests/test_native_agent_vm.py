@@ -1400,8 +1400,19 @@ class LifecycleTests(Fixture):
         cases = {
             "wrong-session": dict(original, operation_id="wrong-session", session_id="other-session"),
             "wrong-action": dict(original, operation_id="wrong-action", action="release"),
+            "wrong-record-id": dict(original, operation_id="actual-operation"),
             "wrong-generation": dict(original, operation_id="wrong-generation", generation=3,
                                       result=dict(original["result"], generation=3)),
+            "wrong-result-session": dict(
+                original,
+                operation_id="wrong-result-session",
+                result=dict(original["result"], session_id="other-session"),
+            ),
+            "wrong-result-task": dict(
+                original,
+                operation_id="wrong-result-task",
+                result=dict(original["result"], task_id="avm-other123"),
+            ),
             "pending": {"outcome": "pending", "_request_digest": "pending-digest"},
             "error": {
                 "outcome": "error",
@@ -3076,11 +3087,12 @@ class ReclaimTests(Fixture):
             return False
 
         self.runner.failure = fail_once
-        self.error("command_failed", self.call, "destroy", "cached")
+        request = self.request("destroy", "cached", operation="retry-delete")
+        self.error("command_failed", self.control.dispatch, request)
         self.assertEqual(self.store.get_task(task_id=cached["task_id"])["state"], "deleting")
         self.runner.failure = None
 
-        result = self.call("destroy", "cached")
+        result = self.control.dispatch(request)["result"]
 
         self.assertEqual(result["state"], "absent")
 
@@ -3088,11 +3100,12 @@ class ReclaimTests(Fixture):
         cached = self.acquire("cached")
         self.call("release", "cached")
         self.runner.failure = lambda args: args[3:4] == ["delete"]
-        self.error("command_failed", self.call, "destroy", "cached")
+        request = self.request("destroy", "cached", operation="retry-absent-delete")
+        self.error("command_failed", self.control.dispatch, request)
         self.runner.failure = None
         self.runner.instances.pop(cached["instance_name"])
 
-        result = self.call("destroy", "cached")
+        result = self.control.dispatch(request)["result"]
 
         self.assertEqual(result["state"], "absent")
 

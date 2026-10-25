@@ -3666,6 +3666,12 @@ class Control:
         }
         return bool(phases & native_phases)
 
+    def _pending_cleanup_retry_allowed(self, action: str, session_id: str | None) -> bool:
+        if action not in {"release", "destroy"} or session_id is None:
+            return False
+        task = self.store.get_task(session_id=session_id)
+        return task is not None and task.get("state") in {"closing", "deleting", "absent"}
+
     def _expire_preempt(self, request: Mapping[str, Any]) -> None:
         """Close the admission fence and perform a confirmed native withdrawal.
 
@@ -4192,29 +4198,31 @@ class Control:
                 if cached.get("_request_digest") != digest:
                     raise ControlError("operation_conflict", "operation ID belongs to a different request")
                 if cached.get("outcome") == "pending":
-                    raise ControlError("operation_incomplete", "previous execution has an uncertain outcome; inspect status and reconcile before another mutation",
-                                       {"operation_id": operation_id})
-                if cached.get("outcome") == "error":
+                    if not self._pending_cleanup_retry_allowed(action, session_id):
+                        raise ControlError("operation_incomplete", "previous execution has an uncertain outcome; inspect status and reconcile before another mutation",
+                                           {"operation_id": operation_id})
+                elif cached.get("outcome") == "error":
                     error = cached["error"]
                     raise ControlError(error["code"], error["message"], error.get("detail"))
-                self._validate_cached_success(action, operation_id, session_id, request, cached)
-                response = dict(cached)
-                response.pop("_request_digest", None)
-                response["server_time"] = iso_time(self.now())
-                response["outcome"] = "replayed"
-                cached_warnings = response.get("warnings", [])
-                response["warnings"] = self._merge_warnings(
-                    cached_warnings if isinstance(cached_warnings, list) else [],
-                    compatibility_warnings,
-                )
-                response.setdefault("response", self._response_compatibility())
-                response["release"] = self._release_metadata()
-                if session_id:
-                    task = self.store.get_task(session_id=session_id)
-                    response["current_state"] = self._state_summary(task) if task else None
-                    if action == "renew" and task and self._state_summary(task)["effective_lease"]:
-                        self._schedule_expiry(task)
-                return response
+                else:
+                    self._validate_cached_success(action, operation_id, session_id, request, cached)
+                    response = dict(cached)
+                    response.pop("_request_digest", None)
+                    response["server_time"] = iso_time(self.now())
+                    response["outcome"] = "replayed"
+                    cached_warnings = response.get("warnings", [])
+                    response["warnings"] = self._merge_warnings(
+                        cached_warnings if isinstance(cached_warnings, list) else [],
+                        compatibility_warnings,
+                    )
+                    response.setdefault("response", self._response_compatibility())
+                    response["release"] = self._release_metadata()
+                    if session_id:
+                        task = self.store.get_task(session_id=session_id)
+                        response["current_state"] = self._state_summary(task) if task else None
+                        if action == "renew" and task and self._state_summary(task)["effective_lease"]:
+                            self._schedule_expiry(task)
+                    return response
             if "generation" not in request:
                 raise ControlError("invalid_request", "write request requires generation")
             require_int(request["generation"], "generation", 0)
@@ -6222,6 +6230,7 @@ class Control:
                 operation
                 and operation.get("outcome") == "success"
                 and operation.get("action") == "acquire"
+                and operation.get("operation_id") == recovery_operation_id
                 and operation.get("session_id") == session_id
                 and operation_session_id == session_id
                 and operation_task_id == task["task_id"]
@@ -6437,6 +6446,9 @@ class Control:
         assert session_id is not None
         task = self._task_for_session(session_id)
         self._check_generation(task, request)
+        if task["state"] == "deleting":
+            self._delete_cache(task)
+            return self._state_summary(self.store.get_task(task_id=task["task_id"]))
         return self._release_task(task)
 
     def _release_task(

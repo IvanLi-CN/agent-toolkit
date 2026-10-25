@@ -328,7 +328,7 @@
         "type": "prometheus",
         "uid": "__PROMETHEUS_UID__"
       },
-      "description": "One bounded row per managed task. The collector replaces the complete textfile atomically, so stale rows disappear after a successful scrape.",
+      "description": "One bounded row per managed task. RAM and disk columns are GiB; lease expiry is Unix seconds. The collector replaces the complete textfile atomically, so stale rows disappear after a successful scrape.",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -382,7 +382,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_task_cpu_vcpu{job=\"$controller_job\",state=~\"$state\"}",
+          "expr": "sum by (task_id) (agent_vm_task_cpu_vcpu{job=\"$controller_job\",state=~\"$state\"})",
           "format": "table",
           "instant": true,
           "legendFormat": "{{task_id}} CPU",
@@ -394,7 +394,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_task_memory_bytes{job=\"$controller_job\",state=~\"$state\"}",
+          "expr": "sum by (task_id) (agent_vm_task_memory_bytes{job=\"$controller_job\",state=~\"$state\"}) / 1073741824",
           "format": "table",
           "instant": true,
           "legendFormat": "{{task_id}} RAM",
@@ -406,7 +406,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_task_disk_bytes{job=\"$controller_job\",state=~\"$state\"}",
+          "expr": "sum by (task_id) (agent_vm_task_disk_bytes{job=\"$controller_job\",state=~\"$state\"}) / 1073741824",
           "format": "table",
           "instant": true,
           "legendFormat": "{{task_id}} disk",
@@ -418,7 +418,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_task_lease_expires_at_seconds{job=\"$controller_job\",state=~\"$state\"}",
+          "expr": "max by (task_id) (agent_vm_task_lease_expires_at_seconds{job=\"$controller_job\",state=~\"$state\"})",
           "format": "table",
           "instant": true,
           "legendFormat": "{{task_id}} lease",
@@ -430,7 +430,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_task_ssh_mapping{job=\"$controller_job\",state=~\"$state\"}",
+          "expr": "max by (task_id) (agent_vm_task_ssh_mapping{job=\"$controller_job\",state=~\"$state\"})",
           "format": "table",
           "instant": true,
           "legendFormat": "{{task_id}} SSH",
@@ -442,7 +442,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_task_last_error_info{job=\"$controller_job\",state=~\"$state\"}",
+          "expr": "max by (task_id) (agent_vm_task_last_error_info{job=\"$controller_job\",state=~\"$state\"})",
           "format": "table",
           "instant": true,
           "legendFormat": "{{task_id}} error",
@@ -468,17 +468,14 @@
               "instance": true,
               "job": true,
               "service": true,
-              "Value #A": true,
-              "state 2": true,
-              "state 3": true,
-              "state 4": true
+              "Value #A": true
             },
             "renameByName": {
               "state 1": "state",
               "Value #B": "CPU vCPU",
-              "Value #C": "RAM bytes",
-              "Value #D": "Disk bytes",
-              "Value #E": "Lease expiry",
+              "Value #C": "RAM GiB",
+              "Value #D": "Disk GiB",
+              "Value #E": "Lease expiry (Unix s)",
               "Value #F": "SSH mapping",
               "Value #G": "Last error"
             }

@@ -74,7 +74,7 @@ The capacity view must show the actual CPU and memory walls separately from poli
 
 The capacity view must also show the configured default VM request/cost, observed task-state counts, logical default-VM slots and currently startable default-VM slots. The two slot values are bounded snapshot estimates: calculate the logical estimate from the minimum verified CPU, memory and physical-disk headroom ratios, then apply current CT-visible CPU capacity and the 50 percent startup-pressure policy for the startable estimate. Omit them when inputs are unverified. Never label them as a native or safe maximum.
 
-The inventory view must show active, preparing, closing, deleting, failed, cached and absent records, with active/transitional rows first, failed cleanup next and cached/absent rows collapsed by default. Keep task ID, instance/session identity, state, native status, guest availability, requested resources, effective lease, expiry, SSH mapping and structured last-error code/phase. Do not expose raw error messages, credentials or deployment paths.
+The inventory view must show active, preparing, closing, deleting, failed, cached and absent records, with active/transitional rows first, failed cleanup next and cached/absent rows collapsed by default. Keep task ID, instance/session identity, state, native status, guest availability, requested resources, effective lease, expiry, SSH mapping and structured last-error code/phase. Render requested CPU as vCPU, requested RAM and disk as GiB, and lease expiry as Unix seconds so the table does not present raw byte counts as ambiguous short values. Do not expose raw error messages, credentials or deployment paths.
 
 ## Acceptance
 

@@ -13,7 +13,7 @@ bun skills/agent-vm/scripts/render_observability_dashboard.ts \
   --force
 ```
 
-The renderer writes `agent-vm-observability.json` and `agent-vm-observability.yml`. The JSON is the dashboard source; the YAML is a Grafana file provider definition whose `path` must be the path visible inside the Grafana container.
+The renderer writes the parameterized dashboard source and a Grafana file-provider definition. The deployment implementation must render the approved `Agent VM / Capacity & Admission` and `Agent VM / Inventory & Operations` views, either as two dashboard JSON files or through a documented split-render wrapper; the YAML path must be visible inside the Grafana container.
 
 The deployment repository should review and commit the rendered files together with its Prometheus scrape configuration and read-only controller metrics bridge. The public repository does not receive those rendered files, datasource credentials, hostnames, collector paths, or live inventory.
 

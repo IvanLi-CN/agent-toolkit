@@ -48,6 +48,12 @@ The deployment-facing collector must expose the following stable metric families
 | `agent_vm_admission_instances_remaining_count` | gauge | remaining VM slot count; absent without an authoritative limit |
 | `agent_vm_admission_instances_limit_count` | gauge | VM slot limit; absent when unverified |
 | `agent_vm_admission_instances_capacity_count` | gauge | authoritative VM slot capacity when exposed |
+| `agent_vm_admission_default_request_cpu_vcpu` | gauge | configured default VM request CPU |
+| `agent_vm_admission_default_request_memory_bytes` | gauge | configured default VM request memory |
+| `agent_vm_admission_default_request_disk_bytes` | gauge | configured default VM virtual disk size |
+| `agent_vm_admission_default_request_physical_cost_bytes` | gauge | configured default VM physical admission cost |
+| `agent_vm_admission_default_vm_logical_slots` | gauge | derived snapshot estimate; absent when inputs are unverified |
+| `agent_vm_admission_default_vm_startable_slots` | gauge | derived snapshot estimate with current startup gates; absent when inputs are unverified |
 | `agent_vm_memory_current_bytes` | gauge | CT-local cgroup `memory.current`; absent when unavailable |
 | `agent_vm_memory_available_bytes` | gauge | CT-local verified LXCfs/cgroup available memory |
 | `agent_vm_memory_pressure_threshold_bytes` | gauge | CT-local pressure observation threshold |
@@ -63,6 +69,13 @@ The deployment-facing collector must expose the following stable metric families
 | `agent_vm_operations_total` | counter | `action`, `outcome`, and `phase` |
 | `agent_vm_image_unpack_failures_total` | counter | `phase` and `reason` |
 | `agent_vm_task_states` | gauge | `state=preparing|active|cached|closing|failed|absent` |
+| `agent_vm_task_info` | gauge | bounded labels for task ID, instance/session identity, state, native status, guest availability and effective lease |
+| `agent_vm_task_cpu_vcpu` | gauge | requested task CPU, labelled by bounded task ID |
+| `agent_vm_task_memory_bytes` | gauge | requested task memory, labelled by bounded task ID |
+| `agent_vm_task_disk_bytes` | gauge | requested task virtual disk, labelled by bounded task ID |
+| `agent_vm_task_lease_expires_at_seconds` | gauge | lease deadline, labelled by bounded task ID |
+| `agent_vm_task_ssh_mapping` | gauge | bounded task-to-SSH mapping metadata, without credentials |
+| `agent_vm_task_last_error_info` | gauge | stable error `code` and `phase`, without raw message text |
 | `agent_vm_warnings_total` | counter | stable warning `code` |
 | `agent_vm_up` | gauge | `0` or `1` |
 
@@ -70,27 +83,35 @@ The one-shot controller remains the source of truth for native state and must no
 
 The `admin-metrics` JSON is the bridge input contract: `observed_at` is the freshness timestamp, `up` is the controller read success flag, `resources` is the logical admission object, `ct_cpu` is the CT-local CPU PSI and default startup-pressure observation, `ct_memory` is the CT-local runtime observation, and `pending_operations` lists journal entries whose native outcome remains uncertain. A collector must expose `agent_vm_up=0` and freshness failure when the action cannot be read or parsed; it must not emit `agent_vm_memory_pressure=0` when `ct_memory.pressure` is `null` or CPU pressure values when `ct_cpu.pressure` is unverified. The bridge must preserve `null` or absent limits and observations instead of coercing them to zero.
 
+For the approved overcommit deployment profile, `agent_vm_cpu_startup_pressure_threshold_percent` is `50`. This is a deployment policy threshold for the compound startup gate, not a logical CPU limit; the public metric remains configurable for other consumers.
+
 When `admin-metrics.reclaim_required` is `null`, the collector must omit `agent_vm_admission_reclaim_required` for that scrape; `null` means disk admission is unverified, not that reclamation is unnecessary.
 
 The `admin-metrics` response keeps disk domains separate: `disk_admission.guest_allocation` reports sparse guest virtual-disk sizes, while `disk_admission.physical_admission` reports CT filesystem used/reserved/headroom against its low watermark. Consumers must map native disk admission metrics from the physical domain and must not compare sparse guest allocation totals with physical capacity. VM-slot admission is under `instances.admission`; its limit and remaining values are null when Incus exposes no authoritative slot limit, including `-1`.
 
+The default-request and slot-estimate families are derived bridge observations, not controller limits. The bridge reads the configured default request and physical cost from the controller/operations contract and calculates `logical_vm_slots` as the minimum of the verified logical CPU, logical memory and physical disk headroom ratios, rounded down. It calculates `startable_vm_slots` from the same snapshot after applying CT-visible CPU capacity and the configured CPU startup-pressure gate. It omits both estimates when an input is missing, contradictory or unverified. It must never emit a fabricated zero as a substitute for an unavailable estimate.
+
 ## Dashboard contract
 
-The provisioned dashboard enables automatic refresh by default with `refresh: "auto"`, while retaining explicit user-selectable intervals. Grafana may choose an interval based on the current time range; the rendered control must show `Auto selected` after a reload.
+The provisioned dashboards enable automatic refresh by default with `refresh: "auto"`, while retaining explicit user-selectable intervals. Grafana may choose an interval based on the current time range; the rendered control must show `Auto selected` after a reload.
 
-The first row contains CT root available/used, image-staging available/used, physical pool total/used/free, and native admission allocated/reserved/remaining/limit. The existing guest rootfs panel is renamed to `Guest rootfs allocation`; a separate physical pool panel prevents quota totals from being mistaken for real disk usage. The capacity view must answer both whether an actual wall is being approached and what resource headroom remains for the next VM.
+The deployment renders two views. `Agent VM / Capacity & Admission` is the aggregate capacity view; `Agent VM / Inventory & Operations` is the per-task table and lifecycle view. The first uses `admin-metrics`; the second uses `admin-status`. Both are read-only and must expose scrape failure and freshness rather than silently retaining stale task rows.
+
+The capacity dashboard contains CT root available/used, image-staging available/used, physical pool total/used/free, and native admission allocated/reserved/remaining/limit. It includes the configured default request/cost, observed task-state counts and the logical/startable default-VM snapshot estimates. The existing guest rootfs panel is renamed to `Guest rootfs allocation`; a separate physical pool panel prevents quota totals from being mistaken for real disk usage. The capacity view must answer both whether an actual wall is being approached and what resource headroom remains for the next VM.
+
+The CPU capacity view shows logical reservation composition, CT-visible CPU capacity, `some.avg10`, `full.avg10`, the configured startup threshold and startup-blocked state. The memory view shows logical reservation composition and CT-visible capacity separately from `memory.current`, `MemAvailable`, pressure and OOM. The inventory dashboard shows active, preparing, closing, deleting, failed, cached and absent tasks with state filters; cached rows are collapsed by default and no native slot limit is invented when Incus exposes `-1`.
 
 Every chart with an authoritative limit renders that limit as a horizontal dashed line. This includes pool total, configured low/target watermarks, native CPU/memory/disk/VM-slot limits, and guest warning/critical thresholds where the policy defines them. A line is not rendered when the source is missing, unverified or `-1`.
 
-The dashboard includes readiness and failure panels for admission state, reclaim-required and draining flags, operation outcomes by phase, image-unpack failures, warnings, uptime and scrape freshness, plus current task states and pending/failed cleanup counts. These panels are required to explain an image-unpack failure when the pool still has free space.
+The dashboards include readiness and failure panels for admission state, reclaim-required and draining flags, operation outcomes by phase, image-unpack failures, warnings, uptime and scrape freshness, plus current task states and pending/failed cleanup counts. These panels are required to explain an image-unpack failure when the pool still has free space.
 
 The top network TX/RX packets-per-second queries must use packet rates directly. They must not multiply a `pps` query by `8`; multiplying by `8` converts a count rate incorrectly and does not produce bytes per second.
 
 ## Provisioning boundary
 
-The Grafana database is not a source of truth for this dashboard. This public repository owns a sanitized, parameterized dashboard baseline and file-provider template under [`skills/agent-vm/references/observability`](../../../skills/agent-vm/references/observability/README.md), together with the renderer and validator. It does not contain deployment addresses, credentials, a real datasource identity, a real controller job, collector paths, or a consumer-specific rendered export.
+The Grafana database is not a source of truth for these dashboards. This public repository owns a sanitized, parameterized dashboard baseline and file-provider template under [`skills/agent-vm/references/observability`](../../../skills/agent-vm/references/observability/README.md), together with the renderer and validator. It does not contain deployment addresses, credentials, a real datasource identity, a real controller job, collector paths, or a consumer-specific rendered export.
 
-The deployment repository renders that baseline with its explicit values and owns the resulting JSON, provisioning file, Prometheus scrape configuration and collector configuration. The renderer must replace the Grafana organization ID, Prometheus datasource UID, controller job, Dashboard UID/title/folder, and container-visible dashboard path before writing output. The generated dashboard keeps native controller queries behind a hidden `controller_job` variable, reads CPU capacity from `agent_vm_admission_cpu_capacity_vcpu`, and derives memory/disk limit lines only from authoritative metric families.
+The deployment repository renders that baseline with its explicit values and owns the resulting JSON, provisioning file, Prometheus scrape configuration and collector configuration. The renderer must replace the Grafana organization ID, Prometheus datasource UID, controller job, Dashboard UID/title/folder, and container-visible dashboard path before writing output. The generated dashboards keep native controller queries behind a hidden `controller_job` variable, read CPU capacity from `agent_vm_admission_cpu_capacity_vcpu`, and derive memory/disk limit lines only from authoritative metric families.
 
 The deployment source has been located in the operator-owned `obs` stack: `grafana/dashboards/incus/incus-agent-vm.json` is loaded by `grafana/provisioning/dashboards/incus.yml`, and the Grafana service mounts both paths read-only. A recovered runtime copy may be copied back into that owning deployment checkout for versioning and review. It must not replace the public template or be copied into this public repository as a deployment export. Treat an untracked runtime copy as a recovery artifact until its owner, checksum and source revision are recorded.
 
@@ -105,3 +126,5 @@ Run the public validator against the rendered JSON and provisioning file before 
 - [Native Agent VM specification](../SPEC.md)
 - [Agent VM operations runbook](../OPERATIONS.md)
 - [Agent VM memory reservation-only admission ADR](../../adr/0029-agent-vm-memory-reservation-only-admission.md)
+- [Agent VM CPU startup pressure for overcommit ADR](../../adr/0032-agent-vm-cpu-startup-pressure-for-overcommit.md)
+- [Agent VM capacity and inventory observability ADR](../../adr/0033-agent-vm-capacity-and-inventory-observability.md)

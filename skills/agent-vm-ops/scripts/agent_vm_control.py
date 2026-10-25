@@ -791,6 +791,22 @@ def one_line(result, phase, command):
     return lines[0]
 
 
+def topology_types(result, phase, command, *, require_partition):
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if (
+        not lines
+        or lines[0] != "disk"
+        or lines.count("disk") != 1
+        or any(line != "part" and line != "disk" for line in lines)
+        or (require_partition and "part" not in lines)
+    ):
+        raise GuestFailure(phase, command, result.returncode, result.stdout, result.stderr,
+                           cause="invalid_topology",
+                           stdout_truncated=getattr(result, "stdout_truncated", False),
+                           stderr_truncated=getattr(result, "stderr_truncated", False))
+    return lines
+
+
 def number_from(command, phase, key):
     result = run(command, phase)
     raw = result.stdout.strip()
@@ -848,11 +864,11 @@ def inspect_layout():
     parent = parent_lines[0]
     disk = "/dev/" + parent
     source_type_command = ["lsblk", "-n", "-o", "TYPE", source]
-    if one_line(run(source_type_command, "topology-type"), "topology-type", source_type_command) != "part":
-        raise GuestFailure("topology-check", source_type_command, cause="root_is_not_partition")
+    topology_types(run(source_type_command, "topology-type"), "topology-type", source_type_command,
+                   require_partition=True)
     disk_type_command = ["lsblk", "-n", "-o", "TYPE", disk]
-    if one_line(run(disk_type_command, "topology-type"), "topology-type", disk_type_command) != "disk":
-        raise GuestFailure("topology-check", disk_type_command, cause="parent_is_not_disk")
+    topology_types(run(disk_type_command, "topology-type"), "topology-type", disk_type_command,
+                   require_partition=False)
 
     filesystem_tool = "resize2fs" if fstype == "ext4" else "xfs_growfs"
     required_tools = ["findmnt", "lsblk", "blockdev", "growpart", filesystem_tool]

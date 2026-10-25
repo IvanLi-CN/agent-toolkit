@@ -48,6 +48,41 @@ class SessionContractTests(unittest.TestCase):
         self.assertNotEqual(CLI.local_session_dir("first"), CLI.local_session_dir("second"))
         self.assertIn("agent-vm", str(CLI.local_session_dir("first")))
 
+    def test_failed_acquire_persists_state_for_public_cleanup_commands(self):
+        session = "failed-acquire"
+        task = {
+            "task_id": "avm-recovery123",
+            "session_id": session,
+            "generation": 1,
+            "state": "cached",
+            "effective_lease": False,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private_key = root / "id_ed25519"
+            args = CLI.build_parser().parse_args(["acquire", "--session-id", session])
+            status_responses = [
+                {"result": {"generation": 0}},
+                {"result": task},
+            ]
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", root / "state"):
+                with mock.patch.object(CLI, "make_ssh_key", return_value=(private_key, "ssh-ed25519 AAAA")), \
+                     mock.patch.object(CLI, "control_request", side_effect=status_responses), \
+                     mock.patch.object(CLI, "mutation", side_effect=CLI.CliError("guest_resize_unverified", "guest growth failed")):
+                    with self.assertRaises(CLI.CliError) as failure:
+                        CLI.command_acquire(args)
+                self.assertEqual(failure.exception.code, "guest_resize_unverified")
+                self.assertEqual(CLI.read_session_state(session)["generation"], 1)
+                self.assertEqual(CLI.read_session_state(session)["task_id"], "avm-recovery123")
+
+                for command in ("release", "destroy"):
+                    cleanup_args = CLI.build_parser().parse_args([command, "--session-id", session])
+                    with mock.patch.object(CLI, "control_request", return_value={"action": command}) as request, \
+                         mock.patch.object(CLI, "json_output"):
+                        self.assertEqual(CLI.dispatch(cleanup_args), 0)
+                    self.assertEqual(request.call_args.args[0], command)
+                    self.assertEqual(request.call_args.kwargs["generation"], 1)
+
     def test_sync_passes_selected_identity_to_helper(self):
         args = CLI.build_parser().parse_args(["sync", "--name", "repo", "--session-id", "explicit"])
         with mock.patch.object(CLI, "run_command", return_value=0) as run_command:

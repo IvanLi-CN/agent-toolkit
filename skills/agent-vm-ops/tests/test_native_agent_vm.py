@@ -1402,6 +1402,9 @@ class LifecycleTests(Fixture):
         self.assertEqual(failure["stderr"], "resize2fs: transient guest failure")
         self.assertEqual(failure["guest_capacity"]["disk_bytes"], 20 * GIB)
 
+        self.assertEqual(self.call("release")["state"], "cached")
+        self.assertEqual(self.call("destroy")["state"], "absent")
+
     def test_native_init_timeout_keeps_absence_pending_for_delayed_reconciliation(self):
         task = self.control._base_task("thread-a", 1)
         task.update(
@@ -2123,6 +2126,8 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         escaped_child_pid_path=None,
         root_exits_before_timeout=False,
         source_output="/dev/sda2\n",
+        source_type_output="disk\npart\npart\n",
+        disk_type_output="disk\npart\npart\n",
         partition_marker_exists=True,
         udevadm_available=False,
         udevadm_returncode=0,
@@ -2161,7 +2166,7 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
                 output = b"sda\n"
                 timeout = False
             elif command[:4] == ["lsblk", "-n", "-o", "TYPE"]:
-                output = ("part\n" if command[-1] == "/dev/sda2" else "disk\n").encode()
+                output = (source_type_output if command[-1] == "/dev/sda2" else disk_type_output).encode()
                 timeout = False
             elif command[:2] == ["blockdev", "--getsize64"]:
                 value = target if command[-1] == "/dev/sda" else state["partition"]
@@ -2320,6 +2325,20 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         self.assertGreaterEqual(payload["filesystem_bytes"], payload["filesystem_threshold_bytes"])
         self.assertEqual(len([command for command in calls if command[0] == "growpart"]), 1)
         self.assertNotIn(["blockdev", "--rereadpt", "/dev/sda"], calls)
+
+    def test_guest_root_growth_script_accepts_partition_topology_rows(self):
+        exit_code, stdout, stderr, _ = self.execute_script(
+            initial_partition=20 * GIB,
+            initial_filesystem=20 * GIB,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        payload = json.loads(stdout)
+        self.assertEqual(payload["source"], "/dev/sda2")
+        self.assertEqual(payload["parent"], "/dev/sda")
+        self.assertEqual(payload["filesystem"], "ext4")
+        self.assertTrue(payload["capacity"]["verified"])
 
     def test_guest_root_growth_script_retries_stale_partition_and_grows(self):
         exit_code, stdout, stderr, calls = self.execute_script()
@@ -2592,6 +2611,15 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         error = json.loads(stderr)["error"]
         self.assertEqual(error["phase"], "topology-source")
         self.assertEqual(error["cause"], "ambiguous_output")
+
+    def test_guest_root_growth_script_rejects_invalid_topology_type(self):
+        exit_code, stdout, stderr, _ = self.execute_script(source_type_output="disk\npart\ncrypt\n")
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout, "")
+        error = json.loads(stderr)["error"]
+        self.assertEqual(error["phase"], "topology-type")
+        self.assertEqual(error["cause"], "invalid_topology")
 
 
 class CommandRunnerTests(unittest.TestCase):

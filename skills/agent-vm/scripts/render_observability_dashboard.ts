@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -184,7 +184,14 @@ export function renderBundle(config: ObservabilityConfig, templateDir: string = 
   };
 }
 
-export function writeBundle(bundle: RenderedBundle, outputDir: string, force = false): { dashboardPath: string; inventoryDashboardPath: string; provisioningPath: string } {
+type RenameFile = typeof renameSync;
+
+export function writeBundle(
+  bundle: RenderedBundle,
+  outputDir: string,
+  force = false,
+  renameFile: RenameFile = renameSync,
+): { dashboardPath: string; inventoryDashboardPath: string; provisioningPath: string } {
   const directory = resolve(outputDir);
   mkdirSync(directory, { recursive: true });
   const activeDirectory = join(directory, "current");
@@ -201,6 +208,8 @@ export function writeBundle(bundle: RenderedBundle, outputDir: string, force = f
   let releasePath: string | undefined;
   let currentNextPath: string | undefined;
   let provisioningTempPath: string | undefined;
+  let activeDirectoryReplaced = false;
+  let previousCurrentTarget: string | undefined;
   try {
     try {
       mkdirSync(lockPath);
@@ -212,6 +221,7 @@ export function writeBundle(bundle: RenderedBundle, outputDir: string, force = f
     if (activeStat && !activeStat.isSymbolicLink()) {
       throw new Error(`active bundle path must be a symlink: ${activeDirectory}; migrate the existing dashboard directory before rendering`);
     }
+    if (activeStat?.isSymbolicLink()) previousCurrentTarget = readlinkSync(activeDirectory);
     const legacyPaths = [join(directory, bundle.dashboardFilename), join(directory, bundle.inventoryDashboardFilename)];
     if (legacyPaths.some((path) => existsSync(path))) {
       throw new Error(`legacy dashboard files exist beside the atomic bundle path; migrate ${directory} before rendering`);
@@ -224,7 +234,7 @@ export function writeBundle(bundle: RenderedBundle, outputDir: string, force = f
     writeFileSync(join(staging, bundle.dashboardFilename), bundle.dashboardText, "utf8");
     writeFileSync(join(staging, bundle.inventoryDashboardFilename), bundle.inventoryDashboardText, "utf8");
     releasePath = join(releasesDirectory, basename(staging).replace(/^\.bundle-/, "bundle-"));
-    renameSync(staging, releasePath);
+    renameFile(staging, releasePath);
     staging = undefined;
 
     // The dashboard provider points at the stable `current` symlink. Replacing
@@ -232,15 +242,27 @@ export function writeBundle(bundle: RenderedBundle, outputDir: string, force = f
     currentNextPath = join(directory, `.current-${basename(releasePath)}`);
     symlinkSync(join(".releases", basename(releasePath)), currentNextPath);
 
+    // Switch the stable current link first, then publish provisioning. If the
+    // second rename fails, the old link and old provisioning remain active.
+    renameFile(currentNextPath, activeDirectory);
+    currentNextPath = undefined;
+    activeDirectoryReplaced = true;
+
     // Provisioning is a separate single-file artifact. Its provider path is
     // stable, so an atomic file rename cannot expose a mixed dashboard path.
     provisioningTempPath = join(directory, `.agent-vm-observability.yml.${basename(releasePath)}.tmp`);
     writeFileSync(provisioningTempPath, bundle.provisioningText, "utf8");
-    renameSync(provisioningTempPath, provisioningPath);
+    renameFile(provisioningTempPath, provisioningPath);
     provisioningTempPath = undefined;
-    renameSync(currentNextPath, activeDirectory);
-    currentNextPath = undefined;
   } catch (error) {
+    if (activeDirectoryReplaced) {
+      try {
+        unlinkSync(activeDirectory);
+        if (previousCurrentTarget !== undefined) symlinkSync(previousCurrentTarget, activeDirectory);
+      } catch (rollbackError) {
+        throw new Error(`failed to restore active dashboard bundle after provisioning failure: ${String(rollbackError)}; original error: ${String(error)}`);
+      }
+    }
     if (provisioningTempPath && existsSync(provisioningTempPath)) rmSync(provisioningTempPath, { force: true });
     if (currentNextPath && existsSync(currentNextPath)) rmSync(currentNextPath, { force: true });
     if (releasePath && existsSync(releasePath)) rmSync(releasePath, { recursive: true, force: true });

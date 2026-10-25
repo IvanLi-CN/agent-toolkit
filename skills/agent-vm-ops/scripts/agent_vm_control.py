@@ -2484,13 +2484,17 @@ class StateStore:
                 );
                 """
             )
+            self.connection.execute(
+                "INSERT OR IGNORE INTO meta(key, value) VALUES ('state_epoch', ?)",
+                (uuid.uuid4().hex,),
+            )
 
     def close(self) -> None:
         with self._lock:
             self.connection.close()
 
     @contextmanager
-    def transaction(self):
+    def transaction(self, *, mutating: bool = True):
         """Nestable short transactions; never wrap native operations/waits."""
         with self._lock:
             self._ensure_usable(phase="connection", sql_operation="write")
@@ -2539,6 +2543,11 @@ class StateStore:
             else:
                 if outer:
                     try:
+                        if mutating:
+                            self.connection.execute(
+                                "UPDATE meta SET value = ? WHERE key = 'state_epoch'",
+                                (uuid.uuid4().hex,),
+                            )
                         self.connection.commit()
                     except sqlite3.Error as exc:
                         rollback_error = None
@@ -2559,7 +2568,7 @@ class StateStore:
 
     @contextmanager
     def read_transaction(self):
-        """Keep one consistent SQLite snapshot without blocking native probes."""
+        """Keep one short SQLite snapshot; callers must keep native probes outside it."""
         with self._lock:
             self._ensure_usable(phase="connection", sql_operation="read")
             outer = self.depth == 0
@@ -4903,7 +4912,7 @@ class Control:
                 else self._storage_headroom(0)
             )
             lock = nullcontext() if global_locked else self._global_lock()
-            with lock, self.store.transaction():
+            with lock, self.store.read_transaction():
                 breakdown = self._allocation_breakdown()
                 disk = self._disk_admission_diagnostics(disk_capacity)
             if not disk.get("verified"):
@@ -5068,7 +5077,7 @@ class Control:
             reasons.append(capacity["error"])
         elif resources.get("verified"):
             lock = nullcontext() if global_locked else self._global_lock()
-            with lock, self.store.transaction():
+            with lock, self.store.read_transaction():
                 reclaim_required = not self._space_sufficient(capacity, self.config["create_cost_bytes"], "low")
             if reclaim_required:
                 reasons.append({"code": "disk_reclaim_required", "message": "default creation needs capacity reclamation"})
@@ -7469,56 +7478,89 @@ class Control:
         return {"draining": draining, "tasks": tasks, "doctor": self.doctor(request, session_id)}
 
     def admin_metrics(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:
-        observation_epoch = uuid.uuid4().hex
-        with self.store.read_transaction():
+        max_attempts = 3
+        observation_attempts = 0
+        observation_consistent = False
+        state_epoch_before = "initial"
+        state_epoch_after = "initial"
+        doctor: dict[str, Any] | None = None
+        snapshot: dict[str, Any] | None = None
+        for attempt in range(max_attempts):
+            observation_attempts = attempt + 1
+            # Native probes must run outside the SQLite lock. The epoch check
+            # below rejects a durable-state change that overlaps the probe.
+            with self.store.read_transaction():
+                state_epoch_before = self.store.get_meta("state_epoch") or "initial"
             doctor = self.doctor(request, session_id)
-            tasks = self.store.list_tasks()
-            task_states = Counter(str(task["state"]) for task in tasks)
-            resources = doctor.get("resources", {})
-            memory = resources.get("memory") or {} if isinstance(resources, Mapping) else {}
-            warnings = list(doctor.get("default_admission", {}).get("warnings", []))
-            audit = self.store.audit_summary()
-            disk_admission = resources.get("disk_admission") if isinstance(resources, Mapping) else None
-            if not isinstance(disk_admission, Mapping):
-                disk_admission = self._disk_admission_diagnostics(doctor.get("capacity"))
-            return {
-                "observation_epoch": observation_epoch,
-                "observed_at": iso_time(self.now()),
-                "up": True,
-                "draining": self.store.get_meta("draining") == "1",
-                "admission_ready": bool(doctor.get("admission_ready")),
-                "reclaim_required": doctor.get("default_admission", {}).get("reclaim_required"),
-                "resources": resources,
-                "capacity": doctor.get("capacity"),
-                "disk_admission": disk_admission,
-                "default_admission": doctor.get("default_admission"),
-                "ct_cpu": {
-                    "capacity_vcpu": (resources.get("ct_capacity") or {}).get("cpu")
-                    if isinstance(resources, Mapping) else None,
-                    "pressure": resources.get("cpu_pressure") if isinstance(resources, Mapping) else None,
-                    "startup_pressure": doctor.get("default_admission", {}).get("observations", {}).get(
-                        "cpu_startup_pressure"
-                    ),
-                },
-                "ct_memory": {
-                    "capacity_bytes": memory.get("limit_bytes"),
-                    "current_bytes": memory.get("current_bytes"),
-                    "available_bytes": memory.get("available_bytes"),
-                    "pressure_threshold_bytes": memory.get("threshold_bytes"),
-                    "pressure": resources.get("memory_pressure") if isinstance(resources, Mapping) else None,
-                    "oom_events": memory.get("oom_events"),
-                },
-                "instances": doctor.get("instances"),
-                "task_states": dict(task_states),
-                "operations": audit["operations"],
-                "pending_operations": self.store.pending_operations(),
-                "image_unpack_failures": audit["image_unpack_failures"],
-                "warnings": warnings,
-                "warning_counts": audit["warnings"],
-                "doctor": {"ready": doctor.get("ready"), "issues": doctor.get("issues", [])},
-                "release": self._release_metadata(),
-                "release_warnings": self._merge_warnings(self.release_warnings),
-            }
+            with self.store.read_transaction():
+                state_epoch_after = self.store.get_meta("state_epoch") or "initial"
+                tasks = self.store.list_tasks()
+                audit = self.store.audit_summary()
+                snapshot = {
+                    "draining": self.store.get_meta("draining") == "1",
+                    "task_states": dict(Counter(str(task["state"]) for task in tasks)),
+                    "pending_operations": self.store.pending_operations(),
+                    "audit": audit,
+                }
+            if state_epoch_before == state_epoch_after:
+                observation_consistent = True
+                break
+
+        assert doctor is not None
+        assert snapshot is not None
+        resources = doctor.get("resources", {})
+        memory = resources.get("memory") or {} if isinstance(resources, Mapping) else {}
+        warnings = list(doctor.get("default_admission", {}).get("warnings", []))
+        if not observation_consistent:
+            warnings.append({
+                "code": "observation_inconsistent",
+                "message": "durable state changed while native metrics were sampled",
+                "attempts": observation_attempts,
+            })
+        audit = snapshot["audit"]
+        disk_admission = resources.get("disk_admission") if isinstance(resources, Mapping) else None
+        if not isinstance(disk_admission, Mapping):
+            disk_admission = self._disk_admission_diagnostics(doctor.get("capacity"))
+        return {
+            "observation_epoch": state_epoch_after,
+            "observation_consistent": observation_consistent,
+            "observation_attempts": observation_attempts,
+            "observed_at": iso_time(self.now()),
+            "up": True,
+            "draining": snapshot["draining"],
+            "admission_ready": bool(doctor.get("admission_ready")),
+            "reclaim_required": doctor.get("default_admission", {}).get("reclaim_required"),
+            "resources": resources,
+            "capacity": doctor.get("capacity"),
+            "disk_admission": disk_admission,
+            "default_admission": doctor.get("default_admission"),
+            "ct_cpu": {
+                "capacity_vcpu": (resources.get("ct_capacity") or {}).get("cpu")
+                if isinstance(resources, Mapping) else None,
+                "pressure": resources.get("cpu_pressure") if isinstance(resources, Mapping) else None,
+                "startup_pressure": doctor.get("default_admission", {}).get("observations", {}).get(
+                    "cpu_startup_pressure"
+                ),
+            },
+            "ct_memory": {
+                "capacity_bytes": memory.get("limit_bytes"),
+                "current_bytes": memory.get("current_bytes"),
+                "available_bytes": memory.get("available_bytes"),
+                "pressure_threshold_bytes": memory.get("threshold_bytes"),
+                "pressure": resources.get("memory_pressure") if isinstance(resources, Mapping) else None,
+                "oom_events": memory.get("oom_events"),
+            },
+            "instances": doctor.get("instances"),
+            "task_states": snapshot["task_states"],
+            "operations": audit["operations"],
+            "pending_operations": snapshot["pending_operations"],
+            "image_unpack_failures": audit["image_unpack_failures"],
+            "warnings": warnings,
+            "warning_counts": audit["warnings"],
+            "doctor": {"ready": doctor.get("ready"), "issues": doctor.get("issues", [])},
+            "release": self._release_metadata(),
+            "release_warnings": self._merge_warnings(self.release_warnings),
+        }
 
 
     def drain_status(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:

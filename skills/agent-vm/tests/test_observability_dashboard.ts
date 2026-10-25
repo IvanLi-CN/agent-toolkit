@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { renderBundle, readConfig, writeBundle, type ObservabilityConfig } from "../scripts/render_observability_dashboard.ts";
 import {
@@ -209,6 +209,26 @@ test("writes both outputs and refuses accidental replacement", () => {
     );
     expect(() => writeBundle(bundle, root)).toThrow("pass --force");
     expect(writeBundle(bundle, root, true).dashboardPath).toBe(paths.dashboardPath);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("restores the previous bundle when provisioning activation fails", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-vm-observability-rollback-"));
+  try {
+    const bundle = renderBundle(config);
+    const paths = writeBundle(bundle, root);
+    const previousTarget = readlinkSync(join(root, "current"));
+    const previousProvisioning = readFileSync(paths.provisioningPath, "utf8");
+    const injectedRename: typeof renameSync = (oldPath, newPath) => {
+      if (String(newPath) === paths.provisioningPath) throw new Error("injected provisioning rename failure");
+      renameSync(oldPath, newPath);
+    };
+
+    expect(() => writeBundle(bundle, root, true, injectedRename)).toThrow("injected provisioning rename failure");
+    expect(readlinkSync(join(root, "current"))).toBe(previousTarget);
+    expect(readFileSync(paths.provisioningPath, "utf8")).toBe(previousProvisioning);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

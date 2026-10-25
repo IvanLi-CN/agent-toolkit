@@ -523,6 +523,59 @@ class AdmissionTests(Fixture):
         self.assertEqual(result["task_states"]["active"], 1)
         self.assertEqual(self.store.list_tasks(), before)
 
+    def test_admin_metrics_does_not_hold_store_lock_during_native_probe(self):
+        probe_started = threading.Event()
+        probe_release = threading.Event()
+        result_holder = {}
+        error_holder = []
+        original_doctor = self.control.doctor
+
+        def slow_doctor(request, session_id):
+            probe_started.set()
+            if not probe_release.wait(timeout=2):
+                raise AssertionError("test probe release timed out")
+            return original_doctor(request, session_id)
+
+        def run_metrics():
+            try:
+                result_holder["value"] = self.call("admin-metrics")
+            except BaseException as error:
+                error_holder.append(error)
+
+        with mock.patch.object(self.control, "doctor", side_effect=slow_doctor):
+            thread = threading.Thread(target=run_metrics)
+            thread.start()
+            self.assertTrue(probe_started.wait(timeout=2))
+            acquired = self.store._lock.acquire(blocking=False)
+            if acquired:
+                self.store._lock.release()
+            probe_release.set()
+            thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(error_holder)
+        self.assertTrue(acquired)
+        self.assertTrue(result_holder["value"]["observation_consistent"])
+
+    def test_admin_metrics_retries_when_durable_state_changes_during_probe(self):
+        calls = 0
+        original_doctor = self.control.doctor
+
+        def doctor_with_state_change(request, session_id):
+            nonlocal calls
+            calls += 1
+            result = original_doctor(request, session_id)
+            if calls == 1:
+                self.store.set_meta("test-observation-marker", "changed")
+            return result
+
+        with mock.patch.object(self.control, "doctor", side_effect=doctor_with_state_change):
+            result = self.call("admin-metrics")
+
+        self.assertEqual(calls, 2)
+        self.assertTrue(result["observation_consistent"])
+        self.assertEqual(result["observation_attempts"], 2)
+
     def test_admin_metrics_reports_pending_operation_journals(self):
         request = self.request("acquire", operation="metrics-pending", public_key=KEY)
         digest = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()

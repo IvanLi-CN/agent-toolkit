@@ -4599,7 +4599,7 @@ class Control:
             if layer["free"] - demand < layer[threshold]: return False
         return True
 
-    def _eligible_cache(self, snapshot: Mapping[str, Any], *, allow_deleting: bool = False) -> dict[str, Any]:
+    def _cache_metadata_eligible(self, snapshot: Mapping[str, Any], *, allow_deleting: bool = False) -> dict[str, Any]:
         """Caller holds the session lock. Age selects candidates, not eligibility."""
         task = self.store.get_task(task_id=snapshot["task_id"])
         allowed_states = {"cached", "deleting"} if allow_deleting else {"cached"}
@@ -4609,6 +4609,9 @@ class Control:
             raise ControlError("cache_ineligible", "cache ownership or generation changed")
         if parse_time(task.get("lease_expires_at")) and parse_time(task["lease_expires_at"]) > self.now():
             raise ControlError("cache_ineligible", "cache still has an effective deadline")
+        return task
+
+    def _verify_cache_native(self, task: Mapping[str, Any]) -> dict[str, Any]:
         info = self._ownership(task)
         if any(device.get("type") == "proxy" for device in info.get("expanded_devices", {}).values()):
             raise ControlError("cache_ineligible", "cache still has native proxy mappings")
@@ -4617,10 +4620,39 @@ class Control:
             raise ControlError("cache_ineligible", "cache is running or has unreclaimed mappings")
         return task
 
+    def _eligible_cache(self, snapshot: Mapping[str, Any], *, allow_deleting: bool = False) -> dict[str, Any]:
+        task = self._cache_metadata_eligible(snapshot, allow_deleting=allow_deleting)
+        return self._verify_cache_native(task)
+
+    def _mark_cache_absent(self, task: Mapping[str, Any]) -> None:
+        with self._global_lock():
+            self.store.update_task(task["task_id"], state="absent", vm_ip=None, ssh_host_port=None,
+                                   lease_expires_at=None, inactive_since=None, cleanup_after=None,
+                                   resources_json=json.dumps({"cpu": 0, "memory_mib": 0, "disk_gib": 0}),
+                                   resource_reservation_json="{}", reservation_bytes=0, last_error=None)
+
     def _delete_cache(self, task: Mapping[str, Any]) -> None:
         """Caller owns the session lock; global lock covers only state transitions."""
-        task = self._eligible_cache(task, allow_deleting=task.get("state") == "deleting")
-        if task["state"] == "cached":
+        if task.get("state") == "deleting":
+            task = self._cache_metadata_eligible(task, allow_deleting=True)
+            try:
+                exists = any(item.get("name") == task["instance_name"] for item in self.incus.list_instances())
+            except ControlError as exc:
+                detail = {"native_absence": "unverified", "cause": exc.as_dict(), "operation_phase": "cache-delete"}
+                self.store.update_task(task["task_id"], last_error=json.dumps(detail))
+                raise ControlError(
+                    "cleanup_incomplete",
+                    "native deletion cannot be verified; retry destroy",
+                    detail,
+                ) from exc
+            if not exists:
+                if self.store.get_ports(task["task_id"]):
+                    raise ControlError("cleanup_incomplete", "deleting task still has port mappings")
+                self._mark_cache_absent(task)
+                return
+            task = self._verify_cache_native(task)
+        else:
+            task = self._eligible_cache(task)
             with self._global_lock():
                 self.store.update_task(task["task_id"], state="deleting")
         try:
@@ -4635,11 +4667,7 @@ class Control:
             annotated = ControlError(exc.code, exc.message, detail)
             self.store.update_task(task["task_id"], last_error=json.dumps(annotated.as_dict()))
             raise annotated from exc
-        with self._global_lock():
-            self.store.update_task(task["task_id"], state="absent", vm_ip=None, ssh_host_port=None,
-                                   lease_expires_at=None, inactive_since=None, cleanup_after=None,
-                                   resources_json=json.dumps({"cpu": 0, "memory_mib": 0, "disk_gib": 0}),
-                                   resource_reservation_json="{}", reservation_bytes=0, last_error=None)
+        self._mark_cache_absent(task)
 
 
     def _reclaim_capacity(self, request_cost: int, exclude_task_id: str | None = None) -> list[str]:
@@ -6186,15 +6214,20 @@ class Control:
                                                            "native_status": "absent", "guest_available": False}
         if recovery_operation_id is not None and task is not None:
             operation = self.store.operation(recovery_operation_id)
-            operation_generation = operation.get("generation") if operation else None
+            operation_result = operation.get("result") if operation else None
+            operation_task_id = operation_result.get("task_id") if isinstance(operation_result, Mapping) else None
+            operation_session_id = operation_result.get("session_id") if isinstance(operation_result, Mapping) else None
+            operation_generation = operation_result.get("generation") if isinstance(operation_result, Mapping) else None
             if (
                 operation
                 and operation.get("outcome") == "success"
                 and operation.get("action") == "acquire"
                 and operation.get("session_id") == session_id
+                and operation_session_id == session_id
+                and operation_task_id == task["task_id"]
                 and isinstance(operation_generation, int)
                 and not isinstance(operation_generation, bool)
-                and int(task["generation"]) in {operation_generation, operation_generation + 1}
+                and operation_generation == int(task["generation"])
             ):
                 result["recovery_operation_id"] = recovery_operation_id
         admission = self._resource_diagnostics()

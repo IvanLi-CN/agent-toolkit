@@ -1394,6 +1394,42 @@ class LifecycleTests(Fixture):
         self.assertEqual(result["state"], "active")
         self.assertEqual(result["recovery_operation_id"], "op-1")
 
+    def test_status_rejects_unrelated_or_unverified_recovery_operations(self):
+        self.acquire()
+        original = self.store.operation("op-1")
+        cases = {
+            "wrong-session": dict(original, operation_id="wrong-session", session_id="other-session"),
+            "wrong-action": dict(original, operation_id="wrong-action", action="release"),
+            "wrong-generation": dict(original, operation_id="wrong-generation", generation=3,
+                                      result=dict(original["result"], generation=3)),
+            "pending": {"outcome": "pending", "_request_digest": "pending-digest"},
+            "error": {
+                "outcome": "error",
+                "error": {"code": "guest_resize_unverified", "message": "growth failed"},
+                "_request_digest": "error-digest",
+            },
+        }
+        for operation_id, record in cases.items():
+            self.store.record_operation(operation_id, "acquire", "thread-a", record.get("generation"), record)
+            request = self.request("status")
+            request["operation_id"] = operation_id
+            with self.subTest(operation_id=operation_id):
+                result = self.control.dispatch(request)["result"]
+                self.assertNotIn("recovery_operation_id", result)
+
+    def test_status_rejects_an_old_acquire_after_a_new_generation(self):
+        self.acquire()
+        self.call("release")
+        self.acquire()
+
+        request = self.request("status")
+        request["operation_id"] = "op-1"
+
+        result = self.control.dispatch(request)["result"]
+
+        self.assertEqual(result["generation"], 2)
+        self.assertNotIn("recovery_operation_id", result)
+
     def test_acquire_guest_growth_failure_is_structured_and_closed(self):
         self.runner.guest_growth_results = [self.guest_growth_failure()]
         self.error("guest_resize_unverified", self.acquire)
@@ -2358,17 +2394,21 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
 
     def test_guest_root_growth_script_accepts_digit_ending_parent_name(self):
         exit_code, stdout, stderr, calls = self.execute_script(
-            initial_partition=20 * GIB,
-            initial_filesystem=20 * GIB,
+            initial_partition=10 * GIB,
+            initial_filesystem=5 * GIB,
             source_output="/dev/nvme0n1p2\n",
             parent_output="nvme0n1\n",
+            growpart_expands_partition=True,
         )
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(stderr, "")
         payload = json.loads(stdout)
+        self.assertEqual(payload["status"], "grown")
         self.assertEqual(payload["source"], "/dev/nvme0n1p2")
         self.assertEqual(payload["parent"], "/dev/nvme0n1")
+        self.assertIn(["growpart", "/dev/nvme0n1", "2"], calls)
+        self.assertIn(["resize2fs", "/dev/nvme0n1p2"], calls)
         self.assertIn(["lsblk", "-n", "-o", "TYPE", "/dev/nvme0n1p2"], calls)
         self.assertIn(["lsblk", "-n", "-o", "TYPE", "/dev/nvme0n1"], calls)
 
@@ -3039,6 +3079,18 @@ class ReclaimTests(Fixture):
         self.error("command_failed", self.call, "destroy", "cached")
         self.assertEqual(self.store.get_task(task_id=cached["task_id"])["state"], "deleting")
         self.runner.failure = None
+
+        result = self.call("destroy", "cached")
+
+        self.assertEqual(result["state"], "absent")
+
+    def test_public_destroy_finishes_when_deleting_instance_is_already_absent(self):
+        cached = self.acquire("cached")
+        self.call("release", "cached")
+        self.runner.failure = lambda args: args[3:4] == ["delete"]
+        self.error("command_failed", self.call, "destroy", "cached")
+        self.runner.failure = None
+        self.runner.instances.pop(cached["instance_name"])
 
         result = self.call("destroy", "cached")
 

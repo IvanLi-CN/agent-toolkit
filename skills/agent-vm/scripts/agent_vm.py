@@ -1218,13 +1218,20 @@ def command_acquire(args: argparse.Namespace) -> int:
         raise
     result = response.get("current_state", response["result"])
     if result is None or not isinstance(result, Mapping) or not result.get("effective_lease"):
-        persist_recovery_state(
+        recovered = recover_acquire_state(
             session,
             private_key,
-            result,
             operation_id=acquire_operation_id,
             expected_generation=generation,
         )
+        if not recovered:
+            persist_recovery_state(
+                session,
+                private_key,
+                result,
+                operation_id=acquire_operation_id,
+                expected_generation=generation,
+            )
         fail("lease_unavailable", "replayed allocation no longer has an active lease; inspect status")
     write_session_state(session, {"session_id": session, "task_id": result["task_id"],
                                  "generation": result["generation"], "private_key": str(private_key)})

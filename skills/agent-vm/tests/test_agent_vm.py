@@ -151,14 +151,118 @@ class SessionContractTests(unittest.TestCase):
             ]
             with mock.patch.object(CLI, "LOCAL_STATE_ROOT", root / "state"):
                 with mock.patch.object(CLI, "make_ssh_key", return_value=(private_key, "ssh-ed25519 AAAA")), \
-                     mock.patch.object(CLI, "control_request", side_effect=status_responses), \
+                     mock.patch.object(CLI, "control_request", side_effect=status_responses) as control_request, \
                      mock.patch.object(CLI, "mutation", side_effect=CLI.CliError("protocol_mismatch", "response validation failed")):
                     with self.assertRaises(CLI.CliError):
                         CLI.command_acquire(args)
                 state = CLI.read_session_state(session)
+                recovery_request = control_request.call_args_list[-1]
 
         self.assertEqual(state["task_id"], "avm-committed123")
         self.assertEqual(state["generation"], 1)
+        self.assertEqual(recovery_request.args[0], "status")
+        self.assertEqual(recovery_request.kwargs["operation_id"], "committed-acquire-operation")
+
+    def test_replayed_acquire_without_lease_recovers_cleanup_handle(self):
+        session = "replayed-acquire"
+        task = {
+            "task_id": "avm-replayed123",
+            "session_id": session,
+            "generation": 1,
+            "state": "cached",
+            "effective_lease": False,
+            "recovery_operation_id": "replayed-acquire-operation",
+        }
+        replay = {"current_state": dict(task), "result": {}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private_key = root / "id_ed25519"
+            args = CLI.build_parser().parse_args([
+                "acquire",
+                "--session-id",
+                session,
+                "--operation-id",
+                "replayed-acquire-operation",
+            ])
+            status_responses = [
+                {"result": {"generation": 0}},
+                {"result": task},
+            ]
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", root / "state"):
+                with mock.patch.object(CLI, "make_ssh_key", return_value=(private_key, "ssh-ed25519 AAAA")), \
+                     mock.patch.object(CLI, "control_request", side_effect=status_responses) as control_request, \
+                     mock.patch.object(CLI, "mutation", return_value=replay):
+                    with self.assertRaises(CLI.CliError) as failure:
+                        CLI.command_acquire(args)
+                state = CLI.read_session_state(session)
+
+        self.assertEqual(failure.exception.code, "lease_unavailable")
+        self.assertEqual(state["task_id"], "avm-replayed123")
+        self.assertEqual(state["generation"], 1)
+        recovery_request = control_request.call_args_list[-1]
+        self.assertEqual(recovery_request.args[0], "status")
+        self.assertEqual(recovery_request.kwargs["operation_id"], "replayed-acquire-operation")
+
+    def test_recovery_status_response_must_echo_operation_identity(self):
+        response = {
+            "ok": True,
+            "protocol": CLI.PROTOCOL_VERSION,
+            "action": "status",
+            "session_id": "thread",
+            "server_time": "2026-10-22T00:00:00+00:00",
+            "operation_id": "recover-operation",
+            "outcome": "success",
+            "result": {},
+        }
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(CLI, "DEFAULT_RELEASE_MANIFEST", Path(directory) / "missing.json"), \
+             mock.patch.object(
+                 CLI.subprocess,
+                 "run",
+                 side_effect=[
+                     subprocess.CompletedProcess([], 0, json.dumps(response).encode(), b""),
+                     subprocess.CompletedProcess(
+                         [], 0, json.dumps(dict(response, operation_id="other-operation")).encode(), b""
+                     ),
+                 ],
+             ) as run:
+            result = CLI.control_request("status", session="thread", operation_id="recover-operation")
+            with self.assertRaises(CLI.CliError) as failure:
+                CLI.control_request("status", session="thread", operation_id="recover-operation")
+
+        request = json.loads(run.call_args_list[0].kwargs["input"])
+        self.assertEqual(request["operation_id"], "recover-operation")
+        self.assertEqual(result["operation_id"], "recover-operation")
+        self.assertEqual(failure.exception.code, "protocol_mismatch")
+
+    def test_committed_recovery_rejects_stale_or_unrelated_state(self):
+        base = {
+            "session_id": "committed-recovery",
+            "task_id": "avm-recovery123",
+            "generation": 1,
+            "state": "active",
+            "recovery_operation_id": "recover-operation",
+        }
+        cases = [
+            ("wrong-session", dict(base, session_id="other-session")),
+            ("wrong-operation", dict(base, recovery_operation_id="other-operation")),
+            ("stale-generation", dict(base, generation=3)),
+            ("missing-proof", {key: value for key, value in base.items() if key != "recovery_operation_id"}),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", root / "state"):
+                for name, result in cases:
+                    with self.subTest(name=name):
+                        self.assertFalse(
+                            CLI.persist_recovery_state(
+                                "committed-recovery",
+                                root / "id_ed25519",
+                                result,
+                                operation_id="recover-operation",
+                                expected_generation=1,
+                            )
+                        )
 
     def test_sync_passes_selected_identity_to_helper(self):
         args = CLI.build_parser().parse_args(["sync", "--name", "repo", "--session-id", "explicit"])

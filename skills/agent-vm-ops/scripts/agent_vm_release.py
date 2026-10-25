@@ -978,6 +978,7 @@ class ReleasePublisher:
         try:
             self._health(manifest)
         except ReleaseError as health_error:
+            rollback_manifest = legacy_manifest()
             try:
                 rollback_result = self._wrapper("rollback", transaction, manifest["release_id"])
                 self._verify_automatic_rollback(transaction, manifest["release_id"], rollback_result)
@@ -985,14 +986,14 @@ class ReleasePublisher:
                 # retained previous release.  Validate that peer through the
                 # explicit protocol-4 legacy contract, not the failed bundle's
                 # release-specific action window.
-                self._health(legacy_manifest())
+                self._health(rollback_manifest)
             except ReleaseError as rollback_error:
                 raise ReleaseError("rollback_failed", "remote health failed and the single rollback did not restore verified health", {
                     "health_error": health_error.as_dict(),
                     "rollback_error": rollback_error.as_dict(),
                     "draining": True,
                 }) from rollback_error
-            self._control(manifest, "drain-exit", session=session, write=True)
+            self._control(rollback_manifest, "drain-exit", session=session, write=True)
             return {
                 "published": False,
                 "rolled_back": True,

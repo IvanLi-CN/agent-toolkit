@@ -46,7 +46,7 @@ The renderer validates both dashboards before writing them. A previously rendere
 
 ```bash
 bun skills/agent-vm/scripts/validate_observability_dashboard.ts \
-  --dashboard /path/to/deployment/grafana/generated/agent-vm-observability.json \
+  --dashboard /path/to/deployment/grafana/generated/current/agent-vm-observability.json \
   --provisioning /path/to/deployment/grafana/generated/agent-vm-observability.yml
 ```
 
@@ -54,7 +54,7 @@ Use the inventory profile when checking `agent-vm-observability-inventory.json`:
 
 ```bash
 bun skills/agent-vm/scripts/validate_observability_dashboard.ts \
-  --dashboard /path/to/deployment/grafana/generated/agent-vm-observability-inventory.json \
+  --dashboard /path/to/deployment/grafana/generated/current/agent-vm-observability-inventory.json \
   --provisioning /path/to/deployment/grafana/generated/agent-vm-observability.yml \
   --profile inventory
 ```

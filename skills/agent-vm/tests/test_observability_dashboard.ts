@@ -59,6 +59,14 @@ test("renders a portable dashboard and provisioning bundle", () => {
   const cpuLimitTarget = (cpuPanel?.targets as Array<Record<string, unknown>>).find((target) => target.refId === "M");
   expect(String(cpuTarget?.expr)).not.toContain("by (mode)");
   expect(String(cpuLimitTarget?.expr)).toContain("agent_vm_admission_cpu_limit_vcpu");
+  const inventoryPanels = bundle.inventoryDashboard.panels as Array<Record<string, unknown>>;
+  const inventoryTable = inventoryPanels.find((panel) => panel.id === 7) as Record<string, unknown>;
+  const stateOrderTarget = (inventoryTable.targets as Array<Record<string, unknown>>).find((target) => target.refId === "A");
+  expect(String(stateOrderTarget?.expr)).toContain('"state_order", "3", "state", "^failed$"');
+  expect(String(stateOrderTarget?.expr)).toContain('"state_order", "4", "state", "^closing$"');
+  expect(String(stateOrderTarget?.expr)).toContain('"state_order", "4", "state", "^deleting$"');
+  expect(String(stateOrderTarget?.expr)).toContain('"state_order", "5", "state", "^cached$"');
+  expect(String(stateOrderTarget?.expr)).toContain('"state_order", "6", "state", "^absent$"');
   for (const title of ["Disk admission", "VM slot admission", "Control filesystem capacity"]) {
     const panel = panels.find((candidate) => candidate.title === title) as Record<string, any> | undefined;
     expect(panel?.fieldConfig?.defaults?.custom?.spanNulls).toBe(false);
@@ -126,6 +134,19 @@ test("requires the rendered provisioning path", () => {
   expect(validateProvisioning(bundle.provisioningText.replace(config.dashboard_path, "/wrong/path"), config.dashboard_path)).toContain(
     `provisioning provider path must be ${config.dashboard_path}`,
   );
+});
+
+test("requires provisioning path to target the stable current directory", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-vm-observability-config-"));
+  try {
+    const path = join(root, "config.json");
+    const invalidConfig = { ...config, dashboard_path: "/var/lib/grafana/dashboards/agent-vm/generated" };
+    writeFileSync(path, JSON.stringify(invalidConfig));
+    expect(() => readConfig(path)).toThrow("dashboard_path must target the stable current directory");
+    expect(() => renderBundle(invalidConfig)).toThrow("dashboard_path must target the stable current directory");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("rejects a provisioning mapping where a provider list is required", () => {

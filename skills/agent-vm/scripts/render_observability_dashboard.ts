@@ -82,6 +82,11 @@ function validateOutputFilenames(config: ObservabilityConfig): void {
   if (new Set(filenames).size !== filenames.length) throw new Error("dashboard output filenames must be unique");
 }
 
+function validateStableDashboardPath(path: string): void {
+  if (!path.startsWith("/") || path.includes("..")) throw new Error("dashboard_path must be an absolute path without ..");
+  if (basename(path) !== "current") throw new Error("dashboard_path must target the stable current directory");
+}
+
 export function readConfig(path: string): ObservabilityConfig {
   let parsed: unknown;
   try {
@@ -112,7 +117,7 @@ export function readConfig(path: string): ObservabilityConfig {
   if (config.inventory_dashboard_uid && !/^[A-Za-z0-9_-]{1,40}$/.test(config.inventory_dashboard_uid)) throw new Error("inventory_dashboard_uid contains unsupported characters");
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(config.prometheus_datasource_uid)) throw new Error("prometheus_datasource_uid contains unsupported characters");
   if (!/^[A-Za-z0-9_.:-]{1,128}$/.test(config.controller_job)) throw new Error("controller_job contains unsupported characters");
-  if (!config.dashboard_path.startsWith("/") || config.dashboard_path.includes("..")) throw new Error("dashboard_path must be an absolute path without ..");
+  validateStableDashboardPath(config.dashboard_path);
   if (config.dashboard_filename && !/^[A-Za-z0-9._-]+\.json$/.test(config.dashboard_filename)) throw new Error("dashboard_filename must be a simple .json filename");
   if (config.inventory_dashboard_filename && !/^[A-Za-z0-9._-]+\.json$/.test(config.inventory_dashboard_filename)) throw new Error("inventory_dashboard_filename must be a simple .json filename");
   inventoryUid(config);
@@ -129,6 +134,7 @@ function renderText(template: string, replacements: Record<string, string>): str
 }
 
 export function renderBundle(config: ObservabilityConfig, templateDir: string = TEMPLATE_DIR): RenderedBundle {
+  validateStableDashboardPath(config.dashboard_path);
   const commonReplacements = {
     [TOKENS.grafana_org_id]: String(config.grafana_org_id),
     [TOKENS.provider_name]: config.provider_name,

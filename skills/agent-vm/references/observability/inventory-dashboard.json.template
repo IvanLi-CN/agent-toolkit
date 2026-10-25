@@ -438,7 +438,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "label_join(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(agent_vm_task_info{job=\"$controller_job\",state=~\"$state\"}, \"state_order\", \"1\", \"state\", \"^active$\"), \"state_order\", \"2\", \"state\", \"^preparing$\"), \"state_order\", \"3\", \"state\", \"^closing$\"), \"state_order\", \"4\", \"state\", \"^deleting$\"), \"state_order\", \"5\", \"state\", \"^failed$\"), \"state_order\", \"6\", \"state\", \"^cached$\"), \"state_order\", \"7\", \"state\", \"^absent$\"), \"task_key\", \"|\", \"task_id\", \"state\")",
+          "expr": "label_join(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(agent_vm_task_info{job=\"$controller_job\",state=~\"$state\"}, \"state_order\", \"1\", \"state\", \"^active$\"), \"state_order\", \"2\", \"state\", \"^preparing$\"), \"state_order\", \"3\", \"state\", \"^failed$\"), \"state_order\", \"4\", \"state\", \"^closing$\"), \"state_order\", \"4\", \"state\", \"^deleting$\"), \"state_order\", \"5\", \"state\", \"^cached$\"), \"state_order\", \"6\", \"state\", \"^absent$\"), \"task_key\", \"|\", \"task_id\", \"state\")",
           "format": "table",
           "instant": true,
           "legendFormat": "{{task_id}}",

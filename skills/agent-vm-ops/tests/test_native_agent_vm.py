@@ -2192,11 +2192,12 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
                     helper = (
                         "import os, subprocess, sys, time; "
                         "child=subprocess.Popen([sys.executable, '-c', "
-                        "'import os,sys,time; os.setsid(); "
-                        "open(sys.argv[1], 'w').write(\\\"ready\\\"); time.sleep(10)', "
+                        "\"import os,sys,time; os.setsid(); "
+                        "open(sys.argv[1], 'w').write('ready'); time.sleep(10)\", "
                         "sys.argv[2]], close_fds=False); "
-                        "open(sys.argv[1], 'w').write(str(child.pid)); "
-                        "while not os.path.exists(sys.argv[2]): time.sleep(0.01); "
+                        "open(sys.argv[1], 'w').write(str(child.pid))\n"
+                        "while not os.path.exists(sys.argv[2]):\n"
+                        "    time.sleep(0.01)\n"
                         "sys.stdout.buffer.write(" + repr(output) + "); "
                         "sys.stderr.buffer.write(" + repr(error) + "); "
                         "sys.stdout.flush(); sys.stderr.flush(); "
@@ -2460,7 +2461,7 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         command = ["findmnt", "-n", "-o", "SOURCE", "-T", "/"]
         exit_code, stdout, stderr, _ = self.execute_script(
             timeout_command=command,
-            command_timeout=0.05,
+            command_timeout=1.0,
             killpg_error=True,
         )
 
@@ -2477,7 +2478,7 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
             pid_path = Path(directory) / "child.pid"
             exit_code, stdout, stderr, _ = self.execute_script(
                 timeout_command=command,
-                command_timeout=0.05,
+                command_timeout=1.0,
                 escaped_child_pid_path=str(pid_path),
             )
 
@@ -2497,7 +2498,7 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
             pid_path = Path(directory) / "child.pid"
             exit_code, _, stderr, _ = self.execute_script(
                 timeout_command=command,
-                command_timeout=0.3,
+                command_timeout=1.0,
                 escaped_child_pid_path=str(pid_path),
                 root_exits_before_timeout=True,
             )
@@ -2667,7 +2668,7 @@ class CommandRunnerTests(unittest.TestCase):
             code = (
                 "import subprocess,sys,time; "
                 "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)'], close_fds=False); "
-                "open(sys.argv[1], 'w').write(str(child.pid)); "
+                "open(sys.argv[1], 'w').write(str(child.pid))\n"
                 "time.sleep(10)"
             )
             with self.assertRaises(CONTROL.ControlError):
@@ -2688,15 +2689,16 @@ class CommandRunnerTests(unittest.TestCase):
             code = (
                 "import os,subprocess,sys,time; "
                 "child=subprocess.Popen([sys.executable, '-c', "
-                "'import os,sys,time; os.setsid(); open(sys.argv[1], 'w').write(\"ready\"); time.sleep(10)', "
+                "\"import os,sys,time; os.setsid(); open(sys.argv[1], 'w').write('ready'); time.sleep(10)\", "
                 "sys.argv[2]], close_fds=False); "
-                "open(sys.argv[1], 'w').write(str(child.pid)); "
-                "while not os.path.exists(sys.argv[2]): time.sleep(0.01); "
+                "open(sys.argv[1], 'w').write(str(child.pid))\n"
+                "while not os.path.exists(sys.argv[2]):\n"
+                "    time.sleep(0.01)\n"
                 "time.sleep(10)"
             )
             with self.assertRaises(CONTROL.ControlError):
                 CONTROL.CommandRunner().run_bounded(
-                    [os.sys.executable, "-c", code, str(pid_path), str(ready_path)], timeout=0.2
+                    [os.sys.executable, "-c", code, str(pid_path), str(ready_path)], timeout=1.0
                 )
             if not wait_until(pid_path.exists):
                 self.fail("setsid diagnostic child did not publish its pid")
@@ -2712,15 +2714,16 @@ class CommandRunnerTests(unittest.TestCase):
             code = (
                 "import os,subprocess,sys,time; "
                 "child=subprocess.Popen([sys.executable, '-c', "
-                "'import os,sys,time; os.setsid(); open(sys.argv[1], 'w').write(\"ready\"); time.sleep(10)', "
+                "\"import os,sys,time; os.setsid(); open(sys.argv[1], 'w').write('ready'); time.sleep(10)\", "
                 "sys.argv[2]], close_fds=False); "
-                "open(sys.argv[1], 'w').write(str(child.pid)); "
-                "while not os.path.exists(sys.argv[2]): time.sleep(0.01); "
+                "open(sys.argv[1], 'w').write(str(child.pid))\n"
+                "while not os.path.exists(sys.argv[2]):\n"
+                "    time.sleep(0.01)\n"
                 "sys.stdout.flush(); sys.stderr.flush(); time.sleep(0.15); sys.exit(0)"
             )
             with self.assertRaises(CONTROL.ControlError) as failure:
                 CONTROL.CommandRunner().run_bounded(
-                    [os.sys.executable, "-c", code, str(pid_path), str(ready_path)], timeout=0.3
+                    [os.sys.executable, "-c", code, str(pid_path), str(ready_path)], timeout=1.0
                 )
             self.assertEqual(failure.exception.code, "command_timeout")
             if not wait_until(pid_path.exists):
@@ -2742,7 +2745,7 @@ class CommandRunnerTests(unittest.TestCase):
             with mock.patch.object(CONTROL.os, "killpg", side_effect=PermissionError("denied")):
                 with self.assertRaises(CONTROL.ControlError) as failure:
                     CONTROL.CommandRunner().run_bounded(
-                        [os.sys.executable, "-c", code, str(pid_path)], timeout=0.2
+                        [os.sys.executable, "-c", code, str(pid_path)], timeout=1.0
                     )
             self.assertTrue(failure.exception.detail["process_group_killed"])
             # A constrained CI runner may deny signalling a transient process

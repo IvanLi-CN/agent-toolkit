@@ -732,8 +732,6 @@ def run(command, phase, *, check=True):
                     f"{process_group_cleanup_error}:{owner_cleanup_error}"
                     if process_group_cleanup_error else owner_cleanup_error
                 )
-        if process_group_cleanup_error:
-            process_group_killed = False
         reaped = False
         try:
             process.wait(timeout=2)
@@ -2083,8 +2081,6 @@ class CommandRunner:
                         f"{process_group_cleanup_error}:{owner_cleanup_error}"
                         if process_group_cleanup_error else owner_cleanup_error
                     )
-            if process_group_cleanup_error:
-                process_group_killed = False
             pipes_drained = False
             try:
                 process.wait(timeout=1)

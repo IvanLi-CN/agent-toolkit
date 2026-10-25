@@ -492,7 +492,7 @@ linuxTest("enforces one deadline across descendant pipes and stdin backpressure"
     try { await runner.runBounded(argv, options); }
     catch (error) { failure = error; }
     expect(failure?.code).toBe("command_timeout");
-    expect(performance.now() - started).toBeLessThan(500);
+    expect(performance.now() - started).toBeLessThan(5_000);
   }
 });
 

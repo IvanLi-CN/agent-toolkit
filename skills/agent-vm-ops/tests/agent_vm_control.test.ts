@@ -1,6 +1,7 @@
 import { afterEach, expect, setDefaultTimeout, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -25,6 +26,7 @@ import {
 const GIB = 1024 ** 3;
 const KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestfixture";
 const CONTROL_PATH = fileURLToPath(new URL("../scripts/agent_vm_control.ts", import.meta.url));
+const LARGE_GUEST_FIXTURE_DIR = process.platform === "win32" ? tmpdir() : realpathSync("/var/tmp");
 setDefaultTimeout(15_000);
 
 type Dict = Record<string, any>;
@@ -285,7 +287,7 @@ class NativeCommands extends CommandRunner {
 }
 
 class Fixture {
-  readonly root = mkdtempSync("/tmp/agent-vm-control-test-");
+  readonly root = mkdtempSync(join(LARGE_GUEST_FIXTURE_DIR, "agent-vm-control-test-"));
   readonly runner = new NativeCommands();
   readonly store: StateStore;
   readonly systemd: SystemdManager;

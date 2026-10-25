@@ -58,6 +58,8 @@ export const REQUIRED_METRICS = [
   "agent_vm_admission_ready",
   "agent_vm_admission_reclaim_required",
   "agent_vm_admission_draining",
+  "agent_vm_up",
+  "agent_vm_scrape_timestamp_seconds",
   "agent_vm_filesystem_size_bytes",
   "agent_vm_filesystem_used_bytes",
   "agent_vm_filesystem_available_bytes",

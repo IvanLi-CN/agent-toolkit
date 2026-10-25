@@ -33,8 +33,9 @@ test("renders a portable dashboard and provisioning bundle", () => {
   expect(bundle.inventoryDashboardText).toContain('"ssh_host_port": "SSH port"');
   expect(bundle.inventoryDashboardText).toContain('"options": "state_order"');
   expect(bundle.inventoryDashboardText).not.toContain('"state_order": true');
-  expect(bundle.inventoryDashboardText).toContain('"text": [\n            "active",\n            "preparing",\n            "failed",\n            "closing",\n            "deleting"');
+  expect(bundle.inventoryDashboardText).toContain('"text": [\n            "active",\n            "preparing",\n            "closing",\n            "deleting",\n            "failed"');
   expect(bundle.inventoryDashboardText).not.toContain("or vector(0)");
+  expect(bundle.inventoryDashboardText).toContain("time() - agent_vm_scrape_timestamp_seconds");
   expect(bundle.dashboardText).toContain('"uid": "prometheus-test"');
   expect(bundle.dashboardText).toContain('"value": "controller-test"');
   expect(bundle.dashboardText).toContain('job=\\"$controller_job\\"');
@@ -43,12 +44,18 @@ test("renders a portable dashboard and provisioning bundle", () => {
   expect(bundle.dashboardText).toContain("agent_vm_admission_default_request_disk_bytes");
   expect(bundle.dashboardText).toContain("agent_vm_admission_default_request_physical_cost_bytes");
   expect(bundle.dashboardText).toContain("agent_vm_task_states");
+  expect(bundle.dashboardText).toContain("agent_vm_up");
+  expect(bundle.dashboardText).toContain("agent_vm_scrape_timestamp_seconds");
   const panels = bundle.dashboard.panels as Array<Record<string, unknown>>;
   const cpuPanel = panels.find((panel) => panel.id === 328);
   const cpuTarget = (cpuPanel?.targets as Array<Record<string, unknown>>).find((target) => target.refId === "C");
   const cpuLimitTarget = (cpuPanel?.targets as Array<Record<string, unknown>>).find((target) => target.refId === "M");
   expect(String(cpuTarget?.expr)).not.toContain("by (mode)");
   expect(String(cpuLimitTarget?.expr)).toContain("agent_vm_admission_cpu_limit_vcpu");
+  for (const title of ["Disk admission", "VM slot admission", "Control filesystem capacity"]) {
+    const panel = panels.find((candidate) => candidate.title === title) as Record<string, any> | undefined;
+    expect(panel?.fieldConfig?.defaults?.custom?.spanNulls).toBe(false);
+  }
   expect(bundle.dashboardText).not.toContain("vector(1600)");
   expect(bundle.dashboardText).not.toContain("16 cores");
   expect(bundle.dashboardText).not.toContain("64 GiB");

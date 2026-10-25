@@ -4452,7 +4452,7 @@
             "fillOpacity": 16,
             "lineWidth": 1,
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"
@@ -4582,7 +4582,7 @@
             "fillOpacity": 16,
             "lineWidth": 1,
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"
@@ -4712,7 +4712,7 @@
             "fillOpacity": 16,
             "lineWidth": 1,
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"
@@ -4843,6 +4843,26 @@
           "instant": true,
           "legendFormat": "Warnings / s",
           "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "agent_vm_up{job=\"$controller_job\"}",
+          "instant": true,
+          "legendFormat": "Collector up",
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          },
+          "expr": "time() - agent_vm_scrape_timestamp_seconds{job=\"$controller_job\"}",
+          "instant": true,
+          "legendFormat": "Scrape age (s)",
+          "refId": "E"
         }
       ],
       "title": "Admission state",

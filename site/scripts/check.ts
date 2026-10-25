@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { copyFile, lstat, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { parse, type DefaultTreeAdapterTypes } from 'parse5';
 import { unified } from 'unified';
@@ -153,6 +154,23 @@ const cache = path.join(siteRoot, '.cache');
 await mkdir(cache, { recursive: true });
 const fixture = await mkdtemp(path.join(cache, 'content-check-'));
 try {
+  const external = await mkdtemp(path.join(tmpdir(), 'site-generation-boundary-'));
+  try {
+    const externalData = path.join(external, 'data');
+    const marker = path.join(externalData, 'marker.txt');
+    await mkdir(externalData);
+    await writeFile(marker, 'must survive rejected generation');
+    const redirect = path.join(fixture, 'redirect');
+    await symlink(external, redirect, 'dir');
+    for (const destination of [redirect, path.join(redirect, 'data'), path.join(redirect, 'missing', 'generated')]) {
+      await assert.rejects(() => generate(repoRoot, destination), /Symlink in generation destination path/);
+      assert.equal(await readFile(marker, 'utf8'), 'must survive rejected generation');
+    }
+    await assert.rejects(() => lstat(path.join(external, 'missing')), { code: 'ENOENT' });
+    console.log('Generation controls: symlink destination/ancestor rejected before removal; external marker preserved; missing redirected suffix not created');
+  } finally {
+    await rm(external, { recursive: true, force: true });
+  }
   const resources = path.join(fixture, 'resources');
   await mkdir(path.join(resources, 'static'), { recursive: true });
   const resourcePaths = ['index.html', 'static/style.css', 'static/image.svg', 'static/image two.svg'];
@@ -188,7 +206,7 @@ try {
   ]) await assert.rejects(() => resourceCheck(validHtml, css), /Missing built|escapes repository base|Unterminated CSS/);
   console.log('Resource controls: href/src independently, srcset, inline/style-sheet CSS, escaped URLs, relative/base/query/fragment, external schemes, missing targets and anchors');
   const source = path.join(fixture, 'source');
-  const generated = path.join(fixture, 'generated');
+  const generated = path.join(fixture, 'nested', 'generated');
   const output = path.join(fixture, 'dist');
   const bin = path.join(fixture, 'bin');
   await mkdir(bin);

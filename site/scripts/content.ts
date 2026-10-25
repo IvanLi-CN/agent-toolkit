@@ -112,13 +112,40 @@ export async function inventory(root = repoRoot): Promise<Inventory> {
   return { skills, pages };
 }
 
+async function generationDestination(root: string, destination: string): Promise<string> {
+  const target = path.resolve(destination);
+  const relative = path.relative(siteRoot, target);
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative) || target === path.resolve(root)) {
+    throw new Error('Generation destination must be inside site and separate from canonical source');
+  }
+  const realSiteRoot = await realpath(siteRoot);
+  let current = siteRoot;
+  // Inspect the destination itself and every parent below the site root before
+  // recursive removal. A missing suffix is safe only after its parents pass.
+  for (const component of ['', ...relative.split(path.sep)]) {
+    current = path.join(current, component);
+    let entry;
+    try {
+      entry = await lstat(current);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') break;
+      throw error;
+    }
+    if (entry.isSymbolicLink()) throw new Error('Symlink in generation destination path');
+    if (!entry.isDirectory()) throw new Error('Generation destination path must contain only directories');
+    const resolved = await realpath(current);
+    const realRelative = path.relative(realSiteRoot, resolved);
+    if (realRelative === '..' || realRelative.startsWith(`..${path.sep}`) || path.isAbsolute(realRelative)) {
+      throw new Error('Generation destination resolves outside site');
+    }
+  }
+  return target;
+}
+
 export async function generate(root = repoRoot, destination = path.join(siteRoot, '.generated')) {
   const index = await inventory(root);
   const bySource = new Map(index.pages.map(page => [page.source, page.route]));
-  // destination is always the caller-owned generation directory, never source.
-  if (!destination.startsWith(`${siteRoot}${path.sep}`) || path.resolve(destination) === path.resolve(root)) {
-    throw new Error('Generation destination must be inside site and separate from canonical source');
-  }
+  destination = await generationDestination(root, destination);
   await rm(destination, { recursive: true, force: true });
   await mkdir(destination, { recursive: true });
   const linkEvidence: { source: string; target: string; href: string; kind: string }[] = [];

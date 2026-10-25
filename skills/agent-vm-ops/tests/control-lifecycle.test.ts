@@ -156,12 +156,17 @@ scenario("legacy numeric protocol equality does not coerce string or boolean ide
 scenario("missing guest Bun blocks disk action and SSH exposure without a Python fallback", async f => {
   f.config.required_guest_tools = ["sshd", "docker"]; // Old explicit config still requires Bun.
   f.runner.on_run = argv => {
-    if (argv.includes("exec") && argv.at(-1)?.includes("command -v")) {
+    if (argv.includes("exec") && argv.at(-1)?.includes("missing_tool=")) {
       expect(argv.at(-1)).toContain("for tool in bun ");
-      throw new ControlError("command_failed", "guest Bun missing");
+      return command_result({
+        returncode: 1,
+        stdout: "missing_tool=bun\nmissing_compose=true\n",
+      });
     }
   };
-  await expect_error("command_failed", () => f.acquire());
+  const error = await expect_error("command_failed", () => f.acquire());
+  expect(error.detail.stdout).toContain("missing_tool=bun");
+  expect(error.detail.stdout).toContain("missing_compose=true");
   expect(f.runner.calls.some(([argv]) => argv.includes("exec") && argv.includes("bun"))).toBe(false);
   expect(f.runner.calls.some(([argv]) => argv.includes("authorized_keys"))).toBe(false);
   expect(f.store.get_ports(task(f).task_id)).toEqual([]);

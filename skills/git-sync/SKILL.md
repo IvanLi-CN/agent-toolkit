@@ -9,6 +9,12 @@ Use this skill for pure local git synchronization: fetching remotes, aligning a 
 
 This skill does not create PRs, merge PRs, clean worktrees, or change remote configuration. PR freshness and GitHub merge behavior remain owned by `$project-engineering-workflow`.
 
+## Prerequisites and validation boundary
+
+This is a text workflow using the operator's installed Git and configured remotes on Linux/macOS; it has no production script or programming-runtime requirement. Use `ACTION=check BASE_REF=origin/main REMOTE=origin` for a read-only divergence request after the documented fetch. Results are the branch/detached identity, confirmed base and ahead/behind counts described below. Fetch updates remote-tracking refs; alignment/rebase/fast-forward mutate local Git state only under the chosen action's authorization.
+
+The owned behavior suite uses installed Bun and Git: `bun test ./tests/detached_alignment_contract.test.ts` from this Skill. It creates temporary local repositories and a filesystem bare remote, then checks actual refs, HEAD, reflog recoverability, configuration invariance and blocked actions. This is isolated native Git evidence, not external remote access. The Bun command implementation is test-only; it adds no production Git CLI and does not replace the workflow instructions.
+
 ## Inputs
 
 - `ACTION=fetch|check|align-detached-base|ff-topic-upstream|rebase-base`; default selection is described below.

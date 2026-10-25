@@ -2,7 +2,7 @@
 
 ## Current Status
 
-Public membership: 13 Skills, defined by [PUBLIC_SKILLS.txt](../../../PUBLIC_SKILLS.txt). The root governance guide and maintained repository checks use the standalone public source with directly executed TypeScript under installed Bun. Buzzer/framebuffer conversion, DST local tooling and the owned Git alignment test use Bun with the helper behavior evidence below; remote Shell, native C rendering, Python CAD/application bindings and text-only production workflows retain their declared boundaries. The language matrix records allocation separately from this implementation coverage. Usage-guide expansion and the documentation site remain unimplemented requirements here.
+Public membership: 13 Skills, defined by [PUBLIC_SKILLS.txt](../../../PUBLIC_SKILLS.txt). The root governance guide and maintained repository checks use the standalone public source with directly executed TypeScript under installed Bun. Buzzer/framebuffer conversion, DST local tooling and the owned Git alignment test use Bun with the helper behavior evidence below; remote Shell, native C rendering, Python CAD/application bindings and text-only production workflows retain their declared boundaries. The language matrix records allocation separately from this implementation coverage. Usage-guide coverage is described under DOC-01..04 below; the documentation site remains an unimplemented requirement here.
 
 ## Skill Migration Coverage
 
@@ -30,8 +30,29 @@ The statuses below describe language migration coverage, not deployment status. 
 - Foundation consistency: `bin/foundation_contract_check.ts` compares manifest membership against catalog, language allocation, and implementation coverage; validates membership counts, preserved requirement/scenario identities, source links, and local/CI validation wiring. Behavioral fixtures exercise drift and fail-closed input handling. Existing public-boundary and tool-dependency checks remain authoritative for private coupling and dependency safety.
 - Repository validation: `bin/spec_contract_check.ts`, `bin/skills_index_check.ts`, `bin/public_boundary_check.ts`, `bin/public_skill_boundary_check.ts`, and `bin/source_target_inventory_check.ts` are the maintained Bun entrypoints. `bin/public_tool_boundary_check.ts` recursively checks local TypeScript, JavaScript, Python, and Shell dependencies, rejects unverifiable loader forms and imports of excluded test files, and keeps local references inside the public repository. The source-target inventory also rejects duplicate or invalid public manifest names before comparing source and target. The old private workflow-only root tools are not part of the public source.
 - Skill implementations: [SCRIPT-LANGUAGE-MATRIX.md](SCRIPT-LANGUAGE-MATRIX.md) distinguishes source implementations from accepted targets. Agent VM client/source transaction, Agent VM ops, buzzer/framebuffer helpers, DST local entrypoints and the owned Git test have one active Bun implementation per replaced responsibility; their replaced Python/local Shell entrypoints are removed. Agent VM complete-package release integration has isolated contract evidence; Linux/image deployment verification remains incomplete. The C firmware harness, remote Shell collector, five Python CAD/application scripts and text production workflows retain their concrete interfaces. Other deferred domains keep their existing implementation/tests until replacement behavior is covered.
-- Public design material: Agent VM lifecycle, CLI, retention/reclamation designs and ADRs are already present. This slice anchors the CVM Python module-integration and XP policy/audit guarantees to their current Skill contracts and tests; the broader usage guides and documentation site remain separate work.
+- Public design material: Agent VM lifecycle, CLI, retention/reclamation designs and ADRs are already present. This slice anchors the CVM Python module-integration and XP policy/audit guarantees to their current Skill contracts and tests; DOC-01..04 usage-guide evidence is described below, and the documentation site remains separate work.
 - Verification coverage: SPEC.md retains seven cross-cutting evidence requirements and 48 detailed domain scenarios, in addition to the project requirement assertions. No result is inferred from their presence in the document.
+
+### DOC-01..04 guide coverage
+
+公共文档以 [README](../../../README.md)、`CONTRIBUTING.md` 和[指南索引](../../guides/README.md)为入口，沿用 13 个 public Skills 的 canonical source。指南不是第二份行为规范；详细 CLI、lifecycle、policy 与 application 行为继续链接所属 Skill/contracts。
+
+| Requirement | 文档入口与实现 | 证据边界 |
+| --- | --- | --- |
+| DOC-01 | README 首屏的五个能力组、全部 13 个可点击 Skill、用途/场景、前置条件和输出；指南索引提供逐 Skill 的唯一目标。 | 对 allowlist、README、guide headings 和 canonical source 做 completeness 与本地路径/锚点静态核对，不推断站点路由。 |
+| DOC-02 | [安装与更新](../../guides/installation.md)：HTTPS checkout、直接 source links、collision、enable/disable、update、上游删除 reconciliation、uninstall；skills-switch 明确为可选外部工具。 | 使用 disposable upstream/consumer 的真实 Git、symlink、realpath 及内容 identity 验证直接链接流程；外部管理器命令只核对已安装工具的帮助，不宣称真实用户 catalog 生命周期已运行。 |
+| DOC-03 | [隔离执行](../../guides/isolated-execution.md)、[服务运维](../../guides/service-operations.md)、[Git 与文档](../../guides/git-and-docs.md)、[媒体预览](../../guides/media-previews.md)、[CAD](../../guides/cad-repair.md)：逐 Skill 列出何时使用、平台/前提、配置、最小例子、输出与读写边界。 | 离线例子使用 temporary fixtures；remote/service、可信 imagegen 模块和 CAD/native 应用例子明确所需真实前提与授权，不以 source inspection 代替应用执行。 |
+| DOC-04 | [Protected configuration](../../guides/configuration.md)覆盖 XP、Agent VM、imagegen、Tavily、DST、Linux、Git 与 CAD/native；维护性 source inventory 对照留在 CONTRIBUTING。 | 中性 env/模板路径及公共安全/coupling 检查；不包含私有 inventory、个人路径、凭据或部署观察。 |
+
+Guides 场景与验证层级如下。当前候选的 OS/runtime、实际运行结果和 blocker 记录在执行报告，不由本表存在推断通过。
+
+| Scenario | 可复查的场景与方法 | 不包含的证据 |
+| --- | --- | --- |
+| GUIDES-01 | 逐一比较 allowlist 与五组指南的 Skill heading、README/索引入口；检查 purpose、prerequisites、configuration、example、output、boundaries 及所有相对链接/锚点。 | Website render/search/navigation。 |
+| GUIDES-02 | Temporary consumer 直接链接选定源码；验证 realpath/文件 identity、普通目录与第三方/dangling link collision 均不覆盖。 | 修改主人真实 consumer root 或安装外部工具。 |
+| GUIDES-03 | Disposable local bare upstream 与 checkout 执行 fast-forward update；删除上游 Skill 后人工 reconciliation，仅 unlink 精确自有链接；验证 disable/re-enable/uninstall 保留 source checkout 和其它 entries。 | 声称手工流程自动清理，或将 source update 等同于外部管理器 prune。 |
+| GUIDES-04 | 实际 Bun audio/PNG/local DST、local VM version/XP/Tavily help 与隔离 Git 示例 smoke；CVM 使用 synthetic fallback dry-run，并对 canonical entrypoints 与 prerequisites 做 contract review。 | Live image API、真实 Incus/远端主机、真实 firmware renderer、FreeCAD/Gmsh/Blender 与实物输出。 |
+| GUIDES-05 | Standalone newcomer path、protected configuration、链接与 public boundary checks；核对 root/Skill test discovery 和 CI 中实际 commands。 | 私有 runtime/task 集成、复制 consumer tree、生产部署与发布。 |
 
 ### Helper behavior evidence
 

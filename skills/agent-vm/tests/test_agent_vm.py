@@ -165,7 +165,7 @@ class SessionContractTests(unittest.TestCase):
 
         self.assertEqual(state["task_id"], "avm-committed123")
         self.assertEqual(state["generation"], 1)
-        self.assertTrue(state["cleanup_only"])
+        self.assertFalse(state["cleanup_only"])
         self.assertEqual(recovery_request.args[0], "status")
         self.assertEqual(recovery_request.kwargs["operation_id"], "committed-acquire-operation")
 
@@ -205,6 +205,7 @@ class SessionContractTests(unittest.TestCase):
         self.assertEqual(failure.exception.code, "lease_unavailable")
         self.assertEqual(state["task_id"], "avm-replayed123")
         self.assertEqual(state["generation"], 1)
+        self.assertTrue(state["cleanup_only"])
         recovery_request = control_request.call_args_list[-1]
         self.assertEqual(recovery_request.args[0], "status")
         self.assertEqual(recovery_request.kwargs["operation_id"], "replayed-acquire-operation")

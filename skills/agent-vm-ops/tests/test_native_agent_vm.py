@@ -1434,6 +1434,65 @@ class LifecycleTests(Fixture):
         self.error("lease_unavailable", self.call, "renew")
         self.error("lease_unavailable", self.call, "ssh-info")
 
+    def test_successful_acquire_retry_converges_old_pending_operation(self):
+        task = self.acquire()
+        pending_request = self.request("acquire", operation="old-pending", public_key=KEY)
+        digest = CONTROL.hashlib.sha256(json.dumps(pending_request, sort_keys=True).encode()).hexdigest()
+        self.store.record_operation(
+            pending_request["operation_id"],
+            "acquire",
+            "thread-a",
+            pending_request["generation"],
+            {
+                "outcome": "pending",
+                "_request_digest": digest,
+                "task_id": task["task_id"],
+                "task_generation": task["generation"],
+            },
+        )
+
+        retry_request = self.request("acquire", operation="retry-acquire", public_key=KEY)
+        response = self.control.dispatch(retry_request)
+
+        self.assertEqual(response["outcome"], "success")
+        completed = self.store.operation("old-pending")
+        self.assertEqual(completed["outcome"], "success")
+        self.assertEqual(completed["operation_id"], "old-pending")
+        self.assertEqual(self.control.dispatch(pending_request)["outcome"], "replayed")
+        self.call("renew")
+        self.call("ssh-info")
+
+    def test_release_cancels_multiple_pending_active_acquires(self):
+        task = self.acquire()
+        pending_requests = []
+        for operation in ("old-pending-one", "old-pending-two"):
+            pending_request = self.request("acquire", operation=operation, public_key=KEY)
+            digest = CONTROL.hashlib.sha256(json.dumps(pending_request, sort_keys=True).encode()).hexdigest()
+            self.store.record_operation(
+                operation,
+                "acquire",
+                "thread-a",
+                pending_request["generation"],
+                {
+                    "outcome": "pending",
+                    "_request_digest": digest,
+                    "task_id": task["task_id"],
+                    "task_generation": task["generation"],
+                },
+            )
+            pending_requests.append(pending_request)
+
+        self.assertEqual(self.call("release")["state"], "cached")
+        self.assertEqual(
+            [item for item in self.store.pending_operations() if item.get("action") == "acquire"],
+            [],
+        )
+        for pending_request in pending_requests:
+            with self.assertRaises(CONTROL.ControlError) as failure:
+                self.control.dispatch(pending_request)
+            self.assertEqual(failure.exception.code, "lease_released")
+        self.assertEqual(self.call("destroy")["state"], "absent")
+
     def test_status_rejects_unrelated_or_unverified_recovery_operations(self):
         self.acquire()
         original = self.store.operation("op-1")
@@ -3255,6 +3314,49 @@ class ReclaimTests(Fixture):
         self.assertFalse(failure.exception.detail["outcome_verified"])
         self.assertEqual(self.store.operation(request["operation_id"])["outcome"], "pending")
         self.assertEqual(self.store.get_task(task_id=cached["task_id"])["state"], "deleting")
+
+    def test_reclaim_failure_preserves_failed_acquire_recovery_marker(self):
+        cached = self.acquire("cached")
+        self.call("release", "cached")
+        task = self.store.get_task(task_id=cached["task_id"])
+        self.store.update_task(
+            task["task_id"],
+            last_error=json.dumps({
+                "code": "acquire_partial",
+                "operation_id": "failed-acquire-marker",
+                "task_id": task["task_id"],
+                "task_generation": task["generation"],
+            }),
+        )
+        self.store.record_operation(
+            "failed-acquire-marker",
+            "acquire",
+            "cached",
+            task["generation"],
+            {
+                "outcome": "error",
+                "error": {"code": "guest_resize_unverified", "message": "growth failed"},
+                "_request_digest": "failed-acquire-digest",
+            },
+        )
+        self.runner.free = 10 * GIB
+        self.runner.failure = lambda args: args[3:4] == ["delete"]
+        request = self.request("acquire", "new", operation="reclaim-marker", public_key=KEY)
+
+        self.error("reclaim_failed", self.control.dispatch, request)
+
+        current = self.store.get_task(task_id=task["task_id"])
+        marker = json.loads(current["last_error"])
+        self.assertEqual(marker["operation_id"], "failed-acquire-marker")
+        self.assertEqual(marker["task_id"], task["task_id"])
+        self.assertEqual(marker["task_generation"], task["generation"])
+        status_request = self.request("status", "cached")
+        status_request["operation_id"] = "failed-acquire-marker"
+        status = self.control.dispatch(status_request)["result"]
+        self.assertEqual(status["last_error"]["operation_id"], "failed-acquire-marker")
+
+        self.runner.failure = None
+        self.assertEqual(self.call("destroy", "cached")["state"], "absent")
 
     def test_public_destroy_retries_deleting_cache(self):
         cached = self.acquire("cached")

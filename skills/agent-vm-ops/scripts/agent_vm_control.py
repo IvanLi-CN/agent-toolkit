@@ -3579,6 +3579,39 @@ class Control:
                     record.setdefault(key, retry_record[key])
         return record
 
+    @staticmethod
+    def _preserve_recovery_marker(task: Mapping[str, Any], detail: Any) -> dict[str, Any]:
+        record = dict(detail) if isinstance(detail, Mapping) else {}
+        raw_error = task.get("last_error")
+        if not isinstance(raw_error, str) or not raw_error:
+            return record
+        try:
+            previous = json.loads(raw_error)
+        except (TypeError, ValueError):
+            return record
+        if not isinstance(previous, Mapping):
+            return record
+        marker = previous
+        while isinstance(marker, Mapping):
+            operation_id = marker.get("operation_id")
+            if (
+                isinstance(operation_id, str)
+                and SESSION_ID_RE.fullmatch(operation_id) is not None
+                and marker.get("task_id") == task.get("task_id")
+                and marker.get("task_generation") == task.get("generation")
+            ):
+                break
+            marker = marker.get("detail")
+        if (
+            not isinstance(operation_id, str)
+            or SESSION_ID_RE.fullmatch(operation_id) is None
+        ):
+            return record
+        record.setdefault("operation_id", operation_id)
+        record.setdefault("task_id", task.get("task_id"))
+        record.setdefault("task_generation", task.get("generation"))
+        return record
+
     @classmethod
     def _native_init_absence_retry_pending(cls, task: Mapping[str, Any]) -> bool:
         return cls._native_init_absence_retry_record(task) is not None
@@ -3676,6 +3709,57 @@ class Control:
             task["session_id"],
             request["generation"],
             operation,
+        )
+
+    def _complete_pending_acquire_operation(
+        self,
+        pending: Mapping[str, Any],
+        task: Mapping[str, Any],
+        result: Mapping[str, Any],
+    ) -> None:
+        operation_id = require_nonempty_string(pending.get("operation_id"), "operation_id", SESSION_ID_RE)
+        generation = pending.get("generation")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise ControlError(
+                "operation_unverified",
+                "pending acquire generation is invalid",
+                {"operation_id": operation_id},
+            )
+        operation = self.store.operation(operation_id)
+        if (
+            operation is None
+            or operation.get("outcome") != "pending"
+            or operation.get("_request_digest") is None
+        ):
+            raise ControlError(
+                "operation_unverified",
+                "pending acquire operation cannot be completed",
+                {"operation_id": operation_id},
+            )
+        warnings = operation.get("warnings")
+        if not isinstance(warnings, list):
+            warnings = []
+        response = {
+            "ok": True,
+            "protocol": PROTOCOL_VERSION,
+            "server_time": iso_time(self.now()),
+            "action": "acquire",
+            "session_id": task["session_id"],
+            "generation": generation,
+            "operation_id": operation_id,
+            "outcome": "success",
+            "result": dict(result),
+            "response": self._response_compatibility(),
+            "release": self._release_metadata(),
+            "warnings": warnings,
+            "_request_digest": operation["_request_digest"],
+        }
+        self.store.record_operation(
+            operation_id,
+            "acquire",
+            task["session_id"],
+            generation,
+            response,
         )
 
     def _recovered_native_init_operation(
@@ -4756,6 +4840,7 @@ class Control:
                 exists = any(item.get("name") == task["instance_name"] for item in self.incus.list_instances())
             except ControlError as exc:
                 detail = {"native_absence": "unverified", "cause": exc.as_dict(), "operation_phase": "cache-delete"}
+                detail = self._preserve_recovery_marker(task, detail)
                 self.store.update_task(task["task_id"], last_error=json.dumps(detail))
                 raise ControlError(
                     "cleanup_incomplete",
@@ -4782,7 +4867,8 @@ class Control:
             detail["operation_phase"] = "cache-delete"
             detail["outcome_verified"] = False
             annotated = ControlError(exc.code, exc.message, detail)
-            self.store.update_task(task["task_id"], last_error=json.dumps(annotated.as_dict()))
+            stored = self._preserve_recovery_marker(task, annotated.as_dict())
+            self.store.update_task(task["task_id"], last_error=json.dumps(stored))
             raise annotated from exc
         self._mark_cache_absent(task)
 
@@ -5428,7 +5514,7 @@ class Control:
 
 
 
-    def _pending_acquire_for_task(self, task: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    def _pending_acquire_operations_for_task(self, task: Mapping[str, Any]) -> list[dict[str, Any]]:
         try:
             pending = self.store.pending_operations()
         except ControlError as exc:
@@ -5437,13 +5523,16 @@ class Control:
                 "pending acquire operations cannot be verified",
                 {"task_id": task["task_id"]},
             ) from exc
-        matches = [
+        return [
             item for item in pending
             if item.get("action") == "acquire"
             and item.get("session_id") == task.get("session_id")
             and item.get("task_id") == task.get("task_id")
             and item.get("task_generation") == task.get("generation")
         ]
+
+    def _pending_acquire_for_task(self, task: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        matches = self._pending_acquire_operations_for_task(task)
         if len(matches) > 1:
             raise ControlError(
                 "operation_unverified",
@@ -5451,6 +5540,45 @@ class Control:
                 {"task_id": task["task_id"]},
             )
         return matches[0] if matches else None
+
+    def _cancel_pending_acquire_operations(
+        self,
+        pending: Iterable[Mapping[str, Any]],
+        task: Mapping[str, Any],
+    ) -> None:
+        for item in pending:
+            operation_id = require_nonempty_string(item.get("operation_id"), "operation_id", SESSION_ID_RE)
+            operation = self.store.operation(operation_id)
+            if (
+                operation is None
+                or operation.get("outcome") != "pending"
+                or not isinstance(operation.get("_request_digest"), str)
+                or not operation["_request_digest"]
+            ):
+                raise ControlError(
+                    "operation_unverified",
+                    "pending acquire operation cannot be finalized",
+                    {"operation_id": operation_id},
+                )
+            self.store.record_operation(
+                operation_id,
+                "acquire",
+                task["session_id"],
+                item.get("generation"),
+                {
+                    "outcome": "error",
+                    "error": {
+                        "code": "lease_released",
+                        "message": "the lease was released before the acquire operation was acknowledged",
+                        "detail": {
+                            "task_id": task["task_id"],
+                            "task_generation": int(task["generation"]),
+                            "outcome_verified": True,
+                        },
+                    },
+                    "_request_digest": operation["_request_digest"],
+                },
+            )
 
     def _require_active(self, task: Mapping[str, Any], *, allow_pending_acquire: bool = False) -> None:
         if task["state"] != "active":
@@ -6424,6 +6552,7 @@ class Control:
         assert session_id is not None
         existing = self.store.get_task(session_id=session_id)
         if existing and existing["state"] == "active":
+            pending_acquires = self._pending_acquire_operations_for_task(existing)
             self._check_generation(existing, request)
             self._require_active(existing, allow_pending_acquire=True)
             self._ownership(existing)
@@ -6434,7 +6563,12 @@ class Control:
                 raise ControlError("resource_config_mismatch", "active lease configuration differs; use resize explicitly",
                                    {"current": resources, "requested": target,
                                     "differences": [key for key in resources if resources[key] != target[key]]})
-            return self._runtime_summary(existing)
+            result = self._runtime_summary(existing)
+            if pending_acquires:
+                with self.store.transaction():
+                    for pending in pending_acquires:
+                        self._complete_pending_acquire_operation(pending, existing, result)
+            return result
         if existing and existing["state"] not in {"absent", "cached"}:
             raise ControlError("task_transition", "session slot is not available until reconciliation completes")
         expected = existing["generation"] if existing else 0
@@ -6667,6 +6801,11 @@ class Control:
             task = current
             if task["state"] in {"cached", "absent"} and requested_state != "closing":
                 return self._state_summary(task)
+            pending_acquires_to_cancel = (
+                self._pending_acquire_operations_for_task(task)
+                if requested_state == "active"
+                else []
+            )
             recovery_operation_id = self._pending_acquire_recovery_operation_id(task)
             expiry = parse_time(task.get("lease_expires_at"))
             inactive = parse_time(task.get("inactive_since")) or min(self.now(), expiry or self.now())
@@ -6702,7 +6841,7 @@ class Control:
             try:
                 pending_acquire = (
                     self._pending_native_init_for_task(task)
-                    if recover_pending_acquire
+                    if recover_pending_acquire and requested_state != "active"
                     else None
                 )
             except ControlError as exc:
@@ -6859,6 +6998,8 @@ class Control:
                         task["generation"],
                         operation,
                     )
+                if pending_acquires_to_cancel:
+                    self._cancel_pending_acquire_operations(pending_acquires_to_cancel, task)
                 task = self.store.update_task(task["task_id"], state="absent" if absent else "cached",
                                              ssh_host_port=None, reservation_bytes=0, last_error=retained_recovery_error, previous_generation=None, resource_reservation_json='{}',
                                              resources_json=json.dumps(resources),

@@ -266,7 +266,11 @@ def persist_recovery_state(
         "session_id": session,
         "task_id": task_id,
         "generation": generation,
-        "cleanup_only": True,
+        "cleanup_only": not (
+            committed_operation
+            and result.get("state") == "active"
+            and result.get("effective_lease") is True
+        ),
     }
     state["private_key"] = str(private_key)
     try:

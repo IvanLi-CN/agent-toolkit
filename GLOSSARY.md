@@ -44,6 +44,14 @@ A stopped managed VM whose retained disk may be reused or reclaimed under the de
 The operator-owned environment that holds authoritative Agent VM lifecycle state and is permitted to coordinate Incus resources, leases, mappings, and maintenance actions.
 _Avoid_: Agent VM guest, PVE host, underlying host
 
+**Control authority**:
+在一个 Control environment 内，对 Agent VM 的租约、生命周期和持久结果承担唯一决策责任的一方。
+_Avoid_: Control request adapter, telemetry collector
+
+**Control request adapter**:
+承接调用方请求并交给 Control authority、再向调用方返回结果的兼容边界；它不独立决定租约或生命周期结果。
+_Avoid_: One-shot control process, second controller
+
 **One-shot control process**:
 A control-plane execution that handles one request against the authoritative state and native resources, then exits; it is an invocation boundary rather than a resident broker.
 _Avoid_: Control daemon, HTTP broker

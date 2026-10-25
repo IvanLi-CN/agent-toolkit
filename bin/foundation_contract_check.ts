@@ -9,7 +9,7 @@ import { check as checkSpec } from "./spec_contract_check.ts";
 
 const TOPIC = "docs/specs/project-foundation";
 const CONTRACT_FILES = ["SPEC.md", "IMPLEMENTATION.md", "SCRIPT-LANGUAGE-MATRIX.md"];
-const VALIDATION_COMMANDS = ["bun --version", "bun install --frozen-lockfile", "bun run typecheck", "bun run check", "bun run test:repo", "bun run test:skills"];
+const VALIDATION_COMMANDS = ["bun --version", "go version", "bun install --frozen-lockfile", "bun run typecheck", "bun run check", "bun run test:repo", "bun run test:skills", "go -C skills/agent-vm-ops/control vet ./..."];
 const CHECK_COMMANDS = [
   "bun run typecheck",
   "bun run bin/spec_contract_check.ts --path docs/specs/project-foundation/SPEC.md",
@@ -18,6 +18,7 @@ const CHECK_COMMANDS = [
   "bun run bin/public_skill_boundary_check.ts",
   "bun run bin/public_tool_boundary_check.ts",
   "bun run bin/foundation_contract_check.ts",
+  "go -C skills/agent-vm-ops/control vet ./...",
 ];
 
 function sameMembers(actual: string[], expected: string[]): boolean {
@@ -103,7 +104,7 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
     if (!sameMembers(headings.filter((id) => /^REQ-FOUNDATION-(?:GOV|LANG|COMMON)-/.test(id)), required) || !sameMembers(headings.filter((id) => /^VER-FOUNDATION-(?!REQUIREMENT-)/.test(id)), scenarios)) findings.push("FOUNDATION_SCENARIO_SET_DRIFT");
     findings.push(...checkSpec(join(repoRoot, TOPIC, "SPEC.md"), repoRoot));
     for (const path of ["AGENTS.md", `${TOPIC}/IMPLEMENTATION.md`]) {
-      const commands = new Set([...load(path).matchAll(/^bun .+$/gm)].map((match) => match[0]));
+      const commands = new Set([...load(path).matchAll(/^(?:bun|go) .+$/gm)].map((match) => match[0]));
       for (const command of VALIDATION_COMMANDS) if (!commands.has(command)) findings.push(`FOUNDATION_LOCAL_COMMAND_DRIFT ${path} ${command}`);
     }
     const pkg = JSON.parse(load("package.json")) as { scripts?: Record<string, string> };

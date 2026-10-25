@@ -5,6 +5,10 @@ description: "Render firmware-driven displays to preview PNGs."
 
 # Firmware Display Preview
 
+## Prerequisites and boundary
+
+The converter runs directly under installed Bun on Linux/macOS with no third-party packages. Native rendering requires the project's C compiler, firmware headers/assets and a completed framebuffer accessor in the supplied C harness. Bun converts bytes only; the native harness remains C and must call the real firmware renderer. The scripts read a framebuffer and write the selected PNG path, replacing an existing file. No device or network access is performed.
+
 ## Overview
 
 在主机侧复用固件的“画屏幕”代码（含字体/位图资产），生成与设备 **1:1 一致** 的预览图：
@@ -14,7 +18,7 @@ description: "Render firmware-driven displays to preview PNGs."
 
 ## Hard requirements（确保一致）
 
-- 不要在 Python 里“重写一套渲染器”（尤其是字体光栅化、字距/换行、位图解码、透明/裁剪规则）；必须复用固件实现与资产。
+- 必须复用固件实现与资产，保持字体光栅化、字距/换行、位图解码、透明/裁剪规则一致。
 - 使用与设备一致的：`width/height`、像素格式、内存布局（stride / page layout / endian）、旋转/镜像、坐标系原点与方向。
 
 ## Workflow（推荐）
@@ -47,12 +51,12 @@ cp "$SKILL_DIR/assets/host_c/preview_main.c" tools/display_preview/main.c
 
 ### 3) 转成 `preview.png`
 
-使用 `scripts/fb_to_png.py` 把 raw framebuffer 转 PNG：
+使用 `scripts/fb_to_png.ts` 把 raw framebuffer 转 PNG：
 
 #### SSD1306（1bpp，page layout）
 
 ```bash
-python3 "$SKILL_DIR/scripts/fb_to_png.py" \
+bun "$SKILL_DIR/scripts/fb_to_png.ts" \
   --format ssd1306 \
   --width 128 \
   --height 64 \
@@ -63,7 +67,7 @@ python3 "$SKILL_DIR/scripts/fb_to_png.py" \
 #### RGB565（16bpp，行优先）
 
 ```bash
-python3 "$SKILL_DIR/scripts/fb_to_png.py" \
+bun "$SKILL_DIR/scripts/fb_to_png.ts" \
   --format rgb565 \
   --endian le \
   --width 240 \
@@ -80,6 +84,8 @@ python3 "$SKILL_DIR/scripts/fb_to_png.py" \
 - 颜色不对（RGB565）：endianness 搞反了（`--endian le/be`）。
 
 ## Output handling
+
+- [The framebuffer contract](references/framebuffer-contract.md) defines formats, strides, bit order, dimensions, validation and focused tests. The converter preserves input orientation; it performs no rotation or mirroring.
 
 - `preview.png` is a working artifact. Consumers that display local images should use their own immutable-artifact or attachment mechanism before presenting it to an owner.
 - Keep the project output path separate from any consumer-specific presentation or chat attachment path.

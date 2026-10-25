@@ -5,6 +5,10 @@ description: "Preview buzzer tones as MIDI and WAV."
 
 # Buzzer Audio Preview
 
+## Prerequisites and boundary
+
+Use installed Bun on Linux or macOS; no Python or third-party MIDI/audio library is required. The helper reads one JSON score and writes `.mid`/`.wav` files in the selected output directory. It performs no playback, network access or device writes. Existing matching output files are replaced, so choose a fresh output directory when keeping prior previews.
+
 ## Overview
 
 把“蜂鸣器音效/旋律”从一个可编辑的 `score.json` 生成两份输出：
@@ -23,7 +27,7 @@ cp "$SKILL_DIR/assets/score.example.json" ./score.json
 2) 生成 `MIDI + WAV`：
 
 ```bash
-python3 "$SKILL_DIR/scripts/buzzer_preview.py" \
+bun "$SKILL_DIR/scripts/buzzer_preview.ts" \
   --in ./score.json \
   --out-dir ./out
 ```
@@ -54,3 +58,5 @@ python3 "$SKILL_DIR/scripts/buzzer_preview.py" \
 
 - WAV 是“电子合成预览”，不模拟蜂鸣器腔体/谐振/音量曲线；用来确认旋律、节奏、时长是否符合预期。
 - 若你要“跟固件的毫秒级时序一致”，优先用 `ms/rest_ms` 描述事件（而不是 `beats`）。
+
+The supported score schema, numeric limits, rounding and behavior-test command are in [the media contract](references/media-contract.md). Run the helper from a checkout or a directory symlink; no repository installation step is required for generation.

@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // Execute the published examples, rather than maintaining a second installer.
@@ -91,6 +91,134 @@ test("published enable/disable examples parse under the installed Bash", () => {
     expect(spawnSync("bash", ["-n"], { input: script }).status).toBe(0);
   }
 });
+
+function fileIdentity(path: string): string {
+  const { dev, ino } = lstatSync(path);
+  return `${dev}:${ino}`;
+}
+
+function snapshot(path: string): unknown {
+  const stat = lstatSync(path);
+  return {
+    identity: fileIdentity(path),
+    mode: stat.mode,
+    contents: stat.isSymbolicLink() ? readlinkSync(path)
+      : stat.isDirectory() ? readdirSync(path).sort().map((name) => [name, snapshot(join(path, name))])
+        : readFileSync(path, "utf8"),
+  };
+}
+
+for (const [operation, script] of [["enable", enable], ["disable", disable]] as const) {
+  for (const kind of ["directory", "foreign-directory", "file", "symlink", "dangling-symlink"]) {
+    test(`${operation} preserves an existing consumer-root lock: ${kind}`, () => {
+      const f = fixture();
+      if (operation === "disable") f.ok(enable);
+      const lock = join(f.consumer, ".agent-toolkit-links.lock");
+      const foreign = join(f.root, "foreign-lock");
+      if (kind === "directory" || kind === "foreign-directory") {
+        mkdirSync(lock);
+        if (kind === "foreign-directory") writeFileSync(join(lock, ".owner.foreign"), "foreign owner\n");
+      } else if (kind === "file") {
+        writeFileSync(lock, "foreign lock file\n");
+      } else {
+        if (kind === "symlink") {
+          mkdirSync(foreign);
+          writeFileSync(join(foreign, ".owner.foreign"), "foreign owner\n");
+        }
+        symlinkSync(foreign, lock);
+      }
+      const before = snapshot(f.root);
+      // These failures must retain the lock; fixture.fail() expects its removal.
+      const result = f.run(script);
+      expect(result.error).toBeUndefined();
+      expect(result.signal).toBeNull();
+      expect(result.status, result.stderr).toBe(1);
+      expect(result.stderr).toContain("consumer-root lock is already held or unavailable; no state was changed");
+      expect(result.stdout).not.toMatch(/Enabled |Disabled /u);
+      // Includes entry/record state, lock type/identity/contents and symlink referents.
+      expect(snapshot(f.root)).toEqual(before);
+    });
+  }
+
+  for (const fault of ["replacement", "foreign-contents", "token-loss"] as const) {
+    test(`${operation} refuses lock release and preserves evidence after ${fault}`, () => {
+      const f = fixture();
+      if (operation === "disable") f.ok(enable);
+      const lock = join(f.consumer, ".agent-toolkit-links.lock");
+      const mutation = fault === "replacement" ? `
+        command mv "$LOCK_DIR" "$LOCK_DIR.original"
+        command mkdir "$LOCK_DIR"
+        printf 'foreign owner\\n' > "$LOCK_DIR/.foreign"`
+        : fault === "foreign-contents" ? `printf 'foreign owner\\n' > "$LOCK_DIR/.foreign"`
+          : `command unlink "$lock_token"`;
+      // Interpose a native command at the last staging-directory removal, after
+      // link/record work and before release_lock. Do not replace installer logic.
+      const result = f.run(script, `rmdir() {
+        command rmdir "$@" || return $?
+        if [ "$1" = "${operation === "enable" ? "$link_tmp" : "$PENDING"}" ]; then
+          printf '%s\\n' "$lock_dir_identity" "$lock_token_identity" "$lock_token" "$lock_owner" > "$CONSUMER_SKILLS/../lock-before"
+          ${mutation}
+          path_identity "$LOCK_DIR" > "$CONSUMER_SKILLS/../lock-injected"
+          if [ -f "$LOCK_DIR/.foreign" ]; then
+            path_identity "$LOCK_DIR/.foreign" >> "$CONSUMER_SKILLS/../lock-injected"
+          fi
+        fi
+      }`);
+      expect(result.error).toBeUndefined();
+      expect(result.signal).toBeNull();
+      expect(result.status, result.stderr).toBe(1);
+      const reason = fault === "replacement" ? "lock directory identity changed"
+        : fault === "foreign-contents" ? "lock directory contains unexpected state"
+          : "ownership token is missing or foreign";
+      expect(result.stderr).toContain(`Consumer-root lock ownership could not be proven; leaving it untouched: ${reason}`);
+      expect(result.stderr).toContain("consumer-root lock could not be released safely");
+      expect(result.stdout).not.toMatch(/Enabled |Disabled /u);
+
+      const [directoryId, tokenId, tokenPath, owner] = readFileSync(join(f.root, "lock-before"), "utf8").trimEnd().split("\n");
+      expect(tokenPath!).toStartWith(`${lock}/.owner.`);
+      expect(owner).toMatch(/^pid=\d+ token=/u);
+      expect(owner!).toEndWith(` token=${tokenPath}`);
+      const tokenName = basename(tokenPath!);
+      const [injectedLockId, foreignId] = readFileSync(join(f.root, "lock-injected"), "utf8").trimEnd().split("\n");
+      expect(lstatSync(lock).isDirectory()).toBe(true);
+      expect(fileIdentity(lock)).toBe(injectedLockId);
+      if (fault === "replacement") {
+        expect(fileIdentity(lock)).not.toBe(directoryId);
+        expect(fileIdentity(`${lock}.original`)).toBe(directoryId);
+        expect(readdirSync(`${lock}.original`)).toEqual([tokenName]);
+        expect(fileIdentity(join(`${lock}.original`, tokenName))).toBe(tokenId);
+        expect(readFileSync(join(`${lock}.original`, tokenName), "utf8")).toBe(`${owner}\n`);
+        expect(readdirSync(lock)).toEqual([".foreign"]);
+      } else {
+        expect(fileIdentity(lock)).toBe(directoryId);
+        if (fault === "foreign-contents") {
+          expect(readdirSync(lock).sort()).toEqual([".foreign", tokenName].sort());
+          expect(fileIdentity(tokenPath!)).toBe(tokenId);
+          expect(readFileSync(tokenPath!, "utf8")).toBe(`${owner}\n`);
+        } else {
+          expect(readdirSync(lock)).toEqual([]);
+          f.absent(tokenPath!);
+        }
+      }
+      if (fault !== "token-loss") {
+        expect(fileIdentity(join(lock, ".foreign"))).toBe(foreignId);
+        expect(readFileSync(join(lock, ".foreign"), "utf8")).toBe("foreign owner\n");
+      }
+      // Release failure does not roll back already completed link/record work.
+      if (operation === "enable") {
+        expect(lstatSync(f.target).isSymbolicLink()).toBe(true);
+        expect(readlinkSync(f.target)).toBe(f.directory);
+        expect(readFileSync(f.record, "utf8")).toContain(`link_file_id=${fileIdentity(f.target)}\n`);
+        expect(readdirSync(f.ledger)).toEqual([`${skill}.record`]);
+      } else {
+        f.absent(f.target);
+        f.absent(f.record);
+        f.absent(f.ledger);
+      }
+      f.absent(f.pending);
+    });
+  }
+}
 
 test("ownership carries source and symlink file identities; disable permits re-enable", () => {
   const f = fixture();

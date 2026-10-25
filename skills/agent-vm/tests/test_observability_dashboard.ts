@@ -32,7 +32,9 @@ test("renders a portable dashboard and provisioning bundle", () => {
   expect(bundle.inventoryDashboardText).toContain('"vm_ip": "VM IP"');
   expect(bundle.inventoryDashboardText).toContain('"ssh_host_port": "SSH port"');
   expect(bundle.inventoryDashboardText).toContain('"options": "state_order"');
-  expect(bundle.inventoryDashboardText).not.toContain('"state_order": true');
+  expect(bundle.inventoryDashboardText).toContain('"state_order": true');
+  expect(bundle.inventoryDashboardText).toContain('"task_id 1": true');
+  expect(bundle.inventoryDashboardText).toContain('"options": "Scrape age (s)"');
   expect(bundle.inventoryDashboardText).toContain('"text": [\n            "active",\n            "preparing",\n            "closing",\n            "deleting",\n            "failed"');
   expect(bundle.inventoryDashboardText).not.toContain("or vector(0)");
   expect(bundle.inventoryDashboardText).toContain("time() - agent_vm_scrape_timestamp_seconds");

@@ -219,7 +219,20 @@
           "mappings": [],
           "unit": "dateTimeAsIso"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Scrape age (s)"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 5,
@@ -502,6 +515,21 @@
               "job": true,
               "service": true,
               "task_key": true,
+              "task_key 1": true,
+              "task_key 2": true,
+              "task_key 3": true,
+              "task_key 4": true,
+              "task_key 5": true,
+              "task_key 6": true,
+              "task_key 7": true,
+              "task_id 1": true,
+              "task_id 2": true,
+              "task_id 3": true,
+              "task_id 4": true,
+              "task_id 5": true,
+              "task_id 6": true,
+              "task_id 7": true,
+              "state_order": true,
               "state 2": true,
               "state 3": true,
               "state 4": true,
@@ -513,6 +541,7 @@
               "Value #G": true
             },
             "renameByName": {
+              "task_id": "Task ID",
               "state 1": "state",
               "Value #B": "CPU vCPU",
               "Value #C": "RAM GiB",

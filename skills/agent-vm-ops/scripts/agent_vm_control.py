@@ -75,6 +75,7 @@ GUEST_READINESS_BUDGET_SECONDS = 300
 GUEST_READINESS_DIAGNOSTIC_SECONDS = 120
 DIAGNOSTIC_COMMAND_TIMEOUT_SECONDS = 5
 NATIVE_INIT_TIMEOUT_SECONDS = 300
+NATIVE_INIT_ABSENCE_RETRY_SECONDS = 2
 DIAGNOSTIC_LOG_LIMIT = 8192
 DIAGNOSTIC_LOG_TRUNCATION_MARKER = "\n[TRUNCATED BY DIAGNOSTIC LIMIT]"
 DEFAULT_CONFIG_PATH = Path("/etc/agent-vm-native/config.json")
@@ -754,10 +755,18 @@ def run(command, phase, *, check=True):
             )
         else:
             process_group_cleanup_error = "process_identity_unverified"
+        tree_root_verified = not procfs_available or (
+            leader_identity is not None
+            and (leader_identity in tree_members or leader_identity in tracked_tree_members)
+        )
         tree_killed = True
         tree_error = None
         if tree_members:
-            tree_killed, tree_error = kill_process_tree_members(tree_members)
+            if not tree_root_verified:
+                tree_killed = False
+                tree_error = "process_tree_identity_unverified"
+            else:
+                tree_killed, tree_error = kill_process_tree_members(tree_members)
         if not tree_complete:
             tree_killed = False
             tree_error = "process_tree_inspection_failed"
@@ -2152,10 +2161,18 @@ class CommandRunner:
                 )
             else:
                 process_group_cleanup_error = "process_identity_unverified"
+            tree_root_verified = not procfs_available or (
+                leader_identity is not None
+                and (leader_identity in tree_members or leader_identity in tracked_tree_members)
+            )
             tree_killed = True
             tree_error = None
             if tree_members:
-                tree_killed, tree_error = self._kill_process_tree_members(tree_members)
+                if not tree_root_verified:
+                    tree_killed = False
+                    tree_error = "process_tree_identity_unverified"
+                else:
+                    tree_killed, tree_error = self._kill_process_tree_members(tree_members)
             if not tree_complete:
                 tree_killed = False
                 tree_error = "process_tree_inspection_failed"
@@ -2249,10 +2266,20 @@ class IncusClient:
         input_data: bytes | str | None = None,
         timeout: float = 60,
         check: bool = True,
+        bounded: bool = False,
     ) -> subprocess.CompletedProcess[bytes]:
-        return self.runner.run(
-            self.prefix + list(args), input_data=input_data, timeout=timeout, check=check
-        )
+        command = self.prefix + list(args)
+        if bounded:
+            if input_data is not None:
+                raise ControlError("invalid_request", "bounded Incus commands do not accept stdin")
+            return self.runner.run_bounded(
+                command,
+                timeout=timeout,
+                stdout_limit=DIAGNOSTIC_LOG_LIMIT,
+                stderr_limit=4000,
+                check=check,
+            )
+        return self.runner.run(command, input_data=input_data, timeout=timeout, check=check)
 
     def json(self, args: Sequence[str], *, timeout: float = 60) -> Any:
         result = self.call([*args, "--format", "json"], timeout=timeout)
@@ -2301,6 +2328,7 @@ class IncusClient:
                 *[part for key, value in (metadata or {}).items() for part in ("--config", f"{key}={value}")],
             ],
             timeout=NATIVE_INIT_TIMEOUT_SECONDS,
+            bounded=True,
         )
 
     def start(self, name: str) -> None:
@@ -3470,10 +3498,41 @@ class Control:
         return ControlError(error.code, error.message, detail)
 
     @staticmethod
+    def _native_init_absence_retry_record(task: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        raw_error = task.get("last_error")
+        if not isinstance(raw_error, str) or not raw_error:
+            return None
+        try:
+            error = json.loads(raw_error)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(error, Mapping) or error.get("native_init_absence_retry") is not True:
+            return None
+        return error
+
+    @classmethod
+    def _native_init_absence_retry_pending(cls, task: Mapping[str, Any]) -> bool:
+        return cls._native_init_absence_retry_record(task) is not None
+
+    def _native_init_absence_retry_ready(self, task: Mapping[str, Any]) -> bool:
+        record = self._native_init_absence_retry_record(task)
+        if record is None:
+            return False
+        try:
+            retry_after = parse_time(record.get("native_init_absence_retry_after"))
+        except (TypeError, ValueError):
+            return False
+        if retry_after is None:
+            return False
+        return retry_after <= self.now()
+
+    @staticmethod
     def _operation_outcome_uncertain(action: str, error: ControlError) -> bool:
         """Keep a journal pending only when a native effect may have occurred."""
         detail = error.detail if isinstance(error.detail, Mapping) else {}
         if error.code == "sqlite_unavailable" and detail.get("state_committed") is not False:
+            return True
+        if detail.get("native_init_absence_retry") is True:
             return True
         cleanup = detail.get("cleanup")
         if isinstance(cleanup, Mapping) and cleanup.get("ok") is False:
@@ -6086,8 +6145,12 @@ class Control:
                     "readiness": readiness, "stage_timings": stage_timings}
         except ControlError as exc:
             cleanup = {"ok": False, "error": {"code": "not_attempted", "message": "cleanup was not attempted"}}
+            native_init_uncertain = phase == "native-init"
             try:
-                cleanup["result"] = self._release_task(self.store.get_task(task_id=task["task_id"]))
+                cleanup["result"] = self._release_task(
+                    self.store.get_task(task_id=task["task_id"]),
+                    require_native_init_absence_retry=native_init_uncertain,
+                )
                 cleanup["ok"] = True
             except ControlError as cleanup_error:
                 cleanup = {"ok": False, "error": cleanup_error.as_dict()}
@@ -6095,6 +6158,16 @@ class Control:
             failure_phase = detail.get("phase", phase)
             detail.update({"phase": failure_phase, "operation_phase": phase, "completed": completed,
                            "requested": resources, "cleanup": cleanup})
+            if native_init_uncertain:
+                detail["native_init_absence_retry"] = True
+                cleanup_error = cleanup.get("error") if isinstance(cleanup, Mapping) else None
+                cleanup_detail = cleanup_error.get("detail") if isinstance(cleanup_error, Mapping) else None
+                detail["native_init_absence_retry_after"] = (
+                    cleanup_detail.get("native_init_absence_retry_after")
+                    if isinstance(cleanup_detail, Mapping)
+                    and cleanup_detail.get("native_init_absence_retry_after")
+                    else iso_time(self.now() + dt.timedelta(seconds=NATIVE_INIT_ABSENCE_RETRY_SECONDS))
+                )
             if readiness is not None:
                 detail["readiness"] = readiness
             error = {"code": "acquire_partial", **detail, "error": exc.as_dict()}
@@ -6136,7 +6209,12 @@ class Control:
         self._check_generation(task, request)
         return self._release_task(task)
 
-    def _release_task(self, task: Mapping[str, Any]) -> dict[str, Any]:
+    def _release_task(
+        self,
+        task: Mapping[str, Any],
+        *,
+        require_native_init_absence_retry: bool = False,
+    ) -> dict[str, Any]:
         requested_state = task.get("state")
         with self._object_lock("cleanup:" + str(task["session_id"])):
             current = self.store.get_task(task_id=task["task_id"])
@@ -6159,6 +6237,28 @@ class Control:
                 raise ControlError("cleanup_incomplete", "entry/port reservations remain closed until reconciliation succeeds", errors)
             self.systemd.remove_expiry(task["task_id"], task["generation"])
             absent = not any(item.get("name") == task["instance_name"] for item in self.incus.list_instances())
+            delayed_absence = self._native_init_absence_retry_pending(task)
+            retry_ready = self._native_init_absence_retry_ready(task)
+            if absent and (require_native_init_absence_retry or delayed_absence) and not (
+                delayed_absence and retry_ready
+            ):
+                retry_record = self._native_init_absence_retry_record(task) or {}
+                detail = {
+                    "native_init_absence_retry": True,
+                    "outcome_verified": False,
+                    "native_absence": "pending",
+                    "native_init_absence_retry_after": retry_record.get(
+                        "native_init_absence_retry_after",
+                        iso_time(self.now() + dt.timedelta(seconds=NATIVE_INIT_ABSENCE_RETRY_SECONDS)),
+                    ),
+                }
+                self.store.update_task(task["task_id"], last_error=json.dumps(detail))
+                self.systemd.retry_cleanup(task["task_id"], task["generation"])
+                raise ControlError(
+                    "cleanup_incomplete",
+                    "native init result remains unresolved; delayed reconciliation is required",
+                    detail,
+                )
             if not absent and task.get("previous_generation") is not None:
                 self._ownership(task)
                 self.incus.config_set(task["instance_name"], "user.agent-vm.generation", str(task["generation"]))

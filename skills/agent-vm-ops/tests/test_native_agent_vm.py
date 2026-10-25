@@ -1384,6 +1384,32 @@ class LifecycleTests(Fixture):
         self.assertEqual(failure["stderr"], "resize2fs: transient guest failure")
         self.assertEqual(failure["guest_capacity"]["disk_bytes"], 20 * GIB)
 
+    def test_native_init_timeout_keeps_absence_pending_for_delayed_reconciliation(self):
+        task = self.control._base_task("thread-a", 1)
+        task.update(
+            state="preparing",
+            lease_expires_at=CONTROL.iso_time(self.now + dt.timedelta(minutes=10)),
+            resources_json=json.dumps({"cpu": 2, "memory_mib": 4096, "disk_gib": 20}),
+            resource_reservation_json=json.dumps({"cpu": 2, "memory_mib": 4096, "disk_gib": 20}),
+            reservation_bytes=4 * GIB,
+        )
+        self.store.put_task(task)
+        with mock.patch.object(self.control, "_cleanup_task", return_value=([], [])), \
+             mock.patch.object(self.control.incus, "list_instances", return_value=[]):
+            with self.assertRaises(CONTROL.ControlError) as failure:
+                self.control._release_task(task, require_native_init_absence_retry=True)
+        self.assertEqual(failure.exception.code, "cleanup_incomplete")
+        pending = self.store.get_task(task_id=task["task_id"])
+        self.assertEqual(pending["state"], "closing")
+        self.assertEqual(pending["reservation_bytes"], 4 * GIB)
+        self.assertTrue(json.loads(pending["last_error"])["native_init_absence_retry"])
+
+        self.now += dt.timedelta(seconds=CONTROL.NATIVE_INIT_ABSENCE_RETRY_SECONDS)
+        with mock.patch.object(self.control, "_cleanup_task", return_value=([], [])), \
+             mock.patch.object(self.control.incus, "list_instances", return_value=[]):
+            self.control._release_task(pending)
+        self.assertEqual(self.store.get_task(task_id=task["task_id"])["state"], "absent")
+
     def test_resize_guest_growth_failure_is_structured_and_closed(self):
         self.acquire()
         self.runner.guest_growth_results = [self.guest_growth_failure(disk_gib=40)]
@@ -2401,6 +2427,21 @@ class CommandRunnerTests(unittest.TestCase):
         )
 
     @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
+    def test_bounded_runner_refuses_tree_cleanup_without_leader_identity(self):
+        sleeper = "import time; time.sleep(10)"
+        with mock.patch.object(CONTROL.CommandRunner, "_process_identity", return_value=None), \
+             mock.patch.object(
+                 CONTROL.CommandRunner,
+                 "_kill_process_tree_members",
+                 side_effect=AssertionError("unverified tree must not be signalled"),
+             ) as tree_cleanup:
+            with self.assertRaises(CONTROL.ControlError) as failure:
+                CONTROL.CommandRunner().run_bounded([os.sys.executable, "-c", sleeper], timeout=0.05)
+        self.assertEqual(failure.exception.code, "command_timeout")
+        self.assertIn("process_tree_identity_unverified", failure.exception.detail["process_group_cleanup_error"])
+        tree_cleanup.assert_not_called()
+
+    @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
     def test_bounded_runner_kills_descendants_holding_pipes(self):
         with tempfile.TemporaryDirectory() as directory:
             pid_path = Path(directory) / "child.pid"
@@ -2572,14 +2613,30 @@ class IncusWaitTests(unittest.TestCase):
             self.client.wait("vm", "agent", 1)
 
     def test_native_init_uses_a_long_bounded_timeout_for_image_unpack(self):
-        self.runner.run.return_value = subprocess.CompletedProcess([], 0, b"", b"")
+        self.runner.run_bounded.return_value = subprocess.CompletedProcess([], 0, b"", b"")
 
         self.client.init("a" * 64, "vm", {"user.agent-vm.managed": "native-v1"})
 
-        self.runner.run.assert_called_once()
-        self.assertEqual(
-            self.runner.run.call_args.kwargs["timeout"],
-            CONTROL.NATIVE_INIT_TIMEOUT_SECONDS,
+        self.runner.run_bounded.assert_called_once_with(
+            [
+                "incus",
+                "--project",
+                "agents",
+                "init",
+                "a" * 64,
+                "vm",
+                "--vm",
+                "--profile",
+                "agent-vm",
+                "--config",
+                "boot.autostart=false",
+                "--config",
+                "user.agent-vm.managed=native-v1",
+            ],
+            timeout=CONTROL.NATIVE_INIT_TIMEOUT_SECONDS,
+            stdout_limit=CONTROL.DIAGNOSTIC_LOG_LIMIT,
+            stderr_limit=4000,
+            check=True,
         )
 
     def test_bounded_exec_uses_process_group_safe_runner(self):

@@ -3670,7 +3670,7 @@ class Control:
         if action not in {"release", "destroy"} or session_id is None:
             return False
         task = self.store.get_task(session_id=session_id)
-        return task is not None and task.get("state") in {"closing", "deleting", "absent"}
+        return task is not None and task.get("state") in {"closing", "cached", "deleting", "absent"}
 
     def _expire_preempt(self, request: Mapping[str, Any]) -> None:
         """Close the admission fence and perform a confirmed native withdrawal.
@@ -6444,8 +6444,13 @@ class Control:
 
     def release(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:
         assert session_id is not None
-        task = self._task_for_session(session_id)
+        task = self.store.get_task(session_id=session_id)
+        if task is None:
+            raise ControlError("task_missing", "no VM lease exists for this session")
+        self._validate_task_state(task)
         self._check_generation(task, request)
+        if task["state"] == "absent":
+            return self._state_summary(task)
         if task["state"] == "deleting":
             self._delete_cache(task)
             return self._state_summary(self.store.get_task(task_id=task["task_id"]))

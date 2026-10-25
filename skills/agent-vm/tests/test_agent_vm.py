@@ -264,6 +264,37 @@ class SessionContractTests(unittest.TestCase):
                             )
                         )
 
+    def test_recovery_state_cannot_overwrite_a_newer_local_generation(self):
+        session = "newer-local-state"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(CLI, "LOCAL_STATE_ROOT", root / "state"):
+                CLI.write_session_state(session, {
+                    "session_id": session,
+                    "task_id": "avm-newer123",
+                    "generation": 2,
+                    "private_key": str(root / "newer-key"),
+                })
+                self.assertFalse(
+                    CLI.persist_recovery_state(
+                        session,
+                        root / "older-key",
+                        {
+                            "session_id": session,
+                            "task_id": "avm-older123",
+                            "generation": 1,
+                            "state": "cached",
+                            "last_error": {"operation_id": "older-operation"},
+                        },
+                        operation_id="older-operation",
+                        expected_generation=0,
+                    )
+                )
+                state = CLI.read_session_state(session)
+
+        self.assertEqual(state["task_id"], "avm-newer123")
+        self.assertEqual(state["generation"], 2)
+
     def test_sync_passes_selected_identity_to_helper(self):
         args = CLI.build_parser().parse_args(["sync", "--name", "repo", "--session-id", "explicit"])
         with mock.patch.object(CLI, "run_command", return_value=0) as run_command:

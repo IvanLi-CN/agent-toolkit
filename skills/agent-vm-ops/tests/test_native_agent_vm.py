@@ -3109,6 +3109,43 @@ class ReclaimTests(Fixture):
 
         self.assertEqual(result["state"], "absent")
 
+    def test_pending_release_replay_converges_a_cached_task(self):
+        self.acquire("cached")
+        self.call("release", "cached")
+        request = self.request("release", "cached", operation="pending-cached-release")
+        digest = CONTROL.hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
+        self.store.record_operation(
+            request["operation_id"],
+            "release",
+            "cached",
+            request["generation"],
+            {"outcome": "pending", "_request_digest": digest},
+        )
+
+        result = self.control.dispatch(request)["result"]
+
+        self.assertEqual(result["state"], "cached")
+        self.assertEqual(self.store.operation(request["operation_id"])["outcome"], "success")
+
+    def test_pending_release_replay_converges_an_absent_task(self):
+        self.acquire("absent")
+        self.call("release", "absent")
+        self.call("destroy", "absent")
+        request = self.request("release", "absent", operation="pending-absent-release")
+        digest = CONTROL.hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
+        self.store.record_operation(
+            request["operation_id"],
+            "release",
+            "absent",
+            request["generation"],
+            {"outcome": "pending", "_request_digest": digest},
+        )
+
+        result = self.control.dispatch(request)["result"]
+
+        self.assertEqual(result["state"], "absent")
+        self.assertEqual(self.store.operation(request["operation_id"])["outcome"], "success")
+
     def test_manual_gc_previews_and_deletes_all_eligible_caches(self):
         old = self.acquire("old")
         self.call("release", "old")

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import ipaddress
 import json
@@ -132,9 +134,21 @@ def read_session_state(value: str) -> dict[str, Any]:
     return state
 
 
-def write_session_state(value: str, state: dict[str, Any]) -> None:
+@contextmanager
+def session_state_lock(value: str):
     directory = local_session_dir(value)
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_path = directory / ".state.lock"
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield directory
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _write_session_state_unlocked(directory: Path, state: dict[str, Any]) -> None:
     path = directory / "state.json"
     temp = path.with_name(f".{path.name}.{os.getpid()}")
     with temp.open("w", encoding="utf-8") as handle:
@@ -144,6 +158,11 @@ def write_session_state(value: str, state: dict[str, Any]) -> None:
         os.fchmod(handle.fileno(), 0o600)
         os.fsync(handle.fileno())
     os.replace(temp, path)
+
+
+def write_session_state(value: str, state: dict[str, Any]) -> None:
+    with session_state_lock(value) as directory:
+        _write_session_state_unlocked(directory, state)
 
 
 def current_generation(value: str) -> int:
@@ -196,7 +215,26 @@ def persist_recovery_state(
             "generation": generation,
         }
         state["private_key"] = str(private_key)
-        write_session_state(session, state)
+        with session_state_lock(session) as directory:
+            path = directory / "state.json"
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    current = json.load(handle)
+            except FileNotFoundError:
+                current = None
+            except (OSError, json.JSONDecodeError):
+                return False
+            if current is not None:
+                if not isinstance(current, dict):
+                    return False
+                current_generation = current.get("generation")
+                if isinstance(current_generation, bool) or not isinstance(current_generation, int):
+                    return False
+                if current_generation > generation:
+                    return False
+                if current_generation == generation and current.get("task_id") != task_id:
+                    return False
+            _write_session_state_unlocked(directory, state)
     except OSError:
         return False
     return True

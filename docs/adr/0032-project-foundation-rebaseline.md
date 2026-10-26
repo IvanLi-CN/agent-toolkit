@@ -6,7 +6,7 @@ status: accepted
 
 ## Context
 
-The public manifest and standalone Skill tree contain 13 Skills. Foundation prose and the language-policy inventory describe a larger membership, while the language matrix contains removed entries. Treating those descriptions as active membership would reintroduce capabilities outside the maintained source and misstate migration coverage.
+The public manifest and standalone Skill tree contain 11 Skills. Foundation prose and the language-policy inventory describe a larger membership, while the language matrix contains removed entries. Treating those descriptions as active membership would reintroduce capabilities outside the maintained source and misstate migration coverage.
 
 ## Decision
 

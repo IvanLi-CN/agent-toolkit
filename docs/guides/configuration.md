@@ -20,22 +20,6 @@ export XP_POLICY_FILE=/path/to/private/xp/deployment-policy.yaml
 
 完整 schema 与 restricted YAML 子集以 [CLI contract](../../skills/xp-infra/references/cli.md)为准；不要加入任意 YAML tags/anchors。真实节点 runtime 配置和 tokens 留在 operator/node 环境，helper 不读取 administrator tokens。离线 `policy check` 不能证明 DNS/public ingress、进程身份或远端 service 健康。Public probes 会联网，按授权的 policy 和目标执行，结果必须脱敏。
 
-## Agent VM configuration
-
-日常 consumer 只指定受保护 control endpoint 与会话 identity，不管理控制配置：
-
-```bash
-export AGENT_VM_CONTROL_HOST='<configured-control-alias>'
-export AGENT_VM_REMOTE_CONTROL=/opt/agent-vm-native/agent_vm_control.ts
-export AGENT_VM_SESSION_ID='<stable-session-id>'
-```
-
-Session ID 不是 credential；保持 SSH host checking，私有 keys/known-host material、XDG client state 和 operation journals 不进入 checkout。不要把 Codex thread ID、私有 task API 或特定 runtime home 作为公共 prerequisite。
-
-基础设施 operator 使用 [config.json.example](../../skills/agent-vm-ops/assets/config.json.example)与 [deployment contract](../../skills/agent-vm-ops/references/deployment.md)，在 canonical `/etc/agent-vm-native/config.json` 安装受保护 root-owned 配置。该固定路径使 control 和 native units 使用同一状态；不要新增环境变量改写到第二个配置文件。模板中的 project/profile/image/network/ACL/pool、control address、guest address range、storage/state/timer paths 都需实际核验，并按 contract 核对容量 policy。模板不是可直接上线的部署卡。
-
-Daily client、one-shot control 与 native units/manifest 是不同责任；发布使用完整匹配 package，保留 state/WAL/journals/generations 与 rollback 材料。Owner 允许 guest root 不等于允许 CT/Incus/host 维护。一次性存储迁移或控制环境重建不属于 newcomer 安装；仅在另行授权后按 [operations](../specs/agent-vm/OPERATIONS.md)与 [release contract](../specs/agent-vm/contracts/release.md)执行。
-
 ## imagegen
 
 配置可信的外部 Python fallback；dry-run 不要求 endpoint/key：

@@ -9,7 +9,7 @@ import { check as checkSpec } from "./spec_contract_check.ts";
 
 const TOPIC = "docs/specs/project-foundation";
 const CONTRACT_FILES = ["SPEC.md", "IMPLEMENTATION.md", "SCRIPT-LANGUAGE-MATRIX.md"];
-const VALIDATION_COMMANDS = ["bun --version", "go version", "bun install --frozen-lockfile", "bun run typecheck", "bun run check", "bun run test:repo", "bun run test:skills", "go -C skills/agent-vm-ops/control vet ./..."];
+const VALIDATION_COMMANDS = ["bun --version", "bun install --frozen-lockfile", "bun run typecheck", "bun run check", "bun run test:repo", "bun run test:skills"];
 const CHECK_COMMANDS = [
   "bun run typecheck",
   "bun run bin/spec_contract_check.ts --path docs/specs/project-foundation/SPEC.md",
@@ -18,7 +18,6 @@ const CHECK_COMMANDS = [
   "bun run bin/public_skill_boundary_check.ts",
   "bun run bin/public_tool_boundary_check.ts",
   "bun run bin/foundation_contract_check.ts",
-  "go -C skills/agent-vm-ops/control vet ./...",
 ];
 
 function sameMembers(actual: string[], expected: string[]): boolean {
@@ -97,14 +96,14 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
     const spec = documents.get("SPEC.md")!;
     const headings = [...spec.matchAll(/^### ((?:REQ|VER)-FOUNDATION-[A-Z0-9-]+)$/gm)].map((match) => match[1]);
     const required = Object.entries({ GOV: 5, LANG: 6, COMMON: 7 }).flatMap(([group, count]) => Array.from({ length: count }, (_, i) => `REQ-FOUNDATION-${group}-${String(i + 1).padStart(2, "0")}`));
-    const scenarios = Object.entries({ COMMON: 7, GOVERNANCE: 5, TOOLING: 5, HELPERS: 6, XP: 6, "VM-CONTROL": 8, "VM-CLIENT": 7, GUIDES: 5, SITE: 6 }).flatMap(([group, count]) => Array.from({ length: count }, (_, i) => `VER-FOUNDATION-${group}-${String(i + 1).padStart(2, "0")}`));
+    const scenarios = Object.entries({ COMMON: 7, GOVERNANCE: 5, TOOLING: 5, HELPERS: 6, XP: 6, GUIDES: 5, SITE: 6 }).flatMap(([group, count]) => Array.from({ length: count }, (_, i) => `VER-FOUNDATION-${group}-${String(i + 1).padStart(2, "0")}`));
     for (const id of [...required, ...scenarios]) {
       if (headings.filter((heading) => heading === id).length !== 1) findings.push(`FOUNDATION_ID_DRIFT ${id}`);
     }
     if (!sameMembers(headings.filter((id) => /^REQ-FOUNDATION-(?:GOV|LANG|COMMON)-/.test(id)), required) || !sameMembers(headings.filter((id) => /^VER-FOUNDATION-(?!REQUIREMENT-)/.test(id)), scenarios)) findings.push("FOUNDATION_SCENARIO_SET_DRIFT");
     findings.push(...checkSpec(join(repoRoot, TOPIC, "SPEC.md"), repoRoot));
     for (const path of ["AGENTS.md", `${TOPIC}/IMPLEMENTATION.md`]) {
-      const commands = new Set([...load(path).matchAll(/^(?:bun|go) .+$/gm)].map((match) => match[0]));
+      const commands = new Set([...load(path).matchAll(/^bun .+$/gm)].map((match) => match[0]));
       for (const command of VALIDATION_COMMANDS) if (!commands.has(command)) findings.push(`FOUNDATION_LOCAL_COMMAND_DRIFT ${path} ${command}`);
     }
     const pkg = JSON.parse(load("package.json")) as { scripts?: Record<string, string> };

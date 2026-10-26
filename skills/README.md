@@ -13,8 +13,6 @@ bun run bin/public_skill_boundary_check.ts
 
 | Skill | Description | Path |
 |---|---|---|
-| `agent-vm` | Use a session-owned Incus Linux VM for isolated execution, Docker/Compose, heavy validation, and source transfer. | [Skill source](agent-vm/SKILL.md) |
-| `agent-vm-ops` | Maintain a configured native Incus Agent VM installation under an explicit infrastructure task. | [Skill source](agent-vm-ops/SKILL.md) |
 | `buzzer-audio-preview` | Render editable buzzer scores as MIDI and WAV previews. | [Skill source](buzzer-audio-preview/SKILL.md) |
 | `cvm-imagegen` | Run an explicit OpenAI-compatible image generation fallback through configured endpoints. | [Skill source](cvm-imagegen/SKILL.md) |
 | `docs-no-revision-markers` | Write timeless documentation without document-level revision markers. | [Skill source](docs-no-revision-markers/SKILL.md) |

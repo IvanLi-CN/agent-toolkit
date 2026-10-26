@@ -30,22 +30,16 @@ export const documents: [string, string][] = [
   ['GLOSSARY.md', '/architecture/glossary/'],
   ['CONTRIBUTING.md', '/architecture/contributing/'],
   ['docs/guides/README.md', '/guides/'],
-  ...['installation', 'configuration', 'isolated-execution', 'service-operations',
+  ...['installation', 'configuration', 'service-operations',
     'git-and-docs', 'media-previews', 'cad-repair'].map(name =>
     [`docs/guides/${name}.md`, `/guides/${name}/`] as [string, string]),
   ['docs/specs/project-foundation/SPEC.md', '/contracts/project-foundation/'],
   ['docs/specs/project-foundation/IMPLEMENTATION.md', '/contracts/project-foundation/implementation/'],
   ['docs/specs/project-foundation/SCRIPT-LANGUAGE-MATRIX.md', '/contracts/languages/'],
   ['docs/adr/0032-project-foundation-rebaseline.md', '/architecture/foundation/'],
-  ['docs/specs/agent-vm/SPEC.md', '/contracts/agent-vm/'],
-  ['docs/specs/agent-vm/OPERATIONS.md', '/contracts/agent-vm/operations/'],
-  ...['cli', 'release', 'observability'].map(name =>
-    [`docs/specs/agent-vm/contracts/${name}.md`, `/contracts/agent-vm/${name}/`] as [string, string]),
 ];
 
 export const references: Record<string, string[]> = {
-  'agent-vm': ['observability/README'],
-  'agent-vm-ops': ['control-runtime', 'deployment'],
   'buzzer-audio-preview': ['media-contract'],
   'cvm-imagegen': ['cli', 'image-api'],
   'dst-dedicated-server': ['environment', 'dst-paths', 'helper-contract'],

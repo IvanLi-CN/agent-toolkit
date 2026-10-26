@@ -1,6 +1,6 @@
 # 安装与更新
 
-所有消费者都可使用 HTTPS checkout 或原生 source directory 配置；只需消费者能发现 `SKILL.md`。普通消费不依赖本仓库的 Bun 开发依赖，也不要求特定 agent 产品。先查看 [13 个公共 Skills](../../PUBLIC_SKILLS.txt) 及[运行前置条件](../../README.md#五个能力组)，按需启用。
+所有消费者都可使用 HTTPS checkout 或原生 source directory 配置；只需消费者能发现 `SKILL.md`。普通消费不依赖本仓库的 Bun 开发依赖，也不要求特定 agent 产品。先查看 [11 个公共 Skills](../../PUBLIC_SKILLS.txt) 及[运行前置条件](../../README.md#四个能力组)，按需启用。
 
 ## HTTPS checkout
 

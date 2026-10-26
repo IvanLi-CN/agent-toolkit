@@ -161,14 +161,21 @@ export class Client {
         fsyncDir(dirname(op));
       }
     }
-    const result = await this.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", this.env.AGENT_VM_CONTROL_HOST ?? "agent-vm-host", shellJoin(["bun", this.env.AGENT_VM_REMOTE_CONTROL ?? "/opt/agent-vm-native/agent_vm_control.ts"])], { input: json(request), timeoutMs: timeoutSeconds(action, fields) * 1000, stdoutLimit: STDOUT_LIMIT, stderrLimit: STDERR_LIMIT, env: this.env });
+    const timeout = timeoutSeconds(action, fields);
+    const transport = metadata.transport ?? "legacy-bun";
+    const remoteCommand = transport === "go-request"
+      ? shellJoin([this.env.AGENT_VM_REMOTE_REQUEST ?? "/opt/agent-vm-native/bin/agent-vm-control", "request", "--socket", this.env.AGENT_VM_REMOTE_SOCKET ?? "/run/agent-vm-native/control.sock", "--timeout", `${timeout}s`])
+      : shellJoin(["bun", this.env.AGENT_VM_REMOTE_CONTROL ?? "/opt/agent-vm-native/agent_vm_control.ts"]);
+    const result = await this.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", this.env.AGENT_VM_CONTROL_HOST ?? "agent-vm-host", remoteCommand], { input: json(request), timeoutMs: timeout * 1000, stdoutLimit: STDOUT_LIMIT, stderrLimit: STDERR_LIMIT, env: this.env });
     const detail = { operation_id: request.operation_id ?? null, stream_cleanup_verified: result.streamCleanupVerified, ...(!result.streamCleanupVerified ? { stream_cleanup_error: "reader_cancelled_before_eof" } : {}) };
     if (result.timedOut) fail("remote_timeout", "control outcome is uncertain; retry the same operation ID", detail);
     if (result.stderr.length) this.diagnostics(result.stderr);
     if (!result.streamCleanupVerified) fail("remote_failed", "control response stream cleanup is not verified", detail, result.code || 1);
     if (result.code) {
       if (result.stdoutTruncated || result.stderrTruncated) fail("remote_failed", "remote request output was truncated", { ...detail, stdout_truncated: result.stdoutTruncated, stderr_truncated: result.stderrTruncated, stdout_limit_bytes: STDOUT_LIMIT, stderr_limit_bytes: STDERR_LIMIT }, result.code);
-      const error = remoteError(result.stderr, request);
+      const errorMatches = [remoteError(result.stderr, request), remoteError(result.stdout, request)].filter((value): value is Data => value !== null);
+      if (errorMatches.length > 1) fail("invalid_remote_response", "control returned multiple matching error envelopes", { operation_id: request.operation_id ?? null }, result.code);
+      const error = errorMatches[0];
       if (error) { if (op && !uncertain(error, action)) this.finalize(op, request, { outcome: "error", error }); fail(error.code, error.message, error.detail, result.code); }
       fail("remote_failed", "remote request failed; control outcome is not verified", { operation_id: request.operation_id ?? null }, result.code);
     }

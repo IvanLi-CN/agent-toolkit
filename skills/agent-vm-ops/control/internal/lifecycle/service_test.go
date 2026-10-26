@@ -1,0 +1,567 @@
+package lifecycle
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/IvanLi-CN/agent-toolkit/skills/agent-vm-ops/control/internal/config"
+	"github.com/IvanLi-CN/agent-toolkit/skills/agent-vm-ops/control/internal/native"
+	"github.com/IvanLi-CN/agent-toolkit/skills/agent-vm-ops/control/internal/observe"
+	"github.com/IvanLi-CN/agent-toolkit/skills/agent-vm-ops/control/internal/protocol"
+	"github.com/IvanLi-CN/agent-toolkit/skills/agent-vm-ops/control/internal/state"
+)
+
+type staticCPUObserver struct {
+	observation observe.CPUObservation
+	err         error
+}
+
+type startupGuest struct {
+	status    string
+	config    map[string]any
+	configErr error
+}
+
+func (guest *startupGuest) Init(context.Context, string, string) error              { return nil }
+func (guest *startupGuest) ConfigSet(context.Context, string, string, string) error { return nil }
+func (guest *startupGuest) DeviceSet(context.Context, string, string, string, string) error {
+	return nil
+}
+func (guest *startupGuest) DeviceAdd(context.Context, string, string, string, map[string]string) error {
+	return nil
+}
+func (guest *startupGuest) DeviceRemove(context.Context, string, string) error { return nil }
+func (guest *startupGuest) Start(context.Context, string) error                { return nil }
+func (guest *startupGuest) Stop(context.Context, string) error                 { return nil }
+func (guest *startupGuest) Delete(context.Context, string) error               { return nil }
+func (guest *startupGuest) Status(context.Context, string) (map[string]any, error) {
+	return map[string]any{"status": guest.status}, nil
+}
+func (guest *startupGuest) Config(context.Context, string) (map[string]any, error) {
+	if guest.configErr != nil {
+		return nil, guest.configErr
+	}
+	return guest.config, nil
+}
+func (guest *startupGuest) Exec(context.Context, string, []string, []byte) (native.Result, error) {
+	return native.Result{}, errors.New("startup guest exec is not used")
+}
+
+func (observer staticCPUObserver) Observe(context.Context) (observe.CPUObservation, error) {
+	return observer.observation, observer.err
+}
+
+func TestLeaseJournalAndBuiltInCleanup(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	cfg.ImageFingerprint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	cfg.CacheSeconds = 60
+	service := New(store, cfg, Options{Clock: func() time.Time { return now }})
+	ctx := context.Background()
+	request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "demo", "generation": int64(0), "operation_id": "acquire-demo"}
+	first, err := service.Dispatch(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first["outcome"] != "success" || first["result"].(map[string]any)["state"] != stateActive {
+		t.Fatalf("acquire = %#v", first)
+	}
+	replay, err := service.Dispatch(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay["outcome"] != "replayed" {
+		t.Fatalf("replay = %#v", replay)
+	}
+	status, err := service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "status", "session_id": "demo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status["result"].(map[string]any)["effective_lease"] != true {
+		t.Fatalf("status = %#v", status)
+	}
+	release, err := service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "release", "session_id": "demo", "generation": int64(1), "operation_id": "release-demo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if release["result"].(map[string]any)["state"] != stateCached {
+		t.Fatalf("release = %#v", release)
+	}
+	if err := store.UpdateTask(ctx, "avm-", map[string]any{}); err != nil {
+		_ = err
+	}
+	if _, err := service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "drain-enter", "generation": int64(0), "operation_id": "drain"}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "blocked", "generation": int64(0), "operation_id": "blocked"})
+	if control := protocol.AsError(err); control.Code != "draining" {
+		t.Fatalf("drain error = %#v", control)
+	}
+}
+
+func TestAdmissionAndLeaseTransitionsRemainDurable(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	cfg.MemoryBudgetMiB = 4096
+	cfg.MemoryOvercommitRatio = json.Number("1")
+	service := New(store, cfg, Options{Clock: func() time.Time { return now }})
+	ctx := context.Background()
+	_, err = service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "first", "generation": int64(0), "operation_id": "acquire-first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "second", "generation": int64(0), "operation_id": "acquire-second"})
+	if control := protocol.AsError(err); control.Code != "resource_insufficient" {
+		t.Fatalf("second acquire error = %#v", control)
+	}
+	if task, getErr := store.GetTask(ctx, map[string]any{"session_id": "second"}); getErr != nil || task != nil {
+		t.Fatalf("rejected acquire left durable task: task=%#v err=%v", task, getErr)
+	}
+	first, err := store.GetTask(ctx, map[string]any{"session_id": "first"})
+	if err != nil || first == nil {
+		t.Fatalf("first task = %#v err=%v", first, err)
+	}
+	if err := store.UpdateTask(ctx, first.TaskID, map[string]any{"lease_expires_at": nowString(now.Add(-time.Second))}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "renew", "session_id": "first", "generation": first.Generation, "operation_id": "renew-expired"})
+	if control := protocol.AsError(err); control.Code != "lease_expired" {
+		t.Fatalf("expired renew error = %#v", control)
+	}
+	result, err := service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "timer-expire", "task_id": first.TaskID, "generation": first.Generation})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["result"].(map[string]any)["state"] != stateCached {
+		t.Fatalf("expired cleanup result = %#v", result)
+	}
+}
+
+func TestConcurrentOperationRetryDoesNotDuplicateLifecycleMutation(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := New(store, config.Defaults(), Options{})
+	request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "concurrent", "generation": int64(0), "operation_id": "same-operation"}
+	responses := make(chan map[string]any, 2)
+	errors := make(chan error, 2)
+	var group sync.WaitGroup
+	for range 2 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			response, dispatchErr := service.Dispatch(context.Background(), request)
+			responses <- response
+			errors <- dispatchErr
+		}()
+	}
+	group.Wait()
+	close(responses)
+	close(errors)
+	successes, replays := 0, 0
+	for response := range responses {
+		if response == nil {
+			continue
+		}
+		switch response["outcome"] {
+		case "success":
+			successes++
+		case "replayed":
+			replays++
+		}
+	}
+	for dispatchErr := range errors {
+		if dispatchErr != nil {
+			t.Fatalf("concurrent dispatch error = %v", dispatchErr)
+		}
+	}
+	if successes != 1 || replays != 1 {
+		t.Fatalf("successes=%d replays=%d", successes, replays)
+	}
+}
+
+func TestActiveOperationReferenceCountSurvivesConcurrentReplay(t *testing.T) {
+	service := New(nil, config.Defaults(), Options{})
+	finishFirst := service.markOperationActive("same-operation")
+	finishSecond := service.markOperationActive("same-operation")
+	finishFirst()
+	if !service.operationActive("same-operation") {
+		t.Fatal("operation was cleared while another request still owned it")
+	}
+	finishSecond()
+	if service.operationActive("same-operation") {
+		t.Fatal("operation remained active after all owners finished")
+	}
+}
+
+func TestDestroyedSessionCannotReuseOldGeneration(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "generation-reuse.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Defaults()
+	cfg.PortStart, cfg.PortEnd = 22000, 22010
+	service := New(store, cfg, Options{})
+	ctx := context.Background()
+	acquire := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "generation-reuse", "generation": int64(0), "operation_id": "acquire-old"}
+	response, err := service.Dispatch(ctx, acquire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := response["result"].(map[string]any)["generation"]
+	if generation != int64(1) {
+		t.Fatalf("first generation = %#v", generation)
+	}
+	if _, err := service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "destroy", "session_id": "generation-reuse", "generation": int64(1), "operation_id": "destroy-old"}); err != nil {
+		t.Fatal(err)
+	}
+	response, err = service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "generation-reuse", "generation": int64(0), "operation_id": "acquire-new"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response["result"].(map[string]any)["generation"] != int64(2) {
+		t.Fatalf("reacquired generation = %#v", response)
+	}
+	_, err = service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "renew", "session_id": "generation-reuse", "generation": int64(1), "operation_id": "stale-renew"})
+	if control := protocol.AsError(err); control.Code != "generation_mismatch" {
+		t.Fatalf("stale generation error = %#v", err)
+	}
+}
+
+func TestPortNameConflictDoesNotOverwriteExistingMapping(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "port-conflict.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Defaults()
+	cfg.PortStart, cfg.PortEnd = 22000, 22010
+	service := New(store, cfg, Options{})
+	ctx := context.Background()
+	if _, err := service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "port-session", "generation": int64(0), "operation_id": "port-acquire"}); err != nil {
+		t.Fatal(err)
+	}
+	base := protocol.Request{"protocol": protocol.Version, "action": "port-add", "session_id": "port-session", "generation": int64(1), "name": "web", "vm_port": int64(8080), "operation_id": "port-add-one"}
+	if _, err := service.Dispatch(ctx, base); err != nil {
+		t.Fatal(err)
+	}
+	conflict := protocol.Request{"protocol": protocol.Version, "action": "port-add", "session_id": "port-session", "generation": int64(1), "name": "web", "vm_port": int64(9090), "operation_id": "port-add-two"}
+	if _, err := service.Dispatch(ctx, conflict); protocol.AsError(err).Code != "operation_conflict" {
+		t.Fatalf("port conflict error = %#v", err)
+	}
+	task, err := store.GetTask(ctx, map[string]any{"session_id": "port-session"})
+	if err != nil || task == nil {
+		t.Fatalf("port task = %#v err=%v", task, err)
+	}
+	ports, err := store.ListPorts(ctx, task.TaskID)
+	if err != nil || len(ports) != 1 || ports[0].VMPort != 8080 {
+		t.Fatalf("existing port was overwritten: ports=%#v err=%v", ports, err)
+	}
+}
+
+func TestIncompatibleCapabilityIsRejectedBeforeJournalClaim(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	actions := make(map[string]protocol.ActionCompatibility, len(protocol.Actions))
+	for action := range protocol.Actions {
+		actions[action] = protocol.ActionCompatibility{
+			Request:        protocol.Schema{Schema: 1, SemanticRevision: 1},
+			Response:       protocol.Schema{Schema: 1, SemanticRevision: 1},
+			RequestWindow:  protocol.CompatibilityWindow{SchemaMin: 1, SchemaMax: 1, SemanticMin: 1, SemanticMax: 1},
+			ResponseWindow: protocol.CompatibilityWindow{SchemaMin: 1, SchemaMax: 1, SemanticMin: 1, SemanticMax: 1},
+		}
+	}
+	service := New(store, config.Defaults(), Options{Release: &protocol.ReleaseMetadata{ReleaseID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", SourceRevision: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Protocol: protocol.Version, Transport: "go-request", Actions: actions}})
+	request := protocol.Request{
+		"protocol": protocol.Version, "action": "acquire", "session_id": "incompatible", "generation": int64(0), "operation_id": "incompatible-operation",
+		"compatibility": map[string]any{
+			"release_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "protocol": protocol.Version, "action": "acquire",
+			"request":           map[string]any{"schema": int64(2), "semantic_revision": int64(1)},
+			"accepted_response": map[string]any{"schema_min": int64(1), "schema_max": int64(1), "semantic_min": int64(1), "semantic_max": int64(1)},
+		},
+	}
+	_, err = service.Dispatch(context.Background(), request)
+	if control := protocol.AsError(err); control.Code != "request_schema_incompatible" {
+		t.Fatalf("dispatch error = %#v", control)
+	}
+	operation, err := store.GetOperation(context.Background(), "incompatible-operation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation != nil {
+		t.Fatalf("incompatible request claimed operation: %#v", operation)
+	}
+}
+
+func TestCompatibleReleaseWarningAndMetadataSurviveReplay(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	actions := make(map[string]protocol.ActionCompatibility, len(protocol.Actions))
+	for action := range protocol.Actions {
+		actions[action] = protocol.ActionCompatibility{
+			Request: protocol.Schema{Schema: 1, SemanticRevision: 1}, Response: protocol.Schema{Schema: 1, SemanticRevision: 1},
+			RequestWindow: protocol.CompatibilityWindow{SchemaMin: 1, SchemaMax: 1, SemanticMin: 1, SemanticMax: 1}, ResponseWindow: protocol.CompatibilityWindow{SchemaMin: 1, SchemaMax: 1, SemanticMin: 1, SemanticMax: 1},
+		}
+	}
+	releaseID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	service := New(store, config.Defaults(), Options{Release: &protocol.ReleaseMetadata{ReleaseID: releaseID, SourceRevision: releaseID, Protocol: protocol.Version, Transport: "go-request", ManifestPresent: true, ArtifactsVerified: true, Actions: actions}})
+	request := protocol.Request{
+		"protocol": protocol.Version, "action": "drain-enter", "generation": int64(0), "operation_id": "warning-operation",
+		"compatibility": map[string]any{
+			"release_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "protocol": protocol.Version, "action": "drain-enter",
+			"request":           map[string]any{"schema": int64(1), "semantic_revision": int64(1)},
+			"accepted_response": map[string]any{"schema_min": int64(1), "schema_max": int64(1), "semantic_min": int64(1), "semantic_max": int64(1)},
+		},
+	}
+	response, err := service.Dispatch(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response["release"].(map[string]any)["release_id"] != releaseID || response["warnings"].([]any)[0].(map[string]any)["code"] != "compatible_release" {
+		t.Fatalf("response metadata = %#v", response)
+	}
+	replayed, err := service.Dispatch(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed["outcome"] != "replayed" || replayed["release"].(map[string]any)["release_id"] != releaseID || replayed["warnings"].([]any)[0].(map[string]any)["code"] != "compatible_release" {
+		t.Fatalf("replayed response = %#v", replayed)
+	}
+}
+
+func TestResidentServiceRefusesAdmissionBeforeStartupReconcile(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := New(store, config.Defaults(), Options{Resident: true})
+	_, err = service.Dispatch(context.Background(), protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "before-ready", "generation": int64(0), "operation_id": "before-ready"})
+	if control := protocol.AsError(err); control.Code != "startup_reconcile_required" {
+		t.Fatalf("not-ready error = %#v", control)
+	}
+	if service.Ready() {
+		t.Fatal("service became ready before startup reconciliation")
+	}
+}
+
+func TestStartupReconcileRecoversOneSavedPendingOperation(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	request := protocol.Request{
+		"protocol":     protocol.Version,
+		"action":       "drain-enter",
+		"generation":   int64(0),
+		"operation_id": "recover-drain",
+	}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := int64(0)
+	if err := store.RecordOperation(context.Background(), "recover-drain", "drain-enter", nil, &generation, map[string]any{
+		"outcome":         "pending",
+		"_request_digest": digest,
+		"_request":        map[string]any(request),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Resident: true})
+	if err := service.StartupReconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := store.GetOperation(context.Background(), "recover-drain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "success" {
+		t.Fatalf("recovered operation = %#v", operation)
+	}
+}
+
+func TestReconcileDoesNotKillAnActivePendingWorker(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	operationID := "active-worker"
+	if err := store.RecordOperation(context.Background(), operationID, "release", stringPointer("active-session"), nil, map[string]any{
+		"outcome": "pending",
+		"worker":  map[string]any{"pid": int64(999999), "start_time": "1", "state": "running"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{})
+	finish := service.markOperationActive(operationID)
+	defer finish()
+	pending, err := store.PendingOperations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.reconcilePendingWorkers(context.Background(), pending); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := store.GetOperation(context.Background(), operationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := operation.Response["worker"].(map[string]any)
+	if worker["state"] != "running" {
+		t.Fatalf("active worker was reconciled: %#v", operation.Response)
+	}
+}
+
+func TestStartupReconcileLeavesUnsafePendingAcquireBlocked(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "unsafe", "generation": int64(0), "operation_id": "unsafe-acquire"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := int64(0)
+	if err := store.RecordOperation(context.Background(), "unsafe-acquire", "acquire", stringPointer("unsafe"), &generation, map[string]any{
+		"outcome":         "pending",
+		"_request_digest": digest,
+		"_request":        map[string]any(request),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Resident: true})
+	err = service.StartupReconcile(context.Background())
+	if control := protocol.AsError(err); control.Code != "startup_reconcile_required" {
+		t.Fatalf("startup error = %#v", control)
+	}
+	operation, err := store.GetOperation(context.Background(), "unsafe-acquire")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation.Response["outcome"] != "pending" || operation.Response["_recovery_attempts"] != nil {
+		t.Fatalf("unsafe acquire was recovered: %#v", operation.Response)
+	}
+}
+
+func TestStartupReconcileVerifiesDurableActiveGuest(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "native-state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "active-task", SessionID: "active-session", Generation: 1, State: stateActive,
+		InstanceName: "agent-active", LeaseExpiresAt: stringPointer(now.Add(time.Hour).Format(time.RFC3339Nano)),
+		CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{
+		status: "Running",
+		config: map[string]any{
+			"config":           map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "active-task", "user.agent-vm.session": "active-session", "user.agent-vm.generation": "1"},
+			"devices":          map[string]any{},
+			"expanded_devices": map[string]any{},
+		},
+	}
+	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true, Clock: func() time.Time { return now }})
+	if err := service.StartupReconcile(context.Background()); err != nil {
+		t.Fatalf("startup reconcile = %v", err)
+	}
+	guest.status = "Stopped"
+	service = New(store, config.Defaults(), Options{Guest: guest, Resident: true, Clock: func() time.Time { return now }})
+	if control := protocol.AsError(service.StartupReconcile(context.Background())); control.Code != "startup_reconcile_required" {
+		t.Fatalf("stopped active guest error = %#v", control)
+	}
+}
+
+func TestDestroyFinalizesWhenIncusConfirmsTheInstanceIsMissing(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "destroy-state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "destroy-task", SessionID: "destroy-session", Generation: 1, State: stateActive,
+		InstanceName: "agent-destroy", LeaseExpiresAt: stringPointer(now.Add(time.Hour).Format(time.RFC3339Nano)),
+		CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{configErr: &native.CommandError{Result: native.Result{Stderr: []byte("instance not found")}, Cause: errors.New("incus query failed")}}
+	service := New(store, config.Defaults(), Options{Guest: guest, Clock: func() time.Time { return now }})
+	response, err := service.Dispatch(context.Background(), protocol.Request{
+		"protocol": protocol.Version, "action": "destroy", "session_id": "destroy-session", "generation": int64(1), "operation_id": "destroy-missing",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := response["result"].(map[string]any)
+	if result["state"] != stateAbsent {
+		t.Fatalf("destroy response = %#v", response)
+	}
+	task, err := store.GetTask(context.Background(), map[string]any{"session_id": "destroy-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task != nil {
+		t.Fatalf("destroy left task = %#v", task)
+	}
+}
+
+func TestStartupPressureRefusesBeforeDurableAcquire(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Defaults()
+	cfg.ImageFingerprint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	service := New(store, cfg, Options{CPU: staticCPUObserver{observation: observe.CPUObservation{
+		Capacity: 1,
+		Full:     observe.PSIValues{Avg10: 20},
+		Some:     observe.PSIValues{Avg10: 20},
+	}}})
+	_, err = service.Dispatch(context.Background(), protocol.Request{
+		"protocol": protocol.Version, "action": "acquire", "session_id": "pressure", "generation": int64(0), "operation_id": "acquire-pressure",
+	})
+	if control := protocol.AsError(err); control.Code != "resource_pressure" {
+		t.Fatalf("pressure error = %#v", control)
+	}
+	if task, getErr := store.GetTask(context.Background(), map[string]any{"session_id": "pressure"}); getErr != nil || task != nil {
+		t.Fatalf("pressure acquire left task: task=%#v err=%v", task, getErr)
+	}
+}

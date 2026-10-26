@@ -38,6 +38,9 @@ try:
         CLIENT_DEPENDENCY_MODES,
         UNIT_EXEC_START,
         UNIT_CONTENT_SHA256,
+        GO_FIXED_ARTIFACTS,
+        GO_UNIT_EXEC_START,
+        GO_UNIT_CONTENT_SHA256,
         ManifestError,
         build_manifest,
         default_operations,
@@ -46,6 +49,8 @@ try:
         sha256_file,
         verify_client_sidecar,
         verify_bundle,
+        verify_go_bundle,
+        load_release_manifest,
         verify_typescript_syntax,
     )
 except ModuleNotFoundError:
@@ -60,6 +65,9 @@ except ModuleNotFoundError:
         CLIENT_DEPENDENCY_MODES,
         UNIT_EXEC_START,
         UNIT_CONTENT_SHA256,
+        GO_FIXED_ARTIFACTS,
+        GO_UNIT_EXEC_START,
+        GO_UNIT_CONTENT_SHA256,
         ManifestError,
         build_manifest,
         default_operations,
@@ -68,6 +76,8 @@ except ModuleNotFoundError:
         sha256_file,
         verify_client_sidecar,
         verify_bundle,
+        verify_go_bundle,
+        load_release_manifest,
         verify_typescript_syntax,
     )
 
@@ -80,10 +90,11 @@ except ModuleNotFoundError:
 
 
 SOURCE_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
-DEFAULT_TIMEOUT_SECONDS = 300
+DEFAULT_TIMEOUT_SECONDS = 8100
 DEFAULT_POLL_SECONDS = 1.0
-MAX_TIMEOUT_SECONDS = 300
+MAX_TIMEOUT_SECONDS = 8100
 MAX_POLL_SECONDS = 1.0
+ACTIVATION_TIMEOUT_SECONDS = 300
 CANONICAL_REMOTE_CONTROL = "/opt/agent-vm-native/agent_vm_control.ts"
 CANONICAL_REMOTE_WRAPPER = "/usr/local/sbin/agent-vm-release-wrapper"
 CONTROL_TRANSITION_STATES = {"preparing", "closing", "deleting", "failed"}
@@ -257,20 +268,23 @@ def build_release(source_root: Path, output: Path, source_revision: str | None =
 
 
 def _verify_unit_contents(root: Path, manifest: Mapping[str, Any]) -> None:
+    go_release = manifest.get("format") == 2
+    expected_exec = GO_UNIT_EXEC_START if go_release else UNIT_EXEC_START
+    expected_digest = GO_UNIT_CONTENT_SHA256 if go_release else UNIT_CONTENT_SHA256
     for artifact in manifest["artifacts"]:
         if artifact["role"] != "unit":
             continue
         name = Path(artifact["path"]).name
-        if name not in UNIT_EXEC_START and name != "agent-vm-native-age-gc.timer":
+        if name not in expected_exec and (go_release or name != "agent-vm-native-age-gc.timer"):
             _fail("unit_unverified", f"unit is not in the fixed allowlist: {name}")
         try:
             content = (root / Path(*PurePosixPath(artifact["path"]).parts)).read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             _fail("unit_unverified", f"unit cannot be read: {name}")
         path = root / Path(*PurePosixPath(artifact["path"]).parts)
-        if sha256_file(path) != UNIT_CONTENT_SHA256[name]:
+        if sha256_file(path) != expected_digest[name]:
             _fail("unit_unverified", f"unit bytes differ from the fixed policy: {name}")
-        required = UNIT_EXEC_START.get(name, "Unit=agent-vm-native-age-gc.service")
+        required = expected_exec.get(name, "Unit=agent-vm-native-age-gc.service")
         if required not in content or (name != "agent-vm-native-age-gc.timer" and "ExecStart=" not in content):
             _fail("unit_unverified", f"unit does not contain its fixed ExecStart: {name}")
         if any(token in content for token in ("systemctl stop", "systemctl disable", "ExecStop=", "ssh ", "curl ", "wget ")):
@@ -300,7 +314,10 @@ def _reject_bundle_extras(root: Path, manifest: Mapping[str, Any]) -> None:
 
 
 def _verify_fixed_artifact_set(manifest: Mapping[str, Any]) -> None:
-    expected = {(role, destination) for destination, _, role, _ in SOURCE_ARTIFACTS}
+    if manifest.get("format") == 2:
+        expected = {(role, destination) for _, destination, role, _ in GO_FIXED_ARTIFACTS}
+    else:
+        expected = {(role, destination) for destination, _, role, _ in SOURCE_ARTIFACTS}
     actual = {(item["role"], item["path"]) for item in manifest["artifacts"]}
     if actual != expected:
         _fail("bundle_invalid", "manifest artifact set differs from the fixed release allowlist", {
@@ -327,8 +344,11 @@ def _open_bundle(bundle: Path) -> tuple[tempfile.TemporaryDirectory[str], Path, 
                 safe_extract_archive(bundle.read_bytes(), root)
             except OSError:
                 _fail("bundle_invalid", "release bundle cannot be read")
-        manifest = load_manifest(root / MANIFEST_NAME)
-        verify_bundle(root, manifest)
+        manifest = load_release_manifest(root / MANIFEST_NAME)
+        if manifest.get("format") == 2:
+            verify_go_bundle(root, manifest)
+        else:
+            verify_bundle(root, manifest)
         verify_client_sidecar(root, manifest)
         _reject_bundle_extras(root, manifest)
         _verify_fixed_artifact_set(manifest)
@@ -613,7 +633,7 @@ def _install_client_package(root: Path, client_path: Path, release_id: str) -> N
                 _fsync_directory(directory)
             # Readers fail closed while the complete-package recovery marker
             # exists. Verify installed bytes here without bypassing that fence.
-            verify_client_sidecar(directory, load_manifest(root / MANIFEST_NAME))
+            verify_client_sidecar(directory, load_release_manifest(root / MANIFEST_NAME))
             record["phase"] = "complete"
             _write_json(marker, record, 0o600)
         except (OSError, ReleaseError, ManifestError) as exc:
@@ -662,7 +682,7 @@ class SSHTransport:
             _fail("remote_response_invalid", f"{label} response is not an object")
         return value
 
-    def _run(self, host: str, command: list[str], payload: bytes | None) -> Mapping[str, Any]:
+    def _run(self, host: str, command: list[str], payload: bytes | None, *, timeout: float | None = None) -> Mapping[str, Any]:
         try:
             process = subprocess.run(
                 ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", host, shlex.join(command)],
@@ -670,7 +690,7 @@ class SSHTransport:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
-                timeout=self.timeout,
+                timeout=self.timeout if timeout is None else timeout,
             )
         except FileNotFoundError:
             _fail("command_missing", "ssh is not installed")
@@ -682,6 +702,8 @@ class SSHTransport:
         command = [wrapper_path, action]
         if action != "status":
             command.extend(["--transaction-id", transaction_id, "--release-id", release_id])
+        if action == "activate":
+            return self._run(host, command, payload, timeout=ACTIVATION_TIMEOUT_SECONDS)
         return self._run(host, command, payload)
 
     def control(self, host: str, remote_control: str, request: Mapping[str, Any]) -> Mapping[str, Any]:

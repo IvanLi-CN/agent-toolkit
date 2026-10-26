@@ -40,20 +40,22 @@ git clone https://github.com/IvanLi-CN/agent-toolkit.git /path/to/agent-toolkit
 
 ```bash
 bun --version
+go version
 bun install --frozen-lockfile
 bun run typecheck
 bun run check
+go -C skills/agent-vm-ops/control vet ./...
 bun run test:repo
 python3 -m pip install -r requirements-dev.txt
 ruby -e 'require "yaml"'
 bun run test:skills
 ```
 
-`check` 包含 typecheck、foundation/spec、索引与公共安全/依赖检查；`test:repo` 发现 `skills/` 外仓库自有的 Bun/Python/Shell 测试；`test:skills` 发现 Skill 内测试。Python 依赖单列在 [requirements-dev.txt](requirements-dev.txt)。XP 当前本地 CLI 使用 Bun，不需要 Ruby/Python；完整 Skill 测试中的策略 fixture 仍检查 Ruby 标准 YAML 库。应用 Python、C 编译器、原生 OS 工具或外部 fallback 的前提由各指南和 canonical source 说明，不能用装好 Bun 替代。
+`check` 包含 typecheck、foundation/spec、索引与公共安全/依赖检查，并执行 Go control module 的 `go vet`；`test:repo` 发现 `skills/` 外仓库自有的 Bun/Python/Shell 测试；`test:skills` 发现 Skill 内测试并按 module 唯一运行 Go 测试。Python 依赖单列在 [requirements-dev.txt](requirements-dev.txt)。XP 当前本地 CLI 使用 Bun，不需要 Ruby/Python；完整 Skill 测试中的策略 fixture 仍检查 Ruby 标准 YAML 库。应用 Python、C 编译器、原生 OS 工具或外部 fallback 的前提由各指南和 canonical source 说明，不能用装好 Bun 替代。
 
 测试 runner 支持 macOS 和 glibc Linux；依赖 Bun FFI 对 POSIX `getsid`/`getpgid` 的访问，分别使用 `libSystem.B.dylib` 或 `libc.so.6`，并需 PATH 中有 `bash`、`ps`、`mktemp`、`mkfifo`、`cat`、`tr`、`sleep`、`wc`、`rm`。原生 Windows 与非 glibc Linux 不在 runner 支持范围内。
 
-Runner 拒绝空或无声明的 Bun/Python 测试文件。Shell suite 必须在自身 shell 或 sourced helper 中执行至少一个计数的 `test` builtin，并报告 `TESTS_RUN=<count>`；单独子进程的断言不贡献计数，需在 suite shell 断言其结果。具体行为由 [test_runner.ts](bin/test_runner.ts) 定义。
+Runner 拒绝空或无声明的 Bun/Python 测试文件，并按 Go module 聚合测试入口。Shell suite 必须在自身 shell 或 sourced helper 中执行至少一个计数的 `test` builtin，并报告 `TESTS_RUN=<count>`；单独子进程的断言不贡献计数，需在 suite shell 断言其结果。具体行为由 [test_runner.ts](bin/test_runner.ts) 定义。
 
 Root checks 证明结构与契约一致性；隔离 fixture 测试证明其覆盖的行为。两者都不证明真实 VM、CAD 应用、游戏服务器、远端服务、站点发布或生产部署已运行。验证时分别记录本地离线、隔离原生 OS、远端观察及真实应用证据；完整/重型验证使用隔离环境，不在本机 Docker 或生产系统上试运行。平台 wiring 见 [CI](.github/workflows/ci.yml)，证据边界见 [IMPLEMENTATION.md](docs/specs/project-foundation/IMPLEMENTATION.md)。
 

@@ -89,6 +89,7 @@ test("duplicate errors, huge diagnostics, timeout and lost streams never finaliz
   const f = fixture();
   for (const [i, handler] of [
     (r: any) => { const err = json({ ...r, ok: false, error: { code: "draining", message: "drain" } }); return result("", 2, err + "\n" + err); },
+    (r: any) => { const err = json({ ...r, ok: false, error: { code: "draining", message: "drain" } }); return result(err, 2, err); },
     () => result("", 255, "x", { stderrTruncated: true }),
     () => result("", 0, "", { timedOut: true, streamCleanupVerified: false }),
     () => result("", 0, "", { streamCleanupVerified: false }),
@@ -127,6 +128,17 @@ test("sidecar shape, complete actions, exact client artifact, checksum and mode 
   }
   writeFileSync(path, json(sidecar)); chmodSync(client, 0o644); expect(() => loadRelease(path)).toThrow("mode differs"); chmodSync(client, 0o755);
   writeFileSync(join(f.root, "guest-source.ts"), "tampered"); expect(() => loadRelease(path)).toThrow("checksum differs");
+});
+
+test("format-2 client view selects the fixed Go request adapter", async () => {
+  const f = fixture(), client = join(f.root, "agent_vm.ts"), path = join(f.root, "client-release.json");
+  writeFileSync(client, "client", { mode: 0o755 });
+  const schema = { schema: 1, semantic_revision: 1 }, window = { schema_min: 1, schema_max: 1, semantic_min: 1, semantic_max: 1 };
+  const dependencies = CLIENT_DEPENDENCIES.map(([name, mode]) => { writeFileSync(join(f.root, name), name, { mode }); return { name, path: name, role: "support", mode, sha256: sha256(name) }; });
+  const sidecar = { format: 2, protocol: 4, release_id: "b".repeat(40), source_revision: "b".repeat(40), client_artifact: { name: "agent_vm.ts", path: "agent_vm.ts", role: "client", mode: 0o755, sha256: sha256("client") }, client_dependencies: dependencies, client_view: { release_id: "b".repeat(40), source_revision: "b".repeat(40), protocol: 4, transport: "go-request", actions: Object.fromEntries(ACTIONS.map(a => [a, { request: schema, response: schema, client_to_control: window, control_to_client: window }])) } };
+  writeFileSync(path, json(sidecar)); f.client.sidecar = path;
+  await f.client.request("status", { session: "s" });
+  expect(f.commands[0]).toEqual(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", "agent-vm-host", "/opt/agent-vm-native/bin/agent-vm-control request --socket /run/agent-vm-native/control.sock --timeout 240s"]);
 });
 
 test("pending complete-package installation fails before legacy fallback, SSH or journal writes", async () => {

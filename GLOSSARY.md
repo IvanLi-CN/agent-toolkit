@@ -30,19 +30,27 @@ Operator-owned information identifying an actual deployment and its approved pol
 _Avoid_: Public reference, for live deployment information
 
 **Agent VM session**:
-The ownership context for one agent's VM slot and operations. Its identifier describes ownership rather than proving authorization.
+The ownership context for one agent's managed guest/container slot and operations. Its identifier describes ownership rather than proving authorization.
 
 **VM lease**:
-The bounded period during which an Agent VM session may access its VM.
+The bounded period during which an Agent VM session may access its managed guest/container. The product term remains for protocol compatibility even when the underlying Incus instance is a system container.
 
 **Stopped cache**:
-A stopped managed VM whose retained disk may be reused or reclaimed under the deployment's policy. It carries no guarantee of recovery after lease expiry.
+A stopped managed container whose retained root filesystem may be reused or reclaimed under the deployment's policy. It carries no guarantee of recovery after lease expiry.
 
 ## Agent VM control plane
 
 **Control environment**:
 The operator-owned environment that holds authoritative Agent VM lifecycle state and is permitted to coordinate Incus resources, leases, mappings, and maintenance actions.
 _Avoid_: Agent VM guest, PVE host, underlying host
+
+**Control authority**:
+在一个 Control environment 内，对 Agent VM 的租约、生命周期和持久结果承担唯一决策责任的一方。
+_Avoid_: Control request adapter, telemetry collector
+
+**Control request adapter**:
+承接调用方请求并交给 Control authority、再向调用方返回结果的兼容边界；它不独立决定租约或生命周期结果。
+_Avoid_: One-shot control process, second controller
 
 **One-shot control process**:
 A control-plane execution that handles one request against the authoritative state and native resources, then exits; it is an invocation boundary rather than a resident broker.
@@ -54,7 +62,7 @@ _Avoid_: Skill consumer, Agent VM guest
 
 **Control-plane update**:
 A coordinated change to the control components that implement the Agent VM lifecycle contract, including the client-facing compatibility surface and the control environment's executable behavior.
-_Avoid_: VM image update, guest update
+_Avoid_: container image update, guest update
 
 **Control-plane release**:
 An approved set of control components intended to operate as one compatibility unit across the local client and the control environment.
@@ -73,7 +81,7 @@ The resource capacity visible to the Agent VM control environment through its as
 _Avoid_: Logical reservation ceiling, host capacity
 
 **Logical reservation headroom**:
-The difference between a logical reservation ceiling and the resources currently allocated or durably reserved by managed VM tasks.
+The difference between a logical reservation ceiling and the resources currently allocated or durably reserved by managed guest tasks.
 _Avoid_: Runtime available memory, physical free space
 
 **Runtime pressure**:
@@ -81,7 +89,7 @@ An observation that the control environment is experiencing resource contention 
 _Avoid_: Allocation usage, admission ceiling
 
 **Startup admission**:
-The decision to allow a new or restarting VM to change native runtime state after the applicable reservation, capacity, pressure, drain, and integrity checks have passed.
+The decision to allow a new or restarting managed guest/container to change native runtime state after the applicable reservation, capacity, pressure, drain, and integrity checks have passed.
 _Avoid_: Lease existence, guest readiness
 
 **CPU scheduler pressure**:

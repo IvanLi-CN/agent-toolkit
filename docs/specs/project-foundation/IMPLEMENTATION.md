@@ -11,7 +11,7 @@ The statuses below describe language migration coverage, not deployment status. 
 | Skill | Migration status | Evidence |
 | --- | --- | --- |
 | `agent-vm` | migrated | [Bun client and source transaction](../../../skills/agent-vm/SKILL.md); [Behavior evidence](../../../skills/agent-vm/tests/client.test.ts), [transport](../../../skills/agent-vm/tests/transport.test.ts), [source transaction](../../../skills/agent-vm/tests/source.test.ts) and [controller contract](../../../skills/agent-vm/tests/controller.test.ts). Complete-package release/recovery evidence and Linux/image validation limits are detailed below. |
-| `agent-vm-ops` | migrated | [Bun controller and guest growth](../../../skills/agent-vm-ops/SKILL.md); [Behavior evidence](../../../skills/agent-vm-ops/tests/control-process.test.ts): Bun controller lifecycle, structured errors, release fences and guest Bun prerequisites. The client transport regression uses the Bun client and canonical controller. |
+| `agent-vm-ops` | migrated | [Go resident control service](../../../skills/agent-vm-ops/control/cmd/agent-vm-control/main.go) and [Bun compatibility controller](../../../skills/agent-vm-ops/SKILL.md); [Behavior evidence](../../../skills/agent-vm-ops/control/internal/lifecycle/service_test.go), [protocol/state tests](../../../skills/agent-vm-ops/control/internal/protocol/protocol_test.go), and the retained Bun controller tests cover lifecycle, journal, structured errors and compatibility boundaries. |
 | `buzzer-audio-preview` | migrated | [Bun score and MIDI/WAV helper](../../../skills/buzzer-audio-preview/SKILL.md); [Behavior evidence](../../../skills/buzzer-audio-preview/tests/buzzer_preview.test.ts): independent media decoding, timing, tone/sample bounds and invalid inputs. |
 | `cvm-imagegen` | retained | [Python module integration](../../../skills/cvm-imagegen/SKILL.md) |
 | `docs-no-revision-markers` | no-runtime | [Text guidance](../../../skills/docs-no-revision-markers/SKILL.md) |
@@ -111,15 +111,17 @@ The maintained structural and test checks are:
 ```bash
 bun install --frozen-lockfile
 bun --version
+go version
 bun run typecheck
 bun run check
+go -C skills/agent-vm-ops/control vet ./...
 bun run test:repo
 python3 -m pip install -r requirements-dev.txt
 ruby -e 'require "yaml"'
 bun run test:skills
 ```
 
-The test runner discovers Bun, Python, and Shell tests by maintained filename conventions, rejects empty or non-declarative Bun/Python test files, counts Shell `test` builtins in the suite shell and sourced helpers through a Bash wrapper, and fails closed on an empty selection or zero counted assertions. Child-helper results require an assertion in the suite shell. Supported runner platforms and native/Bun FFI prerequisites are listed in the root [validation guide](../../../README.md#validation). `bun run test:skills` preserves Python application/domain and Shell remote-observation tests; their Python dependencies remain in `requirements-dev.txt`, and the XP policy test requires Ruby with its standard YAML library. These runtime prerequisites remain separate from root Bun tooling.
+The test runner discovers Bun, Python, Go modules, and Shell tests by maintained filename conventions, rejects empty or non-declarative Bun/Python test files, runs each Go module once, counts Shell `test` builtins in the suite shell and sourced helpers through a Bash wrapper, and fails closed on an empty selection or zero counted assertions. Child-helper results require an assertion in the suite shell. Supported runner platforms and native/Bun FFI prerequisites are listed in the root [validation guide](../../../README.md#validation). `bun run test:skills` preserves Python application/domain and Shell remote-observation tests and executes the Go control module; their Python dependencies remain in `requirements-dev.txt`, and the XP policy test requires Ruby with its standard YAML library. These runtime prerequisites remain separate from root Bun tooling.
 
 Site validation from `site/` uses its independent lockfile:
 

@@ -19,6 +19,7 @@ SCRIPTS = ROOT / "skills/agent-vm-ops/scripts"
 if str(SCRIPTS) not in os.sys.path:
     os.sys.path.insert(0, str(SCRIPTS))
 import agent_vm_release as RELEASE  # noqa: E402
+import release_manifest as MANIFEST  # noqa: E402
 import agent_vm_release_wrapper as WRAPPER  # noqa: E402
 
 
@@ -72,11 +73,47 @@ class WrapperTests(unittest.TestCase):
             run.call_args.args[0],
             ["/usr/local/bin/bun", str(self.loaded["control_path"])],
         )
+
+    def test_drain_verification_uses_fixed_go_request_after_cutover(self):
+        self.drain_patch.stop()
+        sidecar = Path(self.loaded["control_path"]).with_name("client-release.json")
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(json.dumps({"format": 2, "client_view": {"transport": "go-request"}}), encoding="utf-8")
+        response = json.dumps({"ok": True, "result": {"draining": True}}).encode()
+        with mock.patch.object(
+            WRAPPER.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 0, response, b""),
+        ) as run:
+            WRAPPER._ensure_drained(self.loaded)
+        self.assertEqual(
+            run.call_args.args[0],
+            [str(WRAPPER.GO_CONTROL_PATH), "request", "--socket", str(WRAPPER.GO_CONTROL_SOCKET), "--timeout", "30s"],
+        )
         self.assertEqual(
             json.loads(run.call_args.kwargs["input"]),
             {"protocol": 4, "action": "drain-status"},
         )
         self.assertEqual(run.call_args.kwargs["timeout"], 30)
+
+    def test_missing_legacy_enable_and_disable_are_allowed_but_other_failures_are_not(self):
+        missing = subprocess.CompletedProcess(
+            [], 1, b"", b"Failed to disable unit: Unit agent-vm-native-age-gc.service does not exist\n",
+        )
+        with mock.patch.object(WRAPPER.subprocess, "run", return_value=missing):
+            WRAPPER._systemctl("disable", "agent-vm-native-age-gc.service", allow_missing=True)
+            WRAPPER._systemctl("enable", "agent-vm-native-age-gc.service", allow_missing=True)
+
+        missing_template = subprocess.CompletedProcess(
+            [], 1, b"", b"Failed to stop agent-vm-native-expire@.service: Unit name is missing the instance name\n",
+        )
+        with mock.patch.object(WRAPPER.subprocess, "run", return_value=missing_template):
+            WRAPPER._systemctl("stop", "agent-vm-native-expire@.service", allow_missing=True)
+
+        failed = subprocess.CompletedProcess([], 1, b"", b"Failed to disable unit: permission denied\n")
+        with mock.patch.object(WRAPPER.subprocess, "run", return_value=failed):
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER._systemctl("disable", "agent-vm-native-age-gc.service", allow_missing=True)
+        self.assertEqual(failure.exception.code, "activation_failed")
 
     def test_python_syntax_check_only_compiles_python_files(self):
         python = self.root / "candidate.py"
@@ -199,6 +236,75 @@ class WrapperTests(unittest.TestCase):
                 if path.is_file():
                     archive.add(path, arcname=path.relative_to(extracted).as_posix(), recursive=False)
         return output.getvalue()
+
+    def _go_payload(self, release_id):
+        extracted = self.root / "go-candidate"
+        client_root = ROOT / "skills/agent-vm/scripts"
+        ops_root = ROOT / "skills/agent-vm-ops"
+        artifacts = []
+        for name, relative, role, mode in sorted(MANIFEST.GO_FIXED_ARTIFACTS):
+            path = extracted / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if relative == "bin/agent-vm-control":
+                # Minimal little-endian ELF64 header for the amd64 target.
+                path.write_bytes(b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 10 + b"\x3e\x00" + b"\x00" * 42)
+            elif relative == "systemd/agent-vm-native.service":
+                path.write_bytes((ops_root / "assets/systemd/agent-vm-native.service").read_bytes())
+            elif relative == "agent_vm_control_bridge.ts":
+                path.write_bytes((ops_root / "scripts/agent_vm_control_bridge.ts").read_bytes())
+            else:
+                path.write_bytes((client_root / relative).read_bytes())
+            path.chmod(mode)
+            artifacts.append({
+                "name": name,
+                "path": relative,
+                "role": role,
+                "sha256": MANIFEST.sha256_file(path),
+                "mode": mode,
+            })
+        manifest = MANIFEST.build_go_manifest(release_id, artifacts)
+        (extracted / "release-manifest.json").write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
+        client_artifact = next(item for item in artifacts if item["role"] == "client")
+        sidecar = {
+            "format": 2,
+            "release_id": release_id,
+            "source_revision": release_id,
+            "protocol": 4,
+            "client_artifact": client_artifact,
+            "client_dependencies": [item for item in artifacts if item["path"] in MANIFEST.CLIENT_DEPENDENCY_MODES],
+            "client_view": manifest["client_view"],
+        }
+        (extracted / "client-release.json").write_text(json.dumps(sidecar, sort_keys=True) + "\n", encoding="utf-8")
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w") as archive:
+            for path in sorted(extracted.rglob("*")):
+                if path.is_file():
+                    archive.add(path, arcname=path.relative_to(extracted).as_posix(), recursive=False)
+        return output.getvalue()
+
+    def test_format_two_installs_go_binary_bridge_and_retires_old_units(self):
+        release_id = "a" * 40
+        payload = self._go_payload(release_id)
+        unit_dir = Path(self.loaded["unit_dir"])
+        unit_dir.mkdir(parents=True)
+        for name in MANIFEST.GO_RETIRED_UNITS:
+            old = unit_dir / name
+            old.write_bytes(b"old unit\n")
+            old.chmod(0o644)
+        WRAPPER.stage(self.loaded, "tx-go", release_id, payload)
+        verified = WRAPPER.verify_transaction(self.loaded, "tx-go", release_id)
+        self.assertTrue(verified["verified"])
+        with mock.patch.object(WRAPPER.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")):
+            activated = WRAPPER.activate(self.loaded, "tx-go", release_id)
+        self.assertTrue(activated["activated"])
+        self.assertEqual(
+            (Path(self.loaded["control_path"]).parent / "bin" / "agent-vm-control").read_bytes(),
+            b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 10 + b"\x3e\x00" + b"\x00" * 42,
+        )
+        self.assertEqual(Path(self.loaded["control_path"]).read_bytes(), (ROOT / "skills/agent-vm-ops/scripts/agent_vm_control_bridge.ts").read_bytes())
+        self.assertTrue((unit_dir / "agent-vm-native.service").is_file())
+        for name in MANIFEST.GO_RETIRED_UNITS:
+            self.assertFalse((unit_dir / name).exists())
 
     def test_unit_policy_bytes_are_pinned_even_when_manifest_checksum_matches(self):
         payload = self._tampered_unit_payload()

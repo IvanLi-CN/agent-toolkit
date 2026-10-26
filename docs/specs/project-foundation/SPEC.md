@@ -2,14 +2,14 @@
 
 ## Context and Scope
 
-Agent Toolkit provides reusable Skills for multiple agent consumers. This contract owns the public source boundary, independent maintenance, language allocation, discoverability, and documentation presentation. The existing Agent VM lifecycle and CLI contracts remain authoritative for their business behavior.
+Agent Toolkit provides reusable Skills for multiple agent consumers. This contract owns the public source boundary, independent maintenance, language allocation, discoverability, and documentation presentation. Each retained Skill owns its own behavior contract.
 
 The public source owns shared instructions and executable resources. Operators own actual inventory, credentials, deployment configuration, and consumer-specific integrations. A website renders public source as static presentation; it does not install, adapt, or duplicate consumer Skill files. Production deployment, external publication, third-party Skill ownership, and a new standalone image API client are outside this contract.
 
 ## Terms and Interfaces
 
 - Domain terms are defined in [GLOSSARY.md](../../../GLOSSARY.md).
-- Public membership: 13 Skills, defined by [PUBLIC_SKILLS.txt](../../../PUBLIC_SKILLS.txt). Skill metadata and the catalog describe that membership; consumer discovery uses a direct checkout or source links.
+- Public membership: 11 Skills, defined by [PUBLIC_SKILLS.txt](../../../PUBLIC_SKILLS.txt). Skill metadata and the catalog describe that membership; consumer discovery uses a direct checkout or source links.
 - [The script language matrix](SCRIPT-LANGUAGE-MATRIX.md) allocates the executable responsibilities of every public Skill. Target allocation is distinct from completed migration, which is recorded in [IMPLEMENTATION.md](IMPLEMENTATION.md).
 - General tools use installed Bun with explicit type checking; application-host Python, native C rendering, and bounded remote Shell retain their concrete interface roles.
 - The documentation presentation uses Bun/Rspress and the /agent-toolkit/ repository subpath. A successful build does not establish external publication.
@@ -34,7 +34,7 @@ The project MUST document the public source, consumer installation, private depl
 
 ### REQ-FOUNDATION-GOV-05
 
-The project MUST review private legacy design documents for transferable requirements. Rewrite public contracts against current code/tests, and restore traceable requirements and verification for Agent VM, imagegen integration, and XP policy/audit.
+The project MUST review private legacy design documents for transferable requirements. Rewrite public contracts against current code/tests, and restore traceable requirements and verification for retained imagegen integration and XP policy/audit.
 
 ### REQ-FOUNDATION-LANG-01
 
@@ -68,21 +68,13 @@ The project MUST convert buzzer and framebuffer helpers, DST local tooling, and 
 
 The project MUST convert XP local policy, orchestration, interpretation, and audit decisions to TS/Bun. Retain remote native collection and identity revalidation in POSIX Shell.
 
-### REQ-FOUNDATION-MIG-03
-
-The project MUST convert the one-shot VM controller and guest disk growth to Bun with equivalent native locking, process handling, durable state, and lifecycle contracts. Wire systemd/image prerequisites and the then-current client's control invocation.
-
-### REQ-FOUNDATION-MIG-04
-
-The project MUST convert the VM client, local sync, and guest source transaction to Bun. Complete the cross-component prerequisite and invocation update.
-
 ### REQ-FOUNDATION-MIG-05
 
 The project MUST preserve the accepted Python module/CAD, C rendering, remote Shell, small Tavily helper, and text-only exceptions. Retire only replaced implementations and align affected tests/docs/CI.
 
 ### REQ-FOUNDATION-DOC-01
 
-The project MUST put project purpose, five capability groups, a clickable entry for each public Skill, prerequisites, outputs, and representative scenarios within easy reach of the root README.
+The project MUST put project purpose, four capability groups, a clickable entry for each public Skill, prerequisites, outputs, and representative scenarios within easy reach of the root README.
 
 ### REQ-FOUNDATION-DOC-02
 
@@ -94,7 +86,7 @@ The project MUST for every Skill, explain when to use it, prerequisites/platform
 
 ### REQ-FOUNDATION-DOC-04
 
-The project MUST explain protected configuration for XP, Agent VM, imagegen, and other operational Skills using neutral examples. Move one-off migration instructions out of the newcomer path.
+The project MUST explain protected configuration for XP, imagegen, and other operational Skills using neutral examples. Move one-off migration instructions out of the newcomer path.
 
 ### REQ-FOUNDATION-SITE-01
 
@@ -208,7 +200,7 @@ Verification requirements describe evidence that must be produced, rather than c
 
 - covers: `REQ-FOUNDATION-LANG-06`
 - Method: inspect the maintained implementation and exercise its applicable consumer or test scenario.
-- Pass condition: All manifest-listed Skills appear exactly once in the matrix; text-only Skills acquire no runtime requirement; VM Bun prerequisites and Python/Shell/C exceptions have concrete reasons; targets are distinguished from completed changes.
+- Pass condition: All manifest-listed Skills appear exactly once in the matrix; text-only Skills acquire no runtime requirement; Python/Shell/C exceptions have concrete reasons; targets are distinguished from completed changes.
 
 ### VER-FOUNDATION-REQUIREMENT-MIG-01
 
@@ -221,18 +213,6 @@ Verification requirements describe evidence that must be produced, rather than c
 - covers: `REQ-FOUNDATION-MIG-02`
 - Method: inspect the maintained implementation and exercise its applicable consumer or test scenario.
 - Pass condition: The XP strict-input, policy, identity, network/output-boundary, and read-only scenarios pass without local Ruby.
-
-### VER-FOUNDATION-REQUIREMENT-MIG-03
-
-- covers: `REQ-FOUNDATION-MIG-03`
-- Method: inspect the maintained implementation and exercise its applicable consumer or test scenario.
-- Pass condition: The VM-CONTROL protocol/digest, prior-state, native multi-process, precision, recovery, and current-client interoperability scenarios pass.
-
-### VER-FOUNDATION-REQUIREMENT-MIG-04
-
-- covers: `REQ-FOUNDATION-MIG-04`
-- Method: inspect the maintained implementation and exercise its applicable consumer or test scenario.
-- Pass condition: The VM-CLIENT session precedence, transport/state, byte-path/ownership, atomicity, concurrency, and lost-ack scenarios pass.
 
 ### VER-FOUNDATION-REQUIREMENT-MIG-05
 
@@ -462,96 +442,6 @@ Verification requirements describe evidence that must be produced, rather than c
 - Method and required evidence: Fresh operator-environment smoke and remote dependency inspection.
 - Pass condition: Local entrypoints need Bun and native transport tools, not Ruby or Python; remote probes remain POSIX and require no Bun installation.
 
-### VER-FOUNDATION-VM-CONTROL-01
-
-- covers: `REQ-FOUNDATION-MIG-03`
-- Method and required evidence: Protocol/configuration fixtures and fake-native invocation records.
-- Pass condition: Valid requests retain their envelope/results/error behavior; missing identity, invalid configuration/protocol/action/generation fail before disallowed native writes.
-
-### VER-FOUNDATION-VM-CONTROL-02
-
-- covers: `REQ-FOUNDATION-MIG-03`
-- Method and required evidence: Fixtures created from the accepted baseline, current/new request scenarios, and lost-response/restart tests. Canonical digest serialization is compared explicitly.
-- Pass condition: Prior database/operation fixtures are usable without changing identity or reapplying a completed operation. Same-ID retries, payload conflicts, pending outcomes, and deadline updates preserve idempotence.
-
-### VER-FOUNDATION-VM-CONTROL-03
-
-- covers: `REQ-FOUNDATION-MIG-03`
-- Method and required evidence: Isolated Linux multi-process lock/admission/expiry scenarios, not only mocked lock objects.
-- Pass condition: Two real control processes serialize conflicting operations while unrelated work proceeds as allowed. Expiration closes access despite contended work; long native waits do not hold the global admission transaction.
-
-### VER-FOUNDATION-VM-CONTROL-04
-
-- covers: `REQ-FOUNDATION-MIG-03`
-- Method and required evidence: Boundary-number/digest/transaction fixtures and concurrent admission tests.
-- Pass condition: SQLite transactions and all supported integer/ratio calculations preserve precision, rounding, reservation and capacity results. There is no silent JS-number truncation or newly restricted valid input range.
-
-### VER-FOUNDATION-VM-CONTROL-05
-
-- covers: `REQ-FOUNDATION-MIG-03`
-- Method and required evidence: Carried-forward lifecycle, reclamation, resource-overcommit, and live-memory scenarios with injected partial failures.
-- Pass condition: Release/reclaim/drain/reconcile/live-memory failures preserve protected leases, conservative accounting, bounded retries, generation fences, and the existing no-implicit-restart behavior.
-
-### VER-FOUNDATION-VM-CONTROL-06
-
-- covers: `REQ-FOUNDATION-MIG-03`
-- Method and required evidence: Real isolated process trees, noisy pipe fixtures, and timeout/cleanup failures on Linux.
-- Pass condition: Streams are drained while retained output stays bounded; timeout cleanup handles descendants and leader reaping with accurate diagnostics.
-
-### VER-FOUNDATION-VM-CONTROL-07
-
-- covers: `REQ-FOUNDATION-MIG-03`
-- Method and required evidence: Fake guest/native filesystem scenarios and prerequisite failure records; no real production disk resizing.
-- Pass condition: Guest growth preserves direct ext4/xfs constraints, ambiguous-root refusal, native-command checks, and verified size reporting. Missing guest Bun blocks before writes.
-
-### VER-FOUNDATION-VM-CONTROL-08
-
-- covers: `REQ-FOUNDATION-MIG-03`
-- Method and required evidence: Client/control transport smoke, systemd unit validation, and exact source-reference audit.
-- Pass condition: The then-current client reaches the new controller through its updated transport, all systemd/assets/config references resolve, and only one active controller remains.
-
-### VER-FOUNDATION-VM-CLIENT-01
-
-- covers: `REQ-FOUNDATION-MIG-04`
-- Method and required evidence: Offline CLI scenarios and fake SSH invocation records; no Codex identity reads.
-- Pass condition: Explicit session identity overrides the environment; missing identity fails before remote mutation; requests, journals, and state use the same generic identity.
-
-### VER-FOUNDATION-VM-CLIENT-02
-
-- covers: `REQ-FOUNDATION-MIG-04`
-- Method and required evidence: Client/controller contract scenarios and fixed local-state/journal fixtures.
-- Pass condition: Acquire/retry/status/renew/release/resize/admin behavior preserves current generation and operation identity; observation does not renew a lease. Old connection material is rejected.
-
-### VER-FOUNDATION-VM-CLIENT-03
-
-- covers: `REQ-FOUNDATION-MIG-04`
-- Method and required evidence: Temporary transport/key/state fixtures, fake SSH/rsync, and output/permission assertions.
-- Pass condition: SSH/keys/state/config permissions, argv handling, upload/download, port operations, diagnostics, and transport exit codes remain correct. Credentials are absent from ordinary logs.
-
-### VER-FOUNDATION-VM-CLIENT-04
-
-- covers: `REQ-FOUNDATION-MIG-04`
-- Method and required evidence: Real temporary Git/filesystem scenarios, including spaces/newlines/Unicode and byte-path boundaries. Unsupported preservation is reported as a blocker rather than silent path substitution.
-- Pass condition: Sync handles deletions, symlinks/modes, special byte paths, and changed manifests without damaging adjacent results or unowned paths; submodules are rejected before writes.
-
-### VER-FOUNDATION-VM-CLIENT-05
-
-- covers: `REQ-FOUNDATION-MIG-04`
-- Method and required evidence: Isolated Linux guest-action tests with actual locks/rename/fsync behavior and injected failures.
-- Pass condition: Concurrent baseline conflicts reject stale commits; atomic exchange failure preserves the old source; lost commit acknowledgement returns the defined uncertain outcome and retains recovery material.
-
-### VER-FOUNDATION-VM-CLIENT-06
-
-- covers: `REQ-FOUNDATION-MIG-04`
-- Method and required evidence: Fresh linked-consumer smoke, prerequisite-failure scenarios, and exact runtime/source scan.
-- Pass condition: Missing Bun/native atomic capability fails before unsafe writes; source linking is sufficient to discover and run the new client. No VM-specific Python runtime action remains.
-
-### VER-FOUNDATION-VM-CLIENT-07
-
-- covers: `REQ-FOUNDATION-MIG-04`
-- Method and required evidence: Cross-component scenario and configuration/reference review.
-- Pass condition: New client, controller, guest actions, systemd assets, and deployment instructions agree on prerequisites, protocol, and canonical source; no production rollout is claimed from offline evidence.
-
 ### VER-FOUNDATION-GUIDES-01
 
 - covers: `REQ-FOUNDATION-DOC-01`, `REQ-FOUNDATION-DOC-03`
@@ -625,7 +515,5 @@ Verification requirements describe evidence that must be produced, rather than c
 
 ## References
 
-- [Agent VM lifecycle](../agent-vm/SPEC.md)
-- [Agent VM CLI contract](../agent-vm/contracts/cli.md)
 - [Implementation coverage](IMPLEMENTATION.md)
 - [Topic history](HISTORY.md)

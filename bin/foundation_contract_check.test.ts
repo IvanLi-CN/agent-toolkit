@@ -31,7 +31,7 @@ test("accepts the standalone current membership and CI without consumer state", 
 });
 
 test("rejects an empty, duplicate, malformed, or reduced manifest", () => {
-  for (const content of ["", "agent-vm\nagent-vm\n", "../escape\n", "agent-vm\n"]) {
+  for (const content of ["", "xp-infra\nxp-infra\n", "../escape\n", "xp-infra\n"]) {
     fixture((root) => {
       writeFileSync(join(root, "PUBLIC_SKILLS.txt"), content);
       expect(check(root).length).toBeGreaterThan(0);
@@ -40,20 +40,20 @@ test("rejects an empty, duplicate, malformed, or reduced manifest", () => {
 });
 
 test("rejects duplicate, stale, and non-clickable catalog entries", () => {
-  for (const replacement of ["| `removed-skill` |", "| `agent-vm` |", "| `invalid_name` | "]) {
+  for (const replacement of ["| `removed-skill` |", "| `unknown-skill` |", "| `invalid_name` | "]) {
     fixture((root) => {
       replace(root, "skills/README.md", "| `xp-infra` |", replacement);
       expect(check(root)).toContain("FOUNDATION_CATALOG_DRIFT");
     });
   }
   fixture((root) => {
-    replace(root, "skills/README.md", "[Skill source](agent-vm/SKILL.md)", "`agent-vm/SKILL.md`");
+    replace(root, "skills/README.md", "[Skill source](xp-infra/SKILL.md)", "`xp-infra/SKILL.md`");
     expect(check(root)).toContain("FOUNDATION_CATALOG_DRIFT");
   });
 });
 
 test("rejects missing, duplicate, extra, or malformed matrix rows", () => {
-  for (const replacement of ["| `removed-skill` |", "| `agent-vm` |", "| `invalid_name` |", "| `xp-infra` ||"]) {
+  for (const replacement of ["| `removed-skill` |", "| `unknown-skill` |", "| `invalid_name` |", "| `xp-infra` ||"]) {
     fixture((root) => {
       replace(root, `${TOPIC}/SCRIPT-LANGUAGE-MATRIX.md`, "| `xp-infra` |", replacement);
       expect(check(root)).toContain("FOUNDATION_MATRIX_DRIFT");
@@ -64,7 +64,7 @@ test("rejects missing, duplicate, extra, or malformed matrix rows", () => {
 test("rejects stale membership counts in each active contract", () => {
   for (const path of ["SPEC.md", "IMPLEMENTATION.md", "SCRIPT-LANGUAGE-MATRIX.md"]) {
     fixture((root) => {
-      replace(root, `${TOPIC}/${path}`, "Public membership: 13", "Public membership: 16");
+      replace(root, `${TOPIC}/${path}`, "Public membership: 11", "Public membership: 13");
       expect(check(root)).toContain(`FOUNDATION_COUNT_DRIFT ${path}`);
     });
   }
@@ -79,8 +79,8 @@ test("rejects historical delivery numbering used in an active contract", () => {
 
 test("requires complete migration coverage and behavior evidence for completion", () => {
   fixture((root) => {
-    replace(root, `${TOPIC}/IMPLEMENTATION.md`, "[Behavior evidence](../../../skills/agent-vm/tests/client.test.ts)", "[Release integration evidence missing](../../../skills/agent-vm/tests/client.test.ts)");
-    expect(check(root)).toContain("FOUNDATION_MIGRATION_EVIDENCE_MISSING agent-vm");
+    replace(root, `${TOPIC}/IMPLEMENTATION.md`, "[Behavior evidence](../../../skills/buzzer-audio-preview/tests/buzzer_preview.test.ts)", "[Release integration evidence missing](../../../skills/buzzer-audio-preview/tests/buzzer_preview.test.ts)");
+    expect(check(root)).toContain("FOUNDATION_MIGRATION_EVIDENCE_MISSING buzzer-audio-preview");
   });
   fixture((root) => {
     replace(root, `${TOPIC}/IMPLEMENTATION.md`, "| `xp-infra` | deferred |", "| `unknown-skill` | complete |");
@@ -88,13 +88,13 @@ test("requires complete migration coverage and behavior evidence for completion"
     expect(check(root)).toContain("FOUNDATION_INVALID_COVERAGE unknown-skill");
   });
   fixture((root) => {
-    replace(root, `${TOPIC}/IMPLEMENTATION.md`, "| `agent-vm` | migrated |", "| `agent-vm` | no-runtime |");
-    expect(check(root)).toContain("FOUNDATION_ALLOCATION_COVERAGE_DRIFT agent-vm");
+    replace(root, `${TOPIC}/IMPLEMENTATION.md`, "| `buzzer-audio-preview` | migrated |", "| `buzzer-audio-preview` | no-runtime |");
+    expect(check(root)).toContain("FOUNDATION_ALLOCATION_COVERAGE_DRIFT buzzer-audio-preview");
   });
 });
 
 test("preserves GOV, LANG, COMMON and all domain scenario identities", () => {
-  for (const id of ["REQ-FOUNDATION-GOV-05", "REQ-FOUNDATION-LANG-06", "REQ-FOUNDATION-COMMON-07", "VER-FOUNDATION-VM-CONTROL-08", "VER-FOUNDATION-SITE-06"]) {
+  for (const id of ["REQ-FOUNDATION-GOV-05", "REQ-FOUNDATION-LANG-06", "REQ-FOUNDATION-COMMON-07", "VER-FOUNDATION-HELPERS-06", "VER-FOUNDATION-SITE-06"]) {
     fixture((root) => {
       replace(root, `${TOPIC}/SPEC.md`, `### ${id}`, `### ${id}-removed`);
       expect(check(root)).toContain(`FOUNDATION_ID_DRIFT ${id}`);
@@ -104,7 +104,7 @@ test("preserves GOV, LANG, COMMON and all domain scenario identities", () => {
 
 test("rejects broken source links, escaping links, and non-regular inputs", () => {
   fixture((root) => {
-    replace(root, `${TOPIC}/SCRIPT-LANGUAGE-MATRIX.md`, "../../../skills/agent-vm/scripts/agent_vm.ts", "../../../skills/agent-vm/scripts/missing.ts");
+    replace(root, `${TOPIC}/SCRIPT-LANGUAGE-MATRIX.md`, "../../../skills/buzzer-audio-preview/scripts/buzzer_preview.ts", "../../../skills/buzzer-audio-preview/scripts/missing.ts");
     expect(check(root).some((finding) => finding.startsWith("FOUNDATION_BROKEN_LINK"))).toBe(true);
   });
   fixture((root) => {

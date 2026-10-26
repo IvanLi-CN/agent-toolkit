@@ -138,7 +138,7 @@ assert(!/\bsecrets\s*\.|setup-node|pull_request_target/.test(workflowText));
 console.log('Workflow boundary: PR/manual checks read-only; Pages packaging/deploy requires explicit default-branch dispatch; no secrets');
 
 const main = await checkOutput(repoRoot, path.join(siteRoot, '.generated'), path.join(siteRoot, 'dist'));
-assert.equal(main.skills, 13, 'Foundation membership requires 13 public Skills');
+  assert.equal(main.skills, 11, 'Foundation membership requires 11 public Skills');
 console.log(`Public output: ${main.skills} Skills, ${main.pages} routes/search entries, ${main.checkedLinks} links/assets/anchors; Bun ${main.runtime.bun}`);
 
 // Regression controls must fail, including a private path injected into a built file.
@@ -228,7 +228,7 @@ try {
   for (const [name, marker] of [
     ['.env', 'CONFIG'], ['private/notes.md', 'PRIVATE'],
     ['docs/guides/not-public.md', 'GUIDE'], ['skills/not-public/SKILL.md', 'SKILL'],
-    ['skills/agent-vm/references/hosts.txt', 'INVENTORY'],
+    ['skills/not-public/references/hosts.txt', 'INVENTORY'],
   ]) {
     const target = path.join(source, name);
     await mkdir(path.dirname(target), { recursive: true });
@@ -247,7 +247,7 @@ try {
     return checkOutput(source, generated, output);
   };
   const before = await run();
-  assert.equal(before.skills, 13);
+  assert.equal(before.skills, 11);
   const guides = path.join(source, 'docs/guides');
   const excludedGuides = path.join(source, 'private/redirected-guides');
   await rename(guides, excludedGuides);
@@ -268,13 +268,13 @@ try {
   const manifest = path.join(source, 'PUBLIC_SKILLS.txt');
   await writeFile(manifest, (await readFile(manifest, 'utf8')).split('\n').filter(line => line.trim() !== removed).join('\n'));
   const after = await run();
-  assert.equal(after.skills, 12);
+  assert.equal(after.skills, 10);
   assert(!after.search.some(page => page.routePath.startsWith(`/skills/${removed}/`)), 'Removed Skill remains searchable');
   assert(!(await files(output)).some(name => name.startsWith(`skills/${removed}/`)), 'Removed Skill route remains');
   const catalog = parse(await readFile(path.join(output, 'skills/index.html'), 'utf8'));
   assert(!elements(catalog).some(node => node.tagName === 'td' && text(node) === removed), 'Removed Skill catalog row remains');
   assert(!elements(catalog).some(node => attribute(node, 'href') === `${base}skills/${removed}/`), 'Removed Skill navigation remains');
-  console.log(`Isolated rebuild: 13 → 12 Skills; removed route/catalog/search/navigation; excluded sentinels absent; both builds with Node disabled (Bun ${after.runtime.bun})`);
+  console.log(`Isolated rebuild: 11 → 10 Skills; removed route/catalog/search/navigation; excluded sentinels absent; both builds with Node disabled (Bun ${after.runtime.bun})`);
 } finally {
   await rm(fixture, { recursive: true, force: true });
 }

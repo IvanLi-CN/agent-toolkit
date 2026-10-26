@@ -2,7 +2,7 @@
 
 Status: accepted responsibility allocation. This document records current owned source and the accepted target for every public Skill. [SPEC.md](SPEC.md) defines the requirements and verification, and [IMPLEMENTATION.md](IMPLEMENTATION.md) distinguishes completed migrations with behavior evidence from deferred conversions and retained exceptions. An allocation or source link alone does not prove behavioral equivalence or production deployment.
 
-Public membership: 13 Skills, defined by [PUBLIC_SKILLS.txt](../../../PUBLIC_SKILLS.txt). Only manifest-listed Skills receive allocations here; application and remote prerequisites describe their own execution boundaries.
+Public membership: 11 Skills, defined by [PUBLIC_SKILLS.txt](../../../PUBLIC_SKILLS.txt). Only manifest-listed Skills receive allocations here; application and remote prerequisites describe their own execution boundaries.
 
 ## Decision rules
 
@@ -18,8 +18,6 @@ Local Bun follows the installed host runtime; CI follows the latest stable Bun a
 
 | Skill | Current owned code | Recommended target | Concrete reason |
 | --- | --- | --- | --- |
-| `agent-vm` | Bun client, local sync and bundled one-shot guest source transaction with narrow native byte-path, lock and exchange bindings | TypeScript + Bun for the client, local sync, and guest transaction | Request identity, generation, retry journal, manifests, ownership, transaction phases, and recovery dominate the work. Native directory exchange and locks are necessary mechanisms, not a Python-only domain. |
-| `agent-vm-ops` | Go resident control service, HTTP-over-UDS request adapter, native worker and built-in scheduler; TypeScript/Bun compatibility controller and embedded guest disk-growth action remain during the support window | Go 1.27.3 for the resident control authority; Gin v1 + `database/sql` + `modernc.org/sqlite` for the local service; TypeScript + Bun for the compatibility client/guest boundary | The resident service owns lease/port state machines, idempotence, admission, conservative accounting, expiration, reconciliation and native process isolation. SQLite stays behind standard `database/sql`; Gin is transport-only and the same business service can later be exposed over HTTPS. The Bun controller is a fixed bridge, not a second authority. |
 | `buzzer-audio-preview` | [Bun score/MIDI/WAV helper](../../../skills/buzzer-audio-preview/scripts/buzzer_preview.ts) and [Bun behavior tests](../../../skills/buzzer-audio-preview/tests/buzzer_preview.test.ts) | TypeScript + Bun | Score/config/event models and MIDI/WAV encoding require no Python-host API. Typed score variants and independently decoded byte-level outputs cover the portable local responsibility. |
 | `cvm-imagegen` | Python fallback-module integration, Python tests and fixture | Python for the defined module integration | This Skill explicitly loads a configured Python module and replaces its functions/client factories. A TS implementation cannot preserve that in-process interface directly. The HTTP image API itself does not require Python. |
 | `docs-no-revision-markers` | Markdown only | No script/runtime | Documentation-writing guidance has no owned executable. |
@@ -33,22 +31,6 @@ Local Bun follows the installed host runtime; CI follows the latest stable Bun a
 | `xp-infra` | Bash orchestration, Ruby policy/audit interpretation, POSIX remote probes | TypeScript + Bun for local orchestration, policy, normalization, and decisions; POSIX Shell for remote probes | Policy schema, audit observations, identity revalidation, public target validation, and port-preflight conclusions are complex structured logic. Remote probes retain bounded, authorized native observation without requiring Bun on inspected nodes. |
 
 ## Exact script responsibilities
-
-### Agent VM client and source sync
-
-- [`agent_vm.ts`](../../../skills/agent-vm/scripts/agent_vm.ts) and [`client.ts`](../../../skills/agent-vm/scripts/client.ts): direct TS/Bun CLI and client. Preserve session precedence, missing-identity failure, protocol envelope, exact persisted integers, retry journals, transport exits and generation-bound connection material. The control transport continues to invoke the canonical Bun controller.
-- [`sync_worktree.ts`](../../../skills/agent-vm/scripts/sync_worktree.ts) and [`guest-source.ts`](../../../skills/agent-vm/scripts/guest-source.ts): Git byte-path selection, local orchestration and a bundled bounded guest transaction. Preserve symlinks/modes/hashes, submodule refusal, baseline conflicts, precise owned paths, fsync, exclusive creation, atomic exchange and lost-ack recovery. [`byte-fs.ts`](../../../skills/agent-vm/scripts/byte-fs.ts) and [`sync-native.ts`](../../../skills/agent-vm/scripts/sync-native.ts) bind native byte-path, lock and rename mechanisms inside Bun; there is no Python subprocess or resident service.
-- Guest Bun, GNU `timeout`, native `rsync`, libc `flock` and Linux `renameat2` are explicit managed-image prerequisites. A missing prerequisite fails before staging writes; ordinary execution never installs Bun or substitutes a weaker replacement algorithm. [Behavior evidence and release/Linux gaps](IMPLEMENTATION.md#agent-vm-client-behavior-evidence) distinguish owned source conversion from deployment readiness.
-
-### Agent VM control
-
-- [`agent-vm-ops/control/cmd/agent-vm-control/main.go`](../../../skills/agent-vm-ops/control/cmd/agent-vm-control/main.go): the resident Go control authority. Its protocol, state, lifecycle, HTTP-over-UDS server, scheduler and native worker are separate internal packages, with Gin restricted to transport handling and SQLite accessed through `database/sql`.
-- [`agent_vm_control.ts`](../../../skills/agent-vm-ops/scripts/agent_vm_control.ts): the retained Bun compatibility controller. It remains the fixed legacy bridge during the migration support window and does not own the resident service's durable lifecycle decisions.
-- Implement cross-process locks and native operations directly in the same control process. Preserve short SQLite transactions, native-operation lock ordering, bounded stream draining, descendant termination, generation fences, decimal allocation rounding, conservative reservations, and idempotent operation responses.
-- Convert the embedded guest disk-growth action along with the guest runtime prerequisite. Preserve direct ext4/xfs partition constraints and use native `findmnt`, `lsblk`, `blockdev`, `growpart`, and filesystem growth commands.
-- Update control-host SSH execution, systemd activation, managed-image checks, and deployment prerequisites together. The current client keeps SSH as a compatibility transport and can invoke the fixed Bun bridge; the new request adapter targets the same business API over a protected Unix socket and can later use HTTPS without changing lifecycle code. The manual publisher uses `python3 skills/agent-vm-ops/scripts/agent_vm_release.py build`, `verify`, and `publish` for the legacy fixed release set. Go/Bun on the developer's computer does not establish runtime prerequisites on the control host or guest.
-- Existing persisted digests, database records, and request serialization are compatibility contracts. Ordinary JS object serialization or floating-point arithmetic must not silently replace their semantics.
-- The deployment-owned Agent VM observability bridge is not shipped in public source. When it owns recurring scheduling, snapshot normalization, and Prometheus textfile reporting, its target runtime is TypeScript + Bun; it must invoke the canonical controller contract rather than create a second control plane. Public source carries only the bridge contract and behavior scenarios.
 
 ### XP operations
 
@@ -83,7 +65,7 @@ Every conversion must update its entrypoints, tests, prerequisite declarations, 
 
 ## Sources and evidence limits
 
-This inventory comes from the public Skill tree and script imports, entrypoints, embedded actions, and existing contracts/tests. Language fit is an accepted design decision. Helper execution evidence distinguishes independently decoded media fixtures, fake SSH, isolated native Shell/C/Git, and source-only CAD binding inspection; [implementation coverage](IMPLEMENTATION.md#helper-behavior-evidence) records their limits. It does not establish a real server deployment, physical display/buzzer behavior, or application-level CAD execution. Agent VM release tooling retains Python while publishing the complete Bun client package; package/recovery contracts and Linux/image deployment require separate evidence; the deferred XP allocation does not claim Bun equivalence or operational rollout.
+This inventory comes from the public Skill tree and script imports, entrypoints, embedded actions, and existing contracts/tests. Language fit is an accepted design decision. Helper execution evidence distinguishes independently decoded media fixtures, fake SSH, isolated native Shell/C/Git, and source-only CAD binding inspection; [implementation coverage](IMPLEMENTATION.md#helper-behavior-evidence) records their limits. It does not establish a real server deployment, physical display/buzzer behavior, or application-level CAD execution. Python application integrations and remote/native boundaries require their own evidence; the deferred XP allocation does not claim Bun equivalence or operational rollout.
 
 - [TypeScript discriminated unions and exhaustive handling](https://www.typescriptlang.org/docs/handbook/2/narrowing.html)
 - [Python type hints and static checking boundary](https://docs.python.org/3/library/typing.html)

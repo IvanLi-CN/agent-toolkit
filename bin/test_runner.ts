@@ -1,14 +1,13 @@
 #!/usr/bin/env bun
-/** Discover and run maintained TS, Python, Go, and Shell tests without a root edit per sibling. */
+/** Discover and run maintained TS, Python, and Shell tests without a root edit per sibling. */
 
 import { dirname, join, relative } from "node:path";
-import { existsSync } from "node:fs";
 import { dlopen } from "bun:ffi";
 import * as ts from "typescript";
 import { isDirectRegularFile, isPathInside, readText, REPO_ROOT, relativePath, walkFiles } from "./repo_util.ts";
 
 export type TestScope = "repo" | "skills";
-export type TestKind = "bun" | "python" | "go" | "shell";
+export type TestKind = "bun" | "python" | "shell";
 export type TestFile = { path: string; kind: TestKind };
 
 const IGNORED_DIRECTORIES = new Set([
@@ -451,7 +450,6 @@ export function testKind(path: string): TestKind | undefined {
   const name = path.split(/[\\/]/).at(-1) ?? "";
   if (name.endsWith(".test.ts") || /^test[-_].*\.ts$/.test(name) || /_test\.ts$/.test(name)) return "bun";
   if (name.endsWith(".test.py") || /^test[-_].*\.py$/.test(name) || /_test\.py$/.test(name)) return "python";
-  if (name.endsWith("_test.go")) return "go";
   if (name.endsWith(".test.sh") || /^test[-_].*\.sh$/.test(name) || /_test\.sh$/.test(name)) return "shell";
   return undefined;
 }
@@ -470,7 +468,7 @@ export function discoverTests(root: string = REPO_ROOT, scope: TestScope = "repo
   if (rejectedSymlinks.length > 0) {
     throw new Error(`refusing to discover tests through rejected symlink paths: ${rejectedSymlinks.sort().join(", ")}`);
   }
-  const discovered = files
+  return files
     .filter((path) => path !== join(root, "bin", "test_runner.ts"))
     .filter((path) => (scope === "repo" ? !path.startsWith(join(root, "skills") + "/") && !path.startsWith(join(root, "skills") + "\\") : path.startsWith(join(root, "skills") + "/") || path.startsWith(join(root, "skills") + "\\")))
     .flatMap((path) => {
@@ -478,29 +476,6 @@ export function discoverTests(root: string = REPO_ROOT, scope: TestScope = "repo
       return kind ? [{ path, kind }] : [];
     })
     .sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
-  const modules = new Map<string, TestFile>();
-  const result: TestFile[] = [];
-  for (const test of discovered) {
-    if (test.kind !== "go") {
-      result.push(test);
-      continue;
-    }
-    let directory = dirname(test.path);
-    let moduleRoot: string | undefined;
-    while (isPathInside(root, directory) || directory === root) {
-      if (existsSync(join(directory, "go.mod"))) {
-        moduleRoot = directory;
-        break;
-      }
-      const parent = dirname(directory);
-      if (parent === directory) break;
-      directory = parent;
-    }
-    if (moduleRoot === undefined) throw new Error(`Go test is outside a module: ${test.path}`);
-    modules.set(moduleRoot, { path: join(moduleRoot, "go.mod"), kind: "go" });
-  }
-  result.push(...modules.values());
-  return result.sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
 }
 
 export function ensureTestSelection(files: TestFile[], scope: TestScope): void {
@@ -604,7 +579,6 @@ export function ensureTestSources(files: TestFile[]): void {
       return !hasBunTestDeclaration(test.path, source);
     }
     if (test.kind === "python") return !/\b(?:unittest\.|TestCase\b|def\s+test_|def\s+load_tests\s*\()/m.test(source);
-    if (test.kind === "go") return false;
     return false;
   });
   if (invalid.length > 0) {
@@ -613,22 +587,18 @@ export function ensureTestSources(files: TestFile[]): void {
 }
 
 export function executedTestCount(kind: TestKind, output: string): number | undefined {
-  const summary = kind === "go"
-    ? /^---\s+PASS:\s+\S+/gm
-    : kind === "shell"
+  const summary = kind === "shell"
     ? /^\s*TESTS_RUN\s*=\s*(\d+)\s*$/gim
     : kind === "bun"
       ? /^\s*Ran\s+(\d+)\s+tests?\s+across\b/gim
       : /^\s*Ran\s+(\d+)\s+tests?\s+in\b/gim;
   const matches = [...output.matchAll(summary)];
-  if (kind === "go") return matches.length || undefined;
   if (matches.length !== 1) return undefined;
   return Number(matches[0]?.[1]);
 }
 
 function hasExecutedTests(kind: TestKind, output: string, count: number | undefined): boolean {
   if (count === undefined || count === 0) return false;
-  if (kind === "go") return true;
   if (kind !== "bun") return true;
   const passSummaries = [...output.matchAll(/^\s*(\d+)\s+pass(?:es)?\s*$/gim)];
   return passSummaries.length === 1 && Number(passSummaries[0]?.[1]) > 0;
@@ -637,7 +607,6 @@ function hasExecutedTests(kind: TestKind, output: string, count: number | undefi
 export function commandForTest(test: TestFile): string[] {
   if (test.kind === "bun") return [process.execPath, "test", test.path];
   if (test.kind === "python") return ["python3", "-c", PYTHON_TEST_RUNNER, test.path];
-  if (test.kind === "go") return ["go", "test", "-count=1", "-v", "./..."];
   const shellCommand = [
     "set -euo pipefail",
     "set -m",
@@ -1317,7 +1286,7 @@ export async function runTest(test: TestFile): Promise<number> {
   let err = "";
   try {
     const spawnedChild = Bun.spawn(commandForTest(test), {
-      cwd: test.kind === "go" ? dirname(test.path) : REPO_ROOT,
+      cwd: REPO_ROOT,
       stdout: "pipe",
       stderr: "pipe",
       detached: true,

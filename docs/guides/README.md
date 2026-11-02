@@ -1,11 +1,11 @@
 # 使用指南
 
-从[安装与更新](installation.md)开始，再阅读 [protected configuration](configuration.md) 并选择所需能力。Canonical source 为 `skills/<name>/`，membership 由 [PUBLIC_SKILLS.txt](../../PUBLIC_SKILLS.txt) 定义；[公共 catalog](../../skills/README.md) 是 membership 索引。本页按四组连接全部 11 个 Skill 的唯一使用说明位置。
+从[安装与更新](installation.md)开始，再阅读 [protected configuration](configuration.md) 并选择所需能力。Canonical source 为 `skills/<name>/`，membership 由 [PUBLIC_SKILLS.txt](../../PUBLIC_SKILLS.txt) 定义；[公共 catalog](../../skills/README.md) 是 membership 索引。本页按四组连接全部 12 个 Skill 的唯一使用说明位置。
 
 | 能力组 | 使用说明 |
 | --- | --- |
 | 服务运维 | [xp-infra](service-operations.md#xp-infra)、[tavily-hikari-infra](service-operations.md#tavily-hikari-infra)、[dst-dedicated-server](service-operations.md#dst-dedicated-server)、[linux-server-init](service-operations.md#linux-server-init) |
-| Git 与文档 | [git-remote-troubleshoot](git-and-docs.md#git-remote-troubleshoot)、[git-sync](git-and-docs.md#git-sync)、[docs-no-revision-markers](git-and-docs.md#docs-no-revision-markers) |
+| Git 与文档 | [git-remote-troubleshoot](git-and-docs.md#git-remote-troubleshoot)、[git-sync](git-and-docs.md#git-sync)、[docs-no-revision-markers](git-and-docs.md#docs-no-revision-markers)、[markdown-doc-style](git-and-docs.md#markdown-doc-style) |
 | 媒体与固件预览 | [buzzer-audio-preview](media-previews.md#buzzer-audio-preview)、[firmware-display-preview](media-previews.md#firmware-display-preview)、[cvm-imagegen](media-previews.md#cvm-imagegen) |
 | CAD | [step-stl-print-repair](cad-repair.md#step-stl-print-repair) |
 

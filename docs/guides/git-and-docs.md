@@ -54,3 +54,17 @@ git rev-list --left-right --count 'HEAD...<confirmed-local-ref>'
 **输出：**语义路径与主题标题，正文不包含 Draft/WIP、文档编号式修订后缀、修订历史或更新时间元数据。实际 API/product 标识若属于主题内容仍可保留；历史由 Git 管理。
 
 **读写边界：**只编辑授权文档，不自动重命名其它文件或修复全仓内容；若改路径，更新受影响链接。文本审阅不等于应用、CLI 或部署验证。
+
+## markdown-doc-style
+
+**何时使用：**创建、编辑或审阅 Markdown、README、Spec、指南、Skill 文件及同类文档源文本，要求正文自然段保持单一物理行。[Skill source](../../skills/markdown-doc-style/SKILL.md)定义语义单元、语法换行例外、正反例和审查清单。
+
+**平台与前置条件：**任何文本编辑环境，不需要 runtime、外部账户或 native tools。
+
+**配置：**无必需环境变量；先区分普通正文段落与标题、列表、表格、引用、代码块、frontmatter、定义和其它语法承载结构。
+
+**最小例子：**请求 agent：「按 markdown-doc-style 整理 `docs/guides/setup.md` 的源文本；自然段保持单物理行，段落之间保留空行，不按固定列宽折行。」
+
+**输出：**语义单元稳定、段落之间有空行、语法要求的换行保留的 Markdown 源文本；不会为了渲染宽度或 formatter 的 `lineWidth` 机械换行。
+
+**读写边界：**只调整授权文档的源文本排版，不决定内容、项目写作政策、渲染布局、代码格式或 CI/release/architecture 规则；显式的本地格式契约优先，并应保留其必要例外。

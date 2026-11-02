@@ -80,7 +80,7 @@ test("guide entrypoints and contract links resolve to local files and heading an
     }
   }
   const membership = readFileSync(join(repo, "PUBLIC_SKILLS.txt"), "utf8").split("\n").filter((line) => line && !line.startsWith("#"));
-  expect(membership).toHaveLength(11);
+  expect(membership).toHaveLength(12);
   const groups = ["service-operations", "git-and-docs", "media-previews", "cad-repair"]
     .map((name) => readFileSync(join(repo, `docs/guides/${name}.md`), "utf8")).join("\n");
   for (const name of membership) expect(groups.split(`## ${name}\n`)).toHaveLength(2);

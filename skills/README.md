@@ -21,6 +21,7 @@ bun run bin/public_skill_boundary_check.ts
 | `git-remote-troubleshoot` | Diagnose Git remote, authentication, and network failures. | [Skill source](git-remote-troubleshoot/SKILL.md) |
 | `git-sync` | Synchronize local Git branches and confirmed baselines safely. | [Skill source](git-sync/SKILL.md) |
 | `linux-server-init` | Initialize and harden a Linux server through explicit configuration. | [Skill source](linux-server-init/SKILL.md) |
+| `markdown-doc-style` | Keep Markdown and similar document source readable with single-line prose paragraphs and syntax-aware exceptions. | [Skill source](markdown-doc-style/SKILL.md) |
 | `step-stl-print-repair` | Repair and regenerate print-ready STL files from STEP/CAD sources. | [Skill source](step-stl-print-repair/SKILL.md) |
 | `tavily-hikari-infra` | Inspect a configured Tavily Hikari primary/standby deployment read-only. | [Skill source](tavily-hikari-infra/SKILL.md) |
 | `xp-infra` | Validate configured XP self-hosted nodes using explicit private configuration. | [Skill source](xp-infra/SKILL.md) |

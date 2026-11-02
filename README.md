@@ -2,7 +2,7 @@
 
 Agent Toolkit 为 coding 与 automation agents 提供可独立使用的公共 Skills：从 Git 诊断、离线预览，到有明确授权边界的 Linux 与服务操作。消费者直接读取 checkout 中的 Skill 目录或其源链接。
 
-Canonical source 位于 `skills/<name>/`；公共 membership 以 [PUBLIC_SKILLS.txt](PUBLIC_SKILLS.txt) 为准，共 11 个 Skill。[公共目录](skills/README.md)维护 membership 索引，下面的四组入口连接使用指南。指南提供最小示例；完整行为以各 Skill 的 `SKILL.md` 和 contracts 为准。
+Canonical source 位于 `skills/<name>/`；公共 membership 以 [PUBLIC_SKILLS.txt](PUBLIC_SKILLS.txt) 为准，共 12 个 Skill。[公共目录](skills/README.md)维护 membership 索引，下面的四组入口连接使用指南。指南提供最小示例；完整行为以各 Skill 的 `SKILL.md` 和 contracts 为准。
 
 [安装与更新](docs/guides/installation.md) · [全部指南](docs/guides/README.md) · [Protected configuration](docs/guides/configuration.md) · [Validation](#validation) · [Contracts 与架构](docs/guides/README.md#contracts) · [贡献边界](CONTRIBUTING.md)
 
@@ -17,6 +17,7 @@ Canonical source 位于 `skills/<name>/`；公共 membership 以 [PUBLIC_SKILLS.
 | Git 与文档：[git-remote-troubleshoot](docs/guides/git-and-docs.md#git-remote-troubleshoot) | 识别远端、认证、网络失败原因 | Linux/macOS、Git 与既有 SSH/HTTPS 工具；无编程 runtime | 诊断证据与最小修复建议 |
 | Git 与文档：[git-sync](docs/guides/git-and-docs.md#git-sync) | 对比已确认基线、按授权同步本地状态 | Linux/macOS、Git 与已配置 remote；无编程 runtime | ahead/behind、HEAD 与恢复信息 |
 | Git 与文档：[docs-no-revision-markers](docs/guides/git-and-docs.md#docs-no-revision-markers) | 编写稳定语义路径的 timeless 文档 | 文本编辑环境；无 runtime、账户或部署配置 | 不含文档级修订标记的正文 |
+| Git 与文档：[markdown-doc-style](docs/guides/git-and-docs.md#markdown-doc-style) | 维护 Markdown 源文本的段落换行与语法边界 | 文本编辑环境；无 runtime、账户或部署配置 | 语义单元稳定的 Markdown 源文本 |
 | 媒体与固件预览：[buzzer-audio-preview](docs/guides/media-previews.md#buzzer-audio-preview) | 从 JSON 音符确认蜂鸣器节奏 | Linux/macOS、Bun、合法 score | MIDI 与 WAV，不自动播放 |
 | 媒体与固件预览：[firmware-display-preview](docs/guides/media-previews.md#firmware-display-preview) | 将固件 framebuffer 转为 PNG | Linux/macOS、Bun；真实渲染另需 C 编译器、固件入口与资产 | framebuffer、场景源码、PNG |
 | 媒体与固件预览：[cvm-imagegen](docs/guides/media-previews.md#cvm-imagegen) | 显式要求 CLI/API fallback 时生成或编辑图片 | Python、已配置 fallback 模块及其依赖；在线需 endpoint/key 与授权 | dry-run 请求或生成图片 |

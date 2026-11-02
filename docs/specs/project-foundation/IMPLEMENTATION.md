@@ -2,7 +2,7 @@
 
 ## Current Status
 
-Public membership: 11 Skills, defined by [PUBLIC_SKILLS.txt](../../../PUBLIC_SKILLS.txt). The root governance guide and maintained repository checks use the standalone public source with directly executed TypeScript under installed Bun. Buzzer/framebuffer conversion, DST local tooling and the owned Git alignment test use Bun with the helper behavior evidence below; remote Shell, native C rendering, Python CAD/application bindings and text-only production workflows retain their declared boundaries. The language matrix records allocation separately from this implementation coverage. Usage-guide coverage is described under DOC-01..04 below; SITE-01..04 records the Bun/Rspress site implementation and its remaining visual, Linux and publication limits.
+Public membership: 12 Skills, defined by [PUBLIC_SKILLS.txt](../../../PUBLIC_SKILLS.txt). The root governance guide and maintained repository checks use the standalone public source with directly executed TypeScript under installed Bun. Buzzer/framebuffer conversion, DST local tooling and the owned Git alignment test use Bun with the helper behavior evidence below; remote Shell, native C rendering, Python CAD/application bindings and text-only production workflows retain their declared boundaries. The language matrix records allocation separately from this implementation coverage. Usage-guide coverage is described under DOC-01..04 below; SITE-01..04 records the Bun/Rspress site implementation and its remaining visual, Linux and publication limits.
 
 ## Skill Migration Coverage
 
@@ -18,6 +18,7 @@ The statuses below describe language migration coverage, not deployment status. 
 | `git-remote-troubleshoot` | no-runtime | [Text guidance using existing Git/SSH tools](../../../skills/git-remote-troubleshoot/SKILL.md); [Source-link smoke](../../../skills/git-remote-troubleshoot/tests/helper_sources.test.ts) is a Bun maintainer test, not a production CLI or live authentication check. |
 | `git-sync` | migrated | [Text workflow and Bun contract test](../../../skills/git-sync/SKILL.md); [Behavior evidence](../../../skills/git-sync/tests/detached_alignment_contract.test.ts): isolated native Git refs, HEAD, reflog recovery, configuration invariance and blocked actions; no production Git CLI. |
 | `linux-server-init` | no-runtime | [Text guidance](../../../skills/linux-server-init/SKILL.md) |
+| `markdown-doc-style` | no-runtime | [Text guidance](../../../skills/markdown-doc-style/SKILL.md) |
 | `step-stl-print-repair` | retained | [Five Python FreeCAD/Blender/Gmsh application scripts](../../../skills/step-stl-print-repair/SKILL.md); [Binding/source-link inspection](../../../skills/git-remote-troubleshoot/tests/helper_sources.test.ts) checks retained imports only; CAD application execution is unavailable. |
 | `tavily-hikari-infra` | retained | [Bounded Shell helper](../../../skills/tavily-hikari-infra/SKILL.md) |
 | `xp-infra` | deferred | [Shell/Ruby local logic and POSIX probes](../../../skills/xp-infra/SKILL.md) |
@@ -33,11 +34,11 @@ The statuses below describe language migration coverage, not deployment status. 
 
 ### DOC-01..04 guide coverage
 
-公共文档以 [README](../../../README.md)、`CONTRIBUTING.md` 和[指南索引](../../guides/README.md)为入口，沿用 11 个 public Skills 的 canonical source。指南不是第二份行为规范；详细 CLI、policy 与 application 行为继续链接所属 Skill/contracts。
+公共文档以 [README](../../../README.md)、`CONTRIBUTING.md` 和[指南索引](../../guides/README.md)为入口，沿用 12 个 public Skills 的 canonical source。指南不是第二份行为规范；详细 CLI、policy 与 application 行为继续链接所属 Skill/contracts。
 
 | Requirement | 文档入口与实现 | 证据边界 |
 | --- | --- | --- |
-| DOC-01 | README 首屏的四个能力组、全部 11 个可点击 Skill、用途/场景、前置条件和输出；指南索引提供逐 Skill 的唯一目标。 | 对 allowlist、README、guide headings 和 canonical source 做 completeness 与本地路径/锚点静态核对，不推断站点路由。 |
+| DOC-01 | README 首屏的四个能力组、全部 12 个可点击 Skill、用途/场景、前置条件和输出；指南索引提供逐 Skill 的唯一目标。 | 对 allowlist、README、guide headings 和 canonical source 做 completeness 与本地路径/锚点静态核对，不推断站点路由。 |
 | DOC-02 | [安装与更新](../../guides/installation.md)：HTTPS checkout、直接 source links、每个 link 的隐藏 ownership record、带唯一 owner token 的 consumer-root lock、collision、enable/disable、update、上游删除 reconciliation、uninstall；skills-switch 明确为可选外部工具。 | Disposable upstream/consumer 验证直接链接流程；record 同时保存 canonical source path、source 与 link 的设备号/inode。可执行 smoke 对 enable/disable 分别注入已有 lock、运行中 lock 目录替换、未知内容和 token 丢失，断言具体诊断及 lock 身份/内容保留；释放阶段失败不回滚已完成的 link/record 操作。Disable 先将 record 移入 ledger 私有 pending directory，再捕获并核对 link，最终只在已进入的私有目录内 unlink；中断和删除失败可重跑恢复，不留下陈旧 active record。异常被捕获对象保留供人工核对；不保证抵御同身份/高权限外部写入、inode 复用或断电持久性。外部管理器命令只核对帮助，不宣称真实用户 catalog 生命周期已运行。 |
 | DOC-03 | [服务运维](../../guides/service-operations.md)、[Git 与文档](../../guides/git-and-docs.md)、[媒体预览](../../guides/media-previews.md)、[CAD](../../guides/cad-repair.md)：逐 Skill 列出何时使用、平台/前提、配置、最小例子、输出与读写边界。 | 离线例子使用 temporary fixtures；remote/service、可信 imagegen 模块和 CAD/native 应用例子明确所需真实前提与授权，不以 source inspection 代替应用执行。 |
 | DOC-04 | [Protected configuration](../../guides/configuration.md)覆盖 XP、imagegen、Tavily、DST、Linux、Git 与 CAD/native；维护性 source inventory 对照留在 CONTRIBUTING。 | 中性 env/模板路径及公共安全/coupling 检查；不包含私有 inventory、个人路径、凭据或部署观察。 |
@@ -58,7 +59,7 @@ Guides 场景与验证层级如下。当前候选的 OS/runtime、实际运行�
 bun test ./docs/guides/installation.test.ts
 ```
 
-[可执行 smoke](../../guides/installation.test.ts)检查指南与相关 README/contract 的相对链接、锚点、11 个 membership 入口，并在临时目录执行 enable/disable 原文和故障注入。它证明所运行 OS 上的 fixture 行为，不证明另一 OS 或真实消费者安装。
+[可执行 smoke](../../guides/installation.test.ts)检查指南与相关 README/contract 的相对链接、锚点、12 个 membership 入口，并在临时目录执行 enable/disable 原文和故障注入。它证明所运行 OS 上的 fixture 行为，不证明另一 OS 或真实消费者安装。
 
 ### SITE-01..04 implementation and evidence
 
@@ -76,7 +77,7 @@ The independent site project, documented in repository path `site/README.md`, us
 | SITE-01 | `bun install --frozen-lockfile`, `bun run typecheck`, `bun run build`, `bun run check`; development returned HTTP 200; production preview served real static output. Runtime receipts and two fixture builds establish Bun execution with Node disabled for those builds. | Native Linux execution is unavailable. Bun development shutdown emitted native ObjectRef cleanup notices; no browser framework overlay was observed. |
 | SITE-02 | All manifest Skill routes and guide/contract/catalog pages have exact search membership. The checker follows every local built link/anchor/asset and compares canonical code values/frontmatter. Browser observations include Buzzer Audio Preview and configuration. Parent-thread keyboard navigation through the mobile menu also reached the Skills catalog with the correct heading and content. | External canonical URLs are checked for intended repository/ref/path, not every remote response or GitHub edit authorization. |
 | SITE-03 | Production output at `/agent-toolkit/`: 1440×1000 desktop and 393×852 mobile had the expected heading, nonempty content and no horizontal page overflow or framework overlay. Local `buzzer` search returned the Skill and keyboard ArrowDown/Enter navigated to its quick-start anchor. At 393×852, the parent thread verified the visible mobile hamburger → Enter → visible Skills link → Enter path on the same preview, reaching `/agent-toolkit/skills/` with the correct heading and content. Configuration deep-link reload retained its target and neutral placeholder. Captured browser error/warning/exception events were empty. Source/edit links identify canonical files; expected routes return 200 and outside-base/unknown routes return 404. | Controlled desktop/mobile candidate screenshots were captured from the login-free local site. No prior visual baseline or owner acceptance exists, so visual comparison remains pending and the images are not canonical accepted assets. Earlier pointer locators encountered hidden elements or interception; those attempts do not invalidate the verified visible-element keyboard route. Preview was stopped after bounded checks. |
-| SITE-04 | Disposable source fixture: 11 → 10 manifest Skills; the removed Skill source remains on disk while its page, catalog row, navigation and search entry disappear after rebuild. Synthetic private config, inventory, unrelated guide and unlisted Skill content are absent from output. | Only the explicit allowlist is published. Credential-pattern scanning is a regression control with negative controls, not a universal content-classification guarantee. |
+| SITE-04 | Disposable source fixture: 12 → 11 manifest Skills; the removed Skill source remains on disk while its page, catalog row, navigation and search entry disappear after rebuild. Synthetic private config, inventory, unrelated guide and unlisted Skill content are absent from output. | Only the explicit allowlist is published. Credential-pattern scanning is a regression control with negative controls, not a universal content-classification guarantee. |
 | SITE-05 | Workflow YAML assertions enforce read-only PR/manual validation and the identical explicit default-branch condition on artifact packaging and Pages deployment. No deployment secret is referenced. | Static inspection is not PR CI execution or production publication. Remote CI results must be assessed against the actual PR head separately. |
 | SITE-06 | Site reproduction/publication instructions in `site/README.md`, under “Pages publication boundary”, name the exact checkout, frozen dependencies, Bun commands, artifact directory, repository base and post-deployment checks. | Pages setup, environment approvals and live deployment verification remain operator-owned and unexecuted. |
 

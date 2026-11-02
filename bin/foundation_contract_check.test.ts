@@ -64,7 +64,7 @@ test("rejects missing, duplicate, extra, or malformed matrix rows", () => {
 test("rejects stale membership counts in each active contract", () => {
   for (const path of ["SPEC.md", "IMPLEMENTATION.md", "SCRIPT-LANGUAGE-MATRIX.md"]) {
     fixture((root) => {
-      replace(root, `${TOPIC}/${path}`, "Public membership: 11", "Public membership: 13");
+      replace(root, `${TOPIC}/${path}`, "Public membership: 12", "Public membership: 14");
       expect(check(root)).toContain(`FOUNDATION_COUNT_DRIFT ${path}`);
     });
   }

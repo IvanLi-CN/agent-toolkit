@@ -2,7 +2,7 @@
 
 Status: accepted responsibility allocation. This document records current owned source and the accepted target for every public Skill. [SPEC.md](SPEC.md) defines the requirements and verification, and [IMPLEMENTATION.md](IMPLEMENTATION.md) distinguishes completed migrations with behavior evidence from deferred conversions and retained exceptions. An allocation or source link alone does not prove behavioral equivalence or production deployment.
 
-Public membership: 11 Skills, defined by [PUBLIC_SKILLS.txt](../../../PUBLIC_SKILLS.txt). Only manifest-listed Skills receive allocations here; application and remote prerequisites describe their own execution boundaries.
+Public membership: 12 Skills, defined by [PUBLIC_SKILLS.txt](../../../PUBLIC_SKILLS.txt). Only manifest-listed Skills receive allocations here; application and remote prerequisites describe their own execution boundaries.
 
 ## Decision rules
 
@@ -26,6 +26,7 @@ Local Bun follows the installed host runtime; CI follows the latest stable Bun a
 | `git-remote-troubleshoot` | [Text workflow](../../../skills/git-remote-troubleshoot/SKILL.md); [repository-only Bun source-link smoke](../../../skills/git-remote-troubleshoot/tests/helper_sources.test.ts) | No script/runtime | Diagnosis uses the user's existing Git/SSH/platform tools and has no owned production executable. Bun is a maintainer test prerequisite only. |
 | `git-sync` | [Text workflow](../../../skills/git-sync/SKILL.md) and [Bun detached-alignment contract test](../../../skills/git-sync/tests/detached_alignment_contract.test.ts) | Keep the text workflow; TypeScript + Bun for the owned test | The test creates isolated Git fixtures and checks observable command behavior. It adds no production Git CLI or programming-runtime requirement to the text workflow. |
 | `linux-server-init` | Markdown/reference guidance only | No script/runtime | Native administration commands are workflow instructions, not an owned Python or TS application. |
+| `markdown-doc-style` | Markdown source guidance only | No script/runtime | Source-text layout guidance has no owned executable. |
 | `step-stl-print-repair` | Five Python FreeCAD, Blender, and Gmsh scripts listed under Python-specific integrations; [binding/source-link inspection](../../../skills/git-remote-troubleshoot/tests/helper_sources.test.ts) in the repository smoke | Python for all five domain scripts | FreeCAD/Blender run through their application Python APIs; Gmsh has an official Python binding. The inspection does not execute CAD applications or justify a TS launcher or native binding replacement. |
 | `tavily-hikari-infra` | A short Bash inventory/status/log helper | Shell | Direct role selection and SSH command forwarding have little domain-model complexity. A TS or Python application would add a runtime prerequisite without a clear functional benefit. |
 | `xp-infra` | Bash orchestration, Ruby policy/audit interpretation, POSIX remote probes | TypeScript + Bun for local orchestration, policy, normalization, and decisions; POSIX Shell for remote probes | Policy schema, audit observations, identity revalidation, public target validation, and port-preflight conclusions are complex structured logic. Remote probes retain bounded, authorized native observation without requiring Bun on inspected nodes. |

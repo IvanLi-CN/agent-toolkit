@@ -181,3 +181,62 @@ esac
     expect(source).not.toContain('tr "\\\\000" "\\\\n" < "$env_file" > "$env_dump"');
   });
 });
+
+test("selected runtime environment remains compatible with BusyBox awk", async () => {
+  const f = fixture("busybox-awk");
+  const envPath = join(f.dir, "proc/99/environ");
+  writeFileSync(envPath, "XP_NODE_NAME=fixture\0XP_ADMIN_TOKEN=<SECRET_CANARY>\0OTHER=value\0");
+  const sudo = join(f.dir, "bin/sudo");
+  writeFileSync(sudo, '#!/bin/sh\nset -eu\nshift\nexec "$@"\n');
+  chmodSync(sudo, 0o755);
+  const awk = join(f.dir, "bin/awk");
+  writeFileSync(awk, `#!/bin/sh
+set -eu
+key=
+marker=
+program=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -v)
+      assignment="$2"
+      case "$assignment" in
+        key=*) key="\${assignment#key=}" ;;
+        marker=*) marker="\${assignment#marker=}" ;;
+      esac
+      shift 2
+      ;;
+    *) program="$1"; shift; break ;;
+  esac
+done
+case "$program" in
+  *"RS = "*) printf '%s' "$marker" ;;
+  *) exec /usr/bin/awk -v key="$key" -v marker="$marker" "$program" "$@" ;;
+esac
+`);
+  chmodSync(awk, 0o755);
+  const source = readFileSync(join(import.meta.dir, "../scripts/xp-infra-audit-remote"), "utf8");
+  const body = source.slice(source.indexOf("raw_env_payload() {"), source.indexOf("\nstrict_bool_value()"));
+  const helper = source.slice(source.indexOf("bounded_output() ("), source.indexOf("\ndirect_docker_host_environment_absent()"));
+  expect(source).not.toContain('RS = "\\0"');
+  expect(source).not.toContain("env_dump");
+  const script = `set -eu
+${body.replace("/proc/$runtime_pid/environ", envPath)}
+mode=host
+host_xp_pid=99
+${helper}
+MAX_RAW_BYTES=65536
+READ_ERROR_SENTINEL=__READ_FAILED__
+raw_env_payload XP_NODE_NAME __END__
+`;
+  async function selected() {
+    const child = Bun.spawn(["sh", "-s"], { env: f.env, stdin: new Blob([script]), stdout: "pipe", stderr: "pipe" });
+    const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    return { code, out, err };
+  }
+  const good = await selected();
+  expect(good).toEqual({ code: 0, out: "fixture__END__", err: "" });
+  expect(good.out).not.toContain("SECRET_CANARY");
+  writeFileSync(envPath, "XP_NODE_NAME=fixture\0XP_NODE_NAME=other\0");
+  const duplicate = await selected();
+  expect(duplicate).toEqual({ code: 0, out: "__READ_FAILED____END__", err: "" });
+});

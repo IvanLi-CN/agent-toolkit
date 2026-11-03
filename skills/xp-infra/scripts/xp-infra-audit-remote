@@ -190,11 +190,25 @@ raw_env_payload() {
     marker="$3"
     env_file="/proc/$runtime_pid/environ"
     [ -r "$env_file" ] || exit 1
-    awk -v key="$key" -v marker="$marker" '\''
-      BEGIN { RS = "\0" }
+    tr_status_file="$(mktemp)" || exit 1
+    trap '\''rm -f "$tr_status_file"'\'' 0 HUP INT TERM
+    (
+      set +e
+      tr "\\000" "\\n" < "$env_file"
+      tr_status=$?
+      printf "%s\\n" "$tr_status" > "$tr_status_file"
+      exit "$tr_status"
+    ) | awk -v key="$key" -v marker="$marker" '\''
       index($0, key "=") == 1 { count++; value = $0 }
-      END { if (count > 1) exit 1; printf "%s%s", value, marker }
-    '\'' "$env_file"
+      END {
+        if (count > 1) exit 1
+        if (count == 1) printf "%s%s", value, marker
+        else printf "%s", marker
+      }
+    '\''
+    awk_status=$?
+    tr_status="$(cat "$tr_status_file" 2>/dev/null || printf 1)"
+    [ "$awk_status" -eq 0 ] && [ "$tr_status" = 0 ]
   '
   if [ "$mode" = container ]; then
     value="$(bounded_command docker_cmd exec "$container" sh -c "$read_selected" sh "$container_xp_pid" "$key" "$marker" 2>/dev/null)" || {

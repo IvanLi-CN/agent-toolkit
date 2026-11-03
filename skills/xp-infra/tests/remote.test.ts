@@ -317,6 +317,7 @@ esac`);
       stdin: new Blob([source]), stdout: "pipe", stderr: "pipe",
     });
     const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    if (code !== 0) throw new Error(`collector failed with code ${code}; stdout=${out}; stderr=${err}`);
     expect({ code, err }).toEqual({ code: 0, err: "" });
     expect(out).toContain("runtime_mode=host\n");
     expect(out).toContain("ddns_state_json={}\n");

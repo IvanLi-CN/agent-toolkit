@@ -695,12 +695,6 @@ else
   emit_value xray_public_ports ""
 fi
 
-assert_runtime_file_unchanged "$ddns_state_path" "$ddns_state_identity" "$ddns_state_snapshot"
-if [ "$mode" = host ]; then
-  assert_runtime_file_unchanged "$cloudflare_settings_path" "$cloudflare_settings_identity" "$cloudflare_settings_snapshot"
-fi
-assert_runtime_file_unchanged "$managed_default_state_path" "$managed_default_state_identity" "$managed_default_state_snapshot"
-
 if [ "$docker_access" = sudo ]; then
   env_probe_after="$(sudo -n sh -c 'if [ -e "$1" ] || [ -L "$1" ]; then [ -r "$1" ] || exit 2; printf %s readable; else printf %s absent; fi' sh "$env_file" 2>/dev/null)" || exit 1
   [ "$env_probe_after" = "$env_probe" ] || exit 1
@@ -769,3 +763,9 @@ if [ "$env_probe" = absent ]; then
 else
   [ -z "$containers_after" ] || exit 1
 fi
+
+assert_runtime_file_unchanged "$ddns_state_path" "$ddns_state_identity" "$ddns_state_snapshot"
+if [ "$mode" = host ]; then
+  assert_runtime_file_unchanged "$cloudflare_settings_path" "$cloudflare_settings_identity" "$cloudflare_settings_snapshot"
+fi
+assert_runtime_file_unchanged "$managed_default_state_path" "$managed_default_state_identity" "$managed_default_state_snapshot"

@@ -12,17 +12,18 @@ Dry-run mode works without the credential or endpoint. Live mode fails fast when
 
 ## Examples
 
+Run these commands from this Skill directory:
+
 ```bash
-cd skills/cvm-imagegen
 python3 scripts/image_gen.py generate \
-  --prompt "Test" --out output/imagegen/test.png --dry-run
+  --prompt "Test" --out /path/to/output/imagegen/test.png --dry-run
 
 python3 scripts/image_gen.py edit \
-  --image input.png --prompt "Replace the background" \
-  --out output/imagegen/edited.png
+  --image /path/to/input.png --prompt "Replace the background" \
+  --out /path/to/output/imagegen/edited.png
 
 python3 scripts/image_gen.py generate-batch \
-  --input tmp/imagegen/prompts.jsonl --out-dir output/imagegen/batch
+  --input /path/to/tmp/imagegen/prompts.jsonl --out-dir /path/to/output/imagegen/batch
 ```
 
 Reference-guided `generate --image` uses the edit endpoint and accepts repeated input images. Transparent edits require a PNG or WebP output. Existing output paths are protected unless the fallback's explicit force option is supplied.

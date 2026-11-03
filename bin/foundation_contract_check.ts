@@ -42,9 +42,12 @@ const GUIDE_PATH_FILES = [
 type SkillPathRule = { code: string; pattern: RegExp };
 
 const SKILL_PATH_RULES: SkillPathRule[] = [
-  { code: "FIXED_SKILL_CHECKOUT_PATH", pattern: /(?:^|[\s("'])(?:\/|[A-Za-z]:[\\/])[^\s"']*[\\/]skills[\\/][a-z0-9-]+[\\/](?:scripts|assets|references)[\\/]/m },
+  { code: "FIXED_SKILL_CHECKOUT_PATH", pattern: /(?:^|[\s("'])(?:\/|[A-Za-z]:[\\/])[^\s"']*[\\/]skills[\\/][a-z0-9-]+(?:[\\/](?:scripts|assets|references)[\\/]|(?=[\s"'`]|$))/m },
   { code: "SKILL_DIR_ASSIGNMENT", pattern: /^\s*SKILL_DIR\s*=\s*(?:\/|[A-Za-z]:[\\/])/m },
+  { code: "SKILL_DIRECTORY_CHANGE", pattern: /(?:^|[;&|\n])\s*cd\s+(?:--\s+)?skills\/[a-z0-9-]+(?:\s|$)/m },
+  { code: "REPO_ROOT_SKILL_RESOURCE_PATH", pattern: /(?:^|[\s("'`])skills\/[a-z0-9-]+\/(?:assets|references)\//m },
   { code: "REPO_ROOT_SKILL_SCRIPT_PATH", pattern: /(?:^|[\s("'])(?:bun|python3|bash|sh)\s+skills\/[a-z0-9-]+\/scripts\//m },
+  { code: "NON_ROOT_SKILL_SCRIPT_PATH", pattern: /(?:^|[\s("'`])(?:\.\.\/)+scripts\//m },
 ];
 
 function fencedBlocks(text: string): string[] {

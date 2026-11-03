@@ -10,11 +10,10 @@
 
 **配置：**明确当前输入文件、尺寸/单位、打印公差、新输出目录；`CAD_PYTHON` 是此示例选定的、已可加载 Gmsh 的 Python executable，不是仓库安装器。FreeCAD 的 library/Python 路径与 Blender executable 由 operator 的真实安装提供，参考 canonical invocation notes，不猜个人路径或自动安装插件。
 
-**最小例子：**确认 Gmsh 环境和本地几何处理授权后执行：
+**最小例子：**确认 Gmsh 环境和本地几何处理授权后，进入 `step-stl-print-repair` 的 Skill 根目录执行：
 
 ```bash
 CAD_PYTHON=/path/to/gmsh-python
-cd skills/step-stl-print-repair
 "$CAD_PYTHON" scripts/gmsh_step_to_stl.py \
   /path/to/model.step /path/to/fresh-output/model.stl \
   --mesh-size 0.25 --report /path/to/fresh-output/report.json

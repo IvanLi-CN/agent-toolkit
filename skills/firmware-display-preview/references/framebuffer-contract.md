@@ -1,6 +1,6 @@
 # Framebuffer conversion contract
 
-Run `bun scripts/fb_to_png.ts --format FORMAT --width W --height H --in framebuffer.bin --out preview.png` from this Skill, or pass the absolute source entrypoint from any working directory. `--help` prints all switches. Invalid input exits 2 with `error:` on stderr before a PNG write. The output parent directory must already exist. Width and height are positive safe integers with at most 50000000 pixels. Extra trailing input bytes are ignored; short input fails. Allocation limits and invalid enum values fail with a diagnostic.
+Run `bun scripts/fb_to_png.ts --format FORMAT --width W --height H --in framebuffer.bin --out preview.png` from this Skill directory. The entrypoint does not use the caller's working directory to locate its own source. `--help` prints all switches. Invalid input exits 2 with `error:` on stderr before a PNG write. The output parent directory must already exist. Width and height are positive safe integers with at most 50000000 pixels. Extra trailing input bytes are ignored; short input fails. Allocation limits and invalid enum values fail with a diagnostic.
 
 | Format | Input layout | Output |
 | --- | --- | --- |

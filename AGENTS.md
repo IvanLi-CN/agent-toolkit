@@ -43,6 +43,8 @@ It is not required for ordinary standalone checkout validation.
 
 Use direct repository-relative links and neutral placeholders in public content. Do not add credentials, real hostnames, personal filesystem paths, private runtime/task integration, copied consumer Skills, or resident synchronization services. Python, C, and POSIX Shell remain allowed only where the public language matrix records a concrete application, native-rendering, or remote-observation boundary.
 
+Skill-owned scripts must resolve bundled modules, assets, and sibling helpers from their own source location rather than the caller's current working directory. Skill examples run from the Skill directory with relative `scripts/...` paths; user inputs, outputs, operator configuration, and remote system paths remain explicit external values.
+
 Changes to a CLI, protocol, lifecycle rule, durable state, or configuration schema must update its public contract and behavior tests in the same change. Keep one active implementation per executable responsibility and remove a replaced public check rather than leaving two entrypoints active.
 
 ## Contract anchors

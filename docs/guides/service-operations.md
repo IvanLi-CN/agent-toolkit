@@ -15,8 +15,9 @@
 **最小例子：**从 checkout 调用实际入口；help 完全离线，policy check 只读取私有配置：
 
 ```bash
-/path/to/agent-toolkit/skills/xp-infra/scripts/xp-infra --help
-/path/to/agent-toolkit/skills/xp-infra/scripts/xp-infra policy check
+cd skills/xp-infra
+scripts/xp-infra --help
+scripts/xp-infra policy check
 ```
 
 已授权远端观察时再执行 `xp-infra port preflight '<configured-alias>'`、`xp-infra audit '<configured-alias>'`，使用上例完整入口路径。Alias 必须注册且唯一，不选择“恰好能连通”的其他节点。
@@ -36,8 +37,9 @@
 **最小例子：**help 不联网；配置并获准远端只读观察后运行 status：
 
 ```bash
-bash /path/to/agent-toolkit/skills/tavily-hikari-infra/scripts/tavily-hikari-infra --help
-bash /path/to/agent-toolkit/skills/tavily-hikari-infra/scripts/tavily-hikari-infra status primary
+cd skills/tavily-hikari-infra
+bash scripts/tavily-hikari-infra --help
+bash scripts/tavily-hikari-infra status primary
 ```
 
 **输出：**inventory 解析后的 SSH 连接字段、指定角色的 status 或日志；`logs standby --tail 200` 将 tail 参数交给 operator 配置的命令，operator 必须保证命令只读且输出有界。Inventory 也会暴露解析地址，分享前脱敏。
@@ -55,10 +57,10 @@ bash /path/to/agent-toolkit/skills/tavily-hikari-infra/scripts/tavily-hikari-inf
 **最小例子：**下面只读本地选定目录，不访问服务器：
 
 ```bash
-SKILL_DIR=/path/to/agent-toolkit/skills/dst-dedicated-server
-bun "$SKILL_DIR/scripts/dst_snapshot.ts" --no-remote \
+cd skills/dst-dedicated-server
+bun scripts/dst_snapshot.ts --no-remote \
   --local-dir /path/to/client-data --out /path/to/fresh-output/snapshot.md
-bun "$SKILL_DIR/scripts/dst_mods_from_modoverrides.ts" --cluster-dir /path/to/Cluster_1
+bun scripts/dst_mods_from_modoverrides.ts --cluster-dir /path/to/Cluster_1
 ```
 
 **输出：**一个 Markdown metadata 报告及路径；mod summary 在 stdout 打印 Workshop IDs、状态计数与 shard 差异，不执行 Lua。Snapshot 的 partial warning/exit 0 只表示报告写入成功，不证明远端采集成功。

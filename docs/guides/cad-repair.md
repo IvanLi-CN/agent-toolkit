@@ -14,7 +14,8 @@
 
 ```bash
 CAD_PYTHON=/path/to/gmsh-python
-"$CAD_PYTHON" /path/to/agent-toolkit/skills/step-stl-print-repair/scripts/gmsh_step_to_stl.py \
+cd skills/step-stl-print-repair
+"$CAD_PYTHON" scripts/gmsh_step_to_stl.py \
   /path/to/model.step /path/to/fresh-output/model.stl \
   --mesh-size 0.25 --report /path/to/fresh-output/report.json
 ```

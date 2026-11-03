@@ -44,9 +44,9 @@ The converter runs directly under installed Bun on Linux/macOS with no third-par
 
 ```bash
 mkdir -p tools/display_preview
-SKILL_DIR=/path/to/agent-toolkit/skills/firmware-display-preview
-cp "$SKILL_DIR/assets/host_c/scene.c" tools/display_preview/scene.c
-cp "$SKILL_DIR/assets/host_c/preview_main.c" tools/display_preview/main.c
+cd skills/firmware-display-preview
+cp assets/host_c/scene.c ../../tools/display_preview/scene.c
+cp assets/host_c/preview_main.c ../../tools/display_preview/main.c
 ```
 
 ### 3) 转成 `preview.png`
@@ -56,7 +56,8 @@ cp "$SKILL_DIR/assets/host_c/preview_main.c" tools/display_preview/main.c
 #### SSD1306（1bpp，page layout）
 
 ```bash
-bun "$SKILL_DIR/scripts/fb_to_png.ts" \
+cd skills/firmware-display-preview
+bun scripts/fb_to_png.ts \
   --format ssd1306 \
   --width 128 \
   --height 64 \
@@ -67,7 +68,8 @@ bun "$SKILL_DIR/scripts/fb_to_png.ts" \
 #### RGB565（16bpp，行优先）
 
 ```bash
-bun "$SKILL_DIR/scripts/fb_to_png.ts" \
+cd skills/firmware-display-preview
+bun scripts/fb_to_png.ts \
   --format rgb565 \
   --endian le \
   --width 240 \

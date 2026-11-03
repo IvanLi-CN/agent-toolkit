@@ -13,14 +13,15 @@ Dry-run mode works without the credential or endpoint. Live mode fails fast when
 ## Examples
 
 ```bash
-python3 skills/cvm-imagegen/scripts/image_gen.py generate \
+cd skills/cvm-imagegen
+python3 scripts/image_gen.py generate \
   --prompt "Test" --out output/imagegen/test.png --dry-run
 
-python3 skills/cvm-imagegen/scripts/image_gen.py edit \
+python3 scripts/image_gen.py edit \
   --image input.png --prompt "Replace the background" \
   --out output/imagegen/edited.png
 
-python3 skills/cvm-imagegen/scripts/image_gen.py generate-batch \
+python3 scripts/image_gen.py generate-batch \
   --input tmp/imagegen/prompts.jsonl --out-dir output/imagegen/batch
 ```
 

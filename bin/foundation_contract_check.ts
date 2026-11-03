@@ -2,7 +2,7 @@
 /** Validate relationships between the public foundation contracts and CI. */
 
 import { join, resolve } from "node:path";
-import { isDirectRegularFile, isPathInside, readText, REPO_ROOT } from "./repo_util.ts";
+import { isDirectRegularFile, isPathInside, readText, relativePath, REPO_ROOT, walkFiles } from "./repo_util.ts";
 import { publicSkills, PUBLIC_SKILL_NAME_PATTERN, repositorySkills } from "./public_skill_boundary_check.ts";
 import { check as checkIndex, indexEntries } from "./skills_index_check.ts";
 import { check as checkSpec } from "./spec_contract_check.ts";
@@ -33,6 +33,53 @@ function skillNames(rows: string[][]): string[] {
   return rows.map((row) => /^`([a-z0-9-]+)`$/.exec(row[0] ?? "")?.[1] ?? "<invalid>");
 }
 
+const GUIDE_PATH_FILES = [
+  "docs/guides/service-operations.md",
+  "docs/guides/media-previews.md",
+  "docs/guides/cad-repair.md",
+];
+
+type SkillPathRule = { code: string; pattern: RegExp };
+
+const SKILL_PATH_RULES: SkillPathRule[] = [
+  { code: "FIXED_SKILL_CHECKOUT_PATH", pattern: /(?:^|[\s("'])(?:\/|[A-Za-z]:[\\/])[^\s"']*[\\/]skills[\\/][a-z0-9-]+[\\/](?:scripts|assets|references)[\\/]/m },
+  { code: "SKILL_DIR_ASSIGNMENT", pattern: /^\s*SKILL_DIR\s*=\s*(?:\/|[A-Za-z]:[\\/])/m },
+  { code: "REPO_ROOT_SKILL_SCRIPT_PATH", pattern: /(?:^|[\s("'])(?:bun|python3|bash|sh)\s+skills\/[a-z0-9-]+\/scripts\//m },
+];
+
+function fencedBlocks(text: string): string[] {
+  const blocks: string[] = [];
+  let open = false;
+  let body: string[] = [];
+  for (const line of text.split("\n")) {
+    if (/^\s*```/.test(line)) {
+      if (open) blocks.push(body.join("\n"));
+      open = !open;
+      body = [];
+    } else if (open) {
+      body.push(line);
+    }
+  }
+  return blocks;
+}
+
+export function checkSkillCommandPaths(repoRoot: string, names: string[]): string[] {
+  const files = names.flatMap((name) => walkFiles(join(repoRoot, "skills", name))).filter((path) => path.endsWith(".md"));
+  files.push(...GUIDE_PATH_FILES.map((path) => join(repoRoot, path)));
+  const findings: string[] = [];
+  for (const file of files) {
+    if (!isPathInside(repoRoot, file) || !isDirectRegularFile(file)) {
+      throw new Error(`not a regular repository file: ${relativePath(file, repoRoot)}`);
+    }
+    for (const block of fencedBlocks(readText(file))) {
+      for (const rule of SKILL_PATH_RULES) {
+        if (rule.pattern.test(block)) findings.push(`FOUNDATION_SKILL_PATH_DRIFT ${relativePath(file, repoRoot)} ${rule.code}`);
+      }
+    }
+  }
+  return findings;
+}
+
 type Workflow = {
   on?: Record<string, unknown>;
   permissions?: Record<string, unknown>;
@@ -60,6 +107,7 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
       return ["INVALID_FOUNDATION_MEMBERSHIP"];
     }
     if (!sameMembers([...repositorySkills(repoRoot)], names)) findings.push("FOUNDATION_SOURCE_MEMBERSHIP_DRIFT");
+    findings.push(...checkSkillCommandPaths(repoRoot, names));
     load("skills/README.md");
     findings.push(...checkIndex(repoRoot));
     const entries = indexEntries(join(repoRoot, "skills/README.md"));

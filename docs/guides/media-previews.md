@@ -13,9 +13,9 @@
 **最小例子：**直接读取随 Skill 提供的 score，在工作目录生成产物：
 
 ```bash
-SKILL_DIR=/path/to/agent-toolkit/skills/buzzer-audio-preview
-bun "$SKILL_DIR/scripts/buzzer_preview.ts" \
-  --in "$SKILL_DIR/assets/score.example.json" --out-dir ./fresh-audio
+cd skills/buzzer-audio-preview
+bun scripts/buzzer_preview.ts \
+  --in assets/score.example.json --out-dir ./fresh-audio
 ```
 
 **输出：**按输入 basename 命名的 `.mid` 与 `.wav`。选择该路径会生成 `score.example.mid`、`score.example.wav`。
@@ -33,7 +33,8 @@ bun "$SKILL_DIR/scripts/buzzer_preview.ts" \
 **最小例子：**对已知 128×64 SSD1306 page-layout 输入运行离线转换：
 
 ```bash
-bun /path/to/agent-toolkit/skills/firmware-display-preview/scripts/fb_to_png.ts \
+cd skills/firmware-display-preview
+bun scripts/fb_to_png.ts \
   --format ssd1306 --width 128 --height 64 \
   --in /path/to/framebuffer.bin --out /path/to/fresh-output/preview.png
 ```
@@ -53,8 +54,9 @@ bun /path/to/agent-toolkit/skills/firmware-display-preview/scripts/fb_to_png.ts 
 **最小例子：**已有可信 fallback 时以 dry-run 检查请求，无 endpoint/key 要求且不发网络请求：
 
 ```bash
+cd skills/cvm-imagegen
 AGENT_IMAGEGEN_SYSTEM_PATH=/path/to/trusted/image_gen.py \
-  python3 /path/to/agent-toolkit/skills/cvm-imagegen/scripts/image_gen.py generate \
+  python3 scripts/image_gen.py generate \
   --prompt 'A small mountain cabin' --out /path/to/fresh-output/cabin.png --dry-run
 ```
 

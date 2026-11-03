@@ -12,6 +12,8 @@
 
 公共内容使用仓库相对链接和中性占位符。禁止提交真实凭据、私有域名/地址、个人路径、生产 inventory、运行态、消费者副本或私有 task/runtime 集成。Protected configuration 保存在仓库外；`.gitignore` 本身不能保护已跟踪文件或阻止无意上传。公开报告前须脱敏路径、SSH 输出、日志、请求与响应。
 
+Skill-owned scripts resolve bundled modules, assets, and sibling helpers from their own source location rather than the caller's current working directory. Skill examples run from the Skill directory with relative `scripts/...` paths; user inputs, outputs, operator configuration, and remote system paths remain explicit external values.
+
 ## Validation
 
 执行 [README 的完整验证命令](README.md#validation)，使用已安装 Bun，不额外选择固定 runtime。开发依赖通过 `bun install --frozen-lockfile` 安装；完整 Skill 测试还需要 [requirements-dev.txt](requirements-dev.txt)、Ruby 标准 YAML 库及测试要求的原生工具。领域运行另需匹配的应用环境或远端配置，不要为让 root checks 通过而安装或接触生产服务。

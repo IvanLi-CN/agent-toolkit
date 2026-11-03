@@ -22,7 +22,8 @@ All three values are explicit. Dry-run validation does not require the key or en
 export AGENT_IMAGEGEN_SYSTEM_PATH=/path/to/image_gen.py
 export CVM_BASE_URL=https://api.example.invalid/v1
 export CVM_API_KEY=provided-out-of-band
-python3 skills/cvm-imagegen/scripts/image_gen.py generate \
+cd skills/cvm-imagegen
+python3 scripts/image_gen.py generate \
   --prompt "A cozy alpine cabin at dawn" \
   --out output/imagegen/cabin.png
 ```

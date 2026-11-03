@@ -20,14 +20,14 @@ Use installed Bun on Linux or macOS; no Python or third-party MIDI/audio library
 1) 复制示例输入：
 
 ```bash
-SKILL_DIR=/path/to/agent-toolkit/skills/buzzer-audio-preview
-cp "$SKILL_DIR/assets/score.example.json" ./score.json
+cd skills/buzzer-audio-preview
+cp assets/score.example.json ./score.json
 ```
 
 2) 生成 `MIDI + WAV`：
 
 ```bash
-bun "$SKILL_DIR/scripts/buzzer_preview.ts" \
+bun scripts/buzzer_preview.ts \
   --in ./score.json \
   --out-dir ./out
 ```

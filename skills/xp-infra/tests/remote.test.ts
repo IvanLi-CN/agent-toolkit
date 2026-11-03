@@ -312,18 +312,27 @@ esac`);
       .replace("env_file=/etc/xp/xp.env", `env_file='${envPath}'`)
       .replace("/etc/xp-ops/cloudflare_tunnel/settings.json", settingsPath)
       .replace("/proc/$runtime_pid/environ", procEnvironment);
-    const child = Bun.spawn(["sh", "-s", "--", "false", "true"], {
-      env: { ...process.env, PATH: `${join(dir, "bin")}:/usr/bin:/bin` },
-      stdin: new Blob([source]), stdout: "pipe", stderr: "pipe",
-    });
-    const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
-    if (code !== 0) throw new Error(`collector failed with code ${code}; stdout=${out}; stderr=${err}`);
-    expect({ code, err }).toEqual({ code: 0, err: "" });
-    expect(out).toContain("runtime_mode=host\n");
-    expect(out).toContain("ddns_state_json={}\n");
-    expect(out).toContain("cloudflare_settings_json={}\n");
-    expect(out).toContain("managed_default_state_json={}\n");
-    expect(out).toContain("xray_public_ports=443\n");
+    async function runCollector() {
+      const child = Bun.spawn(["sh", "-s", "--", "false", "true"], {
+        env: { ...process.env, PATH: `${join(dir, "bin")}:/usr/bin:/bin` },
+        stdin: new Blob([source]), stdout: "pipe", stderr: "pipe",
+      });
+      const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      return { code, out, err };
+    }
+    const result = await runCollector();
+    if (result.code !== 0) throw new Error(`collector failed with code ${result.code}; stdout=${result.out}; stderr=${result.err}`);
+    expect(result).toMatchObject({ code: 0, err: "" });
+    expect(result.out).toContain("runtime_mode=host\n");
+    expect(result.out).toContain("ddns_state_json={}\n");
+    expect(result.out).toContain("cloudflare_settings_json={}\n");
+    expect(result.out).toContain("managed_default_state_json={}\n");
+    expect(result.out).toContain("xray_public_ports=443\n");
+    writeFileSync(join(dataDir, "ddns_state.json"), Buffer.from('{"snapshot":{"status":"up"}\0}', "binary"));
+    const nul = await runCollector();
+    expect(nul.code).toBe(1);
+    expect(nul.err).toBe("");
+    expect(nul.out).not.toContain("ddns_state_json=");
   }, 20000);
 });
 

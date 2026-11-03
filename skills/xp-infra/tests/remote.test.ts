@@ -217,6 +217,7 @@ esac
   const source = readFileSync(join(import.meta.dir, "../scripts/xp-infra-audit-remote"), "utf8");
   const body = source.slice(source.indexOf("raw_env_payload() {"), source.indexOf("\nstrict_bool_value()"));
   const helper = source.slice(source.indexOf("bounded_output() ("), source.indexOf("\ndirect_docker_host_environment_absent()"));
+  expect(source).toContain('tr "\\\\n\\\\000" "\\\\001\\\\n" < "$env_file"');
   expect(source).not.toContain('RS = "\\0"');
   expect(source).not.toContain("env_dump");
   const script = `set -eu
@@ -239,4 +240,10 @@ raw_env_payload XP_NODE_NAME __END__
   writeFileSync(envPath, "XP_NODE_NAME=fixture\0XP_NODE_NAME=other\0");
   const duplicate = await selected();
   expect(duplicate).toEqual({ code: 0, out: "__READ_FAILED____END__", err: "" });
+  writeFileSync(envPath, "OTHER=x\nXP_NODE_NAME=attacker\0XP_NODE_NAME=fixture\0");
+  const injected = await selected();
+  expect(injected).toEqual({ code: 0, out: "fixture__END__", err: "" });
+  writeFileSync(envPath, "XP_NODE_NAME=fixture\nattacker\0");
+  const embeddedNewline = await selected();
+  expect(embeddedNewline).toEqual({ code: 0, out: "__READ_FAILED____END__", err: "" });
 });

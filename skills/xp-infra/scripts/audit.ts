@@ -39,6 +39,8 @@ export function normalizeBasic(text: string, now = Date.now()): Observation {
   const intervalValue = fastUntil !== undefined && fastUntil > now ? r.ddns_fast_interval : monitor && monitor !== "none" ? r.ddns_monitored_interval : r.ddns_unmonitored_interval;
   const interval = intervalValue === "" ? (fastUntil !== undefined && fastUntil > now ? 30 : monitor && monitor !== "none" ? 300 : 60) : Math.min(integer(intervalValue, 0, Number.MAX_SAFE_INTEGER, "DDNS interval"), 3600);
   const lastSync = ddnsEnabled ? timestamp(snapshot.last_sync_at, "last_sync_at") : undefined;
+  const lastError = snapshot.last_error;
+  ensure(lastError == null || typeof lastError === "string", "invalid DDNS last_error");
   // XP marks the round up when at least one address family synced; last_error retains nonfatal family diagnostics.
   const ddnsOk = ddnsEnabled && lastSync !== undefined && lastSync <= now && now - lastSync <= interval * 2000 + 60000 && snapshot.status === "up";
   const geoEnabled = explicitBoolean(r.geo_enabled, "geo_enabled", false);

@@ -194,14 +194,17 @@ raw_env_payload() {
     trap '\''rm -f "$tr_status_file"'\'' 0 HUP INT TERM
     (
       set +e
-      tr "\\000" "\\n" < "$env_file"
+      # Encode original LF as SOH before mapping NUL to the awk record separator;
+      # otherwise a newline inside an environment value can become a fake entry.
+      tr "\\n\\000" "\\001\\n" < "$env_file"
       tr_status=$?
       printf "%s\\n" "$tr_status" > "$tr_status_file"
       exit "$tr_status"
     ) | awk -v key="$key" -v marker="$marker" '\''
+      BEGIN { invalid = sprintf("%c", 1) }
       index($0, key "=") == 1 { count++; value = $0 }
       END {
-        if (count > 1) exit 1
+        if (count > 1 || count == 1 && index(value, invalid) > 0) exit 1
         if (count == 1) printf "%s%s", value, marker
         else printf "%s", marker
       }

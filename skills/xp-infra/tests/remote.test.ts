@@ -247,3 +247,28 @@ raw_env_payload XP_NODE_NAME __END__
   const embeddedNewline = await selected();
   expect(embeddedNewline).toEqual({ code: 0, out: "__READ_FAILED____END__", err: "" });
 });
+
+test("remote JSON records preserve formatting whitespace and reject literal string newlines", async () => {
+  const source = readFileSync(join(import.meta.dir, "../scripts/xp-infra-audit-remote"), "utf8");
+  const body = source.slice(source.indexOf("compact_json() {"), source.indexOf("\nstrict_env_value()"));
+  const script = `set -eu
+${body}
+READ_ERROR_SENTINEL=__READ_FAILED__
+value="$1"
+emit_value ddns_state_json "$value"
+`;
+  async function emit(value: string) {
+    const child = Bun.spawn(["sh", "-s", "--", value], { env: { PATH: "/usr/bin:/bin" }, stdin: new Blob([script]), stdout: "pipe", stderr: "pipe" });
+    const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    return { code, out, err };
+  }
+  const pretty = await emit(`{
+  "snapshot": {
+    "status": "up"
+  }
+}`);
+  expect(pretty.code).toBe(0);
+  expect(pretty.out).toContain("ddns_state_json={");
+  expect(pretty.out).not.toContain("{\n");
+  expect(await emit('{"snapshot":{"last_error":"bad\nvalue"}}')).toEqual({ code: 1, out: "", err: "" });
+});

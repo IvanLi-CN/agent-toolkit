@@ -58,6 +58,15 @@ test("XP-05 fake SSH end-to-end private audit passes and failed/duplicate eviden
   writeFileSync(join(dir, "response"), readFileSync(join(dir, "response"), "utf8") + "xp_service=true\n");
   const duplicate = await run(dir, ["audit", "fixture-node"]); expect(duplicate.code).not.toBe(0); expect(duplicate.out).not.toContain("audit: OK");
 });
+test("XP-05 partial DDNS family failure remains healthy and emits a sanitized diagnostic", async () => {
+  const dir = fixture();
+  writeFileSync(join(dir, "response"), readFileSync(join(dir, "response"), "utf8").replace('"last_error":""', '"last_error":"ddns ipv6 probe failed"'));
+  const result = await run(dir, ["audit", "fixture-node"]);
+  expect(result.code).toBe(0);
+  expect(result.out).toContain("PASS cloudflare_ddns");
+  expect(result.out).toContain("INFO cloudflare_ddns_family_diagnostic=present");
+  expect(result.out).toContain("audit: OK (fixture-node)");
+});
 test("XP-05 secret canaries in unrelated fields and diagnostics are never reported", async () => {
   const dir = fixture();
   writeFileSync(join(dir, "response"), readFileSync(join(dir, "response"), "utf8") + "administrator_token=<SECRET_CANARY_TOKEN>\n");

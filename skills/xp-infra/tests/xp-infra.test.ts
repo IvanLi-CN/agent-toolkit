@@ -69,7 +69,9 @@ describe("VER-FOUNDATION-XP-02 strict inputs and normalization", () => {
     const ddnsState = JSON.stringify({ snapshot: {
       last_sync_at: "2025-12-31T23:59:30Z", status: "up", last_error: "ddns ipv6 probe failed", fast_mode_until: null,
     } });
-    expect(normalizeBasic(basic({ ddns_state_json: ddnsState }), now).cloudflare_ddns).toBe(true);
+    const observed = normalizeBasic(basic({ ddns_state_json: ddnsState }), now);
+    expect(observed.cloudflare_ddns).toBe(true);
+    expect(observed.cloudflare_ddns_diagnostic).toBe(true);
   });
   test("DDNS rejects malformed diagnostic types", () => {
     for (const last_error of [false, 123, {}, []]) {

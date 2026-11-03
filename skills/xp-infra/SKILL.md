@@ -9,7 +9,7 @@ Use this Skill for XP node initialization, deployment, cluster joins, upgrades a
 
 ## Entrypoints and prerequisites
 
-Run [scripts/xp-infra](scripts/xp-infra) directly with the Bun installed on the operator machine. Local policy, normalization, port selection and audit decisions run in TypeScript/Bun; local commands require neither Ruby nor Python. Native `ssh` provides transport and `curl` provides operator-side HTTPS probes. The inspected Linux node needs no Bun installation: retained POSIX probes use native privilege/service tools, `/proc`, `awk`, GNU-compatible `dd` with `iflag=fullblock`, and `timeout` for port discovery. See [the CLI contract](references/cli.md) for exact input, output, limits and failure behavior, and [the runbook](references/runbook.md) for operating and verification steps.
+Run [scripts/xp-infra](scripts/xp-infra) directly with the Bun installed on the operator machine. Local policy, normalization, port selection and audit decisions run in TypeScript/Bun; local commands require neither Ruby nor Python. Native `ssh` provides transport and `curl` provides operator-side HTTPS probes. The inspected Linux node needs no Bun installation: retained POSIX probes use native privilege/service tools, `/proc`, `awk`, `stat`, GNU-compatible `dd` with `iflag=fullblock`, and `timeout` for port discovery. See [the CLI contract](references/cli.md) for exact input, output, limits and failure behavior, and [the runbook](references/runbook.md) for operating and verification steps.
 
 ## Policy and safety
 

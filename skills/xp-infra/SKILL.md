@@ -15,7 +15,7 @@ Run [scripts/xp-infra](scripts/xp-infra) directly with the Bun installed on the 
 
 Read the private policy configured by `XP_POLICY_FILE` before any deployment or join. A missing, unconfirmed or incomplete policy blocks mutation. The default policy requires the configured public ingress, DDNS/Geo features and managed endpoint; an exception needs an explicit owner decision and an auditable reason. SS2022 remains disabled unless separately approved.
 
-The helper and audit scripts are read-only. They must fail closed on missing or ambiguous data, never choose another node or port because it is available, and never read administrator tokens. Any future mutating command requires an explicit `--yes` and separate authorization.
+The helper and audit scripts are read-only. They must fail closed on missing or ambiguous data, never choose another node or port because it is available, and never read administrator tokens. Any mutating command must use its documented confirmation mechanism and separate owner authorization: pass `--yes` only when that command exposes it. When the documented command has no `--yes`, require the completed policy and preflight gates and the exact documented command; never invent a flag or substitute Web/API/manual execution.
 
 ## Configuration
 

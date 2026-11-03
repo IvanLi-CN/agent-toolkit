@@ -363,7 +363,9 @@ runtime_file_snapshot /var/lib/xp/data/ddns_state.json
 expected_identity="$snapshot_identity"
 expected="$snapshot_value"
 state='2:11=snapshot-after'
-assert_runtime_file_unchanged /var/lib/xp/data/ddns_state.json "$expected_identity" "$expected"
+runtime_file_snapshot /var/lib/xp/data/ddns_state.json
+[ "$snapshot_identity" = "$expected_identity" ]
+[ "$snapshot_value" = "$expected" ]
 `;
   const child = Bun.spawn(["sh", "-s"], { env: { PATH: "/usr/bin:/bin" }, stdin: new Blob([script]), stdout: "pipe", stderr: "pipe" });
   const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);

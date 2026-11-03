@@ -418,12 +418,12 @@ runtime_file_capture() {
     if [ -e "$path" ] || [ -L "$path" ]; then
       [ -r "$path" ] || exit 2
       exec 3<"$path" || exit 1
-      file_identity="$(stat -c "%d:%i" /proc/self/fd/3 2>/dev/null)" || exit 1
-      path_identity="$(stat -c "%d:%i" "$path" 2>/dev/null)" || exit 1
+      file_identity="$(stat -L -c "%d:%i" /proc/self/fd/3 2>/dev/null)" || exit 1
+      path_identity="$(stat -L -c "%d:%i" "$path" 2>/dev/null)" || exit 1
       [ "$file_identity" = "$path_identity" ] || exit 1
       printf "%s=" "$file_identity"
       cat <&3 || exit 1
-      path_identity_after="$(stat -c "%d:%i" "$path" 2>/dev/null)" || exit 1
+      path_identity_after="$(stat -L -c "%d:%i" "$path" 2>/dev/null)" || exit 1
       [ "$file_identity" = "$path_identity_after" ] || exit 1
       printf "%s" "$marker"
     else
@@ -457,13 +457,96 @@ runtime_file_snapshot() {
   esac
 }
 
-assert_runtime_file_unchanged() {
-  expected_path="$1"
-  expected_identity="$2"
-  expected_value="$3"
-  runtime_file_snapshot "$expected_path" || exit 1
-  [ "$snapshot_identity" = "$expected_identity" ] || exit 1
-  [ "$snapshot_value" = "$expected_value" ] || exit 1
+assert_runtime_files_unchanged() {
+  ddns_path="$1"
+  ddns_identity="$2"
+  ddns_value="$3"
+  cloudflare_path="$4"
+  cloudflare_identity="$5"
+  cloudflare_value="$6"
+  managed_path="$7"
+  managed_identity="$8"
+  managed_value="$9"
+  runtime_files_command='
+    marker=__xp_infra_runtime_file_end__
+    read_fd() {
+      fd="$1"
+      case "$fd" in
+        3) cat <&3 ;;
+        4) cat <&4 ;;
+        5) cat <&5 ;;
+        6) cat <&6 ;;
+        *) exit 1 ;;
+      esac
+    }
+    open_fd() {
+      fd="$1"
+      path="$2"
+      case "$fd" in
+        3) exec 3<"$path" ;;
+        4) exec 4<"$path" ;;
+        5) exec 5<"$path" ;;
+        6) exec 6<"$path" ;;
+        *) exit 1 ;;
+      esac
+    }
+    check_file() {
+      path="$1"
+      expected_identity="$2"
+      expected_value="$3"
+      fd="$4"
+      [ "$path" = - ] && return 0
+      if [ "$expected_identity" = absent ]; then
+        [ ! -e "$path" ] && [ ! -L "$path" ] || exit 1
+        return 0
+      fi
+      [ -e "$path" ] || [ -L "$path" ] || exit 1
+      [ -r "$path" ] || exit 1
+      open_fd "$fd" "$path" || exit 1
+      file_identity="$(stat -L -c "%d:%i" "/proc/self/fd/$fd" 2>/dev/null)" || exit 1
+      path_identity="$(stat -L -c "%d:%i" "$path" 2>/dev/null)" || exit 1
+      [ "$file_identity" = "$expected_identity" ] || exit 1
+      [ "$path_identity" = "$expected_identity" ] || exit 1
+      if ! payload="$(read_fd "$fd"; read_status=$?; [ "$read_status" -eq 0 ] || exit "$read_status"; printf "%s" "$marker")"; then exit 1; fi
+      case "$payload" in *"$marker") value="${payload%"$marker"}" ;; *) exit 1 ;; esac
+      [ "$value" = "$expected_value" ] || exit 1
+      path_identity_after="$(stat -L -c "%d:%i" "$path" 2>/dev/null)" || exit 1
+      [ "$path_identity_after" = "$expected_identity" ] || exit 1
+    }
+    recheck_file() {
+      path="$1"
+      expected_identity="$2"
+      expected_value="$3"
+      [ "$path" = - ] && return 0
+      if [ "$expected_identity" = absent ]; then
+        [ ! -e "$path" ] && [ ! -L "$path" ] || exit 1
+        return 0
+      fi
+      [ -e "$path" ] || [ -L "$path" ] || exit 1
+      [ -r "$path" ] || exit 1
+      open_fd 6 "$path" || exit 1
+      file_identity="$(stat -L -c "%d:%i" /proc/self/fd/6 2>/dev/null)" || exit 1
+      path_identity="$(stat -L -c "%d:%i" "$path" 2>/dev/null)" || exit 1
+      [ "$file_identity" = "$expected_identity" ] || exit 1
+      [ "$path_identity" = "$expected_identity" ] || exit 1
+      if ! payload="$(read_fd 6; read_status=$?; [ "$read_status" -eq 0 ] || exit "$read_status"; printf "%s" "$marker")"; then exit 1; fi
+      case "$payload" in *"$marker") value="${payload%"$marker"}" ;; *) exit 1 ;; esac
+      [ "$value" = "$expected_value" ] || exit 1
+      path_identity_after="$(stat -L -c "%d:%i" "$path" 2>/dev/null)" || exit 1
+      [ "$path_identity_after" = "$expected_identity" ] || exit 1
+    }
+    check_file "$1" "$2" "$3" 3
+    check_file "$4" "$5" "$6" 4
+    check_file "$7" "$8" "$9" 5
+    recheck_file "$1" "$2" "$3"
+    recheck_file "$4" "$5" "$6"
+    recheck_file "$7" "$8" "$9"
+  '
+  if [ "$mode" = container ]; then
+    bounded_command docker_cmd exec "$container" sh -c "$runtime_files_command" sh "$ddns_path" "$ddns_identity" "$ddns_value" "$cloudflare_path" "$cloudflare_identity" "$cloudflare_value" "$managed_path" "$managed_identity" "$managed_value"
+  else
+    bounded_command sudo -n sh -c "$runtime_files_command" sh "$ddns_path" "$ddns_identity" "$ddns_value" "$cloudflare_path" "$cloudflare_identity" "$cloudflare_value" "$managed_path" "$managed_identity" "$managed_value"
+  fi
 }
 
 compact_json() {
@@ -764,8 +847,9 @@ else
   [ -z "$containers_after" ] || exit 1
 fi
 
-assert_runtime_file_unchanged "$ddns_state_path" "$ddns_state_identity" "$ddns_state_snapshot"
 if [ "$mode" = host ]; then
-  assert_runtime_file_unchanged "$cloudflare_settings_path" "$cloudflare_settings_identity" "$cloudflare_settings_snapshot"
+  cloudflare_final_path="$cloudflare_settings_path"
+else
+  cloudflare_final_path=-
 fi
-assert_runtime_file_unchanged "$managed_default_state_path" "$managed_default_state_identity" "$managed_default_state_snapshot"
+assert_runtime_files_unchanged "$ddns_state_path" "$ddns_state_identity" "$ddns_state_snapshot" "$cloudflare_final_path" "$cloudflare_settings_identity" "$cloudflare_settings_snapshot" "$managed_default_state_path" "$managed_default_state_identity" "$managed_default_state_snapshot" || exit 1

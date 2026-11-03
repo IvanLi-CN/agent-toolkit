@@ -182,7 +182,7 @@ esac
   });
 });
 
-test("selected runtime environment remains compatible with BusyBox awk", async () => {
+test("selected runtime environment preserves NUL framing with an awk compatibility fixture", async () => {
   const f = fixture("busybox-awk");
   const envPath = join(f.dir, "proc/99/environ");
   writeFileSync(envPath, "XP_NODE_NAME=fixture\0XP_ADMIN_TOKEN=<SECRET_CANARY>\0OTHER=value\0");
@@ -246,6 +246,84 @@ raw_env_payload XP_NODE_NAME __END__
   writeFileSync(envPath, "XP_NODE_NAME=fixture\nattacker\0");
   const embeddedNewline = await selected();
   expect(embeddedNewline).toEqual({ code: 0, out: "__READ_FAILED____END__", err: "" });
+});
+
+native("VER-FOUNDATION-XP-03 isolated Linux native probe", () => {
+  test("full audit collector executes descriptor-bound runtime snapshots", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "xp-audit-native-")); dirs.push(dir);
+    const dataDir = join(dir, "data"); mkdirSync(dataDir);
+    const envPath = join(dir, "xp.env");
+    const procEnvironment = join(dir, "proc-environ");
+    const settingsPath = join(dir, "cloudflare-settings.json");
+    writeFileSync(envPath, [
+      "XP_BIND=127.0.0.1:62416",
+      `XP_DATA_DIR=${dataDir}`,
+      "XP_CLOUDFLARE_DDNS_ENABLED=false",
+      "XP_CLOUDFLARED_MONITOR_MODE=none",
+      "XP_CLOUDFLARED_RESTART_MODE=none",
+      "XP_CLOUDFLARE_DDNS_FAST_INTERVAL_SECS=30",
+      "XP_CLOUDFLARE_DDNS_INTERVAL_SECS_NO_MONITOR=60",
+      "XP_CLOUDFLARE_DDNS_INTERVAL_SECS_WITH_MONITOR=300",
+      "XP_CLOUDFLARE_HOSTNAME=",
+      "XP_IP_GEO_ENABLED=false",
+      "XP_IP_GEO_ORIGIN=https://api.country.is",
+      "XP_ENABLE_CLOUDFLARE=false",
+      "XP_NODE_NAME=node",
+      "XP_API_BASE_URL=https://node.example.test",
+      "XP_ACCESS_HOST=node.example.test",
+      "XP_XRAY_SYSTEMD_UNIT=xray",
+      "XP_XRAY_OPENRC_SERVICE=xray",
+      "XP_CLOUDFLARED_SYSTEMD_UNIT=cloudflared",
+      "XP_CLOUDFLARED_OPENRC_SERVICE=cloudflared",
+    ].join("\n") + "\n");
+    writeFileSync(procEnvironment, "XP_NODE_NAME=node\0XP_API_BASE_URL=https://node.example.test\0XP_ACCESS_HOST=node.example.test\0");
+    writeFileSync(join(dataDir, "ddns_state.json"), "{}");
+    writeFileSync(join(dataDir, "managed-default-endpoints.json"), "{}");
+    writeFileSync(settingsPath, "{}");
+    mkdirSync(join(dir, "bin"));
+    const tool = (name: string, source: string) => { const path = join(dir, "bin", name); writeFileSync(path, "#!/bin/sh\nset -eu\n" + source); chmodSync(path, 0o755); };
+    tool("sudo", `
+shift
+if [ "$1" = sh ] && [ "$2" = -c ]; then
+  case "$3" in
+    *pidof*) printf 99; exit 0 ;;
+    *stat_file=*) printf 456; exit 0 ;;
+  esac
+fi
+case "$1" in
+  xp-ops) exit 0 ;;
+  *) exec "$@" ;;
+esac`);
+    tool("docker", `
+[ "$1" = --context ] && [ "$2" = default ] || exit 1
+shift 2
+[ "$1" = ps ] && exit 0
+exit 1`);
+    tool("curl", `
+url=
+for arg in "$@"; do case "$arg" in http://*) url="$arg" ;; esac; done
+case "$url" in
+  */api/health) printf '{"status":"ok","xray":{"status":"up"}}' ;;
+  */api/cluster/info) printf '{"role":"leader"}' ;;
+  *) exit 1 ;;
+esac`);
+    tool("ss", `printf '%s\\n' 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:* users:(('"'"'xray'"'"',pid=99,fd=3))'`);
+    const source = readFileSync(join(import.meta.dir, "../scripts/xp-infra-audit-remote"), "utf8")
+      .replace("env_file=/etc/xp/xp.env", `env_file='${envPath}'`)
+      .replace("/etc/xp-ops/cloudflare_tunnel/settings.json", settingsPath)
+      .replace("/proc/$runtime_pid/environ", procEnvironment);
+    const child = Bun.spawn(["sh", "-s", "--", "false", "true"], {
+      env: { ...process.env, PATH: `${join(dir, "bin")}:/usr/bin:/bin` },
+      stdin: new Blob([source]), stdout: "pipe", stderr: "pipe",
+    });
+    const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    expect({ code, err }).toEqual({ code: 0, err: "" });
+    expect(out).toContain("runtime_mode=host\n");
+    expect(out).toContain("ddns_state_json={}\n");
+    expect(out).toContain("cloudflare_settings_json={}\n");
+    expect(out).toContain("managed_default_state_json={}\n");
+    expect(out).toContain("xray_public_ports=443\n");
+  }, 20000);
 });
 
 test("remote JSON records preserve formatting whitespace and reject literal string newlines", async () => {

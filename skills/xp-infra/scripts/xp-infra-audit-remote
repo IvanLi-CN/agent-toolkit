@@ -190,11 +190,28 @@ raw_env_payload() {
     marker="$3"
     env_file="/proc/$runtime_pid/environ"
     [ -r "$env_file" ] || exit 1
-    awk -v key="$key" -v marker="$marker" '\''
-      BEGIN { RS = "\0" }
+    tr_status_file="$(mktemp)" || exit 1
+    trap '\''rm -f "$tr_status_file"'\'' 0 HUP INT TERM
+    (
+      set +e
+      # Encode original LF as SOH before mapping NUL to the awk record separator;
+      # otherwise a newline inside an environment value can become a fake entry.
+      tr "\\n\\000" "\\001\\n" < "$env_file"
+      tr_status=$?
+      printf "%s\\n" "$tr_status" > "$tr_status_file"
+      exit "$tr_status"
+    ) | awk -v key="$key" -v marker="$marker" '\''
+      BEGIN { invalid = sprintf("%c", 1) }
       index($0, key "=") == 1 { count++; value = $0 }
-      END { if (count > 1) exit 1; printf "%s%s", value, marker }
-    '\'' "$env_file"
+      END {
+        if (count > 1 || count == 1 && index(value, invalid) > 0) exit 1
+        if (count == 1) printf "%s%s", value, marker
+        else printf "%s", marker
+      }
+    '\''
+    awk_status=$?
+    tr_status="$(cat "$tr_status_file" 2>/dev/null || printf 1)"
+    [ "$awk_status" -eq 0 ] && [ "$tr_status" = 0 ]
   '
   if [ "$mode" = container ]; then
     value="$(bounded_command docker_cmd exec "$container" sh -c "$read_selected" sh "$container_xp_pid" "$key" "$marker" 2>/dev/null)" || {
@@ -392,61 +409,201 @@ container_process_token() {
   ' sh "$pattern" 2>/dev/null
 }
 
-runtime_file_read() {
+runtime_file_capture() {
   path="$1"
+  marker="$2"
+  capture_command='
+    path="$1"
+    marker="$2"
+    invalid_control="$(printf '\''\001'\'')"
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      [ -r "$path" ] || exit 2
+      exec 3<"$path" || exit 1
+      file_identity="$(stat -L -c "%d:%i" /proc/self/fd/3 2>/dev/null)" || exit 1
+      path_identity="$(stat -L -c "%d:%i" "$path" 2>/dev/null)" || exit 1
+      [ "$file_identity" = "$path_identity" ] || exit 1
+      if ! payload="$(tr "\\000" "\\001" <&3; read_status=$?; [ "$read_status" -eq 0 ] || exit "$read_status"; printf "%s" "$marker")"; then exit 1; fi
+      case "$payload" in *"$marker") value="${payload%"$marker"}" ;; *) exit 1 ;; esac
+      case "$value" in *"$invalid_control"*) exit 1 ;; esac
+      path_identity_after="$(stat -L -c "%d:%i" "$path" 2>/dev/null)" || exit 1
+      [ "$file_identity" = "$path_identity_after" ] || exit 1
+      printf "%s=%s" "$file_identity" "$value"
+      printf "%s" "$marker"
+    else
+      parent_dir=${path%/*}
+      [ -d "$parent_dir" ] && [ -r "$parent_dir" ] && [ -x "$parent_dir" ] || exit 2
+      [ -e "$path" ] || [ -L "$path" ] || printf "absent=%s" "$marker"
+    fi
+  '
   if [ "$mode" = container ]; then
-    presence="$(bounded_command docker_cmd exec "$container" sh -c '
-      if [ -e "$1" ] || [ -L "$1" ]; then
-        printf %s present
-      else
-        parent_dir=${1%/*}
-        [ -d "$parent_dir" ] && [ -r "$parent_dir" ] && [ -x "$parent_dir" ] || exit 2
-        printf %s absent
-      fi
-    ' sh "$path" 2>/dev/null)" || {
-      printf '%s' "$READ_ERROR_SENTINEL"
-      return 0
-    }
+    bounded_command docker_cmd exec "$container" sh -c "$capture_command" sh "$path" "$marker"
   else
-    presence="$(bounded_command sudo -n sh -c '
-      if [ -e "$1" ] || [ -L "$1" ]; then
-        printf %s present
-      else
-        parent_dir=${1%/*}
-        [ -d "$parent_dir" ] && [ -r "$parent_dir" ] && [ -x "$parent_dir" ] || exit 2
-        printf %s absent
-      fi
-    ' sh "$path" 2>/dev/null)" || {
-      printf '%s' "$READ_ERROR_SENTINEL"
-      return 0
-    }
+    bounded_command sudo -n sh -c "$capture_command" sh "$path" "$marker"
   fi
-  case "$presence" in
-    absent) return 0 ;;
-    present)
-      if [ "$mode" = container ]; then
-        if value="$(bounded_command docker_cmd exec "$container" cat "$path" 2>/dev/null)"; then
-          printf '%s' "$value"
-        else
-          printf '%s' "$READ_ERROR_SENTINEL"
-        fi
-      elif value="$(bounded_command sudo -n cat "$path" 2>/dev/null)"; then
-        printf '%s' "$value"
-      else
-        printf '%s' "$READ_ERROR_SENTINEL"
-      fi
-      ;;
-    *)
-      printf '%s' "$READ_ERROR_SENTINEL"
-      ;;
+}
+
+runtime_file_snapshot() {
+  snapshot_path="$1"
+  snapshot_marker=__xp_infra_file_snapshot_end__
+  snapshot_payload="$(runtime_file_capture "$snapshot_path" "$snapshot_marker")" || return 1
+  case "$snapshot_payload" in
+    *"$snapshot_marker") snapshot_body="${snapshot_payload%"$snapshot_marker"}" ;;
+    *) return 1 ;;
   esac
+  case "$snapshot_body" in
+    *=*) snapshot_identity="${snapshot_body%%=*}"; snapshot_value="${snapshot_body#*=}" ;;
+    *) return 1 ;;
+  esac
+  case "$snapshot_identity" in
+    absent|[0-9]*:[0-9]*) ;;
+    *) return 1 ;;
+  esac
+}
+
+assert_runtime_files_unchanged() {
+  ddns_path="$1"
+  ddns_identity="$2"
+  ddns_value="$3"
+  cloudflare_path="$4"
+  cloudflare_identity="$5"
+  cloudflare_value="$6"
+  managed_path="$7"
+  managed_identity="$8"
+  managed_value="$9"
+  runtime_files_command='
+    marker=__xp_infra_runtime_file_end__
+    invalid_control="$(printf '\''\001'\'')"
+    read_fd() {
+      fd="$1"
+      case "$fd" in
+        3) tr "\\000" "\\001" <&3 ;;
+        4) tr "\\000" "\\001" <&4 ;;
+        5) tr "\\000" "\\001" <&5 ;;
+        6) tr "\\000" "\\001" <&6 ;;
+        *) exit 1 ;;
+      esac
+    }
+    open_fd() {
+      fd="$1"
+      path="$2"
+      case "$fd" in
+        3) exec 3<"$path" ;;
+        4) exec 4<"$path" ;;
+        5) exec 5<"$path" ;;
+        6) exec 6<"$path" ;;
+        *) exit 1 ;;
+      esac
+    }
+    check_file() {
+      path="$1"
+      expected_identity="$2"
+      expected_value="$3"
+      fd="$4"
+      [ "$path" = - ] && return 0
+      if [ "$expected_identity" = absent ]; then
+        [ ! -e "$path" ] && [ ! -L "$path" ] || exit 1
+        return 0
+      fi
+      [ -e "$path" ] || [ -L "$path" ] || exit 1
+      [ -r "$path" ] || exit 1
+      open_fd "$fd" "$path" || exit 1
+      file_identity="$(stat -L -c "%d:%i" "/proc/self/fd/$fd" 2>/dev/null)" || exit 1
+      path_identity="$(stat -L -c "%d:%i" "$path" 2>/dev/null)" || exit 1
+      [ "$file_identity" = "$expected_identity" ] || exit 1
+      [ "$path_identity" = "$expected_identity" ] || exit 1
+      if ! payload="$(read_fd "$fd"; read_status=$?; [ "$read_status" -eq 0 ] || exit "$read_status"; printf "%s" "$marker")"; then exit 1; fi
+      case "$payload" in *"$marker") value="${payload%"$marker"}" ;; *) exit 1 ;; esac
+      case "$value" in *"$invalid_control"*) exit 1 ;; esac
+      [ "$value" = "$expected_value" ] || exit 1
+      path_identity_after="$(stat -L -c "%d:%i" "$path" 2>/dev/null)" || exit 1
+      [ "$path_identity_after" = "$expected_identity" ] || exit 1
+    }
+    recheck_file() {
+      path="$1"
+      expected_identity="$2"
+      expected_value="$3"
+      [ "$path" = - ] && return 0
+      if [ "$expected_identity" = absent ]; then
+        [ ! -e "$path" ] && [ ! -L "$path" ] || exit 1
+        return 0
+      fi
+      [ -e "$path" ] || [ -L "$path" ] || exit 1
+      [ -r "$path" ] || exit 1
+      open_fd 6 "$path" || exit 1
+      file_identity="$(stat -L -c "%d:%i" /proc/self/fd/6 2>/dev/null)" || exit 1
+      path_identity="$(stat -L -c "%d:%i" "$path" 2>/dev/null)" || exit 1
+      [ "$file_identity" = "$expected_identity" ] || exit 1
+      [ "$path_identity" = "$expected_identity" ] || exit 1
+      if ! payload="$(read_fd 6; read_status=$?; [ "$read_status" -eq 0 ] || exit "$read_status"; printf "%s" "$marker")"; then exit 1; fi
+      case "$payload" in *"$marker") value="${payload%"$marker"}" ;; *) exit 1 ;; esac
+      case "$value" in *"$invalid_control"*) exit 1 ;; esac
+      [ "$value" = "$expected_value" ] || exit 1
+      path_identity_after="$(stat -L -c "%d:%i" "$path" 2>/dev/null)" || exit 1
+      [ "$path_identity_after" = "$expected_identity" ] || exit 1
+    }
+    check_file "$1" "$2" "$3" 3
+    check_file "$4" "$5" "$6" 4
+    check_file "$7" "$8" "$9" 5
+    recheck_file "$1" "$2" "$3"
+    recheck_file "$4" "$5" "$6"
+    recheck_file "$7" "$8" "$9"
+  '
+  if [ "$mode" = container ]; then
+    bounded_command docker_cmd exec "$container" sh -c "$runtime_files_command" sh "$ddns_path" "$ddns_identity" "$ddns_value" "$cloudflare_path" "$cloudflare_identity" "$cloudflare_value" "$managed_path" "$managed_identity" "$managed_value"
+  else
+    bounded_command sudo -n sh -c "$runtime_files_command" sh "$ddns_path" "$ddns_identity" "$ddns_value" "$cloudflare_path" "$cloudflare_identity" "$cloudflare_value" "$managed_path" "$managed_identity" "$managed_value"
+  fi
+}
+
+compact_json() {
+  awk '
+    BEGIN {
+      in_string = 0
+      escaped = 0
+      invalid = 0
+      carriage_return = sprintf("%c", 13)
+    }
+    {
+      for (i = 1; i <= length($0); i++) {
+        char = substr($0, i, 1)
+        if (char == carriage_return) {
+          if (in_string) invalid = 1
+        } else if (in_string) {
+          if (escaped) {
+            printf "%s", char
+            escaped = 0
+          } else if (char == "\\") {
+            printf "%s", char
+            escaped = 1
+          } else if (char == "\"") {
+            printf "%s", char
+            in_string = 0
+          } else {
+            printf "%s", char
+          }
+        } else if (char == "\"") {
+          printf "%s", char
+          in_string = 1
+        } else {
+          printf "%s", char
+        }
+      }
+      if (in_string) invalid = 1
+    }
+    END {
+      if (in_string || escaped || invalid) exit 1
+    }
+  '
 }
 
 emit_value() {
   key="$1"
   value="$2"
   [ "$value" != "$READ_ERROR_SENTINEL" ] || exit 1
-  value="$(printf '%s' "$value" | tr -d '\r\n')"
+  case "$key" in
+    *_json) value="$(printf '%s' "$value" | compact_json)" || exit 1 ;;
+    *) value="$(printf '%s' "$value" | tr -d '\r\n')" || exit 1 ;;
+  esac
   printf '%s=%s\n' "$key" "$value"
 }
 
@@ -569,6 +726,8 @@ if [ "$mode" = container ]; then
   xp_port="$published_port"
 fi
 local_origin="http://127.0.0.1:${xp_port}"
+ddns_state_path="$data_dir/ddns_state.json"
+managed_default_state_path="$data_dir/managed-default-endpoints.json"
 
 emit_value ddns_enabled "$(strict_bool_value XP_CLOUDFLARE_DDNS_ENABLED)"
 emit_value ddns_monitor_mode "$(env_value XP_CLOUDFLARED_MONITOR_MODE)"
@@ -576,7 +735,10 @@ emit_value ddns_restart_mode "$(env_value XP_CLOUDFLARED_RESTART_MODE)"
 emit_value ddns_fast_interval "$(env_value XP_CLOUDFLARE_DDNS_FAST_INTERVAL_SECS)"
 emit_value ddns_monitored_interval "$(env_value XP_CLOUDFLARE_DDNS_INTERVAL_SECS_WITH_MONITOR)"
 emit_value ddns_unmonitored_interval "$(env_value XP_CLOUDFLARE_DDNS_INTERVAL_SECS_NO_MONITOR)"
-emit_value ddns_state_json "$(runtime_file_read "$data_dir/ddns_state.json" || true)"
+runtime_file_snapshot "$ddns_state_path" || exit 1
+ddns_state_identity="$snapshot_identity"
+ddns_state_snapshot="$snapshot_value"
+emit_value ddns_state_json "$ddns_state_snapshot"
 # Geo opt-in writes `true`; a missing opt-in remains the supported false default.
 geo_enabled="$(strict_bool_value XP_IP_GEO_ENABLED false)"
 emit_value geo_enabled "$geo_enabled"
@@ -600,11 +762,21 @@ emit_value access_host "$access_host"
 emit_value cloudflare_enabled "$(strict_bool_value XP_ENABLE_CLOUDFLARE)"
 emit_value cloudflare_hostname "$(env_value XP_CLOUDFLARE_HOSTNAME)"
 if [ "$mode" = host ]; then
-  emit_value cloudflare_settings_json "$(runtime_file_read /etc/xp-ops/cloudflare_tunnel/settings.json || true)"
+  cloudflare_settings_path=/etc/xp-ops/cloudflare_tunnel/settings.json
+  runtime_file_snapshot "$cloudflare_settings_path" || exit 1
+  cloudflare_settings_identity="$snapshot_identity"
+  cloudflare_settings_snapshot="$snapshot_value"
+  emit_value cloudflare_settings_json "$cloudflare_settings_snapshot"
 else
+  cloudflare_settings_path=
+  cloudflare_settings_identity=
+  cloudflare_settings_snapshot=
   emit_value cloudflare_settings_json ""
 fi
-emit_value managed_default_state_json "$(runtime_file_read "$data_dir/managed-default-endpoints.json" || true)"
+runtime_file_snapshot "$managed_default_state_path" || exit 1
+managed_default_state_identity="$snapshot_identity"
+managed_default_state_snapshot="$snapshot_value"
+emit_value managed_default_state_json "$managed_default_state_snapshot"
 echo "sync_node_meta=$(sync_node_meta && printf true || printf false)"
 if [ "$require_xray_public_listener" = true ]; then
   emit_value xray_public_ports "$(xray_public_ports || true)"
@@ -680,3 +852,10 @@ if [ "$env_probe" = absent ]; then
 else
   [ -z "$containers_after" ] || exit 1
 fi
+
+if [ "$mode" = host ]; then
+  cloudflare_final_path="$cloudflare_settings_path"
+else
+  cloudflare_final_path=-
+fi
+assert_runtime_files_unchanged "$ddns_state_path" "$ddns_state_identity" "$ddns_state_snapshot" "$cloudflare_final_path" "$cloudflare_settings_identity" "$cloudflare_settings_snapshot" "$managed_default_state_path" "$managed_default_state_identity" "$managed_default_state_snapshot" || exit 1

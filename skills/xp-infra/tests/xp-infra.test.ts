@@ -65,6 +65,22 @@ describe("VER-FOUNDATION-XP-02 strict inputs and normalization", () => {
     expect(() => timestamp("2026-01-01", "time")).toThrow();
     expect(() => normalizePublicHealth('{"status":"ok","status":"bad"}')).toThrow();
   });
+  test("DDNS up status remains healthy with a nonfatal family diagnostic", () => {
+    const ddnsState = JSON.stringify({ snapshot: {
+      last_sync_at: "2025-12-31T23:59:30Z", status: "up", last_error: "ddns ipv6 probe failed", fast_mode_until: null,
+    } });
+    const observed = normalizeBasic(basic({ ddns_state_json: ddnsState }), now);
+    expect(observed.cloudflare_ddns).toBe(true);
+    expect(observed.cloudflare_ddns_diagnostic).toBe(true);
+  });
+  test("DDNS rejects malformed diagnostic types", () => {
+    for (const last_error of [false, 123, {}, []]) {
+      const ddnsState = JSON.stringify({ snapshot: {
+        last_sync_at: "2025-12-31T23:59:30Z", status: "up", last_error, fast_mode_until: null,
+      } });
+      expect(() => normalizeBasic(basic({ ddns_state_json: ddnsState }), now)).toThrow("invalid DDNS last_error");
+    }
+  });
 });
 
 describe("VER-FOUNDATION-XP-03 runtime identities", () => {

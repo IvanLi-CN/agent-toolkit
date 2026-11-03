@@ -39,7 +39,10 @@ export function normalizeBasic(text: string, now = Date.now()): Observation {
   const intervalValue = fastUntil !== undefined && fastUntil > now ? r.ddns_fast_interval : monitor && monitor !== "none" ? r.ddns_monitored_interval : r.ddns_unmonitored_interval;
   const interval = intervalValue === "" ? (fastUntil !== undefined && fastUntil > now ? 30 : monitor && monitor !== "none" ? 300 : 60) : Math.min(integer(intervalValue, 0, Number.MAX_SAFE_INTEGER, "DDNS interval"), 3600);
   const lastSync = ddnsEnabled ? timestamp(snapshot.last_sync_at, "last_sync_at") : undefined;
-  const ddnsOk = ddnsEnabled && lastSync !== undefined && lastSync <= now && now - lastSync <= interval * 2000 + 60000 && snapshot.status === "up" && (snapshot.last_error == null || snapshot.last_error === "");
+  const lastError = snapshot.last_error;
+  ensure(lastError == null || typeof lastError === "string", "invalid DDNS last_error");
+  // XP marks the round up when at least one address family synced; last_error retains nonfatal family diagnostics.
+  const ddnsOk = ddnsEnabled && lastSync !== undefined && lastSync <= now && now - lastSync <= interval * 2000 + 60000 && snapshot.status === "up";
   const geoEnabled = explicitBoolean(r.geo_enabled, "geo_enabled", false);
   const geo = jsonObject(r.geo_response_json, "geo_response_json", geoEnabled);
   ensure(!geoEnabled || typeof geo.country === "string" && geo.country.length > 0, "invalid geo country");
@@ -68,7 +71,7 @@ export function normalizeBasic(text: string, now = Date.now()): Observation {
   const out: Observation = {
     runtime_mode: r.runtime_mode, container_identity: r.container_identity, container_started_at: r.container_started_at, container_xray_token: String(r.container_xray_token), host_xray_pid: r.host_xray_pid, host_xray_starttime: r.host_xray_starttime,
     xp_service: explicitBoolean(r.xp_service, "xp_service"), xray_service: explicitBoolean(r.xray_service, "xray_service"), cloudflared_service: explicitBoolean(r.cloudflared_service, "cloudflared_service"),
-    cloudflare_ddns_enabled: ddnsEnabled, cloudflare_ddns: ddnsOk,
+    cloudflare_ddns_enabled: ddnsEnabled, cloudflare_ddns: ddnsOk, cloudflare_ddns_diagnostic: typeof lastError === "string" && lastError !== "",
     ip_geo_enrichment: geoEnabled && (r.geo_origin || "https://api.country.is") === "https://api.country.is" && typeof geo.country === "string" && geo.country !== "",
     local_health: health.status === "ok", xray_runtime: xray.status === "up", cloudflare_tunnel: cloudflared.status === "up", canary_enabled: canary.enabled === true,
     canary_certificate: canary.enabled === true && canary.last_error == null && certExpiry !== undefined && certExpiry > now,
@@ -96,6 +99,7 @@ export function auditDecisions(p: EffectivePolicy, o: Observation): { ok: boolea
   else check("public_hostname_convention", o.node_name_valid === true && o.api_host === `${o.node_name}-xp.${p.public_hostname_zone}` && o.access_host === `${o.node_name}-ep.${p.public_hostname_zone}`);
   for (const key of ["cloudflare_tunnel", "ip_geo_enrichment", "managed_default_vless", "managed_default_ss2022"] as const) check(key, o[key], p[key]);
   check("cloudflare_ddns", p.cloudflare_ddns ? o.cloudflare_ddns_enabled === true && o.cloudflare_ddns === true : o.cloudflare_ddns_enabled, p.cloudflare_ddns);
+  if (o.cloudflare_ddns_diagnostic === true) lines.push("INFO cloudflare_ddns_family_diagnostic=present");
   for (const key of ["xp_service", "xray_service", "cluster_sync", "local_health", "xray_runtime"]) check(key, o[key]);
   if (p.cloudflare_tunnel) { check("cloudflared_service", o.cloudflared_service); check("tunnel_declaration", o.tunnel_declaration === "aligned"); } else skip("cloudflared_service");
   for (const key of ["xray_public_listener", "canary_enabled", "canary_certificate", "local_canary", "vless_ingress"]) { if (p.managed_default_vless) check(key, o[key]); else skip(key); }

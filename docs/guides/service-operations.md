@@ -12,14 +12,14 @@
 
 **配置：**`XP_INFRA_CONFIG_DIR` 或独立 `XP_HOSTS_FILE` / `XP_POLICY_FILE`，实际连接放 operator SSH 配置；[公共模板](../../skills/xp-infra/references/deployment-policy.yaml.example)故意未确认，必须由主人决定 policy。见 [XP 配置](configuration.md#xp)；不把 unavailable 证据默认为健康。
 
-**最小例子：**从 checkout 调用实际入口；help 完全离线，policy check 只读取私有配置：
+**最小例子：**进入 `xp-infra` 的 Skill 根目录后调用实际入口；help 完全离线，policy check 只读取私有配置：
 
 ```bash
-/path/to/agent-toolkit/skills/xp-infra/scripts/xp-infra --help
-/path/to/agent-toolkit/skills/xp-infra/scripts/xp-infra policy check
+scripts/xp-infra --help
+scripts/xp-infra policy check
 ```
 
-已授权远端观察时再执行 `xp-infra port preflight '<configured-alias>'`、`xp-infra audit '<configured-alias>'`，使用上例完整入口路径。Alias 必须注册且唯一，不选择“恰好能连通”的其他节点。
+已授权远端观察时仍在该 Skill 根目录执行 `scripts/xp-infra port preflight '<configured-alias>'`、`scripts/xp-infra audit '<configured-alias>'`。Alias 必须注册且唯一，不选择“恰好能连通”的其他节点。
 
 **输出：**policy 成功/拒绝、经过完整验证的选定端口、audit 的 PASS/FAIL/获准 SKIP 与非零失败。Preflight 不分配真实服务端口，fixture 不建立部署健康证据。
 
@@ -33,11 +33,11 @@
 
 **配置：**`TAVILY_CONFIG_DIR` / `TAVILY_HOSTS_FILE`、两端 alias 与实际 `TAVILY_*_STATUS_COMMAND` / `TAVILY_*_LOG_COMMAND` 均在仓库外。Compose/service/URL 环境变量是 operator 上下文，不能代替 helper 需要的显式命令。见 [Tavily 配置](configuration.md#tavily)。
 
-**最小例子：**help 不联网；配置并获准远端只读观察后运行 status：
+**最小例子：**进入 `tavily-hikari-infra` 的 Skill 根目录后执行；help 不联网，配置并获准远端只读观察后运行 status：
 
 ```bash
-bash /path/to/agent-toolkit/skills/tavily-hikari-infra/scripts/tavily-hikari-infra --help
-bash /path/to/agent-toolkit/skills/tavily-hikari-infra/scripts/tavily-hikari-infra status primary
+bash scripts/tavily-hikari-infra --help
+bash scripts/tavily-hikari-infra status primary
 ```
 
 **输出：**inventory 解析后的 SSH 连接字段、指定角色的 status 或日志；`logs standby --tail 200` 将 tail 参数交给 operator 配置的命令，operator 必须保证命令只读且输出有界。Inventory 也会暴露解析地址，分享前脱敏。
@@ -52,13 +52,12 @@ bash /path/to/agent-toolkit/skills/tavily-hikari-infra/scripts/tavily-hikari-inf
 
 **配置：**`DST_HOST`、`DST_USER`、可选 `DST_LOCAL_DIR`、`DST_CLUSTER` 在仓库外；也可用显式参数。纯本地模式不需要 host，示例路径由使用者提供，输出父目录须存在。
 
-**最小例子：**下面只读本地选定目录，不访问服务器：
+**最小例子：**进入 `dst-dedicated-server` 的 Skill 根目录后只读本地选定目录，不访问服务器：
 
 ```bash
-SKILL_DIR=/path/to/agent-toolkit/skills/dst-dedicated-server
-bun "$SKILL_DIR/scripts/dst_snapshot.ts" --no-remote \
+bun scripts/dst_snapshot.ts --no-remote \
   --local-dir /path/to/client-data --out /path/to/fresh-output/snapshot.md
-bun "$SKILL_DIR/scripts/dst_mods_from_modoverrides.ts" --cluster-dir /path/to/Cluster_1
+bun scripts/dst_mods_from_modoverrides.ts --cluster-dir /path/to/Cluster_1
 ```
 
 **输出：**一个 Markdown metadata 报告及路径；mod summary 在 stdout 打印 Workshop IDs、状态计数与 shard 差异，不执行 Lua。Snapshot 的 partial warning/exit 0 只表示报告写入成功，不证明远端采集成功。

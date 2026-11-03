@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-Use the operator's installed Bun, OpenSSH client and curl. Run `../scripts/xp-infra --help` from this directory, or invoke the executable by its checkout path. Local helpers have no Ruby/Python dependency, package-install step or runtime-version selector. The protected policy and inventory are operator-owned; the public example deliberately fails owner confirmation until the operator supplies an approved configuration.
+Use the operator's installed Bun, OpenSSH client and curl. Run `scripts/xp-infra --help` from this Skill directory. The entrypoint resolves its sibling modules from its source location rather than the caller's working directory. Local helpers have no Ruby/Python dependency, package-install step or runtime-version selector. The protected policy and inventory are operator-owned; the public example deliberately fails owner confirmation until the operator supplies an approved configuration.
 
 Inspected nodes are Linux with a POSIX shell, `/proc`, `awk`, `sed`, `grep`, `tr`, `base64`, `mktemp`, `wc`, `paste` and GNU-compatible `dd` supporting `iflag=fullblock`. Port preflight also needs native `timeout`, `ss` or `netstat`, kernel port-range observations and read-only Xray API access for an existing managed endpoint. Host mode requires a non-root, non-`xp` SSH operator with non-interactive `sudo`, native systemd/OpenRC service observations and curl. Container audit uses Docker in the default local context; direct access requires the explicit approved `direct_docker` exception and verified absence of host runtime configuration. Port preflight continues to require sudo even for containers. No Bun, Ruby or Python is installed or invoked by the remote probes.
 

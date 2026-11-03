@@ -17,24 +17,23 @@ Use installed Bun on Linux or macOS; no Python or third-party MIDI/audio library
 
 ## Quick start
 
-1) 复制示例输入：
+1) 进入本 Skill 根目录后复制示例输入：
 
 ```bash
-SKILL_DIR=/path/to/agent-toolkit/skills/buzzer-audio-preview
-cp "$SKILL_DIR/assets/score.example.json" ./score.json
+cp assets/score.example.json /path/to/score.json
 ```
 
 2) 生成 `MIDI + WAV`：
 
 ```bash
-bun "$SKILL_DIR/scripts/buzzer_preview.ts" \
-  --in ./score.json \
-  --out-dir ./out
+bun scripts/buzzer_preview.ts \
+  --in /path/to/score.json \
+  --out-dir /path/to/fresh-audio
 ```
 
 输出示例：
-- `out/score.mid`
-- `out/score.wav`
+- `/path/to/fresh-audio/score.mid`
+- `/path/to/fresh-audio/score.wav`
 
 ## `score.json` format
 

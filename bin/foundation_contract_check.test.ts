@@ -133,6 +133,44 @@ test("rejects local command drift, bypassed gates, and narrowed test discovery",
   });
 });
 
+test("rejects fixed Skill command paths without rejecting operator paths", () => {
+  fixture((root) => {
+    replace(root, "skills/buzzer-audio-preview/SKILL.md", "bun scripts/buzzer_preview.ts", "bun /path/to/agent-toolkit/skills/buzzer-audio-preview/scripts/buzzer_preview.ts");
+    expect(check(root)).toContain("FOUNDATION_SKILL_PATH_DRIFT skills/buzzer-audio-preview/SKILL.md FIXED_SKILL_CHECKOUT_PATH");
+  });
+  fixture((root) => {
+    replace(root, "docs/guides/media-previews.md", "AGENT_IMAGEGEN_SYSTEM_PATH=/path/to/trusted/image_gen.py", "SKILL_DIR=/path/to/agent-toolkit/skills/buzzer-audio-preview");
+    expect(check(root)).toContain("FOUNDATION_SKILL_PATH_DRIFT docs/guides/media-previews.md SKILL_DIR_ASSIGNMENT");
+  });
+  fixture((root) => {
+    replace(root, "skills/cvm-imagegen/references/cli.md", "python3 scripts/image_gen.py generate", "python3 skills/cvm-imagegen/scripts/image_gen.py generate");
+    expect(check(root)).toContain("FOUNDATION_SKILL_PATH_DRIFT skills/cvm-imagegen/references/cli.md REPO_ROOT_SKILL_SCRIPT_PATH");
+  });
+  fixture((root) => {
+    replace(root, "skills/cvm-imagegen/references/cli.md", "python3 scripts/image_gen.py generate", "cd /path/to/agent-toolkit/skills/cvm-imagegen && python3 scripts/image_gen.py generate");
+    expect(check(root)).toContain("FOUNDATION_SKILL_PATH_DRIFT skills/cvm-imagegen/references/cli.md FIXED_SKILL_CHECKOUT_PATH");
+  });
+  fixture((root) => {
+    replace(root, "docs/guides/media-previews.md", "bun scripts/buzzer_preview.ts", "cd skills/buzzer-audio-preview && bun scripts/buzzer_preview.ts");
+    expect(check(root)).toContain("FOUNDATION_SKILL_PATH_DRIFT docs/guides/media-previews.md SKILL_DIRECTORY_CHANGE");
+  });
+  fixture((root) => {
+    replace(root, "docs/guides/media-previews.md", "--in assets/score.example.json", "--in skills/buzzer-audio-preview/assets/score.example.json");
+    expect(check(root)).toContain("FOUNDATION_SKILL_PATH_DRIFT docs/guides/media-previews.md REPO_ROOT_SKILL_RESOURCE_PATH");
+  });
+  fixture((root) => {
+    replace(root, "skills/cvm-imagegen/references/cli.md", "python3 scripts/image_gen.py generate \\", "python3 ../scripts/image_gen.py generate \\");
+    expect(check(root)).toContain("FOUNDATION_SKILL_PATH_DRIFT skills/cvm-imagegen/references/cli.md NON_ROOT_SKILL_SCRIPT_PATH");
+  });
+  fixture((root) => {
+    replace(root, "docs/guides/cad-repair.md", "CAD_PYTHON=/path/to/gmsh-python", "CAD_PYTHON=/path/to/gmsh-python\nINPUT=/path/to/model.step\nOUTPUT=/path/to/fresh-output/model.stl\nREMOTE=/etc/example/service.conf");
+    expect(check(root).filter((finding) => finding.startsWith("FOUNDATION_SKILL_PATH_DRIFT"))).toEqual([]);
+  });
+  fixture((root) => {
+    expect(check(root).filter((finding) => finding.startsWith("FOUNDATION_SKILL_PATH_DRIFT"))).toEqual([]);
+  });
+});
+
 test("rejects CI platform, runtime, permission, and validation drift", () => {
   const cases = [
     ["macos-latest", "ubuntu-24.04", "FOUNDATION_CI_PLATFORM_DRIFT"],

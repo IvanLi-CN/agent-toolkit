@@ -272,3 +272,21 @@ emit_value ddns_state_json "$value"
   expect(pretty.out).not.toContain("{\n");
   expect(await emit('{"snapshot":{"last_error":"bad\nvalue"}}')).toEqual({ code: 1, out: "", err: "" });
 });
+
+test("runtime state snapshots reject changes after the initial read", async () => {
+  const source = readFileSync(join(import.meta.dir, "../scripts/xp-infra-audit-remote"), "utf8");
+  const body = source.slice(source.indexOf("runtime_file_snapshot() {"), source.indexOf("\ncompact_json() {"));
+  const script = `set -eu
+READ_ERROR_SENTINEL=__READ_FAILED__
+state='snapshot-before'
+runtime_file_read() { printf '%s' "$state"; }
+${body}
+runtime_file_snapshot /var/lib/xp/data/ddns_state.json
+expected="$snapshot_value"
+state='snapshot-after'
+assert_runtime_file_unchanged /var/lib/xp/data/ddns_state.json "$expected"
+`;
+  const child = Bun.spawn(["sh", "-s"], { env: { PATH: "/usr/bin:/bin" }, stdin: new Blob([script]), stdout: "pipe", stderr: "pipe" });
+  const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+  expect({ code, out, err }).toEqual({ code: 1, out: "", err: "" });
+});

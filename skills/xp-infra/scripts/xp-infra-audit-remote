@@ -459,6 +459,24 @@ runtime_file_read() {
   esac
 }
 
+runtime_file_snapshot() {
+  snapshot_path="$1"
+  snapshot_marker=__xp_infra_file_snapshot_end__
+  snapshot_payload="$(runtime_file_read "$snapshot_path"; printf '%s' "$snapshot_marker")" || return 1
+  case "$snapshot_payload" in
+    *"$snapshot_marker") snapshot_value="${snapshot_payload%"$snapshot_marker"}" ;;
+    *) return 1 ;;
+  esac
+  [ "$snapshot_value" != "$READ_ERROR_SENTINEL" ] || return 1
+}
+
+assert_runtime_file_unchanged() {
+  expected_path="$1"
+  expected_value="$2"
+  runtime_file_snapshot "$expected_path" || exit 1
+  [ "$snapshot_value" = "$expected_value" ] || exit 1
+}
+
 compact_json() {
   awk '
     BEGIN {
@@ -630,6 +648,8 @@ if [ "$mode" = container ]; then
   xp_port="$published_port"
 fi
 local_origin="http://127.0.0.1:${xp_port}"
+ddns_state_path="$data_dir/ddns_state.json"
+managed_default_state_path="$data_dir/managed-default-endpoints.json"
 
 emit_value ddns_enabled "$(strict_bool_value XP_CLOUDFLARE_DDNS_ENABLED)"
 emit_value ddns_monitor_mode "$(env_value XP_CLOUDFLARED_MONITOR_MODE)"
@@ -637,7 +657,9 @@ emit_value ddns_restart_mode "$(env_value XP_CLOUDFLARED_RESTART_MODE)"
 emit_value ddns_fast_interval "$(env_value XP_CLOUDFLARE_DDNS_FAST_INTERVAL_SECS)"
 emit_value ddns_monitored_interval "$(env_value XP_CLOUDFLARE_DDNS_INTERVAL_SECS_WITH_MONITOR)"
 emit_value ddns_unmonitored_interval "$(env_value XP_CLOUDFLARE_DDNS_INTERVAL_SECS_NO_MONITOR)"
-emit_value ddns_state_json "$(runtime_file_read "$data_dir/ddns_state.json" || true)"
+runtime_file_snapshot "$ddns_state_path" || exit 1
+ddns_state_snapshot="$snapshot_value"
+emit_value ddns_state_json "$ddns_state_snapshot"
 # Geo opt-in writes `true`; a missing opt-in remains the supported false default.
 geo_enabled="$(strict_bool_value XP_IP_GEO_ENABLED false)"
 emit_value geo_enabled "$geo_enabled"
@@ -661,17 +683,30 @@ emit_value access_host "$access_host"
 emit_value cloudflare_enabled "$(strict_bool_value XP_ENABLE_CLOUDFLARE)"
 emit_value cloudflare_hostname "$(env_value XP_CLOUDFLARE_HOSTNAME)"
 if [ "$mode" = host ]; then
-  emit_value cloudflare_settings_json "$(runtime_file_read /etc/xp-ops/cloudflare_tunnel/settings.json || true)"
+  cloudflare_settings_path=/etc/xp-ops/cloudflare_tunnel/settings.json
+  runtime_file_snapshot "$cloudflare_settings_path" || exit 1
+  cloudflare_settings_snapshot="$snapshot_value"
+  emit_value cloudflare_settings_json "$cloudflare_settings_snapshot"
 else
+  cloudflare_settings_path=
+  cloudflare_settings_snapshot=
   emit_value cloudflare_settings_json ""
 fi
-emit_value managed_default_state_json "$(runtime_file_read "$data_dir/managed-default-endpoints.json" || true)"
+runtime_file_snapshot "$managed_default_state_path" || exit 1
+managed_default_state_snapshot="$snapshot_value"
+emit_value managed_default_state_json "$managed_default_state_snapshot"
 echo "sync_node_meta=$(sync_node_meta && printf true || printf false)"
 if [ "$require_xray_public_listener" = true ]; then
   emit_value xray_public_ports "$(xray_public_ports || true)"
 else
   emit_value xray_public_ports ""
 fi
+
+assert_runtime_file_unchanged "$ddns_state_path" "$ddns_state_snapshot"
+if [ "$mode" = host ]; then
+  assert_runtime_file_unchanged "$cloudflare_settings_path" "$cloudflare_settings_snapshot"
+fi
+assert_runtime_file_unchanged "$managed_default_state_path" "$managed_default_state_snapshot"
 
 if [ "$docker_access" = sudo ]; then
   env_probe_after="$(sudo -n sh -c 'if [ -e "$1" ] || [ -L "$1" ]; then [ -r "$1" ] || exit 2; printf %s readable; else printf %s absent; fi' sh "$env_file" 2>/dev/null)" || exit 1

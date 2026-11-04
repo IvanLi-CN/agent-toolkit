@@ -16,8 +16,8 @@ Resolve the selected alias through the operator's SSH configuration, then run `x
 
 1. Establish a dedicated key-authenticated operator account and verify non-interactive privilege escalation.
 2. Preflight the managed endpoint port from the full bindable range. Reuse a persisted managed endpoint only when runtime identity and ownership match.
-3. Run the official release deployment with policy-selected Tunnel, DDNS, Geo and managed endpoint settings. Keep secrets and provider mappings outside this repository.
-4. Join the node once, observe cluster role and health, then run the complete audit.
+3. After `policy check`, `inventory`, `status`, `version`, bounded `port preflight` and complete `audit` pass, obtain separate owner authorization and use the exact official path for the node shape. For host-managed nodes, run `sudo xp-ops upgrade --version VERSION`; this command has no `--yes`, so never append one. For container nodes, update the configured image tag or digest and restart the container. Do not substitute Web/API/manual execution for the documented path.
+4. Join the node once, observe target version, service/runtime readiness, public health, managed endpoint and cluster convergence, then run the complete audit.
 5. Treat any nonzero audit result as deployment failure. Repair only after explicit authorization and rerun all checks.
 
 ## Audit invariants

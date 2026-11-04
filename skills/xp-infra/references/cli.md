@@ -6,6 +6,16 @@
 
 `xp-infra-audit-remote` and `xp-infra-audit-vless-remote` remain POSIX native collection and identity revalidation. `xp-infra-port-remote` is the extracted bounded native preflight collector; it returns observations for the local typed decision function. `xp-infra-inventory-remote` collects native OS/version/service facts. A remote failure is never replaced by a locally assumed identity. The helper does not install runtimes or run deployment, repair, restart, upload or DNS-write commands.
 
+## Authorized upgrade boundary
+
+The helper does not perform upgrades. For a host-managed node, the official release path is:
+
+```text
+sudo xp-ops upgrade --version VERSION
+```
+
+Run it only after `policy check`, `inventory`, `status`, bounded `port preflight`, `version` and complete `audit` pass for the selected alias, with separate owner authorization. `xp-ops upgrade` does not expose `--yes`; do not append an unsupported flag. Do not replace the documented host command with Web/API/manual execution. For a container node, use the documented image tag or digest replacement plus restart path while preserving its configured deployment contract.
+
 ## Commands and exit status
 
 | Command | Output and gates |

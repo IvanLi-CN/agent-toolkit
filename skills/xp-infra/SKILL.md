@@ -9,7 +9,11 @@ Use this Skill for XP node initialization, deployment, cluster joins, upgrades a
 
 ## Entrypoints and prerequisites
 
-Run [scripts/xp-infra](scripts/xp-infra) directly with the Bun installed on the operator machine. Local policy, normalization, port selection and audit decisions run in TypeScript/Bun; local commands require neither Ruby nor Python. Native `ssh` provides transport and `curl` provides operator-side HTTPS probes. The inspected Linux node needs no Bun installation: retained POSIX probes use native privilege/service tools, `/proc`, `awk`, `stat`, GNU-compatible `dd` with `iflag=fullblock`, and `timeout` for port discovery. See [the CLI contract](references/cli.md) for exact input, output, limits and failure behavior, and [the runbook](references/runbook.md) for operating and verification steps.
+Run [scripts/xp-infra](scripts/xp-infra) directly with the Bun installed on the operator machine. Local policy, normalization, port selection and audit decisions run in TypeScript/Bun; local commands require neither Ruby nor Python. OpenSSH provides transport and `curl` provides operator-side HTTPS probes. The inspected Linux node needs no Bun installation: retained POSIX probes use system privilege/service tools, `/proc`, `awk`, `stat`, GNU-compatible `dd` with `iflag=fullblock`, and `timeout` for port discovery. See [the CLI contract](references/cli.md) for exact input, output, limits and failure behavior, and [the runbook](references/runbook.md) for operating and verification steps.
+
+## Runtime naming
+
+The XP alternate data-plane process is `xp-proxy`; call its managed mode the `xp-proxy runtime`. `native` is not a runtime selector or a health state. Use `POSIX probe` or `isolated Linux probe` when describing the system-command evidence used by tests.
 
 ## Policy and safety
 
@@ -31,4 +35,4 @@ Set `XP_INFRA_CONFIG_DIR` to a protected directory containing `hosts.txt` and `d
 
 The local helpers enforce bounded output and timeout behavior. Host-managed probes require non-interactive privilege checks; container probes require an explicit policy override. Neither path silently downgrades failed evidence.
 
-Treat mock command evidence, isolated Linux native-probe evidence and real deployment observations as separate results. A successful fixture run does not establish deployment health.
+Treat mock command evidence, isolated Linux POSIX-probe evidence and real deployment observations as separate results. A successful fixture run does not establish deployment health.

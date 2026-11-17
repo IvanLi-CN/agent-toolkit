@@ -4,13 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { preflight } from "../scripts/preflight.ts";
 
-// GNU dd fullblock, /proc token handling and native shells are verified on Linux.
+// GNU dd fullblock, /proc token handling and POSIX shells are verified on Linux.
 // Fake command adapters replace service/Docker inventory, never the shell checks.
-const native = process.platform === "linux" ? describe : describe.skip;
+const linuxProbe = process.platform === "linux" ? describe : describe.skip;
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 function fixture(mode: string) {
-  const dir = mkdtempSync(join(tmpdir(), "xp-native-")); dirs.push(dir);
+  const dir = mkdtempSync(join(tmpdir(), "xp-linux-probe-")); dirs.push(dir);
   mkdirSync(join(dir, "bin")); mkdirSync(join(dir, "proc/99"), { recursive: true });
   writeFileSync(join(dir, "proc/99/cmdline"), "xray\0run\0"); symlinkSync("/usr/bin/xray", join(dir, "proc/99/exe"));
   writeFileSync(join(dir, "proc/99/stat"), `99 (xray) ${["S", ...Array(18).fill("0"), "12345", "0"].join(" ")}\n`);
@@ -96,8 +96,8 @@ test("remote probe rejects malformed arguments on every supported host", async (
     expect({ code, out, err }).toEqual({ code: 2, out: "", err: "" });
   }
 });
-native("VER-FOUNDATION-XP-03 isolated Linux native probe", () => {
-  test("native preflight collects kernel bounds and rejects changing listener snapshots", async () => {
+linuxProbe("VER-FOUNDATION-XP-03 isolated Linux probe", () => {
+  test("POSIX preflight collects kernel bounds and rejects changing listener snapshots", async () => {
     for (const [drift, container] of [[false, false], [true, false], [false, true], [true, true]]) {
       const f = fixture("bootstrap");
       writeFileSync(join(f.dir, "bin/sudo"), `#!/bin/sh
@@ -157,7 +157,7 @@ esac
   test("host identity is revalidated around successful loopback request", async () => { const result = await run("host"); expect(result.code).toBe(0); expect(result.out).toBe("vless_ingress=true\n"); expect(result.calls).toContain("curl"); });
   test.each(["pid-drift", "start-drift"])("host identity change fails: %s", async mode => { const result = await run(mode); expect(result.code).not.toBe(0); expect(result.out).not.toContain("vless_ingress=true"); });
   test("host permission failure cannot downgrade to Docker", async () => { const result = await run("deny-sudo"); expect(result.code).not.toBe(0); expect(result.calls).not.toContain("docker"); });
-  test("sudo Docker follows native token scan", async () => { const result = await run("sudo-container", true); expect(result.code).toBe(0); expect(result.out).toContain("vless_ingress=true"); expect(result.calls).toContain("sudo -n docker"); });
+  test("sudo Docker follows process token scan", async () => { const result = await run("sudo-container", true); expect(result.code).toBe(0); expect(result.out).toContain("vless_ingress=true"); expect(result.calls).toContain("sudo -n docker"); });
   test("direct Docker needs explicit override", async () => {
     const denied = await run("direct", true, false); expect(denied.code).not.toBe(0); expect(denied.calls).not.toContain("curl");
     const allowed = await run("direct", true, true); expect(allowed.code).toBe(0); expect(allowed.out).toContain("vless_ingress=true");
@@ -248,9 +248,9 @@ raw_env_payload XP_NODE_NAME __END__
   expect(embeddedNewline).toEqual({ code: 0, out: "__READ_FAILED____END__", err: "" });
 });
 
-native("VER-FOUNDATION-XP-03 isolated Linux native probe", () => {
+linuxProbe("VER-FOUNDATION-XP-03 isolated Linux probe", () => {
   test("full audit collector executes descriptor-bound runtime snapshots", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "xp-audit-native-")); dirs.push(dir);
+    const dir = mkdtempSync(join(tmpdir(), "xp-audit-linux-probe-")); dirs.push(dir);
     const dataDir = join(dir, "data"); mkdirSync(dataDir);
     const envPath = join(dir, "xp.env");
     const procEnvironment = join(dir, "proc-environ");

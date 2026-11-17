@@ -123,7 +123,7 @@ Usage:
   xp-infra version <host>
   xp-infra tunnel <host> [--ui|--metrics] [--local-port PORT]
 Private configuration: XP_INFRA_CONFIG_DIR, XP_HOSTS_FILE, XP_POLICY_FILE.
-Transport and public probes require native ssh and curl. No Ruby/Python runtime.`);
+Transport and public probes require OpenSSH and curl. No Ruby/Python runtime.`);
     return;
   }
   const config = configuration();

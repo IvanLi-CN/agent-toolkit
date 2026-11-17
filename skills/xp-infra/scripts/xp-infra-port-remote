@@ -1,5 +1,5 @@
 #!/bin/sh
-# Bounded native observation only; local interpretation lives in preflight.ts.
+# Bounded system observation only; local interpretation lives in preflight.ts.
 set -eu
 echo XP_INFRA_PORT_PREFLIGHT=1 >/dev/null
 env_file=/etc/xp/xp.env

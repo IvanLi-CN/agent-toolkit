@@ -33,12 +33,12 @@ export async function command(argv: string[], options: CommandOptions = {}): Pro
     // Never echo remote stderr: it can contain secrets and arbitrary terminal data.
     child.stderr.on("data", (chunk: Buffer) => { errorBytes += chunk.length; if (errorBytes > limit) fail("command diagnostics exceed limit"); });
     child.stdin.on("error", () => { /* Early remote failure is handled by exit status. */ });
-    child.on("error", () => { failure ??= new Error("native command unavailable"); });
+    child.on("error", () => { failure ??= new Error("system command unavailable"); });
     child.on("close", code => {
       clearTimeout(timer);
       for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.off(signal, onSignal);
       if (failure) { reject(failure); return; }
-      try { ensure(code === 0, "native command failed"); resolve(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks))); }
+      try { ensure(code === 0, "system command failed"); resolve(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks))); }
       catch (error) { reject(error); }
     });
     child.stdin.end(options.input ?? "");

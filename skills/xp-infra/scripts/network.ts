@@ -33,7 +33,7 @@ export type Resolver = (host: string) => Promise<string[]>;
 export interface PublicTarget { url: string; host: string; port: number; address: string; resolve: string }
 async function resolveAddresses(host: string): Promise<string[]> {
   // getaddrinfo itself is not cancellable. A short-lived Bun child gives DNS
-  // the same enforceable process-group deadline as the native probes.
+  // the same enforceable process-group deadline as the system probes.
   const raw = await command([process.execPath, "-e", 'import { lookup } from "node:dns/promises"; try { const addresses = await lookup(process.argv[1], { all: true }); console.log(JSON.stringify(addresses.map(item => item.address))); } catch { process.exit(1); }', host], { timeoutMs: 10000 });
   const addresses = strictJson(raw);
   ensure(Array.isArray(addresses) && addresses.every((value): value is string => typeof value === "string"), "invalid DNS response");

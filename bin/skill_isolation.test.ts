@@ -33,6 +33,22 @@ function run(command: string[], cwd: string, env: Record<string, string | undefi
   };
 }
 
+async function runWithInput(command: string[], cwd: string, input: string, env: Record<string, string | undefined> = {}): Promise<CommandResult> {
+  const child = Bun.spawn(command, {
+    cwd,
+    env: { ...process.env, ...env },
+    stdin: new Blob([input]),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ]);
+  return { code, stdout, stderr };
+}
+
 function trackedSkillFiles(name: string): string[] {
   const result = run(["git", "ls-files", "--stage", "--", `skills/${name}`], repoRoot);
   if (result.code !== 0) throw new Error(`git ls-files failed for ${name}: ${result.stderr}`);
@@ -77,6 +93,7 @@ function copyFiles(sourceRoot: string, destination: string, files: string[]): vo
 
 function copyListedSkill(name: string, destinationRoot: string): string {
   const sourceRoot = join(repoRoot, "skills", name);
+  assertSafeSourcePath(repoRoot, relative(repoRoot, sourceRoot));
   const destination = join(destinationRoot, name);
   const files = trackedSkillFiles(name).map((file) => relative(sourceRoot, join(repoRoot, file)));
   if (files.length === 0) throw new Error(`no tracked files for ${name}`);
@@ -94,10 +111,15 @@ function expectSuccess(result: CommandResult, label: string): void {
   expect(result.code, `${label}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`).toBe(0);
 }
 
-test("public Skills run from isolated single-directory exports", () => {
-  const workspace = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "skill-isolation-"));
+test("public Skills run from isolated single-directory exports", async () => {
+  const workspaces: string[] = [];
   try {
-    const roots = new Map(publicSkills().map((name) => [name, copyListedSkill(name, workspace)]));
+    const roots = new Map<string, string>();
+    for (const name of publicSkills()) {
+      const workspace = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "skill-isolation-"));
+      workspaces.push(workspace);
+      roots.set(name, copyListedSkill(name, workspace));
+    }
     for (const [name, root] of roots) {
       const skill = readFileSync(join(root, "SKILL.md"), "utf8");
       expect(skill).toContain(`name: ${name}`);
@@ -148,8 +170,41 @@ test("public Skills run from isolated single-directory exports", () => {
 
     const xp = roots.get("xp-infra")!;
     expectSuccess(run([process.execPath, join(xp, "scripts/xp-infra"), "--help"], xp), "XP help");
+    expect(lstatSync(join(xp, "scripts/xp-infra-audit-local")).mode & 0o777).toBe(0o755);
+    const auditLocal = await runWithInput([join(xp, "scripts/xp-infra-audit-local"), "public-health"], xp, '{"status":"ok","xray":{"status":"up"}}', {
+      PATH: dirname(process.execPath),
+    });
+    expectSuccess(auditLocal, "XP local public-health wrapper");
+    expect(auditLocal.stdout).toContain("public_health=true");
+    const policyConfig = join(xp, "policy-fixture");
+    mkdirSync(policyConfig, { recursive: true });
+    writeFileSync(join(policyConfig, "hosts.txt"), "fixture-node\n");
+    writeFileSync(join(policyConfig, "deployment-policy.yaml"), `schema_version: 1
+owner_confirmed: true
+geo:
+  enabled: true
+  origin: https://api.country.is
+  owner_authorized_third_party_lookup: true
+public_hostname:
+  zone: example.test
+defaults:
+  cloudflare_tunnel: true
+  cloudflare_ddns: true
+  ip_geo_enrichment: true
+  managed_default_vless: true
+  managed_default_ss2022: false
+  direct_docker: false
+  vless_port: automatic_preflight
+node_overrides: {}
+`);
+    const policy = run([process.execPath, join(xp, "scripts/xp-infra"), "policy", "check"], xp, {
+      XP_INFRA_CONFIG_DIR: policyConfig,
+      PATH: "/usr/bin:/bin",
+    });
+    expectSuccess(policy, "XP offline policy check");
+    expect(policy.stdout).toBe("policy: OK\n");
   } finally {
-    rmSync(workspace, { recursive: true, force: true });
+    for (const workspace of workspaces) rmSync(workspace, { recursive: true, force: true });
   }
 });
 
@@ -169,6 +224,13 @@ test("single-directory exporter rejects symbolic links", () => {
     expect(() => copyFiles(source, destination, ["nested/escaped.md"])).toThrow("symbolic link");
     symlinkSync(source, join(root, "source-link"));
     expect(() => copyFiles(join(root, "source-link"), destination, ["SKILL.md"])).toThrow("symbolic link");
+    const boundary = join(root, "boundary");
+    const external = join(root, "external");
+    mkdirSync(boundary, { recursive: true });
+    mkdirSync(join(external, "example"), { recursive: true });
+    writeFileSync(join(external, "example/SKILL.md"), "---\nname: example\n---\n");
+    symlinkSync(external, join(boundary, "skills"));
+    expect(() => copyFiles(boundary, destination, ["skills/example/SKILL.md"])).toThrow("symbolic link");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

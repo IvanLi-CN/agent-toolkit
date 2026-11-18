@@ -10,7 +10,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { delimiter, dirname, join, relative, resolve, sep } from "node:path";
 
 import { publicSkills } from "./public_skill_boundary_check.ts";
 
@@ -178,7 +178,14 @@ test("public Skills run from isolated single-directory exports", async () => {
     const tavily = roots.get("tavily-hikari-infra")!;
     const tavilyMode = lstatSync(join(repoRoot, "skills/tavily-hikari-infra/scripts/tavily-hikari-infra")).mode & 0o777;
     expect(tavilyMode).toBe(0o755);
+    const tavilyFixtureBin = join(tavily, "fixture-bin");
+    mkdirSync(tavilyFixtureBin, { recursive: true });
+    const tavilyFixtureSsh = join(tavilyFixtureBin, "ssh");
+    writeFileSync(tavilyFixtureSsh, '#!/bin/sh\n[ "$1" = "-G" ] || exit 1\ncase "$2" in primary|standby) ;; *) exit 1 ;; esac\nprintf "%s\\n" "hostname fixture.invalid" "port 22" "user operator"\n');
+    chmodSync(tavilyFixtureSsh, 0o755);
     expectSuccess(run([join(tavily, "scripts/tavily-hikari-infra"), "inventory"], tavily, {
+      HOME: tavily,
+      PATH: [tavilyFixtureBin, "/usr/bin", "/bin"].join(delimiter),
       TAVILY_HOSTS_FILE: join(tavily, "references/hosts.txt.example"),
     }), "Tavily inventory");
 

@@ -184,8 +184,10 @@ function assertNoCrossSkillReferences(): void {
       const content = readFileSync(join(repoRoot, file), "utf8");
       for (const other of names) {
         if (other === name) continue;
-        const markers = [`skills/${other}/`, `skills\\${other}\\`, `../${other}/`, `..\\${other}\\`];
-        if (markers.some((marker) => content.includes(marker))) findings.push(`${name}/${relativeFile} -> ${other}`);
+        const normalized = content.replaceAll("\\", "/");
+        const escaped = other.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const relativePath = new RegExp(`(?:^|[^A-Za-z0-9_-])(?:\\.\\./)+${escaped}(?:/|$)`);
+        if (normalized.includes(`skills/${other}/`) || relativePath.test(normalized)) findings.push(`${name}/${relativeFile} -> ${other}`);
       }
     }
   }
@@ -278,10 +280,6 @@ function copyListedSkill(name: string, destinationRoot: string): string {
   return destination;
 }
 
-function runBun(root: string, script: string, args: string[], env: Record<string, string | undefined> = {}): CommandResult {
-  return run([process.execPath, script, ...args], root, env);
-}
-
 function expectSuccess(result: CommandResult, label: string): void {
   expect(result.code, `${label}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`).toBe(0);
 }
@@ -298,6 +296,8 @@ test("public Skills run from isolated single-directory exports", async () => {
       workspaces.push(workspace);
       roots.set(name, copyListedSkill(name, workspace));
     }
+    const caller = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "skill-caller-"));
+    workspaces.push(caller);
     for (const [name, root] of roots) {
       const skill = readFileSync(join(root, "SKILL.md"), "utf8");
       expect(skill).toContain(`name: ${name}`);
@@ -307,43 +307,43 @@ test("public Skills run from isolated single-directory exports", async () => {
 
     const buzzer = roots.get("buzzer-audio-preview")!;
     const buzzerOutput = join(buzzer, "output");
-    expectSuccess(runBun(buzzer, "scripts/buzzer_preview.ts", ["--in", "assets/score.example.json", "--out-dir", buzzerOutput]), "buzzer preview");
+    expectSuccess(run([process.execPath, join(buzzer, "scripts/buzzer_preview.ts"), "--in", join(buzzer, "assets/score.example.json"), "--out-dir", buzzerOutput], caller), "buzzer preview");
     executedPortable.add("buzzer-audio-preview/scripts/buzzer_preview.ts");
     expect(readFileSync(join(buzzerOutput, "score.example.mid")).subarray(0, 4).toString()).toBe("MThd");
     expect(readFileSync(join(buzzerOutput, "score.example.wav")).subarray(0, 4).toString()).toBe("RIFF");
 
     const cvm = roots.get("cvm-imagegen")!;
-    const dryRun = run(["python3", "scripts/image_gen.py", "generate", "--prompt", "isolated", "--out", join(cvm, "output.png"), "--dry-run"], cvm, {
+    const dryRun = run(["python3", join(cvm, "scripts/image_gen.py"), "generate", "--prompt", "isolated", "--out", join(cvm, "output.png"), "--dry-run"], caller, {
       AGENT_IMAGEGEN_SYSTEM_PATH: join(cvm, "tests/fixtures/system_image_gen.py"),
     });
     expectSuccess(dryRun, "CVM dry-run with fixture");
     executedPortable.add("cvm-imagegen/scripts/image_gen.py");
-    const missingFallback = run(["python3", "scripts/image_gen.py", "generate", "--prompt", "isolated", "--out", join(cvm, "missing.png"), "--dry-run"], cvm, {
+    const missingFallback = run(["python3", join(cvm, "scripts/image_gen.py"), "generate", "--prompt", "isolated", "--out", join(cvm, "missing.png"), "--dry-run"], caller, {
       AGENT_IMAGEGEN_SYSTEM_PATH: "",
     });
     expect(missingFallback.code).toBe(1);
     expect(missingFallback.stderr).toContain("imagegen fallback script not found");
 
     const dst = roots.get("dst-dedicated-server")!;
-    const snapshot = runBun(dst, "scripts/dst_snapshot.ts", ["--no-local", "--no-remote", "--out", "snapshot.md"]);
+    const snapshot = run([process.execPath, join(dst, "scripts/dst_snapshot.ts"), "--no-local", "--no-remote", "--out", join(dst, "snapshot.md")], caller);
     expectSuccess(snapshot, "DST snapshot");
     executedPortable.add("dst-dedicated-server/scripts/dst_snapshot.ts");
     expect(readFileSync(join(dst, "snapshot.md"), "utf8")).toContain("# DST snapshot");
     mkdirSync(join(dst, "cluster/Master"), { recursive: true });
     writeFileSync(join(dst, "cluster/Master/modoverrides.lua"), 'return {["workshop-1"]={enabled=true}}');
-    const mods = runBun(dst, "scripts/dst_mods_from_modoverrides.ts", ["--cluster-dir", "cluster"]);
+    const mods = run([process.execPath, join(dst, "scripts/dst_mods_from_modoverrides.ts"), "--cluster-dir", join(dst, "cluster")], caller);
     expectSuccess(mods, "DST mod summary");
     executedPortable.add("dst-dedicated-server/scripts/dst_mods_from_modoverrides.ts");
     expect(mods.stdout).toContain("enabled_ids: 1");
 
     const firmware = roots.get("firmware-display-preview")!;
     writeFileSync(join(firmware, "framebuffer.bin"), Buffer.from([0, 255]));
-    expectSuccess(runBun(firmware, "scripts/fb_to_png.ts", ["--format", "gray8", "--width", "2", "--height", "1", "--in", "framebuffer.bin", "--out", "preview.png"]), "framebuffer preview");
+    expectSuccess(run([process.execPath, join(firmware, "scripts/fb_to_png.ts"), "--format", "gray8", "--width", "2", "--height", "1", "--in", join(firmware, "framebuffer.bin"), "--out", join(firmware, "preview.png")], caller), "framebuffer preview");
     executedPortable.add("firmware-display-preview/scripts/fb_to_png.ts");
     expect(readFileSync(join(firmware, "preview.png")).subarray(0, 8).toString("hex")).toBe("89504e470d0a1a0a");
 
     const gitSync = roots.get("git-sync")!;
-    expectSuccess(run([process.execPath, "test", "tests/detached_alignment_contract.test.ts"], gitSync), "Git alignment contract");
+    expectSuccess(run([process.execPath, "test", join(gitSync, "tests/detached_alignment_contract.test.ts")], caller), "Git alignment contract");
 
     const tavily = roots.get("tavily-hikari-infra")!;
     const tavilyMode = lstatSync(join(repoRoot, "skills/tavily-hikari-infra/scripts/tavily-hikari-infra")).mode & 0o777;
@@ -353,16 +353,16 @@ test("public Skills run from isolated single-directory exports", async () => {
     const tavilyFixtureSsh = join(tavilyFixtureBin, "ssh");
     writeFileSync(tavilyFixtureSsh, '#!/bin/sh\n[ "$1" = "-G" ] || exit 1\ncase "$2" in primary|standby) ;; *) exit 1 ;; esac\nprintf "%s\\n" "hostname fixture.invalid" "port 22" "user operator"\n');
     chmodSync(tavilyFixtureSsh, 0o755);
-    expectSuccess(run([join(tavily, "scripts/tavily-hikari-infra"), "inventory"], tavily, {
+    expectSuccess(run([join(tavily, "scripts/tavily-hikari-infra"), "inventory"], caller, {
       HOME: tavily,
       PATH: [tavilyFixtureBin, "/usr/bin", "/bin"].join(delimiter),
       TAVILY_HOSTS_FILE: join(tavily, "references/hosts.txt.example"),
     }), "Tavily inventory");
 
     const xp = roots.get("xp-infra")!;
-    expectSuccess(run([process.execPath, join(xp, "scripts/xp-infra"), "--help"], xp), "XP help");
+    expectSuccess(run([process.execPath, join(xp, "scripts/xp-infra"), "--help"], caller), "XP help");
     expect(lstatSync(join(xp, "scripts/xp-infra-audit-local")).mode & 0o777).toBe(0o755);
-    const auditLocal = await runWithInput([join(xp, "scripts/xp-infra-audit-local"), "public-health"], xp, '{"status":"ok","xray":{"status":"up"}}', {
+    const auditLocal = await runWithInput([join(xp, "scripts/xp-infra-audit-local"), "public-health"], caller, '{"status":"ok","xray":{"status":"up"}}', {
       PATH: dirname(process.execPath),
     });
     expectSuccess(auditLocal, "XP local public-health wrapper");
@@ -389,7 +389,7 @@ defaults:
   vless_port: automatic_preflight
 node_overrides: {}
 `);
-    const policy = run([process.execPath, join(xp, "scripts/xp-infra"), "policy", "check"], xp, {
+    const policy = run([process.execPath, join(xp, "scripts/xp-infra"), "policy", "check"], caller, {
       XP_INFRA_CONFIG_DIR: policyConfig,
       PATH: "/usr/bin:/bin",
     });

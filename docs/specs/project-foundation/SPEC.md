@@ -9,7 +9,7 @@ The public source owns shared instructions and executable resources. Operators o
 ## Terms and Interfaces
 
 - Domain terms are defined in [GLOSSARY.md](../../../GLOSSARY.md).
-- Public membership: 12 Skills, defined by [PUBLIC_SKILLS.txt](../../../PUBLIC_SKILLS.txt). Skill metadata and the catalog describe that membership; consumer discovery uses a direct checkout or source links.
+- Public membership: 11 Skills, defined by [PUBLIC_SKILLS.txt](../../../PUBLIC_SKILLS.txt). Skill metadata and the catalog describe that membership; consumer discovery uses a direct checkout or source links.
 - [The script language matrix](SCRIPT-LANGUAGE-MATRIX.md) allocates the executable responsibilities of every public Skill. Target allocation is distinct from completed migration, which is recorded in [IMPLEMENTATION.md](IMPLEMENTATION.md).
 - General tools use installed Bun with explicit type checking; application-host Python, native C rendering, and bounded remote Shell retain their concrete interface roles.
 - The documentation presentation uses Bun/Rspress and the /agent-toolkit/ repository subpath. A successful build does not establish external publication.
@@ -70,11 +70,11 @@ The project MUST convert XP local policy, orchestration, interpretation, and aud
 
 ### REQ-FOUNDATION-MIG-05
 
-The project MUST preserve the accepted Python module/CAD, C rendering, remote Shell, small Tavily helper, and text-only exceptions. Retire only replaced implementations and align affected tests/docs/CI.
+The project MUST preserve the accepted Python module, C rendering, remote Shell, small Tavily helper, and text-only exceptions. Retire only replaced implementations and align affected tests/docs/CI.
 
 ### REQ-FOUNDATION-DOC-01
 
-The project MUST put project purpose, four capability groups, a clickable entry for each public Skill, prerequisites, outputs, and representative scenarios within easy reach of the root README.
+The project MUST put project purpose, three capability groups, a clickable entry for each public Skill, prerequisites, outputs, and representative scenarios within easy reach of the root README.
 
 ### REQ-FOUNDATION-DOC-02
 
@@ -403,8 +403,8 @@ Verification requirements describe evidence that must be produced, rather than c
 ### VER-FOUNDATION-HELPERS-06
 
 - covers: `REQ-FOUNDATION-MIG-01`
-- Method and required evidence: Consumer-link smoke, CI suite selection, and reference scan.
-- Pass condition: All new entrypoints work from Skill source links on Linux/macOS, replaced helper/test references are gone, and C/Shell prerequisites remain accurate.
+- Method and required evidence: Directory-only export smoke with an explicit tracked-script inventory, CI suite selection, and reference scan; every listed portable/offline entrypoint uses synthetic fixtures while retained remote/native scripts are checked for source-local paths and prerequisite declarations.
+- Pass condition: Each maintained portable/offline script entrypoint works from an isolated single-Skill export on Linux/macOS, retained remote/native Shell/C entrypoints remain source-isolated with accurate prerequisites, and cross-Skill helper/test references are gone.
 
 ### VER-FOUNDATION-XP-01
 

@@ -36,7 +36,6 @@ function skillNames(rows: string[][]): string[] {
 const GUIDE_PATH_FILES = [
   "docs/guides/service-operations.md",
   "docs/guides/media-previews.md",
-  "docs/guides/cad-repair.md",
 ];
 
 type SkillPathRule = { code: string; pattern: RegExp };

@@ -19,7 +19,7 @@ git status -sb
 
 **输出：**目标/协议与工作区信息、错误分类及证据支持的修复建议。联网验证使用 canonical 中的只读 connectivity 命令，凭据挑战由主人完成。
 
-**读写边界：**诊断不更改 remote URL/协议、push URL、upstream、代理或认证设置，不以另一 URL push 绕过错误。任何配置修改或真实 push 都需要对应主人授权；read-only `ls-remote` 成功也不代表已 push。维护者的 Bun source-link smoke 不是 live authentication 验证。
+**读写边界：**诊断不更改 remote URL/协议、push URL、upstream、代理或认证设置，不以另一 URL push 绕过错误。任何配置修改或真实 push 都需要对应主人授权；read-only `ls-remote` 成功也不代表已 push。仓库级 Bun Skill-isolation smoke 不是 live authentication 验证。
 
 ## git-sync
 

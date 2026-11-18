@@ -12,6 +12,5 @@ git-remote-troubleshoot
 git-sync
 linux-server-init
 markdown-doc-style
-step-stl-print-repair
 tavily-hikari-infra
 xp-infra

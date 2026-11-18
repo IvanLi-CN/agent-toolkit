@@ -9,7 +9,7 @@ const TOPIC = "docs/specs/project-foundation";
 function fixture(run: (root: string) => void): void {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "toolkit-foundation-"));
   try {
-    for (const path of ["docs", "skills", "AGENTS.md", "README.md", "GLOSSARY.md", "PUBLIC_SKILLS.txt", "package.json", ".github/workflows/ci.yml", "bin/foundation_contract_check.test.ts"]) {
+    for (const path of ["docs", "skills", "AGENTS.md", "README.md", "GLOSSARY.md", "PUBLIC_SKILLS.txt", "package.json", ".github/workflows/ci.yml", "bin/foundation_contract_check.test.ts", "bin/skill_isolation.test.ts"]) {
       mkdirSync(dirname(join(root, path)), { recursive: true });
       cpSync(join(REPO_ROOT, path), join(root, path), { recursive: true });
     }
@@ -64,7 +64,7 @@ test("rejects missing, duplicate, extra, or malformed matrix rows", () => {
 test("rejects stale membership counts in each active contract", () => {
   for (const path of ["SPEC.md", "IMPLEMENTATION.md", "SCRIPT-LANGUAGE-MATRIX.md"]) {
     fixture((root) => {
-      replace(root, `${TOPIC}/${path}`, "Public membership: 12", "Public membership: 14");
+      replace(root, `${TOPIC}/${path}`, "Public membership: 11", "Public membership: 14");
       expect(check(root)).toContain(`FOUNDATION_COUNT_DRIFT ${path}`);
     });
   }
@@ -161,10 +161,6 @@ test("rejects fixed Skill command paths without rejecting operator paths", () =>
   fixture((root) => {
     replace(root, "skills/cvm-imagegen/references/cli.md", "python3 scripts/image_gen.py generate \\", "python3 ../scripts/image_gen.py generate \\");
     expect(check(root)).toContain("FOUNDATION_SKILL_PATH_DRIFT skills/cvm-imagegen/references/cli.md NON_ROOT_SKILL_SCRIPT_PATH");
-  });
-  fixture((root) => {
-    replace(root, "docs/guides/cad-repair.md", "CAD_PYTHON=/path/to/gmsh-python", "CAD_PYTHON=/path/to/gmsh-python\nINPUT=/path/to/model.step\nOUTPUT=/path/to/fresh-output/model.stl\nREMOTE=/etc/example/service.conf");
-    expect(check(root).filter((finding) => finding.startsWith("FOUNDATION_SKILL_PATH_DRIFT"))).toEqual([]);
   });
   fixture((root) => {
     expect(check(root).filter((finding) => finding.startsWith("FOUNDATION_SKILL_PATH_DRIFT"))).toEqual([]);

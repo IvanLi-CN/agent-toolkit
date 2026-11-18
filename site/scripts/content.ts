@@ -31,7 +31,7 @@ export const documents: [string, string][] = [
   ['CONTRIBUTING.md', '/architecture/contributing/'],
   ['docs/guides/README.md', '/guides/'],
   ...['installation', 'configuration', 'service-operations',
-    'git-and-docs', 'media-previews', 'cad-repair'].map(name =>
+    'git-and-docs', 'media-previews'].map(name =>
     [`docs/guides/${name}.md`, `/guides/${name}/`] as [string, string]),
   ['docs/specs/project-foundation/SPEC.md', '/contracts/project-foundation/'],
   ['docs/specs/project-foundation/IMPLEMENTATION.md', '/contracts/project-foundation/implementation/'],

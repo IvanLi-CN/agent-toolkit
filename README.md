@@ -2,11 +2,11 @@
 
 Agent Toolkit 为 coding 与 automation agents 提供可独立使用的公共 Skills：从 Git 诊断、离线预览，到有明确授权边界的 Linux 与服务操作。消费者直接读取 checkout 中的 Skill 目录或其源链接。
 
-Canonical source 位于 `skills/<name>/`；公共 membership 以 [PUBLIC_SKILLS.txt](PUBLIC_SKILLS.txt) 为准，共 12 个 Skill。[公共目录](skills/README.md)维护 membership 索引，下面的四组入口连接使用指南。指南提供最小示例；完整行为以各 Skill 的 `SKILL.md` 和 contracts 为准。
+Canonical source 位于 `skills/<name>/`；公共 membership 以 [PUBLIC_SKILLS.txt](PUBLIC_SKILLS.txt) 为准，共 11 个 Skill。[公共目录](skills/README.md)维护 membership 索引，下面的三组入口连接使用指南。指南提供最小示例；完整行为以各 Skill 的 `SKILL.md` 和 contracts 为准。
 
 [安装与更新](docs/guides/installation.md) · [全部指南](docs/guides/README.md) · [Protected configuration](docs/guides/configuration.md) · [Validation](#validation) · [Contracts 与架构](docs/guides/README.md#contracts) · [贡献边界](CONTRIBUTING.md)
 
-## 四个能力组
+## 三个能力组
 
 | 能力组 / Skill | 最小用途与代表场景 | 平台 / 前置条件 | 输出 |
 | --- | --- | --- | --- |
@@ -21,7 +21,6 @@ Canonical source 位于 `skills/<name>/`；公共 membership 以 [PUBLIC_SKILLS.
 | 媒体与固件预览：[buzzer-audio-preview](docs/guides/media-previews.md#buzzer-audio-preview) | 从 JSON 音符确认蜂鸣器节奏 | Linux/macOS、Bun、合法 score | MIDI 与 WAV，不自动播放 |
 | 媒体与固件预览：[firmware-display-preview](docs/guides/media-previews.md#firmware-display-preview) | 将固件 framebuffer 转为 PNG | Linux/macOS、Bun；真实渲染另需 C 编译器、固件入口与资产 | framebuffer、场景源码、PNG |
 | 媒体与固件预览：[cvm-imagegen](docs/guides/media-previews.md#cvm-imagegen) | 显式要求 CLI/API fallback 时生成或编辑图片 | Python、已配置 fallback 模块及其依赖；在线需 endpoint/key 与授权 | dry-run 请求或生成图片 |
-| CAD：[step-stl-print-repair](docs/guides/cad-repair.md#step-stl-print-repair) | 从 STEP 重新网格化并检查打印 STL | Linux/macOS、匹配 FreeCAD/Gmsh/Blender 的 Python 环境与扩展 | STL、JSON 报告、渲染预览 |
 
 ## 安装
 
@@ -54,7 +53,7 @@ bun run test:skills
 
 Runner 拒绝空或无声明的 Bun/Python 测试文件。Shell suite 必须在自身 shell 或 sourced helper 中执行至少一个计数的 `test` builtin，并报告 `TESTS_RUN=<count>`；单独子进程的断言不贡献计数，需在 suite shell 断言其结果。具体行为由 [test_runner.ts](bin/test_runner.ts) 定义。
 
-Root checks 证明结构与契约一致性；隔离 fixture 测试证明其覆盖的行为。两者都不证明真实 CAD 应用、游戏服务器、远端服务、站点发布或生产部署已运行。验证时分别记录本地离线、隔离原生 OS、远端观察及真实应用证据；完整/重型验证使用隔离环境，不在本机 Docker 或生产系统上试运行。平台 wiring 见 [CI](.github/workflows/ci.yml)，证据边界见 [IMPLEMENTATION.md](docs/specs/project-foundation/IMPLEMENTATION.md)。
+Root checks 证明结构与契约一致性；隔离 fixture 测试证明其覆盖的行为。两者都不证明真实游戏服务器、远端服务、原生应用、站点发布或生产部署已运行。验证时分别记录本地离线、隔离原生 OS、远端观察及真实应用证据；完整/重型验证使用隔离环境，不在本机 Docker 或生产系统上试运行。平台 wiring 见 [CI](.github/workflows/ci.yml)，证据边界见 [IMPLEMENTATION.md](docs/specs/project-foundation/IMPLEMENTATION.md)。
 
 ## Contracts 与贡献
 

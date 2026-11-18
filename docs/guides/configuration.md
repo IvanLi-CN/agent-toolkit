@@ -59,7 +59,6 @@ export TAVILY_STANDBY_LOG_COMMAND='journalctl --no-pager -u <configured-unit> -n
 | DST | `DST_HOST='<configured-alias>'`、`DST_USER='<operator-user>'`、`DST_LOCAL_DIR=/path/to/client-data`、`DST_CLUSTER='<cluster-name>'` | 主机凭据用 SSH；cluster/server tokens、密码和 saves 留在私有位置。纯本地 `--no-remote` / `--cluster-dir` 不需要真实服务器；restart/update/mod/save 操作另行授权。 |
 | Linux bootstrap | `HOST='<configured-alias>'`、`PORT=22`、`BOOTSTRAP_USER='<current-admin>'`、`NEW_USER='<new-admin>'`、`PUBKEY_PATH=/path/to/admin.pub` | 这是 workflow inputs，不是自动加载 schema；同时确认 PRIV_ESC、SUDO_MODE、CONSOLE_ACCESS。Account/sudoers/sshd 变更是权限写入，保留旧会话与 rescue。 |
 | Git | 已有 remote / SSH configuration 与明确的 ACTION/BASE_REF/REMOTE | 配置和 verbose 输出可能带私有地址或 credential；不自动更换 URL/协议/认证，不隐式 push。 |
-| CAD/native | `CAD_PYTHON=/path/to/gmsh-python`，项目提供 input、output、toolchain/assets | 这是示例 executable 选择，不是新的服务配置；模型/输出留在授权目录，不上传。Blender 以独立 background/factory-startup 进程运行。 |
 | Buzzer/framebuffer | 显式 input/output 与 score / format 参数 | 不需要 service secrets；输出可能替换同名文件。离线产物不证明硬件/应用实测。 |
 
 排障报告仅保留完成判断所需的 runtime、角色、结果类别和脱敏路径；不公开原始 SSH、请求/响应、模型、用户数据或配置副本。Public tests 应使用 synthetic fixtures 和 temporary directories，不读取主人真实配置。验证层级见 [README](../../README.md#validation)，各 Skill 的细节回到[使用指南](README.md)。

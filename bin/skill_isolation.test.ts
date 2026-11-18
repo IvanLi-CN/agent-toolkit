@@ -60,6 +60,18 @@ function trackedSkillFiles(name: string): string[] {
   });
 }
 
+function assertNoSymlinkAncestors(path: string): void {
+  let current = resolve(path);
+  while (true) {
+    if (lstatSync(current).isSymbolicLink()) {
+      throw new Error(`symbolic link is not a public Skill source ancestor: ${path}`);
+    }
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+}
+
 function assertSafeSourcePath(sourceRoot: string, relativePath: string): string {
   const target = resolve(sourceRoot, relativePath);
   if (target !== sourceRoot && !target.startsWith(`${sourceRoot}${sep}`)) {
@@ -79,7 +91,8 @@ function assertSafeSourcePath(sourceRoot: string, relativePath: string): string 
   return target;
 }
 
-function copyFiles(sourceRoot: string, destination: string, files: string[]): void {
+function copyFiles(sourceRoot: string, destination: string, files: string[], boundaryRoot = sourceRoot): void {
+  assertSafeSourcePath(boundaryRoot, relative(boundaryRoot, sourceRoot));
   for (const relativePath of files) {
     const source = assertSafeSourcePath(sourceRoot, relativePath);
     const entry = lstatSync(source);
@@ -93,11 +106,12 @@ function copyFiles(sourceRoot: string, destination: string, files: string[]): vo
 
 function copyListedSkill(name: string, destinationRoot: string): string {
   const sourceRoot = join(repoRoot, "skills", name);
+  assertNoSymlinkAncestors(repoRoot);
   assertSafeSourcePath(repoRoot, relative(repoRoot, sourceRoot));
-  const destination = join(destinationRoot, name);
+  const destination = destinationRoot;
   const files = trackedSkillFiles(name).map((file) => relative(sourceRoot, join(repoRoot, file)));
   if (files.length === 0) throw new Error(`no tracked files for ${name}`);
-  copyFiles(sourceRoot, destination, files);
+  copyFiles(sourceRoot, destination, files, repoRoot);
   if (!existsSync(join(destination, "SKILL.md"))) throw new Error(`missing SKILL.md for ${name}`);
   if (!existsSync(sourceRoot)) throw new Error(`missing source Skill: ${name}`);
   return destination;
@@ -231,6 +245,13 @@ test("single-directory exporter rejects symbolic links", () => {
     writeFileSync(join(external, "example/SKILL.md"), "---\nname: example\n---\n");
     symlinkSync(external, join(boundary, "skills"));
     expect(() => copyFiles(boundary, destination, ["skills/example/SKILL.md"])).toThrow("symbolic link");
+    const logicalRoot = join(root, "logical");
+    const realParent = join(root, "real-parent");
+    mkdirSync(logicalRoot, { recursive: true });
+    mkdirSync(join(realParent, "example"), { recursive: true });
+    writeFileSync(join(realParent, "example/SKILL.md"), "---\nname: example\n---\n");
+    symlinkSync(realParent, join(logicalRoot, "link"));
+    expect(() => copyFiles(join(logicalRoot, "link/example"), destination, ["SKILL.md"], logicalRoot)).toThrow("symbolic link");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

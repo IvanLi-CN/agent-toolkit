@@ -13,6 +13,7 @@ import {
 import { delimiter, dirname, join, relative, resolve, sep } from "node:path";
 
 import { publicSkills } from "./public_skill_boundary_check.ts";
+import { gitEnvironment } from "./repo_util.ts";
 
 const repoRoot = resolve(import.meta.dir, "..");
 setDefaultTimeout(30_000);
@@ -117,7 +118,7 @@ const REMOTE_NATIVE_CONTRACTS: Record<string, RemoteNativeContract> = {
 function run(command: string[], cwd: string, env: Record<string, string | undefined> = {}): CommandResult {
   const result = Bun.spawnSync(command, {
     cwd,
-    env: { ...process.env, ...env },
+    env: gitEnvironment({ ...process.env, ...env }),
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -131,7 +132,7 @@ function run(command: string[], cwd: string, env: Record<string, string | undefi
 async function runWithInput(command: string[], cwd: string, input: string, env: Record<string, string | undefined> = {}): Promise<CommandResult> {
   const child = Bun.spawn(command, {
     cwd,
-    env: { ...process.env, ...env },
+    env: gitEnvironment({ ...process.env, ...env }),
     stdin: new Blob([input]),
     stdout: "pipe",
     stderr: "pipe",

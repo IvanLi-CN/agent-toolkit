@@ -89,6 +89,31 @@ const SCRIPT_INVENTORY: Record<string, ScriptInventory> = {
   },
 };
 
+type RemoteNativeContract = {
+  prerequisiteMarkers: string[];
+  interpreters: Record<string, "sh" | "bash">;
+};
+
+const REMOTE_NATIVE_CONTRACTS: Record<string, RemoteNativeContract> = {
+  "dst-dedicated-server": {
+    prerequisiteMarkers: ["OpenSSH locally", "an already trusted host key", "POSIX `sh`"],
+    interpreters: { "scripts/dst_collect_remote.sh": "sh" },
+  },
+  "tavily-hikari-infra": {
+    prerequisiteMarkers: ["SSH aliases", "operator's SSH configuration"],
+    interpreters: { "scripts/tavily-hikari-infra": "bash" },
+  },
+  "xp-infra": {
+    prerequisiteMarkers: ["OpenSSH provides transport", "inspected Linux node needs no Bun installation", "timeout"],
+    interpreters: {
+      "scripts/xp-infra-audit-remote": "sh",
+      "scripts/xp-infra-audit-vless-remote": "sh",
+      "scripts/xp-infra-inventory-remote": "sh",
+      "scripts/xp-infra-port-remote": "sh",
+    },
+  },
+};
+
 function run(command: string[], cwd: string, env: Record<string, string | undefined> = {}): CommandResult {
   const result = Bun.spawnSync(command, {
     cwd,
@@ -150,6 +175,31 @@ function assertScriptInventory(): void {
 
 function portableScriptInventory(): string[] {
   return publicSkills().flatMap((name) => SCRIPT_INVENTORY[name].portable.map((file) => `${name}/${file}`)).sort();
+}
+
+function assertRemoteNativeContracts(roots: Map<string, string>): void {
+  for (const name of publicSkills()) {
+    const files = SCRIPT_INVENTORY[name].remoteNative;
+    const contract = REMOTE_NATIVE_CONTRACTS[name];
+    if (files.length === 0) {
+      expect(contract, `unexpected remote/native contract for ${name}`).toBeUndefined();
+      continue;
+    }
+    expect(contract, `missing remote/native contract for ${name}`).toBeDefined();
+    if (!contract) continue;
+    expect(Object.keys(contract.interpreters).sort(), `remote/native inventory drift for ${name}`).toEqual(files);
+    const root = roots.get(name)!;
+    const skill = readFileSync(join(root, "SKILL.md"), "utf8");
+    for (const marker of contract.prerequisiteMarkers) expect(skill, `${name} prerequisite documentation`).toContain(marker);
+    for (const file of files) {
+      const source = readFileSync(join(root, file), "utf8");
+      const interpreter = contract.interpreters[file];
+      const shebang = interpreter === "bash" ? "#!/usr/bin/env bash\n" : "#!/bin/sh\n";
+      expect(source.startsWith(shebang), `${name}/${file} interpreter`).toBe(true);
+      expect(source, `${name}/${file} has caller-relative source dependency`).not.toMatch(/(?:^|\n|[;&|])\s*(?:source|\.)\s+(?:["']?(?:\.{1,2}[\\/]|[^/"'$\s]))/m);
+      expectSuccess(run([interpreter, "-n", join(root, file)], root), `${name}/${file} syntax`);
+    }
+  }
 }
 
 function assertNoSymlinkAncestors(path: string): void {
@@ -233,6 +283,7 @@ test("public Skills run from isolated single-directory exports", async () => {
       expect(skill).toContain(`name: ${name}`);
       expect(skill).toMatch(/^description:/m);
     }
+    assertRemoteNativeContracts(roots);
 
     const buzzer = roots.get("buzzer-audio-preview")!;
     const buzzerOutput = join(buzzer, "output");

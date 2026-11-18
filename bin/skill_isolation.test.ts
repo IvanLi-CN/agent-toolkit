@@ -19,6 +19,29 @@ const repoRoot = resolve(import.meta.dir, "..");
 setDefaultTimeout(30_000);
 
 type CommandResult = { code: number; stdout: string; stderr: string };
+const UNSAFE_GIT_PROCESS_ENVIRONMENT = new Set([
+  "GIT_ASKPASS",
+  "GIT_CURL_VERBOSE",
+  "GIT_DIFF_OPTS",
+  "GIT_EDITOR",
+  "GIT_EXTERNAL_DIFF",
+  "GIT_EXEC_PATH",
+  "GIT_PAGER",
+  "GIT_PROXY_COMMAND",
+  "GIT_SEQUENCE_EDITOR",
+  "GIT_SSH",
+  "GIT_SSH_COMMAND",
+  "GIT_SSH_VARIANT",
+]);
+
+function isolatedProcessEnvironment(environment: Record<string, string | undefined>): Record<string, string> {
+  const sanitized = gitEnvironment(environment);
+  for (const key of Object.keys(sanitized)) {
+    if (key.startsWith("GIT_TRACE") || UNSAFE_GIT_PROCESS_ENVIRONMENT.has(key)) delete sanitized[key];
+  }
+  return sanitized;
+}
+
 type ScriptInventory = {
   portable: string[];
   remoteNative: string[];
@@ -118,7 +141,7 @@ const REMOTE_NATIVE_CONTRACTS: Record<string, RemoteNativeContract> = {
 function run(command: string[], cwd: string, env: Record<string, string | undefined> = {}): CommandResult {
   const result = Bun.spawnSync(command, {
     cwd,
-    env: gitEnvironment({ ...process.env, ...env }),
+    env: isolatedProcessEnvironment({ ...process.env, ...env }),
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -132,7 +155,7 @@ function run(command: string[], cwd: string, env: Record<string, string | undefi
 async function runWithInput(command: string[], cwd: string, input: string, env: Record<string, string | undefined> = {}): Promise<CommandResult> {
   const child = Bun.spawn(command, {
     cwd,
-    env: gitEnvironment({ ...process.env, ...env }),
+    env: isolatedProcessEnvironment({ ...process.env, ...env }),
     stdin: new Blob([input]),
     stdout: "pipe",
     stderr: "pipe",

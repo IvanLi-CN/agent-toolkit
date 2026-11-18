@@ -174,6 +174,24 @@ function assertScriptInventory(): void {
   }
 }
 
+function assertNoCrossSkillReferences(): void {
+  const names = publicSkills();
+  const findings: string[] = [];
+  for (const name of names) {
+    const sourceRoot = join(repoRoot, "skills", name);
+    for (const file of trackedSkillFiles(name)) {
+      const relativeFile = relative(sourceRoot, join(repoRoot, file));
+      const content = readFileSync(join(repoRoot, file), "utf8");
+      for (const other of names) {
+        if (other === name) continue;
+        const markers = [`skills/${other}/`, `skills\\${other}\\`, `../${other}/`, `..\\${other}\\`];
+        if (markers.some((marker) => content.includes(marker))) findings.push(`${name}/${relativeFile} -> ${other}`);
+      }
+    }
+  }
+  expect(findings, "cross-Skill helper/test references").toEqual([]);
+}
+
 function portableScriptInventory(): string[] {
   return publicSkills().flatMap((name) => SCRIPT_INVENTORY[name].portable.map((file) => `${name}/${file}`)).sort();
 }
@@ -272,6 +290,7 @@ test("public Skills run from isolated single-directory exports", async () => {
   const workspaces: string[] = [];
   try {
     assertScriptInventory();
+    assertNoCrossSkillReferences();
     const roots = new Map<string, string>();
     const executedPortable = new Set<string>();
     for (const name of publicSkills()) {

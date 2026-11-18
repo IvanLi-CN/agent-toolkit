@@ -403,7 +403,7 @@ Verification requirements describe evidence that must be produced, rather than c
 ### VER-FOUNDATION-HELPERS-06
 
 - covers: `REQ-FOUNDATION-MIG-01`
-- Method and required evidence: Directory-only export smoke, CI suite selection, and reference scan; portable/offline entrypoints use synthetic fixtures while retained remote/native scripts are checked for source-local paths and prerequisite declarations.
+- Method and required evidence: Directory-only export smoke with an explicit tracked-script inventory, CI suite selection, and reference scan; every listed portable/offline entrypoint uses synthetic fixtures while retained remote/native scripts are checked for source-local paths and prerequisite declarations.
 - Pass condition: Each maintained portable/offline script entrypoint works from an isolated single-Skill export on Linux/macOS, retained remote/native Shell/C entrypoints remain source-isolated with accurate prerequisites, and cross-Skill helper/test references are gone.
 
 ### VER-FOUNDATION-XP-01

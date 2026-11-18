@@ -18,6 +18,76 @@ const repoRoot = resolve(import.meta.dir, "..");
 setDefaultTimeout(30_000);
 
 type CommandResult = { code: number; stdout: string; stderr: string };
+type ScriptInventory = {
+  portable: string[];
+  remoteNative: string[];
+  support: string[];
+  test: string[];
+  retired: string[];
+};
+
+const SCRIPT_INVENTORY: Record<string, ScriptInventory> = {
+  "buzzer-audio-preview": {
+    portable: ["scripts/buzzer_preview.ts"],
+    remoteNative: [],
+    support: [],
+    test: [],
+    retired: [],
+  },
+  "cvm-imagegen": {
+    portable: ["scripts/image_gen.py"],
+    remoteNative: [],
+    support: [],
+    test: ["scripts/test_image_gen.py"],
+    retired: [],
+  },
+  "docs-no-revision-markers": { portable: [], remoteNative: [], support: [], test: [], retired: [] },
+  "dst-dedicated-server": {
+    portable: ["scripts/dst_mods_from_modoverrides.ts", "scripts/dst_snapshot.ts"],
+    remoteNative: ["scripts/dst_collect_remote.sh"],
+    support: ["scripts/dst_common.ts", "scripts/mod_parser.ts"],
+    test: [],
+    retired: [],
+  },
+  "firmware-display-preview": {
+    portable: ["scripts/fb_to_png.ts"],
+    remoteNative: [],
+    support: [],
+    test: [],
+    retired: [],
+  },
+  "git-remote-troubleshoot": { portable: [], remoteNative: [], support: [], test: [], retired: [] },
+  "git-sync": { portable: [], remoteNative: [], support: [], test: [], retired: [] },
+  "linux-server-init": { portable: [], remoteNative: [], support: [], test: [], retired: [] },
+  "markdown-doc-style": { portable: [], remoteNative: [], support: [], test: [], retired: [] },
+  "tavily-hikari-infra": {
+    portable: [],
+    remoteNative: ["scripts/tavily-hikari-infra"],
+    support: [],
+    test: [],
+    retired: [],
+  },
+  "xp-infra": {
+    portable: ["scripts/xp-infra", "scripts/xp-infra-audit-local"],
+    remoteNative: [
+      "scripts/xp-infra-audit-remote",
+      "scripts/xp-infra-audit-vless-remote",
+      "scripts/xp-infra-inventory-remote",
+      "scripts/xp-infra-port-remote",
+    ],
+    support: [
+      "scripts/audit.ts",
+      "scripts/cli.ts",
+      "scripts/input.ts",
+      "scripts/network.ts",
+      "scripts/policy.ts",
+      "scripts/preflight.ts",
+      "scripts/process.ts",
+    ],
+    test: [],
+    retired: ["scripts/xp-infra-compose-image-check"],
+  },
+};
 
 function run(command: string[], cwd: string, env: Record<string, string | undefined> = {}): CommandResult {
   const result = Bun.spawnSync(command, {
@@ -58,6 +128,28 @@ function trackedSkillFiles(name: string): string[] {
     if (match[1] === "120000") throw new Error(`symbolic link is not a public Skill file: ${match[2]}`);
     return match[2];
   });
+}
+
+function scriptInventoryFiles(name: string): string[] {
+  const sourceRoot = join(repoRoot, "skills", name);
+  return trackedSkillFiles(name)
+    .map((file) => relative(sourceRoot, join(repoRoot, file)))
+    .filter((file) => file.startsWith(`scripts${sep}`))
+    .sort();
+}
+
+function assertScriptInventory(): void {
+  for (const name of publicSkills()) {
+    const inventory = SCRIPT_INVENTORY[name];
+    if (!inventory) throw new Error(`missing script inventory for ${name}`);
+    const expected = [inventory.portable, inventory.remoteNative, inventory.support, inventory.test, inventory.retired].flat().sort();
+    expect(new Set(expected).size, `duplicate script inventory entries for ${name}`).toBe(expected.length);
+    expect(scriptInventoryFiles(name), `unclassified tracked scripts for ${name}`).toEqual(expected);
+  }
+}
+
+function portableScriptInventory(): string[] {
+  return publicSkills().flatMap((name) => SCRIPT_INVENTORY[name].portable.map((file) => `${name}/${file}`)).sort();
 }
 
 function assertNoSymlinkAncestors(path: string): void {
@@ -128,7 +220,9 @@ function expectSuccess(result: CommandResult, label: string): void {
 test("public Skills run from isolated single-directory exports", async () => {
   const workspaces: string[] = [];
   try {
+    assertScriptInventory();
     const roots = new Map<string, string>();
+    const executedPortable = new Set<string>();
     for (const name of publicSkills()) {
       const workspace = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "skill-isolation-"));
       workspaces.push(workspace);
@@ -143,6 +237,7 @@ test("public Skills run from isolated single-directory exports", async () => {
     const buzzer = roots.get("buzzer-audio-preview")!;
     const buzzerOutput = join(buzzer, "output");
     expectSuccess(runBun(buzzer, "scripts/buzzer_preview.ts", ["--in", "assets/score.example.json", "--out-dir", buzzerOutput]), "buzzer preview");
+    executedPortable.add("buzzer-audio-preview/scripts/buzzer_preview.ts");
     expect(readFileSync(join(buzzerOutput, "score.example.mid")).subarray(0, 4).toString()).toBe("MThd");
     expect(readFileSync(join(buzzerOutput, "score.example.wav")).subarray(0, 4).toString()).toBe("RIFF");
 
@@ -151,6 +246,7 @@ test("public Skills run from isolated single-directory exports", async () => {
       AGENT_IMAGEGEN_SYSTEM_PATH: join(cvm, "tests/fixtures/system_image_gen.py"),
     });
     expectSuccess(dryRun, "CVM dry-run with fixture");
+    executedPortable.add("cvm-imagegen/scripts/image_gen.py");
     const missingFallback = run(["python3", "scripts/image_gen.py", "generate", "--prompt", "isolated", "--out", join(cvm, "missing.png"), "--dry-run"], cvm, {
       AGENT_IMAGEGEN_SYSTEM_PATH: "",
     });
@@ -160,16 +256,19 @@ test("public Skills run from isolated single-directory exports", async () => {
     const dst = roots.get("dst-dedicated-server")!;
     const snapshot = runBun(dst, "scripts/dst_snapshot.ts", ["--no-local", "--no-remote", "--out", "snapshot.md"]);
     expectSuccess(snapshot, "DST snapshot");
+    executedPortable.add("dst-dedicated-server/scripts/dst_snapshot.ts");
     expect(readFileSync(join(dst, "snapshot.md"), "utf8")).toContain("# DST snapshot");
     mkdirSync(join(dst, "cluster/Master"), { recursive: true });
     writeFileSync(join(dst, "cluster/Master/modoverrides.lua"), 'return {["workshop-1"]={enabled=true}}');
     const mods = runBun(dst, "scripts/dst_mods_from_modoverrides.ts", ["--cluster-dir", "cluster"]);
     expectSuccess(mods, "DST mod summary");
+    executedPortable.add("dst-dedicated-server/scripts/dst_mods_from_modoverrides.ts");
     expect(mods.stdout).toContain("enabled_ids: 1");
 
     const firmware = roots.get("firmware-display-preview")!;
     writeFileSync(join(firmware, "framebuffer.bin"), Buffer.from([0, 255]));
     expectSuccess(runBun(firmware, "scripts/fb_to_png.ts", ["--format", "gray8", "--width", "2", "--height", "1", "--in", "framebuffer.bin", "--out", "preview.png"]), "framebuffer preview");
+    executedPortable.add("firmware-display-preview/scripts/fb_to_png.ts");
     expect(readFileSync(join(firmware, "preview.png")).subarray(0, 8).toString("hex")).toBe("89504e470d0a1a0a");
 
     const gitSync = roots.get("git-sync")!;
@@ -197,6 +296,7 @@ test("public Skills run from isolated single-directory exports", async () => {
     });
     expectSuccess(auditLocal, "XP local public-health wrapper");
     expect(auditLocal.stdout).toContain("public_health=true");
+    executedPortable.add("xp-infra/scripts/xp-infra-audit-local");
     const policyConfig = join(xp, "policy-fixture");
     mkdirSync(policyConfig, { recursive: true });
     writeFileSync(join(policyConfig, "hosts.txt"), "fixture-node\n");
@@ -224,6 +324,8 @@ node_overrides: {}
     });
     expectSuccess(policy, "XP offline policy check");
     expect(policy.stdout).toBe("policy: OK\n");
+    executedPortable.add("xp-infra/scripts/xp-infra");
+    expect([...executedPortable].sort()).toEqual(portableScriptInventory());
   } finally {
     for (const workspace of workspaces) rmSync(workspace, { recursive: true, force: true });
   }

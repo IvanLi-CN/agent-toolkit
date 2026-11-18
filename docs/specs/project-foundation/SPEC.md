@@ -74,7 +74,7 @@ The project MUST preserve the accepted Python module, C rendering, remote Shell,
 
 ### REQ-FOUNDATION-DOC-01
 
-The project MUST put project purpose, four capability groups, a clickable entry for each public Skill, prerequisites, outputs, and representative scenarios within easy reach of the root README.
+The project MUST put project purpose, three capability groups, a clickable entry for each public Skill, prerequisites, outputs, and representative scenarios within easy reach of the root README.
 
 ### REQ-FOUNDATION-DOC-02
 
@@ -403,8 +403,8 @@ Verification requirements describe evidence that must be produced, rather than c
 ### VER-FOUNDATION-HELPERS-06
 
 - covers: `REQ-FOUNDATION-MIG-01`
-- Method and required evidence: Consumer-link smoke, CI suite selection, and reference scan.
-- Pass condition: Each maintained script entrypoint works from an isolated single-Skill export on Linux/macOS, cross-Skill helper/test references are gone, and C/Shell prerequisites remain accurate.
+- Method and required evidence: Directory-only export smoke, CI suite selection, and reference scan; portable/offline entrypoints use synthetic fixtures while retained remote/native scripts are checked for source-local paths and prerequisite declarations.
+- Pass condition: Each maintained portable/offline script entrypoint works from an isolated single-Skill export on Linux/macOS, retained remote/native Shell/C entrypoints remain source-isolated with accurate prerequisites, and cross-Skill helper/test references are gone.
 
 ### VER-FOUNDATION-XP-01
 

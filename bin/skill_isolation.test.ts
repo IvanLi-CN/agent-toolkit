@@ -10,7 +10,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 
 import { publicSkills } from "./public_skill_boundary_check.ts";
 
@@ -44,11 +44,29 @@ function trackedSkillFiles(name: string): string[] {
   });
 }
 
+function assertSafeSourcePath(sourceRoot: string, relativePath: string): string {
+  const target = resolve(sourceRoot, relativePath);
+  if (target !== sourceRoot && !target.startsWith(`${sourceRoot}${sep}`)) {
+    throw new Error(`public Skill path escapes source: ${relativePath}`);
+  }
+  if (lstatSync(sourceRoot).isSymbolicLink()) {
+    throw new Error(`symbolic link is not a public Skill directory: ${sourceRoot}`);
+  }
+  let current = sourceRoot;
+  for (const component of relativePath.split(/[\\/]+/)) {
+    if (!component || component === ".") continue;
+    current = join(current, component);
+    if (lstatSync(current).isSymbolicLink()) {
+      throw new Error(`symbolic link is not a public Skill file: ${relativePath}`);
+    }
+  }
+  return target;
+}
+
 function copyFiles(sourceRoot: string, destination: string, files: string[]): void {
   for (const relativePath of files) {
-    const source = join(sourceRoot, relativePath);
+    const source = assertSafeSourcePath(sourceRoot, relativePath);
     const entry = lstatSync(source);
-    if (entry.isSymbolicLink()) throw new Error(`symbolic link is not a public Skill file: ${relativePath}`);
     if (!entry.isFile()) throw new Error(`public Skill file is not regular: ${relativePath}`);
     const target = join(destination, relative(sourceRoot, source));
     mkdirSync(dirname(target), { recursive: true });
@@ -140,10 +158,17 @@ test("single-directory exporter rejects symbolic links", () => {
   try {
     const source = join(root, "source");
     const destination = join(root, "destination");
+    const outside = join(root, "outside");
     mkdirSync(source, { recursive: true });
+    mkdirSync(outside, { recursive: true });
     writeFileSync(join(source, "SKILL.md"), "---\nname: example\n---\n");
     symlinkSync(join(source, "SKILL.md"), join(source, "linked.md"));
     expect(() => copyFiles(source, destination, ["SKILL.md", "linked.md"])).toThrow("symbolic link");
+    symlinkSync(outside, join(source, "nested"));
+    writeFileSync(join(outside, "escaped.md"), "outside");
+    expect(() => copyFiles(source, destination, ["nested/escaped.md"])).toThrow("symbolic link");
+    symlinkSync(source, join(root, "source-link"));
+    expect(() => copyFiles(join(root, "source-link"), destination, ["SKILL.md"])).toThrow("symbolic link");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

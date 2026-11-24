@@ -28,9 +28,3 @@ The implementation's declared relationship to its target allocation, separating 
 **Private deployment configuration**:
 Operator-owned information identifying an actual deployment and its approved policy, including inventory, connection details, and credentials.
 _Avoid_: Public reference, for live deployment information
-
-## XP infrastructure
-
-**XP-proxy runtime**:
-The XP-managed Rust data-plane process and its host service lifecycle, identified by the `xp-proxy` executable, control socket, snapshot and listeners.
-_Avoid_: native runtime, local runtime

@@ -1,3 +1,0 @@
-# SSH aliases are deployment inputs. Replace these placeholders locally or set
-# XP_HOSTS_FILE to a protected file; do not commit resolved addresses.
-<node-alias>

@@ -1,8 +1,8 @@
 # Script language decisions by Skill
 
-Status: accepted responsibility allocation. This document records current owned source and the accepted target for every public Skill. [SPEC.md](SPEC.md) defines the requirements and verification, and [IMPLEMENTATION.md](IMPLEMENTATION.md) distinguishes completed migrations with behavior evidence from deferred conversions and retained exceptions. An allocation or source link alone does not prove behavioral equivalence or production deployment.
+Status: accepted responsibility allocation. This document records current owned source and the accepted target for every public Skill. [SPEC.md](SPEC.md) defines the requirements and verification, and [IMPLEMENTATION.md](IMPLEMENTATION.md) distinguishes completed migrations with behavior evidence from retained exceptions. An allocation or source link alone does not prove behavioral equivalence or production deployment.
 
-Public membership: 11 Skills, defined by [PUBLIC_SKILLS.txt](../../../PUBLIC_SKILLS.txt). Only manifest-listed Skills receive allocations here; application and remote prerequisites describe their own execution boundaries.
+Public membership: 10 Skills, defined by [PUBLIC_SKILLS.txt](../../../PUBLIC_SKILLS.txt). Only manifest-listed Skills receive allocations here; application and remote prerequisites describe their own execution boundaries.
 
 ## Decision rules
 
@@ -28,16 +28,8 @@ Local Bun follows the installed host runtime; CI follows the latest stable Bun a
 | `linux-server-init` | Markdown/reference guidance only | No script/runtime | Native administration commands are workflow instructions, not an owned Python or TS application. |
 | `markdown-doc-style` | Markdown source guidance only | No script/runtime | Source-text layout guidance has no owned executable. |
 | `tavily-hikari-infra` | A short Bash inventory/status/log helper | Shell | Direct role selection and SSH command forwarding have little domain-model complexity. A TS or Python application would add a runtime prerequisite without a clear functional benefit. |
-| `xp-infra` | Bash orchestration, Ruby policy/audit interpretation, POSIX remote probes | TypeScript + Bun for local orchestration, policy, normalization, and decisions; POSIX Shell for remote probes | Policy schema, audit observations, identity revalidation, public target validation, and port-preflight conclusions are complex structured logic. Remote probes retain bounded, authorized native observation without requiring Bun on inspected nodes. |
 
 ## Exact script responsibilities
-
-### XP operations
-
-- [`xp-infra`](../../../skills/xp-infra/scripts/xp-infra): replace local CLI routing, policy validation, timeouts, target checks, result interpretation, and reporting with TS/Bun. Move complex local Ruby expressions into typed functions; keep remote-native collection at its existing execution boundary.
-- [`xp-infra-audit-local`](../../../skills/xp-infra/scripts/xp-infra-audit-local): replace the Ruby interpretation with TS/Bun. Preserve duplicate-record/member rejection, explicit booleans, schema checks, freshness, identity, public-port and URL rules. `JSON.parse` or a YAML parser alone does not reproduce these validation contracts.
-- [`xp-infra-compose-image-check`](../../../skills/xp-infra/scripts/xp-infra-compose-image-check): express its exact-single-image check as a local typed function, rather than keeping an extra parser runtime or wrapper process.
-- [`xp-infra-audit-remote`](../../../skills/xp-infra/scripts/xp-infra-audit-remote) and [`xp-infra-audit-vless-remote`](../../../skills/xp-infra/scripts/xp-infra-audit-vless-remote): retain POSIX Shell for bounded native collection and identity revalidation. Keep permission/runtime observation where it actually occurs. Do not require Bun on arbitrary inspected servers or move remote identity checks into an unverifiable local assumption.
 
 ### Game-server diagnostics
 
@@ -56,13 +48,13 @@ Local Bun follows the installed host runtime; CI follows the latest stable Bun a
 
 ### Repository checks and tests
 
-Retained index, public-boundary/coupling, source-target inventory, contract checks and the isolated Skill smoke use TS/Bun with their behavioral tests. Remove unrelated private workflow remnants by public scope rather than converting them. The [detached Git alignment test](../../../skills/git-sync/tests/detached_alignment_contract.test.ts) uses Bun to exercise the documented commands against temporary repositories and a filesystem bare remote, checking refs, HEAD, reflog recoverability and configuration invariance; it is test-only. The root [Skill isolation test](../../../bin/skill_isolation.test.ts) exercises each allowlisted Skill from a directory-only export, including portable entrypoints, mode preservation and symlink rejection. VM/XP tests follow their allocated execution interfaces; Python integration tests stay Python where they verify Python module/application contracts.
+Retained index, public-boundary/coupling, source-target inventory, contract checks and the isolated Skill smoke use TS/Bun with their behavioral tests. Remove unrelated private workflow remnants by public scope rather than converting them. The [detached Git alignment test](../../../skills/git-sync/tests/detached_alignment_contract.test.ts) uses Bun to exercise the documented commands against temporary repositories and a filesystem bare remote, checking refs, HEAD, reflog recoverability and configuration invariance; it is test-only. The root [Skill isolation test](../../../bin/skill_isolation.test.ts) exercises each allowlisted Skill from a directory-only export, including portable entrypoints, mode preservation and symlink rejection. Python integration tests stay Python where they verify Python module/application contracts.
 
 Every conversion must update its entrypoints, tests, prerequisite declarations, and contract evidence together. [The project foundation contract](SPEC.md) distinguishes source implementation, required behavior evidence, and later operational rollout. Verified coverage belongs in [IMPLEMENTATION.md](IMPLEMENTATION.md).
 
 ## Sources and evidence limits
 
-This inventory comes from the public Skill tree and script imports, entrypoints, embedded actions, and existing contracts/tests. Language fit is an accepted design decision. Helper execution evidence distinguishes independently decoded media fixtures, fake SSH, isolated native Shell/C/Git, and directory-only export smoke; [implementation coverage](IMPLEMENTATION.md#helper-behavior-evidence) records their limits. It does not establish a real server deployment, physical display/buzzer behavior, image backend availability or native application execution. Python application integrations and remote/native boundaries require their own evidence; the deferred XP allocation does not claim Bun equivalence or operational rollout.
+This inventory comes from the public Skill tree and script imports, entrypoints, embedded actions, and existing contracts/tests. Language fit is an accepted design decision. Helper execution evidence distinguishes independently decoded media fixtures, fake SSH, isolated native Shell/C/Git, and directory-only export smoke; [implementation coverage](IMPLEMENTATION.md#helper-behavior-evidence) records their limits. It does not establish a real server deployment, physical display/buzzer behavior, image backend availability or native application execution. Python application integrations and remote/native boundaries require their own evidence.
 
 - [TypeScript discriminated unions and exhaustive handling](https://www.typescriptlang.org/docs/handbook/2/narrowing.html)
 - [Python type hints and static checking boundary](https://docs.python.org/3/library/typing.html)

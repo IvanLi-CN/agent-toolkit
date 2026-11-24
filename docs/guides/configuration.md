@@ -6,20 +6,6 @@ Public source 保存可复用说明、schema 和中性模板；operator 保存�
 
 以下环境变量都只展示配置形状，路径和 alias 不能直接作为部署使用。环境变量也可能被子进程继承或调试日志记录；凭据由受保护的 secret 注入渠道提供，不在 shell 命令中粘贴真实 key，不使用 `set -x`。仓库不自动加载此页面所示 env 文件，也不提供统一配置 runtime。
 
-## xp
-
-本地 Bun helper 读取 `XP_INFRA_CONFIG_DIR` 下的 `hosts.txt` / `deployment-policy.yaml`，也可逐文件覆盖：
-
-```bash
-export XP_INFRA_CONFIG_DIR=/path/to/private/xp
-export XP_HOSTS_FILE=/path/to/private/xp/hosts.txt
-export XP_POLICY_FILE=/path/to/private/xp/deployment-policy.yaml
-```
-
-从公共 [hosts template](../../skills/xp-infra/references/hosts.txt.example)、[policy template](../../skills/xp-infra/references/deployment-policy.yaml.example)与 [env key template](../../skills/xp-infra/references/xp.env.template)在仓库外建立私有文件。Inventory 仅列唯一小写 SSH aliases，真实 HostName/User/IdentityFile 放 operator 的 SSH configuration。Policy 示例的 `owner_confirmed: false` 故意不能通过检查，不应为了通过而机械改成 true；主人须确认所有功能基线、public hostname、geo 与例外理由。
-
-完整 schema 与 restricted YAML 子集以 [CLI contract](../../skills/xp-infra/references/cli.md)为准；不要加入任意 YAML tags/anchors。真实节点 runtime 配置和 tokens 留在 operator/node 环境，helper 不读取 administrator tokens。离线 `policy check` 不能证明 DNS/public ingress、进程身份或远端 service 健康。Public probes 会联网，按授权的 policy 和目标执行，结果必须脱敏。
-
 ## imagegen
 
 配置可信的外部 Python fallback；dry-run 不要求 endpoint/key：

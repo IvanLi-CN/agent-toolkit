@@ -16,7 +16,7 @@ Skill-owned scripts resolve bundled modules, assets, and sibling helpers from th
 
 ## Validation
 
-执行 [README 的完整验证命令](README.md#validation)，使用已安装 Bun，不额外选择固定 runtime。开发依赖通过 `bun install --frozen-lockfile` 安装；完整 Skill 测试还需要 [requirements-dev.txt](requirements-dev.txt)、Ruby 标准 YAML 库及测试要求的原生工具。领域运行另需匹配的应用环境或远端配置，不要为让 root checks 通过而安装或接触生产服务。
+执行 [README 的完整验证命令](README.md#validation)，使用已安装 Bun，不额外选择固定 runtime。开发依赖通过 `bun install --frozen-lockfile` 安装；完整 Skill 测试还需要 [requirements-dev.txt](requirements-dev.txt) 及测试要求的原生工具。领域运行另需匹配的应用环境或远端配置，不要为让 root checks 通过而安装或接触生产服务。
 
 `bun run check` 包含 foundation/spec、索引与公共边界检查；`bun run test:repo` 与 `bun run test:skills` 的 discovery scope 不同。改动后至少运行受影响检查、对应行为测试与 `git diff --check`。链接核对包括文件/目录存在、相对路径与锚点；还需确认每个 allowlist Skill 有唯一明确的使用指南入口。记录实际 OS/runtime、通过/失败项及缺失依赖，不把 skipped 或未运行项目计为通过。
 

@@ -91,26 +91,6 @@ const SCRIPT_INVENTORY: Record<string, ScriptInventory> = {
     test: [],
     retired: [],
   },
-  "xp-infra": {
-    portable: ["scripts/xp-infra", "scripts/xp-infra-audit-local"],
-    remoteNative: [
-      "scripts/xp-infra-audit-remote",
-      "scripts/xp-infra-audit-vless-remote",
-      "scripts/xp-infra-inventory-remote",
-      "scripts/xp-infra-port-remote",
-    ],
-    support: [
-      "scripts/audit.ts",
-      "scripts/cli.ts",
-      "scripts/input.ts",
-      "scripts/network.ts",
-      "scripts/policy.ts",
-      "scripts/preflight.ts",
-      "scripts/process.ts",
-    ],
-    test: [],
-    retired: ["scripts/xp-infra-compose-image-check"],
-  },
 };
 
 type RemoteNativeContract = {
@@ -127,15 +107,6 @@ const REMOTE_NATIVE_CONTRACTS: Record<string, RemoteNativeContract> = {
     prerequisiteMarkers: ["SSH aliases", "operator's SSH configuration"],
     interpreters: { "scripts/tavily-hikari-infra": "bash" },
   },
-  "xp-infra": {
-    prerequisiteMarkers: ["OpenSSH provides transport", "inspected Linux node needs no Bun installation", "timeout"],
-    interpreters: {
-      "scripts/xp-infra-audit-remote": "sh",
-      "scripts/xp-infra-audit-vless-remote": "sh",
-      "scripts/xp-infra-inventory-remote": "sh",
-      "scripts/xp-infra-port-remote": "sh",
-    },
-  },
 };
 
 function run(command: string[], cwd: string, env: Record<string, string | undefined> = {}): CommandResult {
@@ -150,22 +121,6 @@ function run(command: string[], cwd: string, env: Record<string, string | undefi
     stdout: result.stdout.toString(),
     stderr: result.stderr.toString(),
   };
-}
-
-async function runWithInput(command: string[], cwd: string, input: string, env: Record<string, string | undefined> = {}): Promise<CommandResult> {
-  const child = Bun.spawn(command, {
-    cwd,
-    env: isolatedProcessEnvironment({ ...process.env, ...env }),
-    stdin: new Blob([input]),
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const [stdout, stderr, code] = await Promise.all([
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-    child.exited,
-  ]);
-  return { code, stdout, stderr };
 }
 
 function trackedSkillFiles(name: string): string[] {
@@ -381,44 +336,6 @@ test("public Skills run from isolated single-directory exports", async () => {
       PATH: [tavilyFixtureBin, "/usr/bin", "/bin"].join(delimiter),
       TAVILY_HOSTS_FILE: join(tavily, "references/hosts.txt.example"),
     }), "Tavily inventory");
-
-    const xp = roots.get("xp-infra")!;
-    expectSuccess(run([process.execPath, join(xp, "scripts/xp-infra"), "--help"], caller), "XP help");
-    expect(lstatSync(join(xp, "scripts/xp-infra-audit-local")).mode & 0o777).toBe(0o755);
-    const auditLocal = await runWithInput([join(xp, "scripts/xp-infra-audit-local"), "public-health"], caller, '{"status":"ok","xray":{"status":"up"}}', {
-      PATH: dirname(process.execPath),
-    });
-    expectSuccess(auditLocal, "XP local public-health wrapper");
-    expect(auditLocal.stdout).toContain("public_health=true");
-    executedPortable.add("xp-infra/scripts/xp-infra-audit-local");
-    const policyConfig = join(xp, "policy-fixture");
-    mkdirSync(policyConfig, { recursive: true });
-    writeFileSync(join(policyConfig, "hosts.txt"), "fixture-node\n");
-    writeFileSync(join(policyConfig, "deployment-policy.yaml"), `schema_version: 1
-owner_confirmed: true
-geo:
-  enabled: true
-  origin: https://api.country.is
-  owner_authorized_third_party_lookup: true
-public_hostname:
-  zone: example.test
-defaults:
-  cloudflare_tunnel: true
-  cloudflare_ddns: true
-  ip_geo_enrichment: true
-  managed_default_vless: true
-  managed_default_ss2022: false
-  direct_docker: false
-  vless_port: automatic_preflight
-node_overrides: {}
-`);
-    const policy = run([process.execPath, join(xp, "scripts/xp-infra"), "policy", "check"], caller, {
-      XP_INFRA_CONFIG_DIR: policyConfig,
-      PATH: "/usr/bin:/bin",
-    });
-    expectSuccess(policy, "XP offline policy check");
-    expect(policy.stdout).toBe("policy: OK\n");
-    executedPortable.add("xp-infra/scripts/xp-infra");
     expect([...executedPortable].sort()).toEqual(portableScriptInventory());
   } finally {
     for (const workspace of workspaces) rmSync(workspace, { recursive: true, force: true });

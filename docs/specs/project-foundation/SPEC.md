@@ -9,7 +9,7 @@ The public source owns shared instructions and executable resources. Operators o
 ## Terms and Interfaces
 
 - Domain terms are defined in [GLOSSARY.md](../../../GLOSSARY.md).
-- Public membership: 11 Skills, defined by [PUBLIC_SKILLS.txt](../../../PUBLIC_SKILLS.txt). Skill metadata and the catalog describe that membership; consumer discovery uses a direct checkout or source links.
+- Public membership: 10 Skills, defined by [PUBLIC_SKILLS.txt](../../../PUBLIC_SKILLS.txt). Skill metadata and the catalog describe that membership; consumer discovery uses a direct checkout or source links.
 - [The script language matrix](SCRIPT-LANGUAGE-MATRIX.md) allocates the executable responsibilities of every public Skill. Target allocation is distinct from completed migration, which is recorded in [IMPLEMENTATION.md](IMPLEMENTATION.md).
 - General tools use installed Bun with explicit type checking; application-host Python, native C rendering, and bounded remote Shell retain their concrete interface roles.
 - The documentation presentation uses Bun/Rspress and the /agent-toolkit/ repository subpath. A successful build does not establish external publication.
@@ -34,7 +34,7 @@ The project MUST document the public source, consumer installation, private depl
 
 ### REQ-FOUNDATION-GOV-05
 
-The project MUST review private legacy design documents for transferable requirements. Rewrite public contracts against current code/tests, and restore traceable requirements and verification for retained imagegen integration and XP policy/audit.
+The project MUST review private legacy design documents for transferable requirements. Rewrite public contracts against current code/tests, and restore traceable requirements and verification for the retained imagegen integration.
 
 ### REQ-FOUNDATION-LANG-01
 
@@ -64,10 +64,6 @@ The project MUST record a target language for every public Skill's owned scripts
 
 The project MUST convert buzzer and framebuffer helpers, DST local tooling, and the owned Git contract test to TS/Bun. Retain native C rendering and remote Shell collection.
 
-### REQ-FOUNDATION-MIG-02
-
-The project MUST convert XP local policy, orchestration, interpretation, and audit decisions to TS/Bun. Retain remote native collection and identity revalidation in POSIX Shell.
-
 ### REQ-FOUNDATION-MIG-05
 
 The project MUST preserve the accepted Python module, C rendering, remote Shell, small Tavily helper, and text-only exceptions. Retire only replaced implementations and align affected tests/docs/CI.
@@ -86,7 +82,7 @@ The project MUST for every Skill, explain when to use it, prerequisites/platform
 
 ### REQ-FOUNDATION-DOC-04
 
-The project MUST explain protected configuration for XP, imagegen, and other operational Skills using neutral examples. Move one-off migration instructions out of the newcomer path.
+The project MUST explain protected configuration for imagegen and other operational Skills using neutral examples. Move one-off migration instructions out of the newcomer path.
 
 ### REQ-FOUNDATION-SITE-01
 
@@ -208,12 +204,6 @@ Verification requirements describe evidence that must be produced, rather than c
 - Method: inspect the maintained implementation and exercise its applicable consumer or test scenario.
 - Pass condition: The HELPERS format, parsing, report, transport, Git recoverability, and consumer-source scenarios pass.
 
-### VER-FOUNDATION-REQUIREMENT-MIG-02
-
-- covers: `REQ-FOUNDATION-MIG-02`
-- Method: inspect the maintained implementation and exercise its applicable consumer or test scenario.
-- Pass condition: The XP strict-input, policy, identity, network/output-boundary, and read-only scenarios pass without local Ruby.
-
 ### VER-FOUNDATION-REQUIREMENT-MIG-05
 
 - covers: `REQ-FOUNDATION-MIG-05`
@@ -332,7 +322,7 @@ Verification requirements describe evidence that must be produced, rather than c
 
 - covers: `REQ-FOUNDATION-GOV-05`
 - Method and required evidence: Requirement-to-verification mapping and public-content inspection.
-- Pass condition: Public guarantees for VM, CVM fallback, and XP point to current contracts/scenarios, and published design text contains no real private deployment material.
+- Pass condition: Public guarantees for the VM and CVM fallback point to current contracts/scenarios, and published design text contains no real private deployment material.
 
 ### VER-FOUNDATION-GOVERNANCE-05
 
@@ -405,42 +395,6 @@ Verification requirements describe evidence that must be produced, rather than c
 - covers: `REQ-FOUNDATION-MIG-01`
 - Method and required evidence: Directory-only export smoke with an explicit tracked-script inventory, CI suite selection, and reference scan; every listed portable/offline entrypoint uses synthetic fixtures while retained remote/native scripts are checked for source-local paths and prerequisite declarations.
 - Pass condition: Each maintained portable/offline script entrypoint works from an isolated single-Skill export on Linux/macOS, retained remote/native Shell/C entrypoints remain source-isolated with accurate prerequisites, and cross-Skill helper/test references are gone.
-
-### VER-FOUNDATION-XP-01
-
-- covers: `REQ-FOUNDATION-MIG-02`
-- Method and required evidence: Neutral policy/inventory fixtures and fake-command records proving no disallowed continuation.
-- Pass condition: Missing/unconfirmed/incomplete policies, unsupported schema/fields, ambiguous inventory, and invalid values block the relevant operation.
-
-### VER-FOUNDATION-XP-02
-
-- covers: `REQ-FOUNDATION-MIG-02`
-- Method and required evidence: Explicit parser and normalization fixtures; do not rely on ordinary `JSON.parse` alone.
-- Pass condition: Duplicate record/JSON members, malformed values, invalid booleans/timestamps/ports, and stale or contradictory observations are rejected. YAML parsing does not silently broaden previously prohibited constructs.
-
-### VER-FOUNDATION-XP-03
-
-- covers: `REQ-FOUNDATION-MIG-02`
-- Method and required evidence: Fake remote runtime scenarios and retained remote-probe tests in isolated Linux.
-- Pass condition: Host/container/process identity changes between observation and revalidation fail closed; direct/sudo Docker and native-service access follow the declared policy.
-
-### VER-FOUNDATION-XP-04
-
-- covers: `REQ-FOUNDATION-MIG-02`
-- Method and required evidence: Local fixture endpoints and synthetic target/data tests with bounded outputs; no production network validation.
-- Pass condition: Public probe validation preserves target/redirect/network restrictions, output limits, timeouts, and error reporting. Missing/failed evidence cannot become an audit success.
-
-### VER-FOUNDATION-XP-05
-
-- covers: `REQ-FOUNDATION-MIG-02`
-- Method and required evidence: End-to-end fake SSH/native-command audit cases, secret canaries, and result comparisons.
-- Pass condition: Reports agree with expected policy/audit outcomes and do not read or print administrator tokens. No alternate node or port is chosen automatically.
-
-### VER-FOUNDATION-XP-06
-
-- covers: `REQ-FOUNDATION-MIG-02`
-- Method and required evidence: Fresh operator-environment smoke and remote dependency inspection.
-- Pass condition: Local entrypoints need Bun and native transport tools, not Ruby or Python; remote probes remain POSIX and require no Bun installation.
 
 ### VER-FOUNDATION-GUIDES-01
 

@@ -146,7 +146,7 @@ export function check(repoRoot: string = REPO_ROOT): string[] {
     const spec = documents.get("SPEC.md")!;
     const headings = [...spec.matchAll(/^### ((?:REQ|VER)-FOUNDATION-[A-Z0-9-]+)$/gm)].map((match) => match[1]);
     const required = Object.entries({ GOV: 5, LANG: 6, COMMON: 7 }).flatMap(([group, count]) => Array.from({ length: count }, (_, i) => `REQ-FOUNDATION-${group}-${String(i + 1).padStart(2, "0")}`));
-    const scenarios = Object.entries({ COMMON: 7, GOVERNANCE: 5, TOOLING: 5, HELPERS: 6, XP: 6, GUIDES: 5, SITE: 6 }).flatMap(([group, count]) => Array.from({ length: count }, (_, i) => `VER-FOUNDATION-${group}-${String(i + 1).padStart(2, "0")}`));
+    const scenarios = Object.entries({ COMMON: 7, GOVERNANCE: 5, TOOLING: 5, HELPERS: 6, GUIDES: 5, SITE: 6 }).flatMap(([group, count]) => Array.from({ length: count }, (_, i) => `VER-FOUNDATION-${group}-${String(i + 1).padStart(2, "0")}`));
     for (const id of [...required, ...scenarios]) {
       if (headings.filter((heading) => heading === id).length !== 1) findings.push(`FOUNDATION_ID_DRIFT ${id}`);
     }

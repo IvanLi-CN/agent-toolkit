@@ -13,4 +13,3 @@ git-sync
 linux-server-init
 markdown-doc-style
 tavily-hikari-infra
-xp-infra

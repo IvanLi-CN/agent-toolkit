@@ -2,28 +2,7 @@
 
 [返回指南](README.md) · [Protected configuration](configuration.md)
 
-这些 Skills 使用 operator 已配置的目标。离线帮助或 policy 检查不证明远端健康；只读诊断不授权 deploy、restart、promote、DNS 写入或权限修改。
-
-## xp-infra
-
-**何时使用：**检查 XP policy、指定节点 preflight/audit、诊断部署漂移；deploy/join/upgrade 仍需另行授权。[Skill source](../../skills/xp-infra/SKILL.md)、[CLI contract](../../skills/xp-infra/references/cli.md) 与 [runbook](../../skills/xp-infra/references/runbook.md)定义行为。
-
-**平台与前置条件：**本地 Bun、OpenSSH、curl，不要求本地 Ruby/Python；远端 Linux 保留 POSIX/native 探针及非交互 privilege/service 工具，端口探针需要 GNU-compatible `dd`、`timeout` 等。远端不需要安装 Bun。
-
-**配置：**`XP_INFRA_CONFIG_DIR` 或独立 `XP_HOSTS_FILE` / `XP_POLICY_FILE`，实际连接放 operator SSH 配置；[公共模板](../../skills/xp-infra/references/deployment-policy.yaml.example)故意未确认，必须由主人决定 policy。见 [XP 配置](configuration.md#xp)；不把 unavailable 证据默认为健康。
-
-**最小例子：**进入 `xp-infra` 的 Skill 根目录后调用实际入口；help 完全离线，policy check 只读取私有配置：
-
-```bash
-scripts/xp-infra --help
-scripts/xp-infra policy check
-```
-
-已授权远端观察时仍在该 Skill 根目录执行 `scripts/xp-infra port preflight '<configured-alias>'`、`scripts/xp-infra audit '<configured-alias>'`。Alias 必须注册且唯一，不选择“恰好能连通”的其他节点。
-
-**输出：**policy 成功/拒绝、经过完整验证的选定端口、audit 的 PASS/FAIL/获准 SKIP 与非零失败。Preflight 不分配真实服务端口，fixture 不建立部署健康证据。
-
-**读写边界：**helpers/audit 只读，不读 administrator tokens、不部署/修复/重启；public HTTPS probes 会访问网络，必须使用明确 policy 和目标，保持 TLS/redirect/output 安全限制。隧道创建本地 listener/SSH forwarding，另需授权与精确端口。真实 policy、例外理由、logs、node runtime secrets 不进入公共源码。
+这些 Skills 使用 operator 已配置的目标。离线帮助不证明远端健康；只读诊断不授权 deploy、restart、promote、DNS 写入或权限修改。
 
 ## tavily-hikari-infra
 

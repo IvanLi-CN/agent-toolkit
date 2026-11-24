@@ -45,7 +45,6 @@ export const references: Record<string, string[]> = {
   'dst-dedicated-server': ['environment', 'dst-paths', 'helper-contract'],
   'firmware-display-preview': ['framebuffer-contract'],
   'tavily-hikari-infra': ['runbook'],
-  'xp-infra': ['README', 'cli', 'runbook'],
 };
 
 export async function readPublic(root: string, name: string): Promise<string> {

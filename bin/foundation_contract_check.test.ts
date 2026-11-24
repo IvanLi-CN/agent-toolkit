@@ -31,7 +31,7 @@ test("accepts the standalone current membership and CI without consumer state", 
 });
 
 test("rejects an empty, duplicate, malformed, or reduced manifest", () => {
-  for (const content of ["", "xp-infra\nxp-infra\n", "../escape\n", "xp-infra\n"]) {
+  for (const content of ["", "tavily-hikari-infra\ntavily-hikari-infra\n", "../escape\n", "tavily-hikari-infra\n"]) {
     fixture((root) => {
       writeFileSync(join(root, "PUBLIC_SKILLS.txt"), content);
       expect(check(root).length).toBeGreaterThan(0);
@@ -42,20 +42,20 @@ test("rejects an empty, duplicate, malformed, or reduced manifest", () => {
 test("rejects duplicate, stale, and non-clickable catalog entries", () => {
   for (const replacement of ["| `removed-skill` |", "| `unknown-skill` |", "| `invalid_name` | "]) {
     fixture((root) => {
-      replace(root, "skills/README.md", "| `xp-infra` |", replacement);
+      replace(root, "skills/README.md", "| `tavily-hikari-infra` |", replacement);
       expect(check(root)).toContain("FOUNDATION_CATALOG_DRIFT");
     });
   }
   fixture((root) => {
-    replace(root, "skills/README.md", "[Skill source](xp-infra/SKILL.md)", "`xp-infra/SKILL.md`");
+    replace(root, "skills/README.md", "[Skill source](tavily-hikari-infra/SKILL.md)", "`tavily-hikari-infra/SKILL.md`");
     expect(check(root)).toContain("FOUNDATION_CATALOG_DRIFT");
   });
 });
 
 test("rejects missing, duplicate, extra, or malformed matrix rows", () => {
-  for (const replacement of ["| `removed-skill` |", "| `unknown-skill` |", "| `invalid_name` |", "| `xp-infra` ||"]) {
+  for (const replacement of ["| `removed-skill` |", "| `unknown-skill` |", "| `invalid_name` |", "| `tavily-hikari-infra` ||"]) {
     fixture((root) => {
-      replace(root, `${TOPIC}/SCRIPT-LANGUAGE-MATRIX.md`, "| `xp-infra` |", replacement);
+      replace(root, `${TOPIC}/SCRIPT-LANGUAGE-MATRIX.md`, "| `tavily-hikari-infra` |", replacement);
       expect(check(root)).toContain("FOUNDATION_MATRIX_DRIFT");
     });
   }
@@ -64,7 +64,7 @@ test("rejects missing, duplicate, extra, or malformed matrix rows", () => {
 test("rejects stale membership counts in each active contract", () => {
   for (const path of ["SPEC.md", "IMPLEMENTATION.md", "SCRIPT-LANGUAGE-MATRIX.md"]) {
     fixture((root) => {
-      replace(root, `${TOPIC}/${path}`, "Public membership: 11", "Public membership: 14");
+      replace(root, `${TOPIC}/${path}`, "Public membership: 10", "Public membership: 14");
       expect(check(root)).toContain(`FOUNDATION_COUNT_DRIFT ${path}`);
     });
   }
@@ -83,7 +83,7 @@ test("requires complete migration coverage and behavior evidence for completion"
     expect(check(root)).toContain("FOUNDATION_MIGRATION_EVIDENCE_MISSING buzzer-audio-preview");
   });
   fixture((root) => {
-    replace(root, `${TOPIC}/IMPLEMENTATION.md`, "| `xp-infra` | deferred |", "| `unknown-skill` | complete |");
+    replace(root, `${TOPIC}/IMPLEMENTATION.md`, "| `tavily-hikari-infra` | retained |", "| `unknown-skill` | complete |");
     expect(check(root)).toContain("FOUNDATION_COVERAGE_DRIFT");
     expect(check(root)).toContain("FOUNDATION_INVALID_COVERAGE unknown-skill");
   });
